@@ -541,7 +541,8 @@ mod tests {
     assert!(read(&report.backup).contains("keep memory pinned"));
   }
 
-  /// `preflight` refuses a group- or world-writable parent directory. It
+  /// `preflight` refuses a parent directory another user could write into
+  /// (world-writable, or group-writable on a dir not owned by you). It
   /// guards the *write*, so a config with nothing to migrate — which makes no
   /// write — must not fail on it. Calling it up front turned every daemon
   /// start on an already-migrated config in such a directory into a logged

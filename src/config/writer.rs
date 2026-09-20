@@ -40,7 +40,7 @@ pub struct WriteOutcome {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WriteError {
-  #[error("parent dir {} is group/world-writable (mode {mode:#o}); refuse to write a 0600 config there", path.display())]
+  #[error("parent dir {} is not owner-only-writable (mode {mode:#o}); refuse to write a 0600 config there", path.display())]
   ParentDirInsecure { path: PathBuf, mode: u32 },
   #[error("config write I/O at {}: {error}", path.display())]
   Io { path: PathBuf, error: String },
@@ -132,24 +132,28 @@ fn serialise_inline(v: &Value) -> String {
 /// symlinks — we *follow* the link and write to its canonical target, so the
 /// link survives the save (a tmp-file + rename over the link itself would
 /// replace the link with a regular file). A non-symlink path is returned
-/// unchanged. The group/world-writable parent-dir check runs on the
-/// *resolved* target's parent (where the rename lands), and is the only
-/// refusal: writing a 0600 config into a permissive dir is pointless because
-/// the dir mode dominates effective access.
+/// unchanged. The swap-surface parent-dir check (which runs on the
+/// *resolved* target's parent, where the rename lands) is the only
+/// refusal: writing a 0600 config into a dir another user can write is
+/// pointless because that user could rename the file away, and the dir
+/// mode dominates effective access.
 pub fn preflight(path: &Path) -> Result<PathBuf, WriteError> {
   let target = resolve_write_target(path);
   #[cfg(unix)]
   {
-    use std::os::unix::fs::PermissionsExt;
+    use crate::util::file_security::{dir_swap_surface, SwapSurface};
     if let Some(parent) = target.parent() {
-      if let Ok(meta) = std::fs::metadata(parent) {
-        let mode = meta.permissions().mode() & 0o777;
-        if mode & 0o022 != 0 {
-          return Err(WriteError::ParentDirInsecure {
-            path: parent.to_path_buf(),
-            mode,
-          });
-        }
+      let our_uid = unsafe { libc::geteuid() };
+      if let Some(surface) = dir_swap_surface(parent, our_uid) {
+        let mode = match surface {
+          SwapSurface::ForeignOwner { mode, .. }
+          | SwapSurface::WorldWritable { mode }
+          | SwapSurface::ForeignOwnerGroupWritable { mode, .. } => mode,
+        };
+        return Err(WriteError::ParentDirInsecure {
+          path: parent.to_path_buf(),
+          mode,
+        });
       }
     }
   }
@@ -428,6 +432,24 @@ arch_defaults:
     let target = dir.join("config.yaml");
     let err = preflight(&target).unwrap_err();
     assert!(matches!(err, WriteError::ParentDirInsecure { .. }));
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::remove_dir_all(&dir).ok();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn preflight_accepts_self_owned_group_writable_parent() {
+    // A group-writable config dir *we* own is not a swap surface — no
+    // other user can rename a 0600 file out of it. (Shares the owner-aware
+    // rule with the init binary-adoption check.)
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("perm-own-gw");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
+    let target = dir.join("config.yaml");
+    assert!(
+      preflight(&target).is_ok(),
+      "a self-owned 0775 dir must not refuse the config write"
+    );
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
     fs::remove_dir_all(&dir).ok();
   }
