@@ -43,34 +43,75 @@ fn auto_label(def: &KnobDef) -> &'static str {
   }
 }
 
-fn as_json(backend_filter: Option<&str>) -> Value {
-  let backends: Vec<Value> = knobs::registry::by_backend()
+/// One listing section: a backend's compiled-in knobs, or one model's runtime
+/// table (`model` set), in registry order then install order.
+struct Section {
+  backend: &'static str,
+  model: Option<&'static str>,
+  defs: &'static [KnobDef],
+}
+
+fn sections(backend_filter: Option<&str>) -> Vec<Section> {
+  let static_rows = knobs::registry::by_backend()
     .into_iter()
-    .filter(|(id, _)| backend_filter.is_none_or(|want| *id == want))
-    .map(|(id, defs)| {
-      let knobs: Vec<Value> = defs
-        .iter()
-        .map(|d| {
-          let mut o = serde_json::Map::new();
-          o.insert("id".into(), json!(d.id));
-          o.insert("flag".into(), json!(d.emit_flag()));
-          o.insert("kind".into(), json!(kind_label(d)));
-          o.insert("help".into(), json!(d.help));
-          o.insert("group".into(), json!(d.group.title()));
-          o.insert("auto".into(), json!(d.auto.map(|_| auto_label(d))));
-          o.insert("concept".into(), json!(d.concept.map(|c| c.neutral_flag())));
-          let choices = d.kind.choices();
-          if !choices.is_empty() {
-            o.insert("choices".into(), json!(choices));
-          }
-          if !d.aliases.is_empty() {
-            o.insert("aliases".into(), json!(d.aliases));
-          }
-          Value::Object(o)
-        })
-        .collect();
-      json!({ "backend": id, "knobs": knobs })
-    })
+    .map(|(backend, defs)| Section {
+      backend,
+      model: None,
+      defs,
+    });
+  let scoped_rows = knobs::registry::scoped_all()
+    .into_iter()
+    .filter_map(|(scope, defs)| {
+      let (backend, model) = knobs::registry::split_scope(scope)?;
+      Some(Section {
+        backend,
+        model: Some(model),
+        defs,
+      })
+    });
+  static_rows
+    .chain(scoped_rows)
+    .filter(|s| backend_filter.is_none_or(|want| s.backend == want))
+    .collect()
+}
+
+fn as_json(backend_filter: Option<&str>) -> Value {
+  let backends: Vec<Value> = sections(backend_filter)
+    .into_iter()
+    .map(
+      |Section {
+         backend: id,
+         model,
+         defs,
+       }| {
+        let knobs: Vec<Value> = defs
+          .iter()
+          .map(|d| {
+            let mut o = serde_json::Map::new();
+            o.insert("id".into(), json!(d.id));
+            o.insert("flag".into(), json!(d.emit_flag()));
+            o.insert("kind".into(), json!(kind_label(d)));
+            o.insert("help".into(), json!(d.help));
+            o.insert("group".into(), json!(d.group.title()));
+            o.insert("auto".into(), json!(d.auto.map(|_| auto_label(d))));
+            o.insert("concept".into(), json!(d.concept.map(|c| c.neutral_flag())));
+            let choices = d.kind.choices();
+            if !choices.is_empty() {
+              o.insert("choices".into(), json!(choices));
+            }
+            if !d.aliases.is_empty() {
+              o.insert("aliases".into(), json!(d.aliases));
+            }
+            Value::Object(o)
+          })
+          .collect();
+        let mut section = json!({ "backend": id, "knobs": knobs });
+        if let Some(m) = model {
+          section["model"] = json!(m);
+        }
+        section
+      },
+    )
     .collect();
   json!({ "backends": backends })
 }
@@ -79,16 +120,22 @@ fn render_human(backend_filter: Option<&str>) -> String {
   use crate::cli::{colors, format};
   let mut out = String::new();
   let mut total = 0usize;
-  for (id, defs) in knobs::registry::by_backend() {
-    if backend_filter.is_some_and(|want| id != want) {
-      continue;
-    }
+  for Section {
+    backend: id,
+    model,
+    defs,
+  } in sections(backend_filter)
+  {
     if !out.is_empty() {
       out.push('\n');
     }
     // Backend name as a section title. Bold when the terminal takes it, the
     // bare id when piped, so `awk -F\t` pipelines still key on the tables.
-    out.push_str(&format!("{}\n", colors::launch_id(id)));
+    let title = match model {
+      Some(m) => format!("{id} {m}"),
+      None => id.to_string(),
+    };
+    out.push_str(&format!("{}\n", colors::launch_id(&title)));
     let header = ["KNOB", "FLAG", "VALUE", "AUTO", "DESCRIPTION"];
     let rows: Vec<Vec<String>> = defs
       .iter()
@@ -138,7 +185,14 @@ mod tests {
   #[test]
   fn json_lists_every_backend_and_knob() {
     let v = as_json(None);
-    let backends = v["backends"].as_array().unwrap();
+    // Runtime tables other tests install in this process come after, marked
+    // with `model`; the compiled-in sections are the stable part.
+    let backends: Vec<&Value> = v["backends"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .filter(|b| b.get("model").is_none())
+      .collect();
     assert_eq!(
       backends.len(),
       knobs::registry::by_backend().len(),

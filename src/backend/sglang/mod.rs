@@ -333,6 +333,8 @@ impl Backend for SglangBackend {
       binary,
       argv: sglang_argv(params, port),
       env_remove: CREDENTIAL_ENV_STRIP.to_vec(),
+      env: Vec::new(),
+      min_stop_grace: std::time::Duration::ZERO,
       readiness: readiness(&served_model_name(&params.model_path)),
       probe,
     })

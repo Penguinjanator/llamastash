@@ -31,11 +31,6 @@ pub struct DiscoveryOptions {
   pub scan_roots: Vec<ScanRoot>,
   pub scan: ScanOptions,
   pub watcher: WatcherOptions,
-  /// When `Some(port)`, each rescan also enumerates the `lemond` umbrella
-  /// on that loopback port and merges its models as Lemonade-tagged catalog
-  /// rows (R11, list-only). `None` (the default, and whenever the Lemonade
-  /// backend is disabled) skips it entirely — no `lemond` contact.
-  pub lemonade_port: Option<u16>,
   /// Backend config + force map, consulted on **every** rescan to decide which
   /// backends project rows from the shared safetensors / HF-repo enumerator.
   ///
@@ -80,7 +75,6 @@ impl DiscoveryOptions {
       scan_roots: roots,
       scan,
       watcher: WatcherOptions::default(),
-      lemonade_port: None,
       backend: Default::default(),
       backend_force: Default::default(),
     }
@@ -182,10 +176,14 @@ async fn full_rescan(catalog: &ModelCatalog, opts: &DiscoveryOptions) {
     }
   }
 
-  // Lemonade models (R11, opt-in, list-only). Best-effort: an unreachable
-  // umbrella yields no rows and never aborts the disk scan above.
-  if let Some(port) = opts.lemonade_port {
-    new_models.extend(crate::backend::lemonade::discovery::enumerate(port).await);
+  // File-less rows each backend contributes from its config or its own API.
+  // Best-effort per backend: an unreachable API yields no rows and never
+  // aborts the disk scan above.
+  for backend in crate::backend::Backends::all() {
+    new_models.extend(
+      crate::backend::Backend::config_catalog_rows(&backend, &opts.backend, &opts.backend_force)
+        .await,
+    );
   }
 
   // Safetensors / HF-repo rows. One walk, shared across every projecting
@@ -217,6 +215,31 @@ async fn full_rescan(catalog: &ModelCatalog, opts: &DiscoveryOptions) {
       Vec::new()
     });
     new_models.extend(projected);
+  }
+
+  // Backends that run a catalog model by config (a pattern over its path)
+  // join its row after the auto default, so they are offered, not routed to.
+  let config_servers: Vec<crate::backend::Backends> = crate::backend::Backends::all()
+    .into_iter()
+    .filter(|b| crate::backend::Backend::enabled_in_config(b, &opts.backend, &opts.backend_force))
+    .collect();
+  if !config_servers.is_empty() {
+    for model in &mut new_models {
+      for backend in &config_servers {
+        let id = crate::backend::Backend::id(backend);
+        if !model.supported_backends.iter().any(|b| b == id)
+          && crate::backend::Backend::serves_path(backend, &model.path)
+        {
+          if model.supported_backends.is_empty() {
+            // An empty list means "the default backend"; keep it first.
+            model
+              .supported_backends
+              .push(crate::backend::DEFAULT_BACKEND_ID.to_string());
+          }
+          model.supported_backends.push(id.to_string());
+        }
+      }
+    }
   }
 
   catalog.replace_all(new_models).await;
@@ -258,9 +281,11 @@ fn watch_mode_for(source: ModelSource) -> WatchMode {
     ModelSource::HuggingFace => WatchMode::Shallow,
     // Lemonade models come from the `lemond` API, not a filesystem root, so
     // this is never reached for them in practice; default to recursive.
-    ModelSource::Ollama | ModelSource::LmStudio | ModelSource::UserPath | ModelSource::Lemonade => {
-      WatchMode::Recursive
-    }
+    ModelSource::Ollama
+    | ModelSource::LmStudio
+    | ModelSource::UserPath
+    | ModelSource::Lemonade
+    | ModelSource::Config => WatchMode::Recursive,
   }
 }
 
@@ -354,7 +379,6 @@ mod tests {
       }],
       scan: ScanOptions::default(),
       watcher: fast_watcher(),
-      lemonade_port: None,
       backend: Default::default(),
       backend_force: Default::default(),
     };
@@ -387,7 +411,6 @@ mod tests {
       }],
       scan: ScanOptions::default(),
       watcher: fast_watcher(),
-      lemonade_port: None,
       backend: Default::default(),
       backend_force: Default::default(),
     };

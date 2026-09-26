@@ -625,6 +625,61 @@ backend:
     # later bare `start` inheriting it. There is no `cors` key: SGLang
     # allows every origin and exposes no flag to narrow it.
 
+  # Generic — run any OpenAI-compatible server llamastash has no dedicated
+  # backend for. llamastash picks the port, polls `ready`, routes the proxy
+  # and stops the process; everything engine-specific lives in the entry or
+  # in a wrapper script. Read once at start: `daemon restart` after editing.
+  # See docs/usage.md § Generic backend for the rules and a Docker wrapper.
+  #
+  # Sources — CLI: (none) · Env: (none). Config-only: `binary` runs as you.
+  generic:
+    servers:
+      # With `model`, the entry is a server option (`generic-<name>`) on every
+      # catalog GGUF the value matches: a preset-key glob, a path, or a model
+      # id. llama.cpp stays the default; pick this server in the TUI Server
+      # row, with `start <model> --server generic-gufo`, or in a preset.
+      - name: gufo
+        model: "Qwen3.8-Flash-Next-UD-Q4_K_XL*"
+        binary: /opt/gufo/build/release/gufo
+        # Placeholders: {port} (llamastash reserves it), {host} (always
+        # 127.0.0.1), {name} (the launch's model id, `id@launch` when named),
+        # {model} (the chosen GGUF path, required with `model`) and
+        # {<knob id>}. Knobs, then `start -- …` extras, follow.
+        args: [serve, --host, "{host}", --port, "{port}", llm,
+               --served-model-name, "{name}", --model, "{model}",
+               --mtp-model, /models/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf]
+        knobs:
+          # Emitted as `<flag> <value>`. `ctx: true` (at most one) makes the
+          # knob the context window: `--ctx`, the TUI Context row, `status`.
+          - flag: --context
+            ctx: true
+            default: "65536"
+          - flag: --speculative
+            default: mtp
+          - flag: --temperature
+            default: "1.0"
+          - --seed                         # no default: sent only when set
+        ready: /ready                      # HTTP path that returns 200 when loaded
+        stop_grace_secs: 60                # SIGTERM→SIGKILL floor for every stop
+      # Without `model`, the entry is its own row, published as `name`. For
+      # engines whose weights are not a catalog GGUF.
+      - name: flash-next-halogen
+        binary: ~/bin/halogen-serve.sh     # wrapper around `docker run`
+        args: ["{port}"]
+        knobs:
+          - flag: --ctx-window             # referenced in env, so never a flag
+            id: halogen-ctx
+            ctx: true
+            default: "65536"
+        env:
+          HALOGEN_MODEL_ID: "{name}"
+          HALOGEN_CTX: "{halogen-ctx}"
+          HALOGEN_KV_POOL_POSITIONS: "{halogen-ctx}"
+        ready: /v1/models
+        memory_gib: 80                     # admission demand; unset = no gating
+        stop_grace_secs: 90
+        ready_timeout_secs: 600
+
 # ─── Keybindings ──────────────────────────────────────────────────
 #
 # Override the default keymap. Each entry maps an action name

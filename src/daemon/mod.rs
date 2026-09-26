@@ -111,8 +111,7 @@ pub struct DaemonOptions {
   /// per-backend `servers:` arrays, distinct from the resolved default
   /// [`Self::binary`] above), the `[lemonade]` block, and the `[ds4]` block.
   /// Each backend reads its own sub-config through its hooks (the server catalog
-  /// is built from `configured_servers`); gate Lemonade activation through
-  /// [`Self::lemonade_available`].
+  /// is built from `configured_servers`).
   pub backend: BackendConfig,
   /// Per-backend force-enable flags keyed by backend id (`--lemonade` /
   /// `LLAMASTASH_LEMONADE`, `--ds4` / `LLAMASTASH_DS4`). Kept separate from the
@@ -157,21 +156,6 @@ pub struct DaemonOptions {
 }
 
 impl DaemonOptions {
-  /// Whether Lemonade activates at boot: enablement intent (the config
-  /// tri-state, or the `--lemonade`/env force) **and** the `lemond` binary
-  /// resolves. Mirrors ds4's on-when-found gate — a `lemond` on `PATH`
-  /// auto-enables Lemonade unless `lemonade.enabled: false`; absent binary =
-  /// zero footprint. Discovery / umbrella / re-exec all gate on this.
-  pub fn lemonade_available(&self) -> bool {
-    let force = self
-      .backend_force
-      .get(crate::backend::lemonade::LEMONADE_BACKEND_ID)
-      .copied()
-      .unwrap_or(false);
-    self.backend.lemonade.intends_enabled(force)
-      && crate::backend::lemonade::resolve_lemond_binary(&self.backend.lemonade).is_some()
-  }
-
   /// Test/utility helper: pin every path under one root directory.
   /// Production callers should prefer `from_defaults` plus the CLI's
   /// `build_options` flow, which threads config-driven overrides
@@ -300,6 +284,12 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
   // binds a TCP listener (§8c) and writes its URL+token into
   // `runtime.json` instead.
 
+  // Config load installs this too; repeating it here covers a daemon built
+  // from `DaemonOptions` alone (tests, embedders). Idempotent.
+  if let Err(e) = crate::backend::install_backend_config(&opts.backend) {
+    log::error!("backend config: {e}");
+  }
+
   // 3. Shutdown plumbing.
   let token = ShutdownToken::new();
   let _signal_task = install_signal_handlers(token.clone());
@@ -309,12 +299,10 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
   // produces a working daemon with an empty catalog — `list_models`
   // returns `{"models": []}`.
   let catalog = ModelCatalog::new();
-  // Lemonade discovery is opt-in and off by default, so a standard install
-  // never contacts `lemond`. Only an enabled backend threads its port in.
+  // Backends decide per rescan whether they contribute rows (Lemonade only
+  // when enabled and installed, so a standard install never contacts
+  // `lemond`).
   let mut discovery_opts = opts.discovery.clone();
-  if opts.lemonade_available() {
-    discovery_opts.lemonade_port = Some(opts.backend.lemonade.port);
-  }
   // Safetensors / HF-repo discovery, generically over whichever backends are
   // available and project rows from the shared enumerator. An install with
   // none enabled contributes an empty list, so the walk never runs and the
@@ -680,7 +668,9 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
   // exits — `daemon stop`, SIGINT, SIGTERM, IPC `shutdown` — we
   // don't want children to leak. The 5 s grace mirrors
   // `default_grace_secs` in the IPC `stop_model` handler.
-  let stopped = crate::ipc::methods::stop_all_managed(&ctx, Duration::from_secs(5)).await;
+  // A backend's own floor (`min_stop_grace`) still applies per child.
+  let stopped =
+    crate::ipc::methods::stop_all_managed(&ctx, crate::ipc::methods::SHUTDOWN_STOP_GRACE).await;
   if !stopped.is_empty() {
     log::info!("shutdown: stopped {} managed launch(es)", stopped.len());
   }

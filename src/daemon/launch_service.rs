@@ -752,6 +752,13 @@ pub(crate) async fn compose_and_spawn(
     ctx,
   );
   let resolved_backend_id = crate::backend::Backend::id(&inference_backend).to_string();
+  // Every knob lookup below runs under this: the backend id, or the model's
+  // own runtime table when its backend declares knobs per model.
+  let knob_scope = crate::backend::knob_scope_for(
+    &inference_backend,
+    &parsed.model_path,
+    launch_params.server.as_deref(),
+  );
 
   // The model's last successful launch params + the backend it resolved to.
   // Cloned once here and reused for the last-used knob layer below.
@@ -831,14 +838,10 @@ pub(crate) async fn compose_and_spawn(
   use crate::launch::knobs::{Concept, KnobValue as KV, Scalar};
   if let Some(c) = parsed.ctx {
     if user_knobs
-      .by_concept(&resolved_backend_id, Concept::ContextLength)
+      .by_concept(knob_scope, Concept::ContextLength)
       .is_none()
     {
-      user_knobs.set_by_concept(
-        &resolved_backend_id,
-        Concept::ContextLength,
-        KV::Set(Scalar::U32(c)),
-      );
+      user_knobs.set_by_concept(knob_scope, Concept::ContextLength, KV::Set(Scalar::U32(c)));
     }
   }
   if let Some(r) = parsed.reasoning {
@@ -886,17 +889,19 @@ pub(crate) async fn compose_and_spawn(
   }
   layers.push((LayerLabel::ArchDefault, yaml_knobs));
   layers.push((LayerLabel::ArchDefault, &builtin_knobs));
-  let mut resolved = crate::launch::knobs::resolve_layered(&resolved_backend_id, &layers);
+  // Defaults the model's own config declares. Labelled as the fallback, so
+  // they read as "where the value comes from when nothing sets it" and are
+  // never persisted.
+  let config_defaults =
+    inference_backend.config_default_knobs(&parsed.model_path, launch_params.server.as_deref());
+  layers.push((LayerLabel::ServerDefault, &config_defaults));
+  let mut resolved = crate::launch::knobs::resolve_layered(knob_scope, &layers);
   // Seed knobs no layer filled per the default launch mode: under
   // `Auto` a layer-less knob delegates to `--fit` (an Auto knob emits
   // nothing, exactly like the unset slot it replaces). The mode is
   // `Config.default_launch_mode` (+ `LLAMASTASH_DEFAULT_LAUNCH_MODE`),
   // threaded through `LaunchEnv`.
-  crate::launch::knobs::seed_layerless(
-    &mut resolved,
-    &resolved_backend_id,
-    env.default_launch_mode,
-  );
+  crate::launch::knobs::seed_layerless(&mut resolved, knob_scope, env.default_launch_mode);
   // A knob some layer supplied that this backend cannot honour is dropped and
   // surfaced rather than silently emitted (R6). The whole-map contamination
   // gate the old shape needed is gone: the resolver carries values across a
@@ -913,10 +918,9 @@ pub(crate) async fn compose_and_spawn(
   // An `Auto` ctx/reasoning collapses to "no inline flag" here
   // (`set_value()` → `None`): `compose` emits nothing and `--fit`
   // governs ctx, the chat template governs reasoning.
-  launch_params.ctx = resolved.knobs.u32_by_concept(
-    &resolved_backend_id,
-    crate::launch::knobs::Concept::ContextLength,
-  );
+  launch_params.ctx = resolved
+    .knobs
+    .u32_by_concept(knob_scope, crate::launch::knobs::Concept::ContextLength);
   launch_params.reasoning = resolved
     .knobs
     .get_by_name("reasoning")
@@ -925,7 +929,7 @@ pub(crate) async fn compose_and_spawn(
     .unwrap_or(false);
   // Provenance for the IPC/CLI response (only knobs a real layer supplied),
   // computed before `resolved.knobs` moves out below.
-  let layer_sources = resolved.real_sources(&resolved_backend_id);
+  let layer_sources = resolved.real_sources(knob_scope);
   launch_params.knobs = resolved.knobs;
   // Close the `knobs.u32(crate::launch::knobs::kid("ctx-size"))` bypass of `MAX_CTX_TOKENS` (the early check
   // only saw the top-level `parsed.ctx`): validate the *resolved* ctx,
@@ -1102,7 +1106,7 @@ pub(crate) async fn compose_and_spawn(
     user_knobs,
     layer_sources,
     auto_set_knobs,
-    volatile_knobs: crate::launch::knobs::volatile_ids(&resolved_backend_id),
+    volatile_knobs: crate::launch::knobs::volatile_ids(knob_scope),
     bypasses_admission,
     force_admission,
     warnings,

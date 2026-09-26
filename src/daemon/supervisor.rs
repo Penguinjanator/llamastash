@@ -234,6 +234,9 @@ struct ManagedInner {
   /// supervisors with `inflight > 0` so a mid-stream generation
   /// can't get SIGTERM'd out from under the caller.
   inflight: std::sync::atomic::AtomicU64,
+  /// The backend's floor under every stop grace (see
+  /// [`crate::backend::ProcessLaunchSpec::min_stop_grace`]).
+  min_stop_grace: Duration,
 }
 
 impl ManagedModel {
@@ -259,6 +262,11 @@ impl ManagedModel {
 
   pub fn origin(&self) -> LaunchOrigin {
     self.inner.origin
+  }
+
+  /// The shortest grace [`Self::stop`] will use, whatever the caller asks.
+  pub fn min_stop_grace(&self) -> Duration {
+    self.inner.min_stop_grace
   }
 
   /// Snapshot the concurrent-request counter. The idle-TTL sweeper
@@ -347,8 +355,9 @@ impl ManagedModel {
     self.inner.ring.lock().await.tail(max)
   }
 
-  /// Trigger graceful shutdown: SIGTERM, `grace` to honor it, then
-  /// SIGKILL. Returns once the child has fully exited.
+  /// Trigger graceful shutdown: SIGTERM, `grace` (raised to the backend's
+  /// [`Self::min_stop_grace`]) to honor it, then SIGKILL. Returns once the
+  /// child has fully exited.
   ///
   /// Signal delivery is guarded against PID reuse: we re-check that
   /// the `Child` handle still reports a non-reaped pid under the
@@ -363,7 +372,7 @@ impl ManagedModel {
       return self.state().await;
     }
     signal_child_with_guard(self, SignalFlavour::Graceful).await;
-    let deadline = Instant::now() + grace;
+    let deadline = Instant::now() + grace.max(self.inner.min_stop_grace);
     loop {
       if let Some(child) = self.inner.child.lock().await.as_mut() {
         if let Ok(Some(_status)) = child.try_wait() {
@@ -452,6 +461,9 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
   for var in &input.plan.env_remove {
     cmd.env_remove(var);
   }
+  for (key, value) in &input.plan.env {
+    cmd.env(key, value);
+  }
   // Stamp an inheritance marker so a future daemon — possibly a
   // restart of this one, possibly an unrelated llamastash instance
   // on the same machine — can recognise this `llama-server` as
@@ -500,6 +512,7 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
     actuals: RwLock::new(super::actuals::Actuals::default()),
     origin: input.origin,
     inflight: std::sync::atomic::AtomicU64::new(0),
+    min_stop_grace: input.plan.min_stop_grace,
   });
   let model = ManagedModel { inner };
 
@@ -1059,6 +1072,7 @@ pub(crate) mod test_support {
         actuals: RwLock::new(crate::daemon::actuals::Actuals::default()),
         origin: LaunchOrigin::Manual,
         inflight: std::sync::atomic::AtomicU64::new(0),
+        min_stop_grace: Duration::ZERO,
       }),
     }
   }

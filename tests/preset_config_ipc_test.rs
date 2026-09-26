@@ -64,7 +64,6 @@ async fn spawn_daemon(
     }],
     scan: ScanOptions::default(),
     watcher: fast_watcher(),
-    lemonade_port: None,
     backend: Default::default(),
     backend_force: Default::default(),
   };

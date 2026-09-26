@@ -131,8 +131,8 @@ pub fn materialize_preset(name: &str, body: &PresetBody, model_path: PathBuf) ->
     .as_deref()
     .map(crate::launch::params::BackendChoice::from_id)
     .unwrap_or_default();
-  let backend_id = backend
-    .explicit_id()
+  let backend_id = crate::backend::runtime_knob_scope(&model_path, body.server.as_deref())
+    .or(backend.explicit_id())
     .unwrap_or(crate::backend::DEFAULT_BACKEND_ID);
 
   let mode = knobs

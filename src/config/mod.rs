@@ -13,6 +13,7 @@ pub mod writer;
 pub mod yaml_edit;
 
 pub use crate::backend::ds4::Ds4Config;
+pub use crate::backend::generic::GenericConfig;
 pub use crate::backend::lemonade::LemonadeConfig;
 pub use crate::backend::llama_cpp::LlamaCppConfig;
 pub use crate::backend::sglang::SglangConfig;

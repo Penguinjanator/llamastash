@@ -81,6 +81,10 @@ pub struct RunningRow {
   /// mirrored from the IPC `status` row's `backend` field. `None` on a row
   /// the daemon didn't tag; defaults to `llamacpp` semantics downstream.
   pub backend: Option<String>,
+  /// The shortest stop grace the daemon will use for this launch (its
+  /// backend's floor), `0` when it has none. The CLI sizes its stop deadline
+  /// around it.
+  pub stop_grace_secs: u64,
 }
 
 impl RunningRow {
@@ -430,6 +434,10 @@ fn parse_running_row(v: &Value) -> Option<RunningRow> {
   let backend = v.get("backend").and_then(Value::as_str).map(str::to_string);
   let name = v.get("name").and_then(Value::as_str).map(str::to_string);
   let preset = v.get("preset").and_then(Value::as_str).map(str::to_string);
+  let stop_grace_secs = v
+    .get("stop_grace_secs")
+    .and_then(Value::as_u64)
+    .unwrap_or(0);
   Some(RunningRow {
     launch_id,
     model_path,
@@ -450,6 +458,7 @@ fn parse_running_row(v: &Value) -> Option<RunningRow> {
     preset_count,
     preset_default,
     backend,
+    stop_grace_secs,
   })
 }
 
@@ -898,6 +907,7 @@ mod tests {
         preset_default: None,
         preset: None,
         backend: None,
+        stop_grace_secs: 0,
       },
       RunningRow {
         launch_id: "L2".into(),
@@ -919,6 +929,7 @@ mod tests {
         preset_default: None,
         preset: None,
         backend: None,
+        stop_grace_secs: 0,
       },
     ];
     assert_eq!(resolve_running(&rows, "41100").unwrap().launch_id, "L1");
@@ -947,6 +958,7 @@ mod tests {
       preset_default: None,
       preset: None,
       backend: None,
+      stop_grace_secs: 0,
     }];
     let err = resolve_running(&rows, "9999").unwrap_err();
     assert_eq!(err.code, MODEL_NOT_FOUND);
@@ -974,6 +986,7 @@ mod tests {
       preset_default: None,
       preset: None,
       backend: None,
+      stop_grace_secs: 0,
     };
     let rows = vec![
       row("L1", "/cache/gemma-4-E2B-it-Q4_K_M.gguf", 41100),

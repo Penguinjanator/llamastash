@@ -64,7 +64,13 @@ pub async fn handle(args: StopArgs, cli: &Cli, config: &Config) -> CliResult {
     // wall-clock is bounded by the slowest stop. Size the IPC budget
     // around `grace + slop` so a long custom grace doesn't trip the
     // default 5-second deadline (`R-01`).
-    let grace_for_timeout = grace.unwrap_or(5);
+    let floor = snap
+      .models
+      .iter()
+      .map(|r| r.stop_grace_secs)
+      .max()
+      .unwrap_or(0);
+    let grace_for_timeout = grace.unwrap_or(5).max(floor);
     let ipc_deadline = std::time::Duration::from_secs(grace_for_timeout.saturating_add(5));
     let resp = client
       .call_with_timeout(
@@ -153,7 +159,7 @@ pub async fn handle(args: StopArgs, cli: &Cli, config: &Config) -> CliResult {
   // a resident model) can run the full grace window. Size the IPC budget around
   // `grace + slop` so the client doesn't time out mid-stop and cancel the
   // handler, leaving a half-cleaned row (matches `stop_all` above).
-  let grace_for_timeout = grace.unwrap_or(5);
+  let grace_for_timeout = grace.unwrap_or(5).max(row.stop_grace_secs);
   let ipc_deadline = std::time::Duration::from_secs(grace_for_timeout.saturating_add(5));
   let resp = client
     .call_with_timeout("stop_model", Some(params), ipc_deadline)
@@ -347,6 +353,7 @@ mod tests {
       ready_at: None,
       params: None,
       backend: None,
+      stop_grace_secs: 0,
       latest_rss_bytes: None,
       latest_cpu_pct: None,
       resolved_ctx: None,

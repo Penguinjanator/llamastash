@@ -413,16 +413,21 @@ async fn handle_stop(force: bool) -> Result<()> {
   if !force {
     match Client::connect(&attach_dir).await {
       Ok(mut client) => {
-        let _ = client.call("shutdown", None).await?;
+        let resp = client.call("shutdown", None).await?;
         // Wait (bounded) for the process to actually exit. `shutdown`
         // only *requests* teardown; returning while the old daemon
         // still holds the lockfile (and its `lemond` umbrella is still
         // dying) makes a chained `daemon stop && daemon start` race
         // straight into "already running" / a half-released umbrella
-        // port. Ten seconds covers the slowest observed teardown
-        // (umbrella SIGTERM→SIGKILL escalation is 5 s); on timeout we
-        // fall back to the old fire-and-forget message.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // port. The daemon reports the longest child stop grace; wait
+        // that plus a margin for its own teardown, at least 10 s. On
+        // timeout we fall back to the old fire-and-forget message.
+        let grace = resp
+          .get("stop_grace_secs")
+          .and_then(|v| v.as_u64())
+          .unwrap_or(0);
+        let wait = Duration::from_secs(grace.saturating_add(5).max(10));
+        let deadline = std::time::Instant::now() + wait;
         loop {
           match existing_daemon_pid(&attach_dir) {
             None => {
@@ -599,8 +604,10 @@ pub(crate) fn build_options(args: BuildOptionsArgs<'_>) -> Result<DaemonOptions>
   // paths. Without this the daemon would come up healthy, the catalog
   // would stay empty forever, and the user would see "no models found"
   // with no signal that it's a config dead-end.
+  // Models declared in config count as something to list.
   crate::config::validate_scan_settings(
-    cli.no_scan || env_no_scan_v || config.disable_scan,
+    (cli.no_scan || env_no_scan_v || config.disable_scan)
+      && !crate::backend::config_declares_models(&config.backend),
     &cli.model_paths,
     &env_paths,
     &config.model_paths,

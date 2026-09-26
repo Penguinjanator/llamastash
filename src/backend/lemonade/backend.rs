@@ -120,6 +120,8 @@ pub fn umbrella_process_spec(port: u16, binary: PathBuf, probe: ProbeOptions) ->
     // it may legitimately use HF_* to pull models, so nothing is stripped
     // here. (Revisit if lemond honors a loopback-bypass env.)
     env_remove: vec![],
+    env: Vec::new(),
+    min_stop_grace: std::time::Duration::ZERO,
     readiness: Readiness::HttpPoll {
       path: LIVE_PATH.to_string(),
       ready_status: 200,
@@ -297,6 +299,30 @@ impl Backend for LemonadeBackend {
       .unwrap_or(false);
     ctx.backend.lemonade.intends_enabled(force)
       && resolve_lemond_binary(&ctx.backend.lemonade).is_some()
+  }
+
+  fn enabled_in_config(
+    &self,
+    config: &crate::backend::BackendConfig,
+    force: &std::collections::BTreeMap<String, bool>,
+  ) -> bool {
+    config
+      .lemonade
+      .intends_enabled(force.get(LEMONADE_BACKEND_ID).copied().unwrap_or(false))
+      && resolve_lemond_binary(&config.lemonade).is_some()
+  }
+
+  /// Opt-in and list-only: rows come from a running `lemond`, and a standard
+  /// install without it never contacts one.
+  async fn config_catalog_rows(
+    &self,
+    config: &crate::backend::BackendConfig,
+    force: &std::collections::BTreeMap<String, bool>,
+  ) -> Vec<crate::discovery::DiscoveredModel> {
+    if !self.enabled_in_config(config, force) {
+      return Vec::new();
+    }
+    super::discovery::enumerate(config.lemonade.port).await
   }
 
   fn installed(&self, ctx: &MethodContext) -> bool {

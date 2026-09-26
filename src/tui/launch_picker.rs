@@ -126,6 +126,9 @@ impl InlineEdit {
 pub struct LaunchPickerState {
   /// Display name of the focused model (rendered in the title).
   pub model_name: String,
+  /// The focused model's catalog path. Keys the knob scope for a backend that
+  /// declares knobs per model; `None` scopes to the backend id.
+  pub model_path: Option<std::path::PathBuf>,
   /// The model's native (trained) context length, when known. Trims any
   /// [`Ring::UpToTrainedContext`] ladder so the editor never offers a window
   /// larger than the model supports; `None` leaves the full ladder available.
@@ -245,6 +248,7 @@ impl LaunchPickerState {
   pub fn for_model(model_name: impl Into<String>) -> Self {
     Self {
       model_name: model_name.into(),
+      model_path: None,
       native_ctx: None,
       user_knobs: KnobSet::new(),
       resolved: KnobSet::new(),
@@ -276,7 +280,7 @@ impl LaunchPickerState {
   /// declaration order within a group, with groups whose rows are all hidden
   /// on this host / model dropped entirely (header included).
   pub fn visible_groups(&self) -> Vec<(Group, Vec<&'static KnobDef>)> {
-    knobs::registry::grouped_for_backend(self.active_backend_id())
+    knobs::registry::grouped_for_backend(self.knob_scope())
       .into_iter()
       .filter(|(g, _)| self.group_gate_open(*g))
       .collect()
@@ -313,7 +317,7 @@ impl LaunchPickerState {
   /// for a row the active backend doesn't declare — which is how a row
   /// disappears after a cross-backend server switch.
   pub fn def(&self, id: KnobId) -> Option<&'static KnobDef> {
-    knobs::def_for_backend(self.active_backend_id(), id)
+    knobs::def_for_backend(self.knob_scope(), id)
   }
 
   /// Whether a row is currently shown / navigable.
@@ -448,7 +452,7 @@ impl LaunchPickerState {
   /// elsewhere.
   fn apply_auto(&mut self) {
     self.user_knobs = KnobSet::new();
-    for def in knobs::for_backend(self.active_backend_id()) {
+    for def in knobs::for_backend(self.knob_scope()) {
       if def.is_fit_delegated() {
         self.user_knobs.set_auto(def.knob_id());
       }
@@ -603,7 +607,7 @@ impl LaunchPickerState {
   /// wire. Shared concepts survive the move — a pinned context window is still
   /// a pinned context window after switching engines.
   fn rescope_knobs_to_backend(&mut self) {
-    let target = self.active_backend_id();
+    let target = self.knob_scope();
     self.user_knobs = knobs::resolve::rescope(&self.user_knobs, target);
     // A cursor on a row the new backend doesn't declare would strand
     // navigation; drop back to the always-present Preset row.
@@ -639,8 +643,18 @@ impl LaunchPickerState {
     }
   }
 
-  /// The active backend's id — the vocabulary every row on this form is
-  /// keyed in.
+  /// The vocabulary every knob row on this form is keyed in: the active
+  /// backend's id, or the focused model's own runtime scope when that backend
+  /// declares knobs per model.
+  pub fn knob_scope(&self) -> &'static str {
+    let backend = self.resolved_backend();
+    match &self.model_path {
+      Some(p) => crate::backend::knob_scope_for(&backend, p, self.selected_server.as_deref()),
+      None => crate::backend::Backend::id(&backend),
+    }
+  }
+
+  /// The active backend's id.
   pub fn active_backend_id(&self) -> &'static str {
     use crate::backend::Backend;
     self.resolved_backend().id()
@@ -802,7 +816,7 @@ impl LaunchPickerState {
   pub fn mode_intent(&self) -> Option<crate::launch::mode::LaunchMode> {
     self
       .user_knobs
-      .str_by_concept(self.active_backend_id(), knobs::Concept::Mode)
+      .str_by_concept(self.knob_scope(), knobs::Concept::Mode)
       .and_then(crate::launch::mode::LaunchMode::from_label)
   }
 
@@ -950,7 +964,7 @@ impl LaunchPickerState {
 
   /// The active backend's device knob, when it declares one.
   fn device_knob(&self) -> Option<&'static KnobDef> {
-    knobs::def_for_backend_concept(self.active_backend_id(), knobs::Concept::Device)
+    knobs::def_for_backend_concept(self.knob_scope(), knobs::Concept::Device)
   }
 
   fn clear_device_row(&mut self) {

@@ -4,6 +4,10 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ## [Unreleased]
 
+### Added
+
+- Generic backend: run any OpenAI-compatible server declared in `config.yaml` (gufo, Halogen via Docker, CIRU tested), as its own row or as a server option on matching GGUFs, with per-entry knobs and a stop-grace floor.
+
 ### Fixed
 
 - **Launches inside an LXC container on an AMD APU are checked against the GTT pool instead of the container RAM limit** when every layer is offloaded, and the TUI VRAM gauge shows the full GTT pool there. CPU-side launches keep the RAM check, since the container limit applies to them. Thanks [@Ramon-Balaguer](https://github.com/Ramon-Balaguer) ([#83](https://github.com/llamastash/llamastash/pull/83)).

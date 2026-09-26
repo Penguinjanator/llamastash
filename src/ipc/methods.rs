@@ -76,8 +76,22 @@ pub async fn dispatch_request(ctx: &MethodContext, req: Request) -> Response {
       )
     }
     "shutdown" => {
+      // The longest grace the teardown may take, so `daemon stop` waits for
+      // it instead of giving up while a slow engine is still stopping.
+      let grace = ctx
+        .supervisors
+        .snapshot()
+        .await
+        .iter()
+        .map(|(_, m)| m.min_stop_grace())
+        .max()
+        .unwrap_or_default()
+        .max(SHUTDOWN_STOP_GRACE);
       ctx.shutdown.trigger();
-      Response::ok(id, json!({"shutdown": "scheduled"}))
+      Response::ok(
+        id,
+        json!({"shutdown": "scheduled", "stop_grace_secs": grace.as_secs()}),
+      )
     }
     #[cfg(feature = "test-fixtures")]
     "_test_sleep" => {
@@ -408,6 +422,9 @@ async fn stop_all_handler(
 /// The `join_all` keeps wall-clock equal to the slowest stop rather
 /// than the sum — the original sequential loop blew the default IPC
 /// client timeout for 2+ stuck launches.
+/// The grace daemon shutdown gives each child, before any backend floor.
+pub(crate) const SHUTDOWN_STOP_GRACE: Duration = Duration::from_secs(5);
+
 pub(crate) async fn stop_all_managed(
   ctx: &MethodContext,
   grace: Duration,
