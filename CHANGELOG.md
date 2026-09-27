@@ -4,9 +4,28 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ## [Unreleased]
 
-- **TUI Host pane VRAM gauge in Linux LXC containers on AMD UMA.** When running inside a Linux LXC container where container RAM is artificially limited, the VRAM denominator preserves the host's full GTT pool rather than clamping against the container's RAM limit.
-- **SGLang backend (experimental).** Safetensors HuggingFace repos launch through `sglang serve`, alongside vLLM for the same rows; default-on when a `sglang` launcher resolves, `--sglang` / `LLAMASTASH_SGLANG=1` force it. On unified-memory hosts the KV pool is capped in tokens (`--max-total-tokens`) from the model's attention geometry, since SGLang has no byte-level cap; a repo whose geometry cannot be read is refused with the override named. A repo two safetensors engines can serve is one catalog row listing both. Second half of [#36](https://github.com/llamastash/llamastash/issues/36).
-- **The vLLM unified-memory guard could not launch beside a tenant, and its reserve was spent on engine overhead.** vLLM 0.28 checks `total × gpu_memory_utilization` against its own free reading before honouring the byte cap, so the capped launch only started on a ~92%-free host; the launcher now passes a utilization sized to the launch. The flat 8 GiB reserve left ~1.3 GiB at ready once the engine's own 5.4–6.7 GiB footprint came out of it (measured on a DGX Spark); the reserve now covers the OS, the engine overhead and the gate's compute band, or 15% of the pool if that is more. (#80)
+### Fixed
+
+- **Launches inside an LXC container on an AMD APU are checked against the GTT pool instead of the container RAM limit** when every layer is offloaded, and the TUI VRAM gauge shows the full GTT pool there. CPU-side launches keep the RAM check, since the container limit applies to them. Thanks [@Ramon-Balaguer](https://github.com/Ramon-Balaguer) ([#83](https://github.com/llamastash/llamastash/pull/83)).
+
+## [0.4.0] — 2026-09-16
+
+This release adds **SGLang** as a second engine for the safetensors HuggingFace repos in your cache, next to vLLM. A repo both engines can serve is one catalog row listing both, `auto` picks vLLM, and `--backend sglang` picks SGLang. On unified-memory hosts SGLang's KV pool is capped in tokens, since it has no byte-level cap.
+
+The admission gate got two fixes for those same hosts. A pool fraction you set yourself (`gpu_memory_utilization`, `mem_fraction_static`) is now priced against the whole pool instead of free memory, which had let through launches that could freeze the machine. And the vLLM guard can now launch beside another process holding memory, with a reserve that covers vLLM's own 5-7 GiB of overhead.
+
+### Added
+
+- **SGLang backend (experimental).** Safetensors HuggingFace repos launch through `sglang serve`, alongside vLLM for the same rows; default-on when a `sglang` launcher resolves, `--sglang` / `LLAMASTASH_SGLANG=1` force it. On unified-memory hosts the KV pool is capped in tokens (`--max-total-tokens`) from the model's attention geometry, since SGLang has no byte-level cap; a repo whose geometry cannot be read is refused with the override named. A repo two safetensors engines can serve is one catalog row listing both. Second half of [#36](https://github.com/llamastash/llamastash/issues/36). Thanks [@BernardoGV](https://github.com/BernardoGV) ([#79](https://github.com/llamastash/llamastash/pull/79)).
+
+### Fixed
+
+- **A pool fraction you set yourself was priced against free memory, not the pool.** `gpu_memory_utilization` / `mem_fraction_static` are shares of the whole pool and cover the weights as well as the cache, but the admission gate projected `free × fraction` and then added the weights again. On a unified-memory host free is always the smaller number, so the projection understated what the engine takes: `0.9` on a 121 GiB host with 52 GiB free was priced at 47 GiB and admitted, when the launch would take ~109 GiB. Both engines now price the pool and net off the weights the gate already counts ([#84](https://github.com/llamastash/llamastash/pull/84)).
+- **The vLLM unified-memory guard could not launch beside a tenant, and its reserve was spent on engine overhead.** vLLM 0.28 checks `total × gpu_memory_utilization` against its own free reading before honouring the byte cap, so the capped launch only started on a ~92%-free host; the launcher now passes a utilization sized to the launch. The flat 8 GiB reserve left ~1.3 GiB at ready once the engine's own 5.4–6.7 GiB footprint came out of it (measured on a DGX Spark); the reserve now covers the OS, the engine overhead and the gate's compute band, or 15% of the pool if that is more. Fixes [#80](https://github.com/llamastash/llamastash/issues/80). Thanks [@BernardoGV](https://github.com/BernardoGV) ([#81](https://github.com/llamastash/llamastash/pull/81)).
+
+### Security
+
+- rustls 0.23.40 → 0.23.45, clearing [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285): TLS 1.3 handshake messages were accepted across encryption level boundaries. Transitive via reqwest.
 
 ## [0.3.0] — 2026-09-10
 

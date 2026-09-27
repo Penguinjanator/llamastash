@@ -144,13 +144,10 @@ fn terminate_child_tree(child: &mut Child) {
   let _ = child.kill();
 }
 
-/// Detect whether a root filesystem contains Linux LXC container signatures.
-///
-/// Inspects (relative to `root`):
-/// 1. `run/systemd/container`
-/// 2. `proc/1/environ`
-/// 3. `proc/1/cgroup`
-pub fn linux_lxc_container_at(root: &std::path::Path) -> bool {
+/// Whether `root` carries an LXC container signature: `run/systemd/container`,
+/// the `container=` entry in `proc/1/environ` (root-only), or an LXC cgroup
+/// path in `proc/1/cgroup` (empty under a cgroup namespace).
+pub(crate) fn linux_lxc_container_at(root: &std::path::Path) -> bool {
   let container = std::fs::read_to_string(root.join("run/systemd/container")).ok();
   let environ = std::fs::read_to_string(root.join("proc/1/environ")).ok();
   let cgroup = std::fs::read_to_string(root.join("proc/1/cgroup")).ok();
@@ -158,49 +155,42 @@ pub fn linux_lxc_container_at(root: &std::path::Path) -> bool {
   is_lxc_container_signatures(container.as_deref(), environ.as_deref(), cgroup.as_deref())
 }
 
-/// Detect whether the current process is running inside a Linux LXC container.
-///
-/// Checks `/run/systemd/container`, `/proc/1/environ`, and `/proc/1/cgroup`
-/// for container signatures. Used by UMA memory estimators and VRAM gauges
-/// when the container memory limit is artificially lower than host hardware.
+/// Whether this process runs inside an LXC container. Read once: the TUI
+/// calls it every frame and admission on every launch.
 pub fn linux_lxc_container() -> bool {
-  if !cfg!(target_os = "linux") {
-    return false;
-  }
-  linux_lxc_container_at(std::path::Path::new("/"))
+  static IN_LXC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+  *IN_LXC
+    .get_or_init(|| cfg!(target_os = "linux") && linux_lxc_container_at(std::path::Path::new("/")))
 }
 
-/// Pure signature check for LXC containers from container metadata strings.
-pub fn is_lxc_container_signatures(
+const LXC_CONTAINER_VALUES: &[&str] = &["lxc", "lxc-libvirt"];
+
+pub(crate) fn is_lxc_container_signatures(
   systemd_container: Option<&str>,
   proc_environ: Option<&str>,
   proc_cgroup: Option<&str>,
 ) -> bool {
-  if let Some(contents) = systemd_container {
-    let normalized = contents.trim().to_ascii_lowercase();
-    if !normalized.is_empty() && (normalized == "lxc" || normalized.contains("lxc")) {
-      return true;
-    }
-  }
-
-  if let Some(env) = proc_environ {
-    let lower = env.to_ascii_lowercase();
-    if lower.contains("container=lxc")
-      || lower.contains("container=lxc-libvirt")
-      || lower.contains("lxc")
-    {
-      return true;
-    }
-  }
-
-  if let Some(cgroup) = proc_cgroup {
-    let lower = cgroup.to_ascii_lowercase();
-    if lower.contains("lxc") || lower.contains("/lxc/") || lower.contains("lxc.monitor") {
-      return true;
-    }
-  }
-
-  false
+  let systemd = systemd_container.is_some_and(|c| LXC_CONTAINER_VALUES.contains(&c.trim()));
+  let environ = proc_environ.is_some_and(|env| {
+    env
+      .split('\0')
+      .filter_map(|entry| entry.strip_prefix("container="))
+      .any(|v| LXC_CONTAINER_VALUES.contains(&v))
+  });
+  // `<id>:<controllers>:<path>` per line; LXC names its cgroups `lxc/<name>`
+  // (legacy), `lxc.payload.<name>` or `lxc.monitor.<name>`.
+  let cgroup = proc_cgroup.is_some_and(|cg| {
+    cg.lines()
+      .filter_map(|line| line.splitn(3, ':').nth(2))
+      .flat_map(|path| path.split('/'))
+      .any(|seg| {
+        seg == "lxc"
+          || seg == "lxc.monitor"
+          || seg.starts_with("lxc.payload.")
+          || seg.starts_with("lxc.monitor.")
+      })
+  });
+  systemd || environ || cgroup
 }
 
 #[cfg(test)]
@@ -281,7 +271,7 @@ mod tests {
   #[test]
   fn detects_lxc_from_systemd_container() {
     assert!(is_lxc_container_signatures(Some("lxc\n"), None, None));
-    assert!(is_lxc_container_signatures(Some("LXC"), None, None));
+    assert!(!is_lxc_container_signatures(Some("lxcfs"), None, None));
     assert!(is_lxc_container_signatures(Some("lxc-libvirt"), None, None));
     assert!(!is_lxc_container_signatures(Some("docker"), None, None));
     assert!(!is_lxc_container_signatures(Some(""), None, None));
@@ -308,6 +298,11 @@ mod tests {
     assert!(!is_lxc_container_signatures(
       None,
       Some("container=podman"),
+      None
+    ));
+    assert!(!is_lxc_container_signatures(
+      None,
+      Some("PATH=/usr/bin:/opt/lxc-tools/bin\0HOME=/root"),
       None
     ));
   }
@@ -338,6 +333,11 @@ mod tests {
       None,
       None,
       Some("0::/user.slice/user-1000.slice")
+    ));
+    assert!(!is_lxc_container_signatures(
+      None,
+      None,
+      Some("0::/system.slice/lxcfs.service")
     ));
   }
 
@@ -400,10 +400,5 @@ mod tests {
 
     assert!(!linux_lxc_container_at(&dir));
     std::fs::remove_dir_all(&dir).ok();
-  }
-
-  #[test]
-  fn linux_lxc_container_runs_cleanly() {
-    let _ = linux_lxc_container();
   }
 }

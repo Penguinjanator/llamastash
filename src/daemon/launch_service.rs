@@ -1191,19 +1191,35 @@ pub(crate) async fn spawn_supervised(
           .ctx
           .or(admission_floor)
           .unwrap_or(crate::config::DEFAULT_FIT_CTX_FLOOR);
-        let free = crate::launch::admission::effective_free_bytes(&snapshot);
+        let backend = crate::backend::Backends::all()
+          .into_iter()
+          .find(|b| crate::backend::Backend::id(b) == resolved_backend_id);
+        // Free and pool total must come from the same pool, so both take one flag.
+        let budget = |layer_count: Option<u64>| {
+          let gpu_resident = backend
+            .as_ref()
+            .is_some_and(|b| crate::backend::Backend::gpu_resident(b, &launch_params, layer_count));
+          let gtt_only = crate::launch::admission::gtt_only_budget(&snapshot, gpu_resident);
+          (
+            crate::launch::admission::effective_free_bytes_for(&snapshot, gtt_only),
+            gtt_only,
+          )
+        };
         let gpu_backend = snapshot.gpu_backend.clone();
         let model_path = launch_params.model_path.clone();
         let knobs = launch_params.knobs.clone();
         let arch_owned = arch.clone();
         let mtp_active = launch_params.mtp_directive.is_some();
-        let demand = if identity.as_gguf().is_some() {
+        let demand_and_free = if identity.as_gguf().is_some() {
           let demand_backend_id = resolved_backend_id.clone();
           tokio::task::spawn_blocking(move || {
             let header = read_gguf_header(&model_path, HeaderReadOptions::default())
               .ok()?
               .header;
-            Some(crate::launch::admission::project_demand(
+            let layer_count = header
+              .string(&["general.architecture"])
+              .and_then(|a| header.u64(&[format!("{a}.block_count")]));
+            let demand = crate::launch::admission::project_demand(
               &header,
               arch_owned.as_deref(),
               &knobs,
@@ -1212,12 +1228,15 @@ pub(crate) async fn spawn_supervised(
               &gpu_backend,
               resident_weight_bytes,
               mtp_active,
-            ))
+            );
+            Some((demand, layer_count))
           })
           .await
           .ok()
           .flatten()
+          .map(|(demand, layer_count)| (demand, budget(layer_count).0))
         } else {
+          let (free, gtt_only) = budget(None);
           // No header, so no per-layer KV estimate. Weights come from
           // `launch_resident_bytes`, which measures a directory when neither
           // the catalog nor `stat` can size it — the same figure the backend
@@ -1230,18 +1249,27 @@ pub(crate) async fn spawn_supervised(
           }
           // Only the backend can price the rest, since the figure lives in its
           // own knob vocabulary and may be a pool fraction rather than bytes.
-          crate::backend::Backends::all()
-            .into_iter()
-            .find(|b| crate::backend::Backend::id(b) == resolved_backend_id)
-            .and_then(|b| crate::backend::Backend::projected_cache_bytes(&b, &launch_params, free))
+          let host_inputs = crate::launch::admission::DemandInputs {
+            free_bytes: free,
+            pool_total_bytes: crate::launch::admission::engine_pool_total_bytes(
+              &snapshot, gtt_only,
+            ),
+            weights_bytes: resident_weight_bytes,
+          };
+          backend
+            .as_ref()
+            .and_then(|b| {
+              crate::backend::Backend::projected_cache_bytes(b, &launch_params, &host_inputs)
+            })
             .filter(|_| resident_weight_bytes > 0)
             .map(|cache| {
-              resident_weight_bytes
+              let demand = resident_weight_bytes
                 .saturating_add(cache)
-                .saturating_add(crate::launch::headroom::overhead_band_bytes(&gpu_backend))
+                .saturating_add(crate::launch::headroom::overhead_band_bytes(&gpu_backend));
+              (demand, free)
             })
         };
-        if let Some(demand) = demand {
+        if let Some((demand, free)) = demand_and_free {
           if let Err(refusal) = ctx.admission.try_admit(u64::from(port), demand, free) {
             if force_admission {
               // Never suppressed by another advisory the way the bypass note

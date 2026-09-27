@@ -459,6 +459,44 @@ impl Backend for LlamaCppBackend {
     actuals::fetch_props_actuals(port, timeout).await
   }
 
+  fn gpu_resident(&self, params: &LaunchParams, layer_count: Option<u64>) -> bool {
+    use crate::launch::knobs::{kid, KnobValue};
+    let k = &params.knobs;
+    if k
+      .str(kid("device"))
+      .is_some_and(|d| d.eq_ignore_ascii_case("none"))
+      || k.u32(kid("n-cpu-moe")).is_some_and(|n| n > 0)
+    {
+      return false;
+    }
+    // Unset or `auto` is `--fit`, which offloads every layer when they fit.
+    let all_layers = match k.get(kid("n-gpu-layers")) {
+      None | Some(KnobValue::Auto) => true,
+      Some(_) => k
+        .u32(kid("n-gpu-layers"))
+        .zip(layer_count)
+        .is_some_and(|(n, layers)| u64::from(n) >= layers),
+    };
+    // A hand-passed placement flag can move work to the CPU; don't parse it.
+    const PLACEMENT_FLAGS: &[&str] = &[
+      "-ngl",
+      "--gpu-layers",
+      "--n-gpu-layers",
+      "-dev",
+      "--device",
+      "-cmoe",
+      "--cpu-moe",
+      "-ncmoe",
+      "--n-cpu-moe",
+      "-ot",
+      "--override-tensor",
+    ];
+    all_layers
+      && !PLACEMENT_FLAGS
+        .iter()
+        .any(|f| crate::launch::params::extras_have_flag(&params.extras, f))
+  }
+
   fn speculation_set_in_extras(&self, extras: &[std::ffi::OsString]) -> bool {
     // llama-server *appends* spec types rather than replacing, so emitting ours
     // on top of a hand-passed `--spec-type` would leave two configured.
@@ -520,6 +558,28 @@ mod tests {
       .expect("parses its own log format");
     assert_eq!((got.accepted, got.generated), (105, 161));
     assert!(b.draft_acceptance(&[]).is_none());
+  }
+
+  #[test]
+  fn gpu_resident_only_when_nothing_is_placed_on_the_cpu() {
+    let b = LlamaCppBackend::new();
+    let with = |knobs: crate::launch::knobs::KnobSet, extras: &[&str]| {
+      let mut p = LaunchParams::new(PathBuf::from("/m/x.gguf"), LaunchMode::Chat);
+      p.knobs = knobs;
+      p.extras = extras.iter().map(std::ffi::OsString::from).collect();
+      p
+    };
+    let layers = Some(64);
+    assert!(b.gpu_resident(&with(crate::knobset! {}, &[]), layers));
+    assert!(b.gpu_resident(&with(crate::knobset! { n_gpu_layers: auto }, &[]), layers));
+    assert!(b.gpu_resident(&with(crate::knobset! { n_gpu_layers: 99 }, &[]), layers));
+    assert!(!b.gpu_resident(&with(crate::knobset! { n_gpu_layers: 32 }, &[]), layers));
+    assert!(!b.gpu_resident(&with(crate::knobset! { n_gpu_layers: 99 }, &[]), None));
+    assert!(!b.gpu_resident(&with(crate::knobset! { n_gpu_layers: 0 }, &[]), layers));
+    assert!(!b.gpu_resident(&with(crate::knobset! { n_cpu_moe: 8 }, &[]), layers));
+    assert!(!b.gpu_resident(&with(crate::knobset! { device: "none" }, &[]), layers));
+    assert!(!b.gpu_resident(&with(crate::knobset! {}, &["-ngl", "0"]), layers));
+    assert!(!b.gpu_resident(&with(crate::knobset! {}, &["--device=none"]), layers));
   }
 
   fn spec_of(plan: LaunchPlan) -> ProcessLaunchSpec {
