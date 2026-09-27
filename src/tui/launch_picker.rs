@@ -757,9 +757,10 @@ impl LaunchPickerState {
 
   /// The value column for one knob row.
   ///
-  /// `auto` for a delegated row, the shared `inherited` word for an unset one,
-  /// and the device row's checkbox view for the device selector; everything
-  /// else renders its scalar the way the engine would take it.
+  /// `auto` for a delegated row, the model config's default for an unset one
+  /// that has one, the shared `inherited` word otherwise, and the device row's
+  /// checkbox view for the device selector; everything else renders its scalar
+  /// the way the engine would take it.
   pub fn value_label(&self, id: KnobId) -> String {
     let Some(def) = self.def(id) else {
       return INHERITED_LABEL.to_string();
@@ -767,7 +768,27 @@ impl LaunchPickerState {
     if matches!(def.ring(), Ring::DeviceCheckbox) {
       return self.device_value_display();
     }
-    KnobValue::render(self.effective(id), INHERITED_LABEL)
+    let config_default = self
+      .effective(id)
+      .is_none()
+      .then(|| self.config_default(id));
+    KnobValue::render(
+      self.effective(id).or(config_default.flatten().as_ref()),
+      INHERITED_LABEL,
+    )
+  }
+
+  /// The value the model's own config declares for `id` (a config entry's
+  /// `default:`), which the launch resolves when no other layer sets the knob.
+  fn config_default(&self, id: KnobId) -> Option<KnobValue> {
+    let path = self.model_path.as_deref()?;
+    crate::backend::Backend::config_default_knobs(
+      &self.resolved_backend(),
+      path,
+      self.selected_server.as_deref(),
+    )
+    .get(id)
+    .cloned()
   }
 
   /// Seed text for an `e`-edit on a knob row: the current effective value, or

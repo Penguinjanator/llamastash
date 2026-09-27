@@ -14,6 +14,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 - A launch whose server binds only after loading (gufo, ds4) could fail with `bind() failed`: the readiness probe sometimes connected to its own port. A picked server now also decides the backend, so a TUI launch on a non-default server no longer gets the default engine's argv.
 - `start --backend <id>` no longer runs on a remembered or preset server that belongs to another backend.
 - The TUI launch picker applies a preset's `server:` and `backend:` pins; it showed and launched the last-used server and the row's default backend instead.
+- The TUI launch editor shows a generic entry's knob `default:` on unset rows instead of `inherited`.
 - A failing command run with `--json` prints `{"error": {"code", "message"}}` on stdout instead of the human error line.
 - A request for a model running more than once goes to an unnamed launch before a named one, then to the newest. It used to pick by launch-id string order, so `L10` lost to `L9`.
 - A host without `llama-server` can start the daemon and launch ds4, Lemonade, vLLM, SGLang and generic models; before, every launch failed with "daemon launch environment not configured".

@@ -540,6 +540,26 @@ mod tests {
   }
 
   #[test]
+  fn the_tui_editor_shows_an_unset_knob_s_entry_default() {
+    use crate::tui::launch_picker::{LaunchPickerState, INHERITED_LABEL};
+    install(
+      "servers:\n  - {name: picker-dflt, binary: /a, ready: /h, knobs: [{flag: --pd-ctx, id: pd-ctx, default: \"4096\"}, --pd-seed]}\n",
+    );
+    let mut s = LaunchPickerState::for_model("picker-dflt");
+    s.model_path = Some(PathBuf::from("generic://picker-dflt"));
+    s.model_backend = crate::launch::params::BackendChoice::from_id(GENERIC_BACKEND_ID);
+    let id = |name: &str| {
+      crate::launch::knobs::registry::for_backend(s.knob_scope())
+        .iter()
+        .find(|d| d.id == name)
+        .unwrap()
+        .knob_id()
+    };
+    assert_eq!(s.value_label(id("pd-ctx")), "4096");
+    assert_eq!(s.value_label(id("pd-seed")), INHERITED_LABEL, "no default");
+  }
+
+  #[test]
   fn each_entry_gets_its_own_scope_with_only_its_knobs() {
     install(
       r#"
