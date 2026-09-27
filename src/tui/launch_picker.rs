@@ -453,6 +453,9 @@ impl LaunchPickerState {
       PresetStop::Auto => self.apply_auto(),
       PresetStop::Named(i) => self.seed_from_preset(i),
     }
+    // A stop's knobs may be keyed for another backend (a preset saved on
+    // llama.cpp, used on a generic server); show them in the scope in play.
+    self.rescope_knobs_to_backend();
   }
 
   /// `auto` stop: delegate every fit-governed knob the active backend
@@ -460,6 +463,9 @@ impl LaunchPickerState {
   /// any manual extras. The form reads "auto" on those rows and "inherited"
   /// elsewhere.
   fn apply_auto(&mut self) {
+    // The daemon's `auto` selection inherits no server either. Set first so
+    // the fit-delegated knobs below come from the default build's backend.
+    self.selected_server = None;
     self.user_knobs = KnobSet::new();
     for def in knobs::for_backend(self.knob_scope()) {
       if def.is_fit_delegated() {
@@ -467,8 +473,6 @@ impl LaunchPickerState {
       }
     }
     self.extras.clear();
-    // The daemon's `auto` selection inherits no server either.
-    self.selected_server = None;
   }
 
   fn seed_from_preset(&mut self, i: usize) {
@@ -2067,6 +2071,30 @@ mod tests {
     // than riding along invisibly.
     assert_eq!(u32_of(&s, "ctx-size"), Some(8192));
     assert!(s.user_knobs.get(kid("ssd-streaming")).is_none());
+  }
+
+  #[test]
+  fn a_preset_keyed_for_another_backend_shows_in_the_scope_in_play() {
+    // A preset saved on llama.cpp (`ctx-size`) that pins another backend: its
+    // context window must show on that backend's own context row.
+    let mut s = LaunchPickerState::for_model("DeepSeek-V4-Flash");
+    s.servers = vec![
+      server("llamacpp-rocm", "llamacpp", "/rocm/llama-server", vec![]),
+      server("ds4", "ds4", "/ds4/ds4-server", vec![]),
+    ];
+    let mut knobs = KnobSet::new();
+    knobs.set(kid("ctx-size"), KnobValue::Set(Scalar::U32(8192)));
+    let pinned = PresetChoice {
+      knobs,
+      backend: Some("ds4".into()),
+      ..choice("pinned", 0)
+    };
+    s.set_presets(vec![pinned], PresetStop::Named(0));
+    assert_eq!(s.active_backend_id(), "ds4");
+    let ctx = knobs::def_for_backend_concept("ds4", knobs::Concept::ContextLength)
+      .unwrap()
+      .knob_id();
+    assert_eq!(s.user_knobs.u32(ctx), Some(8192));
   }
 
   #[test]
