@@ -230,6 +230,8 @@ impl LlamaCppBackend {
         .collect(),
       binary,
       env_remove: LLAMA_ENV_STRIP.to_vec(),
+      env: Vec::new(),
+      min_stop_grace: std::time::Duration::ZERO,
       readiness: Readiness::HttpPoll {
         path: "/health".to_string(),
         ready_status: 200,

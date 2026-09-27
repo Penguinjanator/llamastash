@@ -69,6 +69,11 @@ pub struct PresetChoice {
   /// there is no longer a separate native-knob channel to seed.
   pub knobs: KnobSet,
   pub extras: Vec<std::ffi::OsString>,
+  /// The preset's `server:` pin; `None` runs the row's default build.
+  pub server: Option<String>,
+  /// The preset's `backend:` pin, applied through that backend's first
+  /// compatible server when `server` is unset.
+  pub backend: Option<String>,
 }
 
 /// Inline-edit state owned by [`LaunchPickerState`].
@@ -126,6 +131,9 @@ impl InlineEdit {
 pub struct LaunchPickerState {
   /// Display name of the focused model (rendered in the title).
   pub model_name: String,
+  /// The focused model's catalog path. Keys the knob scope for a backend that
+  /// declares knobs per model; `None` scopes to the backend id.
+  pub model_path: Option<std::path::PathBuf>,
   /// The model's native (trained) context length, when known. Trims any
   /// [`Ring::UpToTrainedContext`] ladder so the editor never offers a window
   /// larger than the model supports; `None` leaves the full ladder available.
@@ -196,6 +204,7 @@ pub struct LaunchPickerState {
   /// last-used params, or empty). Restored when cycling back to `last used`.
   preset_baseline_knobs: KnobSet,
   preset_baseline_extras: Vec<std::ffi::OsString>,
+  preset_baseline_server: Option<String>,
   /// Row offset clipped from the top of the rendered line list so the
   /// focused row stays visible on small viewports. Recomputed on each
   /// render using the actual area height — the `Cell` lets the
@@ -245,6 +254,7 @@ impl LaunchPickerState {
   pub fn for_model(model_name: impl Into<String>) -> Self {
     Self {
       model_name: model_name.into(),
+      model_path: None,
       native_ctx: None,
       user_knobs: KnobSet::new(),
       resolved: KnobSet::new(),
@@ -266,6 +276,7 @@ impl LaunchPickerState {
       mtp_capable: false,
       preset_baseline_knobs: KnobSet::new(),
       preset_baseline_extras: Vec::new(),
+      preset_baseline_server: None,
       scroll_offset: Cell::new(0),
     }
   }
@@ -276,7 +287,7 @@ impl LaunchPickerState {
   /// declaration order within a group, with groups whose rows are all hidden
   /// on this host / model dropped entirely (header included).
   pub fn visible_groups(&self) -> Vec<(Group, Vec<&'static KnobDef>)> {
-    knobs::registry::grouped_for_backend(self.active_backend_id())
+    knobs::registry::grouped_for_backend(self.knob_scope())
       .into_iter()
       .filter(|(g, _)| self.group_gate_open(*g))
       .collect()
@@ -313,7 +324,7 @@ impl LaunchPickerState {
   /// for a row the active backend doesn't declare — which is how a row
   /// disappears after a cross-backend server switch.
   pub fn def(&self, id: KnobId) -> Option<&'static KnobDef> {
-    knobs::def_for_backend(self.active_backend_id(), id)
+    knobs::def_for_backend(self.knob_scope(), id)
   }
 
   /// Whether a row is currently shown / navigable.
@@ -410,6 +421,7 @@ impl LaunchPickerState {
   pub fn set_presets(&mut self, presets: Vec<PresetChoice>, default_stop: PresetStop) {
     self.preset_baseline_knobs = self.user_knobs.clone();
     self.preset_baseline_extras = self.extras.clone();
+    self.preset_baseline_server = self.selected_server.clone();
     self.presets = presets;
     self.default_stop = match default_stop {
       PresetStop::Named(i) if i < self.presets.len() => PresetStop::Named(i),
@@ -436,10 +448,14 @@ impl LaunchPickerState {
       PresetStop::LastUsed => {
         self.user_knobs = self.preset_baseline_knobs.clone();
         self.extras = self.preset_baseline_extras.clone();
+        self.selected_server = self.preset_baseline_server.clone();
       }
       PresetStop::Auto => self.apply_auto(),
       PresetStop::Named(i) => self.seed_from_preset(i),
     }
+    // A stop's knobs may be keyed for another backend (a preset saved on
+    // llama.cpp, used on a generic server); show them in the scope in play.
+    self.rescope_knobs_to_backend();
   }
 
   /// `auto` stop: delegate every fit-governed knob the active backend
@@ -447,8 +463,11 @@ impl LaunchPickerState {
   /// any manual extras. The form reads "auto" on those rows and "inherited"
   /// elsewhere.
   fn apply_auto(&mut self) {
+    // The daemon's `auto` selection inherits no server either. Set first so
+    // the fit-delegated knobs below come from the default build's backend.
+    self.selected_server = None;
     self.user_knobs = KnobSet::new();
-    for def in knobs::for_backend(self.active_backend_id()) {
+    for def in knobs::for_backend(self.knob_scope()) {
       if def.is_fit_delegated() {
         self.user_knobs.set_auto(def.knob_id());
       }
@@ -460,6 +479,16 @@ impl LaunchPickerState {
     if let Some(p) = self.presets.get(i) {
       self.user_knobs = p.knobs.clone();
       self.extras = p.extras.clone();
+      // The picker sends its backend from the row's badge, so a backend pin
+      // only takes effect as a server of that backend.
+      self.selected_server = p.server.clone().or_else(|| {
+        let backend = p.backend.as_deref()?;
+        self
+          .servers
+          .iter()
+          .find(|s| s.backend_id == backend)
+          .map(|s| s.id.clone())
+      });
     }
   }
 
@@ -603,7 +632,7 @@ impl LaunchPickerState {
   /// wire. Shared concepts survive the move — a pinned context window is still
   /// a pinned context window after switching engines.
   fn rescope_knobs_to_backend(&mut self) {
-    let target = self.active_backend_id();
+    let target = self.knob_scope();
     self.user_knobs = knobs::resolve::rescope(&self.user_knobs, target);
     // A cursor on a row the new backend doesn't declare would strand
     // navigation; drop back to the always-present Preset row.
@@ -639,8 +668,18 @@ impl LaunchPickerState {
     }
   }
 
-  /// The active backend's id — the vocabulary every row on this form is
-  /// keyed in.
+  /// The vocabulary every knob row on this form is keyed in: the active
+  /// backend's id, or the focused model's own runtime scope when that backend
+  /// declares knobs per model.
+  pub fn knob_scope(&self) -> &'static str {
+    let backend = self.resolved_backend();
+    match &self.model_path {
+      Some(p) => crate::backend::knob_scope_for(&backend, p, self.selected_server.as_deref()),
+      None => crate::backend::Backend::id(&backend),
+    }
+  }
+
+  /// The active backend's id.
   pub fn active_backend_id(&self) -> &'static str {
     use crate::backend::Backend;
     self.resolved_backend().id()
@@ -802,7 +841,7 @@ impl LaunchPickerState {
   pub fn mode_intent(&self) -> Option<crate::launch::mode::LaunchMode> {
     self
       .user_knobs
-      .str_by_concept(self.active_backend_id(), knobs::Concept::Mode)
+      .str_by_concept(self.knob_scope(), knobs::Concept::Mode)
       .and_then(crate::launch::mode::LaunchMode::from_label)
   }
 
@@ -950,7 +989,7 @@ impl LaunchPickerState {
 
   /// The active backend's device knob, when it declares one.
   fn device_knob(&self) -> Option<&'static KnobDef> {
-    knobs::def_for_backend_concept(self.active_backend_id(), knobs::Concept::Device)
+    knobs::def_for_backend_concept(self.knob_scope(), knobs::Concept::Device)
   }
 
   fn clear_device_row(&mut self) {
@@ -2035,6 +2074,30 @@ mod tests {
   }
 
   #[test]
+  fn a_preset_keyed_for_another_backend_shows_in_the_scope_in_play() {
+    // A preset saved on llama.cpp (`ctx-size`) that pins another backend: its
+    // context window must show on that backend's own context row.
+    let mut s = LaunchPickerState::for_model("DeepSeek-V4-Flash");
+    s.servers = vec![
+      server("llamacpp-rocm", "llamacpp", "/rocm/llama-server", vec![]),
+      server("ds4", "ds4", "/ds4/ds4-server", vec![]),
+    ];
+    let mut knobs = KnobSet::new();
+    knobs.set(kid("ctx-size"), KnobValue::Set(Scalar::U32(8192)));
+    let pinned = PresetChoice {
+      knobs,
+      backend: Some("ds4".into()),
+      ..choice("pinned", 0)
+    };
+    s.set_presets(vec![pinned], PresetStop::Named(0));
+    assert_eq!(s.active_backend_id(), "ds4");
+    let ctx = knobs::def_for_backend_concept("ds4", knobs::Concept::ContextLength)
+      .unwrap()
+      .knob_id();
+    assert_eq!(s.user_knobs.u32(ctx), Some(8192));
+  }
+
+  #[test]
   fn a_backend_switch_moves_a_stranded_cursor_back_to_a_real_row() {
     let mut s = LaunchPickerState::for_model("DeepSeek-V4-Flash");
     s.model_backend = BackendChoice::Explicit("ds4".into());
@@ -2061,7 +2124,62 @@ mod tests {
       name: name.into(),
       knobs: crate::knobset! { ctx: ctx },
       extras: Vec::new(),
+      server: None,
+      backend: None,
     }
+  }
+
+  #[test]
+  fn a_backend_pin_without_a_server_picks_that_backends_server() {
+    let mut s = LaunchPickerState::for_model("qwen");
+    s.servers = vec![
+      server("llamacpp-rocm", "llamacpp", "/rocm/llama-server", vec![]),
+      server("other-a", "other", "/a", vec![]),
+      server("other-b", "other", "/b", vec![]),
+    ];
+    let pinned = PresetChoice {
+      backend: Some("other".into()),
+      ..choice("pinned", 4096)
+    };
+    s.set_presets(vec![pinned], PresetStop::Named(0));
+    assert_eq!(s.selected_server.as_deref(), Some("other-a"));
+
+    let unknown = PresetChoice {
+      backend: Some("absent".into()),
+      ..choice("absent", 4096)
+    };
+    s.set_presets(vec![unknown], PresetStop::Named(0));
+    assert_eq!(
+      s.selected_server, None,
+      "no server of that backend: default build"
+    );
+  }
+
+  #[test]
+  fn a_presets_server_pin_replaces_the_last_used_server() {
+    // Last launch ran on one server; the default preset pins another. The
+    // Server row must show (and send) the preset's pin, not the last-used one,
+    // and a preset with no pin must not pick up the last-used one either.
+    let mut s = LaunchPickerState::for_model("qwen");
+    s.selected_server = Some("last-used-srv".into());
+    let pinned = PresetChoice {
+      server: Some("preset-srv".into()),
+      ..choice("pinned", 4096)
+    };
+    s.set_presets(vec![pinned, choice("unpinned", 8192)], PresetStop::Named(0));
+    assert_eq!(s.selected_server.as_deref(), Some("preset-srv"));
+
+    s.cycle_preset(true);
+    assert_eq!(
+      s.selected_server, None,
+      "last-used values show only on the last-used stop"
+    );
+    s.cycle_preset(true);
+    assert_eq!(s.preset_stop, PresetStop::LastUsed);
+    assert_eq!(s.selected_server.as_deref(), Some("last-used-srv"));
+    s.cycle_preset(true);
+    assert_eq!(s.preset_stop, PresetStop::Auto);
+    assert_eq!(s.selected_server, None, "auto inherits no server");
   }
 
   #[test]
@@ -2133,6 +2251,8 @@ mod tests {
       name: "emb".into(),
       knobs: crate::knobset! { mode: "embedding" },
       extras: Vec::new(),
+      server: None,
+      backend: None,
     };
     s.set_presets(vec![pinned], PresetStop::Named(0));
     assert_eq!(

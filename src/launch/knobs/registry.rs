@@ -38,12 +38,86 @@ pub fn iter() -> impl Iterator<Item = (&'static str, &'static KnobDef)> {
   all_defs().iter().copied()
 }
 
-/// The knobs one backend declares, by backend id. Empty for an unknown id.
+/// Knob tables declared at runtime (in `config.yaml`) rather than compiled in,
+/// keyed by a **knob scope**: a string distinct from every backend id.
+///
+/// Kept apart from [`all_defs`] because that `OnceLock` can initialize during
+/// clap parsing, before config loads. Installed once per process at config
+/// load; the defs are leaked so a [`KnobId`] from one stays `'static`. A
+/// scope is replaced whole on reinstall and the old defs stay leaked, which is
+/// one small table per config load.
+type ScopedTables = std::sync::RwLock<Vec<(&'static str, &'static [KnobDef])>>;
+
+fn scoped_tables() -> &'static ScopedTables {
+  static TABLES: std::sync::OnceLock<ScopedTables> = std::sync::OnceLock::new();
+  TABLES.get_or_init(Default::default)
+}
+
+/// The scope string for `model`'s runtime table under `backend_id`.
+pub fn scope_key(backend_id: &str, model: &str) -> String {
+  format!("{backend_id}:{model}")
+}
+
+/// `(backend_id, model)` from a [`scope_key`] string.
+pub fn split_scope(scope: &str) -> Option<(&str, &str)> {
+  scope.split_once(':')
+}
+
+/// Install (or replace) the knob table for `scope`, returning the interned
+/// scope string. `scope` must not be a backend id: those resolve to the
+/// compiled-in declarations first.
+pub fn install_scoped(scope: &str, defs: Vec<KnobDef>) -> &'static str {
+  let mut tables = scoped_tables().write().unwrap_or_else(|e| e.into_inner());
+  let defs: &'static [KnobDef] = Box::leak(defs.into_boxed_slice());
+  if let Some(slot) = tables.iter_mut().find(|(s, _)| *s == scope) {
+    slot.1 = defs;
+    return slot.0;
+  }
+  let interned: &'static str = Box::leak(scope.to_string().into_boxed_str());
+  tables.push((interned, defs));
+  interned
+}
+
+/// The interned form of an installed `scope`, if it is one.
+pub fn scope_interned(scope: &str) -> Option<&'static str> {
+  scoped_tables()
+    .read()
+    .unwrap_or_else(|e| e.into_inner())
+    .iter()
+    .find(|(s, _)| *s == scope)
+    .map(|(s, _)| *s)
+}
+
+fn scoped(scope: &str) -> Option<&'static [KnobDef]> {
+  scoped_tables()
+    .read()
+    .unwrap_or_else(|e| e.into_inner())
+    .iter()
+    .find(|(s, _)| *s == scope)
+    .map(|(_, d)| *d)
+}
+
+/// Whether `scope` names an installed runtime table rather than a backend.
+pub fn is_scoped(scope: &str) -> bool {
+  scoped(scope).is_some()
+}
+
+/// Every installed runtime table, in install order.
+pub fn scoped_all() -> Vec<(&'static str, &'static [KnobDef])> {
+  scoped_tables()
+    .read()
+    .unwrap_or_else(|e| e.into_inner())
+    .clone()
+}
+
+/// The knobs one backend declares, by backend id, or one runtime table by its
+/// scope. Empty for an unknown id.
 pub fn for_backend(backend_id: &str) -> &'static [KnobDef] {
   Backends::all()
     .iter()
     .find(|b| b.id() == backend_id)
     .map(|b| b.knobs())
+    .or_else(|| scoped(backend_id))
     .unwrap_or(&[])
 }
 
@@ -82,7 +156,23 @@ fn normalise(key: &str) -> String {
 ///
 /// `None` means no backend declares it — which every caller turns into a
 /// warning naming the key, rather than storing an orphan value nothing reads.
+///
+/// Runtime tables resolve after the compiled-in registry, by canonical id
+/// only; config load refuses a runtime id that would shadow a built-in one.
 pub fn resolve_id(key: &str) -> Option<KnobId> {
+  resolve_static_id(key).or_else(|| {
+    let want = normalise(key);
+    scoped_all()
+      .iter()
+      .flat_map(|(_, defs)| defs.iter())
+      .find(|d| normalise(d.id) == want)
+      .map(|d| d.knob_id())
+  })
+}
+
+/// [`resolve_id`] over the compiled-in registry only: the set a runtime knob
+/// id must not collide with.
+pub fn resolve_static_id(key: &str) -> Option<KnobId> {
   let want = normalise(key);
   for (_, def) in iter() {
     if normalise(def.id) == want {
@@ -144,7 +234,15 @@ pub fn resolve_id_for(backend_id: &str, key: &str) -> Option<KnobId> {
 /// surface needs the kind/label/help but not the owning backend (CLI `--help`,
 /// value parsing).
 pub fn def_for(id: KnobId) -> Option<&'static KnobDef> {
-  iter().find(|(_, d)| d.knob_id() == id).map(|(_, d)| d)
+  iter()
+    .find(|(_, d)| d.knob_id() == id)
+    .map(|(_, d)| d)
+    .or_else(|| {
+      scoped_all()
+        .into_iter()
+        .flat_map(|(_, defs)| defs.iter())
+        .find(|d| d.knob_id() == id)
+    })
 }
 
 /// `backend_id`'s definition for `id`, if that backend declares it.
@@ -547,13 +645,17 @@ mod tests {
     // Context is the one tunable every serving engine has. A backend that
     // declares nothing would render an empty Settings pane and accept no
     // flags, which is always a mistake rather than a deliberate choice.
+    let mut runtime_only = 0;
     for backend in Backends::all() {
       let defs = backend.knobs();
-      assert!(
-        !defs.is_empty(),
-        "backend `{}` declares no knobs",
-        backend.id()
-      );
+      // A backend whose knobs are all declared per model in config
+      // (`Backend::knob_scope`) compiles none in; each model's context knob
+      // comes from its own declaration instead. Exactly one such backend
+      // exists, so an accidental empty declaration still fails below.
+      if defs.is_empty() {
+        runtime_only += 1;
+        continue;
+      }
       assert!(
         defs
           .iter()
@@ -562,6 +664,7 @@ mod tests {
         backend.id()
       );
     }
+    assert_eq!(runtime_only, 1, "one backend declares its knobs at runtime");
   }
 
   #[test]

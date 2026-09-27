@@ -32,9 +32,12 @@ pub fn parse_tail_args(
     };
     // Only a flag can name a knob. Without this a bare positional that happens
     // to match a knob id (`threads`) would be swallowed instead of forwarded.
+    // Compiled-in knobs only: a config-declared knob flag is also a plain
+    // engine flag on every other model, so it stays in extras and reaches the
+    // engine as-is without setting the knob.
     let Some(def) = head
       .starts_with('-')
-      .then(|| knobs::resolve_id(&head).and_then(knobs::def_for))
+      .then(|| knobs::registry::resolve_static_id(&head).and_then(knobs::def_for))
       .flatten()
     else {
       extras.push(tok.clone());

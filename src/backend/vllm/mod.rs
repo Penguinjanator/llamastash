@@ -580,6 +580,8 @@ impl VllmBackend {
       binary,
       argv: vllm_argv(params, port),
       env_remove: CREDENTIAL_ENV_STRIP.to_vec(),
+      env: Vec::new(),
+      min_stop_grace: std::time::Duration::ZERO,
       readiness: readiness(&served_model_name(&params.model_path)),
       probe,
     }

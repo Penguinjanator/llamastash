@@ -166,6 +166,12 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
     if let Some(preset) = running_snap.and_then(|r| r.preset.clone()) {
       row["preset"] = json!(preset);
     }
+    // The backend's floor under every stop grace, omitted when there is none
+    // so ordinary rows keep their shape.
+    let min_grace = model.min_stop_grace().as_secs();
+    if min_grace > 0 {
+      row["stop_grace_secs"] = json!(min_grace);
+    }
     models.push(row);
   }
   // Delegated Lemonade models — the registry holds only the shared

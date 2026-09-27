@@ -19,7 +19,7 @@
 
 **Zero-overhead, terminal-native local-LLM manager.**
 
-A fast TUI **and** CLI with init wizard for managing local LLMs. One Rust binary that's a TUI, a CLI, a daemon, and an OpenAI-compatible proxy. [llama.cpp](https://github.com/ggml-org/llama.cpp) is the direct, zero-overhead default backend (vs raw `llama-server`), plus [Lemonade](https://github.com/lemonade-sdk/lemonade) for NPU / multi-engine inference, [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang) for safetensors, and [ds4](https://github.com/antirez/ds4) for DeepSeek-V4. See [benchmarks](docs/benchmarks.md).
+A fast TUI **and** CLI with init wizard for managing local LLMs. One Rust binary that's a TUI, a CLI, a daemon, and an OpenAI-compatible proxy. [llama.cpp](https://github.com/ggml-org/llama.cpp) is the direct, zero-overhead default backend (vs raw `llama-server`), plus [Lemonade](https://github.com/lemonade-sdk/lemonade) for NPU / multi-engine inference, [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang) for safetensors, [ds4](https://github.com/antirez/ds4) for DeepSeek-V4, and a generic backend that runs any OpenAI-compatible server you declare in config. See [benchmarks](docs/benchmarks.md).
 
 ![TUI Gif](https://raw.githubusercontent.com/llamastash/llamastash/main/assets/tui.gif)
 
@@ -229,6 +229,11 @@ Full detail per feature in [`FEATURES.md`](FEATURES.md) — including trade-offs
 - **The same rows vLLM serves.** Safetensors repos launch through `sglang serve`; a GGUF still binds llama.cpp (or ds4). With both engines installed a repo lists both and `auto` picks vLLM — `--backend sglang` selects SGLang.
 - **You install SGLang; LlamaStash drives it.** Default-on when a `sglang` launcher resolves (PATH or `backend.sglang.servers`); force with `--sglang` / `LLAMASTASH_SGLANG=1`, opt out with `backend.sglang.enabled: false`. Zero footprint when absent.
 - **A token cap, not a byte cap, on unified-memory hosts.** SGLang's only deterministic bound on its KV pool is `--max-total-tokens`, so the launcher divides the shared byte budget by the model's KV bytes per token, read from `config.json`. Eight native knobs in the launch picker and presets; `--ctx` maps to `--context-length`.
+
+### [Generic — any OpenAI-compatible server (experimental)](docs/usage.md#generic-backend)
+
+- **Engines LlamaStash has no backend for.** Declare a binary (or a wrapper script around `docker run`), its args with `{port}` / `{model}` placeholders, its readiness path and its own knobs in `config.yaml`. LlamaStash reserves the port, waits for ready, routes the proxy and stops it with a per-entry grace floor. Validated with gufo, Halogen (Docker) and CIRU on a Strix Halo box.
+- **Run a GGUF through another engine.** An entry with `model: "<glob>"` becomes a server option on the matching catalog rows, next to llama.cpp, in the TUI Server row, `--server`, and presets. Its knobs show up in the launch editor, presets and last-used like any other.
 
 ### [ds4 (DwarfStar) — DeepSeek V4 GGUFs](docs/usage.md#ds4-backend)
 

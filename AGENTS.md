@@ -20,8 +20,6 @@ Read the relevant doc before non-trivial work in that area; don't re-derive from
 | Real-hardware UAT | `docs/testing/hardware-uat.md` |
 | Built-in `(arch, gpu_backend)` defaults table | `src/launch/AGENTS.md` (loads when working under `src/launch/`) |
 
-v1's nine Implementation Units (1 scaffold, 2 daemon/IPC, 3 GGUF, 4 discovery, 5 launch/supervisor, 6 TUI shell, 7 right-pane tabs, 8 CLI, 9 release) are defined in `docs/plans/2026-05-13-001-feat-llamatui-v1-launcher-plan.md`. Identify the unit before a non-trivial change; commit subjects use `feat(unit5):` / `fix(unit3):`.
-
 ## Rules
 
 **Docs ship with code.** Any change to user-visible behavior, the CLI/IPC surface, config shape, install paths, exit codes, dependencies, scope, or architecture updates the affected docs in the **same commit**. Check for drift in: `README.md`, this file, `INSTALL.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, `config.example.yaml`, `Cargo.toml`, `TODO.md`, and the `docs/` files in the table above. Tick the matching `- [ ]` → `- [x]` in the feature's plan. If a change makes a doc statement wrong, fix or delete it — don't leave the contradiction. New user-facing concept: add a section to the closest existing doc, don't spawn a file.
@@ -38,7 +36,7 @@ v1's nine Implementation Units (1 scaffold, 2 daemon/IPC, 3 GGUF, 4 discovery, 5
 
 **TUI glyphs are single-cell text-presentation BMP symbols.** Emoji-presentation codepoints (`⚡` U+26A1, anything in an emoji block or carrying a default emoji variation selector) render double-width and colored, which breaks column alignment. Pick from the geometric / arrow / symbol text ranges already in `src/tui/glyphs.rs` and eyeball it with `--render` before committing.
 
-**Style:** plain facts and numbers over jargon. Conventional-commit prefixes (`feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`), unit-scoped where it fits.
+**Style:** plain facts and numbers over jargon. Conventional-commit prefixes (`feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`), scoped by feature or area (`tui`, `proxy`, `vllm`, `generic`, …). The `unitN` scopes in older history are the v1 plan's units and are not used for new work.
 
 ## Build, test, lint
 
@@ -110,7 +108,7 @@ Deliberate omissions, not gaps. Don't "fix" these without a decision.
 - **Loopback-only, same-UID.** Control plane on `:11436` (bearer-authed), proxy on `:11435` (`:11434` in Ollama-compat mode). `--host` / `--listen` / `--bind` / `--api-key` / `--ssl-*` / `--port` are refused via `advanced[]` (`--port` because an extras copy beats the reserved port), and `LLAMA_ARG_*` env vars are stripped before spawn. ds4 extends the denylist with `--cors` / `--dist-`. LAN bind + bearer key are opt-in; the loopback default has no auth, no TLS, no peercred.
 - **Proxy scope.** OpenAI `/v1/*` plus the Anthropic `/v1/messages` surface are forwarded (no body translation); `/ui` reverse-proxies the running model's stock llama.cpp web UI on one port-stable origin. Still deferred from R34: MCP, fallback tuning, TLS for a LAN-exposed proxy. → `docs/architecture.md`, plans `2026-05-21-001` / `2026-06-15-001`.
 - **Presets live in `config.yaml`, not `state.json`** — that is the writable source of truth, written comment-safe through `config::yaml_edit`. A knob delegated to the engine's fitter is the bare token `auto` (**not** `{auto:true}`); a literal `"auto"` value needs the `{value: auto}` escape. Same encoding in `config.yaml`, `--json`, and `state.json`. No `export`, no `presets_set_default`, no TUI list/delete. → `docs/architecture.md` § Named presets, plans `2026-06-22-001` / `2026-06-30-001`.
-- **Five backends; llama.cpp is the stable default.** Lemonade, ds4, vLLM and SGLang are experimental and default-on only when their binary resolves. A ds4-compatible GGUF that can't use ds4 **falls back to llama.cpp — never a refusal**. R13 ("a disk GGUF binds llama.cpp") has exactly this one exception — vLLM and SGLang are not more: they claim safetensors repos, never GGUF. → `docs/architecture.md` § Backends.
+- **Six backends; llama.cpp is the stable default.** Lemonade, ds4, vLLM and SGLang are experimental and default-on only when their binary resolves; generic runs only what `config.yaml` declares, and never becomes a GGUF's default. A ds4-compatible GGUF that can't use ds4 **falls back to llama.cpp — never a refusal**. R13 ("a disk GGUF binds llama.cpp") has exactly this one exception — vLLM and SGLang are not more: they claim safetensors repos, never GGUF. → `docs/architecture.md` § Backends.
 - **`--json` is the agent contract**, not the TTY rendering. Every non-interactive command supports it and emits a wrapped object with a stable shape. Colors and padded tables are TTY-gated (TTY + no `NO_COLOR` + no `--no-colors`); piped output stays `\t`-separated so `awk -F\t` pipelines keep working, and `--json` is byte-stable regardless. `llamastash config` is interactive-only (no JSON). `stop --all` refuses without `--yes` in a non-TTY. → `docs/usage.md`.
 - **Exit codes** follow `<sysexits.h>` numerically with project-specific meanings — pin against `src/cli/exit_codes.rs` (table in `docs/usage.md § Exit codes`), not the libc constants. `doctor` always exits `0`.
 - **Single binary, three roles.** TUI, CLI, and daemon are all `llamastash`; the daemon spawns on demand when a client finds no socket.

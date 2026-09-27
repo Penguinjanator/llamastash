@@ -792,6 +792,13 @@ pub fn status_json(snap: &StatusSnapshot) -> Value {
       obj.insert("default".into(), serde_json::json!(r.preset_default));
       // Resolved backend, mirrored from IPC `status`.
       obj.insert("backend".into(), serde_json::json!(r.backend));
+      // The backend's stop-grace floor, omitted when there is none, as in IPC.
+      if r.stop_grace_secs > 0 {
+        obj.insert(
+          "stop_grace_secs".into(),
+          serde_json::json!(r.stop_grace_secs),
+        );
+      }
       Value::Object(obj)
     })
     .collect();
@@ -1523,6 +1530,7 @@ mod tests {
         preset_default: None,
         preset: None,
         backend: None,
+        stop_grace_secs: 0,
       }],
       external: vec![ExternalRow {
         pid: 999,
@@ -1675,6 +1683,7 @@ mod tests {
       preset_default: None,
       preset: None,
       backend: None,
+      stop_grace_secs: 0,
     }
   }
 

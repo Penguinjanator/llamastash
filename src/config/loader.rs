@@ -810,7 +810,31 @@ fn relocated_keys(contents: &str) -> Vec<(&'static str, &'static str)> {
     .collect()
 }
 
+/// Pass 1 of the config load: parse only the `backend:` block and install
+/// what backends declare there (runtime knob tables), so pass 2's presets can
+/// resolve those knob ids. A `backend:` block that fails to parse is left for
+/// pass 2 to report with its full path.
+fn install_backend_block(contents: &str) -> Result<(), String> {
+  let Ok(doc) = yaml_serde::from_str::<yaml_serde::Value>(contents) else {
+    return Ok(());
+  };
+  let Some(block) = doc.get("backend") else {
+    return Ok(());
+  };
+  let Ok(backend) = yaml_serde::from_value::<crate::backend::BackendConfig>(block.clone()) else {
+    return Ok(());
+  };
+  crate::backend::install_backend_config(&backend)
+}
+
 fn parse_config(contents: &str, path: &Path) -> LoadedConfig {
+  if let Err(error) = install_backend_block(contents) {
+    return LoadedConfig {
+      config: Config::default(),
+      warning: Some(format!("invalid config file {}: {error}", path.display())),
+      relocated_keys: Vec::new(),
+    };
+  }
   match yaml_serde::from_str::<Config>(contents) {
     Ok(config) => LoadedConfig {
       config,

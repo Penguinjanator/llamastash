@@ -44,6 +44,7 @@
 //! rows — reusable by any future backend.
 
 pub mod ds4;
+pub mod generic;
 pub mod identity;
 pub mod lemonade;
 pub mod llama_cpp;
@@ -70,6 +71,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::ds4::Ds4Backend;
+use crate::backend::generic::GenericBackend;
 use crate::backend::identity::ModelIdentity;
 use crate::backend::lemonade::LemonadeBackend;
 use crate::backend::llama_cpp::LlamaCppBackend;
@@ -173,6 +175,12 @@ pub struct ProcessLaunchSpec {
   pub readiness: Readiness,
   /// Probe budget (the caller has already applied `scale_for_model`).
   pub probe: ProbeOptions,
+  /// Environment variables to set on the child, applied after `env_remove`.
+  pub env: Vec<(String, OsString)>,
+  /// The shortest SIGTERM-to-SIGKILL grace any stop path may use for this
+  /// child. A GPU server killed mid-kernel can hang the device, so a slow
+  /// stopper declares its own floor and no caller's shorter grace undercuts it.
+  pub min_stop_grace: std::time::Duration,
 }
 
 /// The result of translating the resolved knob IR into "how to start
@@ -765,6 +773,57 @@ pub trait Backend {
     None
   }
 
+  /// Install whatever this backend declares in `config.yaml` beyond plain
+  /// settings (runtime knob tables), before anything that parses knobs —
+  /// presets, `last_params` — reads them. `Err` is a config-load refusal.
+  /// Default: nothing to install.
+  fn install_config(&self, _config: &BackendConfig) -> Result<(), String> {
+    Ok(())
+  }
+
+  /// The knob scope a launch of `path` on `server` resolves knobs under, when
+  /// this backend declares its knobs per model or server at runtime rather than
+  /// in [`Backend::knobs`]. `None` (the default) means the backend id itself.
+  fn knob_scope(&self, _path: &Path, _server: Option<&str>) -> Option<&'static str> {
+    None
+  }
+
+  /// Knob values configured for `path` on `server` that apply when no layer
+  /// sets one. They resolve below every real layer and are never persisted.
+  /// Default: none.
+  fn config_default_knobs(
+    &self,
+    _path: &Path,
+    _server: Option<&str>,
+  ) -> crate::launch::knobs::KnobSet {
+    crate::launch::knobs::KnobSet::new()
+  }
+
+  /// Whether this backend can run the catalog model at `path` by config, on
+  /// top of header routing. Discovery appends the backend to such a row's
+  /// `supported_backends`, after the auto default. Default `false`.
+  fn serves_path(&self, _path: &Path) -> bool {
+    false
+  }
+
+  /// Whether this backend's server `server_id` runs the model at `path`, for
+  /// scoping a row's server choices. Default `true`: a backend's servers are
+  /// interchangeable builds.
+  fn server_serves(&self, _server_id: &str, _path: &Path) -> bool {
+    true
+  }
+
+  /// File-less catalog rows this backend contributes on each rescan, from its
+  /// config or its own API. Default: none. Keeps the discovery task free of
+  /// backend names; it calls this for every backend.
+  async fn config_catalog_rows(
+    &self,
+    _config: &BackendConfig,
+    _force: &std::collections::BTreeMap<String, bool>,
+  ) -> Vec<crate::discovery::DiscoveredModel> {
+    Vec::new()
+  }
+
   /// Every basename this backend's server binary can carry — the names the
   /// `$PATH` locator searches for and the orphan sweep recognises an
   /// *unmanaged* instance by. The **first** entry is the primary marker (the
@@ -935,6 +994,7 @@ pub struct BackendConfig {
   pub ds4: crate::backend::ds4::Ds4Config,
   pub vllm: crate::backend::vllm::VllmConfig,
   pub sglang: crate::backend::sglang::SglangConfig,
+  pub generic: crate::backend::generic::GenericConfig,
 }
 
 /// Zero-cost, exhaustive dispatch over the available backends.
@@ -955,6 +1015,8 @@ pub enum Backends {
   Vllm(VllmBackend),
   /// SGLang — direct process-per-model for safetensors HF repos.
   Sglang(SglangBackend),
+  /// Any OpenAI-compatible server declared in `config.yaml`.
+  Generic(GenericBackend),
 }
 
 /// Forward a [`Backend`] call to whichever [`Backends`] variant is active.
@@ -973,6 +1035,7 @@ macro_rules! for_each_backend {
       Backends::Ds4($b) => $body,
       Backends::Vllm($b) => $body,
       Backends::Sglang($b) => $body,
+      Backends::Generic($b) => $body,
     }
   };
 }
@@ -992,6 +1055,7 @@ impl Backends {
       Backends::Ds4(Ds4Backend::new()),
       Backends::Vllm(VllmBackend::new()),
       Backends::Sglang(SglangBackend::new()),
+      Backends::Generic(GenericBackend::new()),
     ]
   }
 }
@@ -1243,6 +1307,38 @@ impl Backend for Backends {
     for_each_backend!(self, b => b.synthetic_identity(path))
   }
 
+  fn install_config(&self, config: &BackendConfig) -> Result<(), String> {
+    for_each_backend!(self, b => b.install_config(config))
+  }
+
+  fn knob_scope(&self, path: &Path, server: Option<&str>) -> Option<&'static str> {
+    for_each_backend!(self, b => b.knob_scope(path, server))
+  }
+
+  fn config_default_knobs(
+    &self,
+    path: &Path,
+    server: Option<&str>,
+  ) -> crate::launch::knobs::KnobSet {
+    for_each_backend!(self, b => b.config_default_knobs(path, server))
+  }
+
+  fn serves_path(&self, path: &Path) -> bool {
+    for_each_backend!(self, b => b.serves_path(path))
+  }
+
+  fn server_serves(&self, server_id: &str, path: &Path) -> bool {
+    for_each_backend!(self, b => b.server_serves(server_id, path))
+  }
+
+  async fn config_catalog_rows(
+    &self,
+    config: &BackendConfig,
+    force: &std::collections::BTreeMap<String, bool>,
+  ) -> Vec<crate::discovery::DiscoveredModel> {
+    for_each_backend!(self, b => b.config_catalog_rows(config, force).await)
+  }
+
   fn process_markers(&self) -> &'static [&'static str] {
     for_each_backend!(self, b => b.process_markers())
   }
@@ -1289,6 +1385,53 @@ impl Backend for Backends {
   ) -> Result<serde_json::Value, crate::ipc::protocol::ErrorObject> {
     for_each_backend!(self, b => b.stop(ctx, launch_id, grace_secs).await)
   }
+}
+
+/// Install every backend's config-declared runtime state (see
+/// [`Backend::install_config`]). Run at config load, before presets parse.
+pub fn install_backend_config(config: &BackendConfig) -> Result<(), String> {
+  Backends::all()
+    .iter()
+    .try_for_each(|b| b.install_config(config))
+}
+
+/// The knob scope a launch of `path` on `backend` resolves under: the
+/// backend's runtime scope for that model, else the backend id. Every knob
+/// lookup that knows the model passes this instead of the bare id.
+pub fn knob_scope_for(backend: &Backends, path: &Path, server: Option<&str>) -> &'static str {
+  backend
+    .knob_scope(path, server)
+    .unwrap_or_else(|| backend.id())
+}
+
+/// [`knob_scope_for`] from a backend id, for surfaces that hold the id rather
+/// than a [`Backends`]. An unknown id scopes to the default backend.
+pub fn knob_scope_by_id(backend_id: &str, path: &Path, server: Option<&str>) -> &'static str {
+  let backend = Backends::all()
+    .into_iter()
+    .find(|b| b.id() == backend_id)
+    .unwrap_or_else(default_backend);
+  knob_scope_for(&backend, path, server)
+}
+
+/// The runtime knob scope for `path` on `server`, when some backend declares
+/// one. For code that has the model and server but not the backend (a preset
+/// body). A model with no server pick has none: its default backend runs it.
+pub fn runtime_knob_scope(path: &Path, server: Option<&str>) -> Option<&'static str> {
+  let backends = Backends::all();
+  match server {
+    Some(_) => backends.iter().find_map(|b| b.knob_scope(path, server)),
+    None => backends
+      .iter()
+      .find(|b| b.synthetic_identity(path).is_some())
+      .and_then(|b| b.knob_scope(path, None)),
+  }
+}
+
+/// Whether config itself declares models to list, so a daemon with
+/// scanning off still has a catalog.
+pub fn config_declares_models(config: &BackendConfig) -> bool {
+  config.generic.declares_rows()
 }
 
 /// Map a model's [`ModelIdentity`] to the backend that runs it.
@@ -1768,6 +1911,8 @@ mod tests {
       binary: PathBuf::from("/usr/bin/llama-server"),
       argv: vec![OsString::from("--port"), OsString::from("41100")],
       env_remove: vec!["LLAMA_ARG_HOST"],
+      env: Vec::new(),
+      min_stop_grace: std::time::Duration::ZERO,
       readiness: Readiness::HttpPoll {
         path: "/health".to_string(),
         ready_status: 200,
@@ -1924,6 +2069,8 @@ mod tests {
         OsString::from("13305"),
       ],
       env_remove: vec![],
+      env: Vec::new(),
+      min_stop_grace: std::time::Duration::ZERO,
       readiness: Readiness::HttpPoll {
         path: "/live".to_string(),
         ready_status: 200,
@@ -1960,7 +2107,10 @@ mod tests {
     // construction (one `all()` line), which is what makes it surface in
     // `status` / `doctor` / `--backend` without editing those sites.
     let ids: Vec<&str> = Backends::all().iter().map(|b| b.id()).collect();
-    assert_eq!(ids, vec!["llamacpp", "lemonade", "ds4", "vllm", "sglang"]);
+    assert_eq!(
+      ids,
+      vec!["llamacpp", "lemonade", "ds4", "vllm", "sglang", "generic"]
+    );
     // Forwarding through the macro reaches each variant's real lifecycle.
     let by_id: std::collections::BTreeMap<&str, Lifecycle> = Backends::all()
       .iter()

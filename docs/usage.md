@@ -531,7 +531,7 @@ A `default:` under a key is the model's **standing launch config** (hand-edited;
 
 Picking a preset explicitly (`start --preset <name>`, or the TUI cycle) overrides the default for that launch. `start --preset auto` is the clean per-launch "ignore everything, fit fresh" gesture. In the TUI, the preset cycle (`last used → auto → named…`) marks whichever stop is the configured default with `(default)` and opens on it, and the preset row shows the count of available presets (`preset (N)`).
 
-Alongside its knobs an entry may pin launch **identity**: `mode:` (`chat` / `embedding` / `rerank`), `backend:`, and `server:` (a build id, as shown on the TUI's Server row). These say *what runs* rather than how it is tuned, and they apply on every surface: `start --preset`, a `default:` preset on plain `start` and on proxy auto-start, and the TUI preset cycle. An explicit `--mode` / `--backend` / `--server` still wins over the pin. A `mode:` pin also answers a model whose GGUF hint is `unknown`, which `start` would otherwise refuse with "pass `--mode`". Only a pinned preset carries a mode forward; a one-off `start --mode embedding` is not remembered for the next plain launch, so an embedding request can never lock a chat model out of chat.
+Alongside its knobs an entry may pin launch **identity**: `mode:` (`chat` / `embedding` / `rerank`), `backend:`, and `server:` (a build id, as shown on the TUI's Server row). These say *what runs* rather than how it is tuned, and they apply on every surface: `start --preset`, a `default:` preset on plain `start` and on proxy auto-start, and the TUI preset cycle. An explicit `--mode` / `--backend` / `--server` still wins over the pin, and a pinned or last-used `server:` of another backend is dropped when `--backend` names a different one. A `mode:` pin also answers a model whose GGUF hint is `unknown`, which `start` would otherwise refuse with "pass `--mode`". Only a pinned preset carries a mode forward; a one-off `start --mode embedding` is not remembered for the next plain launch, so an embedding request can never lock a chat model out of chat.
 
 An entry knob set to `auto` delegates that knob to llama-server's `--fit` (e.g. `n_gpu_layers: auto`); `auto` is a reserved token, so to pin a knob to the *literal* string value `auto`, use the escape `{ value: auto }`. The app writes entries in block style (flow `{ ctx: 8192 }` is also accepted when you hand-author). Presets carry no `port` (it is per-launch, auto-assigned). Changes the CLI/TUI make are live immediately; hand-edits to `config.yaml` need a `llamastash daemon restart` to be picked up. See `config.example.yaml` for the full shape. On the first `daemon start` after upgrading, an older `config.yaml` is rewritten in place into the `knobs:` shape with a `.pre-knobs.bak` copy beside it; the daemon logs what it migrated. Comments above a key survive that rewrite, comments *between* two knobs inside a migrated entry do not (the entry body is regenerated), which is what the backup is for. Until that first start, a read that does not reach the daemon (`--no-spawn`) sees an unmigrated entry's knobs as empty.
 
@@ -747,6 +747,182 @@ With vLLM installed too, a repo lists both engines in `supported_backends` and a
 **On unified-memory hosts the KV pool is capped in tokens.** SGLang has no byte-level cap — `--mem-fraction-static` is a fraction of the whole pool — so when neither `max_total_tokens` nor `mem_fraction_static` is set, the launcher divides the shared byte budget by the model's KV bytes per token, read from the repo's `config.json`, and passes `--max-total-tokens`. A repo whose attention geometry cannot be read is refused, naming the override. See [SGLang setup](sglang-setup.md#notes-and-limitations).
 
 `resolved_ctx` on a running SGLang row is read from `/get_server_info`, since SGLang's `/v1/models` carries no context field. There is no `cors` key: SGLang allows every origin and exposes no flag to narrow it.
+
+## Generic backend
+
+**Experimental.** Runs any OpenAI-compatible server llamastash has no dedicated backend for, declared under `backend.generic.servers` in `config.yaml`. llamastash reserves the port, polls the readiness path, routes the proxy, and stops the process. It knows nothing else about the engine: flags, env and weights live in the entry or in a wrapper script you write. Config-only on purpose, since `binary` runs as you; no CLI flag or IPC method sets one. Entries are read at process start, so run `llamastash daemon restart` (and reopen the TUI) after editing them.
+
+Tested on 2026-09-26 with gufo `d9a84f1`, Halogen `0.14.0` (Docker image) and CIRU `3cf984c` on a Strix Halo host. Full configs are in § Examples below.
+
+Two shapes:
+
+- **With `model`**: the entry runs catalog GGUFs. `model` is a preset-key glob (`*Flash-Next*`), a path, or a model id, and may match several models. The entry becomes the server `generic-<name>` on each matching row: `list` shows `llamacpp|generic`, and the TUI Server row, `start <model> --server generic-<name>` and a preset's `server:` pick it. llama.cpp stays the default; a plain `start` runs the entry only when the last launch of that model did. The model id is the GGUF's own id, and `{model}` carries its path (shard 1 of a split set).
+- **Without `model`**: the entry is its own row, published as `name`. Use this for engines whose weights are not a catalog GGUF (Halogen `.hgn`, CIRU's own package).
+
+| Field | Required | Meaning |
+|---|---|---|
+| `name` | yes | Server id suffix (`generic-<name>`) with `model`; the row's model id without it. No `@`, `/` or spaces. |
+| `binary` | yes | Absolute or `~/` path. |
+| `ready` | yes | HTTP path that returns 200 once the model is loaded (gufo `/ready`, llama-server `/health`, Halogen `/v1/models`). |
+| `model` | no | Catalog GGUF(s) this entry runs, as above. Requires `{model}` in `args` or `env`. |
+| `args` | no | argv after `binary`, with placeholders. |
+| `knobs` | no | Knob declarations, below. |
+| `env` | no | Extra env for the child, with placeholders. |
+| `memory_gib` | no | Admission demand for a row without `model` (a `model` launch is sized from its GGUF). Unset means no memory gating. |
+| `stop_grace_secs` | no | Minimum SIGTERM-to-SIGKILL grace on every stop path: `stop`, `stop --all`, idle eviction, daemon shutdown. A shorter `--grace` is raised to it. |
+| `ready_timeout_secs` | no | Readiness timeout, replacing the default probe budget. |
+
+**Placeholders** in `args` and `env`: `{port}`, `{host}` (always `127.0.0.1`), `{name}` (the id `/v1/models` publishes for the model, repo-qualified when another model shares its name; `id@launch` for a named launch), `{model}`, and `{<knob id>}`. An unknown placeholder is refused at config load. Braces that don't hold a plain identifier (`{"a": 1}`) stay literal.
+
+**Knobs** are strings passed as `<flag> <value>`, in declaration order, after `args` and before `-- <extras>`. A bare string (`- --seed`) is shorthand for `{flag: --seed}`. Fields: `flag`, `id` (default: the flag without dashes), `default`, `ctx: true` (at most one; makes the knob the context window, so `--ctx`, the TUI Context row and `status` ctx use it), `label`, `help`. A knob with no value and no default sends nothing. A knob referenced by a placeholder is substituted there instead of emitted; if it has no value the launch is refused. Knob ids may not reuse a built-in knob id or alias (set `id:`). Knobs appear in the TUI editor, presets, `last_params`, `status --json` and `llamastash knobs`, and are set from the CLI with presets or the TUI; `start <model> -- --flag v` passes `--flag v` straight to the engine as an extra; it does not set the knob.
+
+```bash
+llamastash list                                            # entries and matching GGUFs
+llamastash knobs --backend generic                         # each entry's knobs
+llamastash start Qwen3.8-Flash-Next-UD-Q4_K_XL --server generic-gufo --ctx 32768
+llamastash start flash-next-halogen --ctx 65536
+```
+
+### Rules the backend does not enforce
+
+These are documented, not checked. Break one and the launch fails or misbehaves at your own risk:
+
+- **Bind loopback.** Use `{host}` or bind `127.0.0.1` yourself. llamastash can't see what a foreign binary binds.
+- **Stay in the foreground.** The supervised PID must live as long as the server. A wrapper that exits early reads as a crashed launch.
+- **One clean stop.** SIGTERM goes to the whole process group once. Turn it into the engine's own clean stop, and finish inside `stop_grace_secs`. A GPU server killed mid-kernel can hang the device.
+- **Clean up your own leftovers** at start, and name external resources (containers) after `{port}` so two launches don't collide. There is no orphan adoption after a daemon crash.
+- **Multiple launches are your call.** Two launches of one entry get two ports and nothing else: internal ports, GPU memory and disk the engine uses are not checked.
+- **Answer to `{name}`** if the engine checks the request's `model` field (gufo does). A client sending a partial name the proxy accepts will get the engine's 404.
+- **`--server generic-<name>` is not checked against `model`.** Only the TUI Server row filters by it; the CLI and presets run whatever you pick.
+
+### Examples: gufo, Halogen, CIRU
+
+Three Qwen3.8 Flash-Next engines, tested on a Strix Halo box with gufo `d9a84f1`, Halogen `0.14.0` and CIRU `3cf984c`. Replace the `/path/to/...` parts with your own paths. Each takes 80-100 GB, so run one at a time.
+
+**gufo**: a native binary that runs a catalog GGUF directly, so it uses `model` and needs no wrapper. It checks the request's `model` field, hence `--served-model-name "{name}"`. Loads in about 22 s; `/ready` returns 503 until then.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: gufo                                  # server id: generic-gufo
+        model: Qwen3.8-Flash-Next-UD-Q4_K_XL        # a model id; globs work too
+        binary: /path/to/gufo/build/release/gufo
+        args: [serve, --host, "{host}", --port, "{port}", --sessions, "1", llm,
+               --served-model-name, "{name}", --model, "{model}",
+               --mtp-model, /path/to/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf,
+               --top-p, "0.95", --top-k, "20"]
+        knobs:
+          - {flag: --context, ctx: true, default: "131072"}
+          - {flag: --speculative, default: mtp}
+          - {flag: --temperature, default: "1.0"}
+          - --seed
+        ready: /ready
+        stop_grace_secs: 60
+
+presets:
+  Qwen3.8-Flash-Next-*:
+    entries:
+      gufo-128k:
+        server: generic-gufo       # the preset picks the engine
+        knobs:
+          context: 131072
+          speculative: mtp
+          temperature: '1.0'
+```
+
+```bash
+llamastash start Qwen3.8-Flash-Next-UD-Q4_K_XL --preset gufo-128k
+llamastash start Qwen3.8-Flash-Next-UD-Q4_K_XL --server generic-gufo -- --seed 7
+```
+
+**Halogen**: a Docker image configured by `HALOGEN_*` env vars, with its own `.hgn` weights (not a catalog GGUF), so it is its own row. Its knobs feed the container through `env`.
+
+```yaml
+      - name: flash-next-halogen
+        binary: ~/bin/halogen-serve.sh
+        args: ["{port}"]
+        knobs:
+          - {flag: --ctx-window, id: halogen-ctx, ctx: true, default: "131072"}
+          - {flag: --halogen-temperature, id: halogen-temp, default: "1.0"}
+          - {flag: --halogen-mtp-depth, id: halogen-mtp-depth, default: "3"}
+        env:
+          HALOGEN_MODEL_ID: "{name}"
+          HALOGEN_CTX: "{halogen-ctx}"
+          HALOGEN_KV_POOL_POSITIONS: "{halogen-ctx}"
+          HALOGEN_TEMPERATURE: "{halogen-temp}"
+          HALOGEN_MTP_DEPTH: "{halogen-mtp-depth}"
+        ready: /v1/models
+        stop_grace_secs: 90
+        ready_timeout_secs: 600
+```
+
+`~/bin/halogen-serve.sh`:
+
+```sh
+#!/bin/sh
+# llamastash generic wrapper for Halogen 0.14.0. Bridge network published on
+# loopback only: the image's API binds 0.0.0.0 inside the container.
+# $1 = port; HALOGEN_* come from the entry env.
+port="$1"
+name="llamastash-halogen-$port"          # per port, so two launches don't collide
+docker rm -f "$name" >/dev/null 2>&1      # leftover from a crashed daemon
+hub=/path/to/huggingface/hub
+hg=/hub/models--peonist-ai--halogen-qwen3.8-flash-next/snapshots/<revision>
+docker run -d --rm --name "$name" -p "127.0.0.1:$port:8080" \
+  --device /dev/kfd --device /dev/dri \
+  --group-add "$(getent group video | cut -d: -f3)" --group-add "$(getent group render | cut -d: -f3)" \
+  --ipc=host --ulimit memlock=-1:-1 -v "$hub":/hub:ro \
+  -e HALOGEN_API_PORT=8080 -e HALOGEN_MODEL_ID \
+  -e HALOGEN_CHECKPOINT="$hg/qwen38-flash-next-w4b.hgn" \
+  -e HALOGEN_MTP_HEAD="$hg/qwen38-flash-next-mtp.hgn" -e HALOGEN_TOKENIZER="$hg/tokenizer" \
+  -e HALOGEN_CTX -e HALOGEN_KV_POOL_POSITIONS -e HALOGEN_MTP_DEPTH \
+  -e HALOGEN_MAX_TOKENS_DEFAULT=16384 -e HALOGEN_TEMPERATURE -e HALOGEN_TOP_P=0.95 -e HALOGEN_TOP_K=20 \
+  ghcr.io/peonist-ai/halogen-flash-server:0.14.0 >/dev/null || exit 1
+# One clean stop: SIGTERM from llamastash becomes `docker stop`, which the
+# image turns into an engine shutdown (its own SIGKILL comes 30 s later).
+trap 'docker stop -t 60 "$name" >/dev/null 2>&1' TERM INT
+docker logs -f "$name" 2>&1 &
+docker wait "$name" >/dev/null &
+wait $!
+```
+
+- `docker run -d` plus `docker wait` keeps the wrapper in the foreground while the container never sees the process-group SIGTERM directly, so the engine gets exactly one signal. Keep `docker stop -t` above the image's 30 s and `stop_grace_secs` above `-t`.
+- Halogen 0.14.0's `all` mode binds its API on `0.0.0.0` whatever `HALOGEN_BIND` says (that variable covers only the internal engine port). Hence the bridge port published on `127.0.0.1` instead of `--network host`, which also keeps two launches' internal engine ports apart.
+- It does not check the request's `model` field. Cold load took 93-105 s here, about 6 s when the weights are still in page cache.
+
+**CIRU**: a `run-server.sh` launcher configured by env vars that `exec`s its own llama-server build and passes extra args through. The wrapper exports the fixed variables; per-launch values go in the entry's `env`.
+
+```yaml
+      - name: flash-next-ciru
+        binary: ~/bin/ciru-serve.sh
+        knobs:
+          - {flag: --ciru-ctx, id: ciru-ctx, ctx: true, default: "65536"}
+          - {flag: --mtp-depth, id: mtp-depth, default: "3"}
+        env:
+          PORT: "{port}"
+          CONTEXT_SIZE: "{ciru-ctx}"
+          MTP_DEPTH: "{mtp-depth}"
+        ready: /health
+        stop_grace_secs: 60
+        ready_timeout_secs: 600
+```
+
+`~/bin/ciru-serve.sh`:
+
+```sh
+#!/bin/sh
+# llamastash generic wrapper for CIRU (3cf984c). Env comes from the entry;
+# extra args pass through to llama-server.
+export ROCM_ROOT=/path/to/ciru/.venv-rocm/lib/python3.12/site-packages/_rocm_sdk_devel
+export CIRU_RUNTIME_ROOT=/path/to/ciru/runtime
+export MODEL_DIR=/path/to/huggingface/hub/models--jcbtc--Qwen3.8-Flash-CIRU-STRIX-IU4/snapshots/<revision>
+export ENABLE_UI=0 HOST=127.0.0.1
+exec /path/to/ciru/scripts/ciru/run-server.sh "$@"
+```
+
+- `exec` hands the PID to llama-server, so llamastash's one SIGTERM reaches the engine directly.
+- CIRU answers under its own alias (`Qwen3.8-Flash-CIRU-STRIX-IU4`) and does not check the request's `model` field. Loads in about 115 s.
 
 ## Proxy (OpenAI-compatible listener)
 

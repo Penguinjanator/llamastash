@@ -513,7 +513,6 @@ async fn end_to_end_proxy_models_matches_discovery_catalog() {
         periodic_rescan: Duration::from_secs(30),
         channel_capacity: 16,
       },
-      lemonade_port: None,
       backend: Default::default(),
       backend_force: Default::default(),
     },

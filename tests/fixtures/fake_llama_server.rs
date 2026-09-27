@@ -20,6 +20,11 @@
 //!   Loading → Ready transition deterministically)
 //! - `--trap-sigterm` (test-only — ignore SIGTERM so the supervisor's
 //!   SIGKILL-after-5s path can be exercised)
+//! - `--sigterm-exit-delay-ms <N>` (test-only — on SIGTERM, exit N ms later,
+//!   like an engine that drains before it stops)
+//! - `--print-env <VAR>` (test-only, repeatable — print `env VAR=<value>` to
+//!   stdout at start, so a test can read the child's environment from its log)
+//! - `--print-argv` (test-only — print `argv <args…>` to stdout at start)
 //! - `--list-devices` (one-shot, mirrors real `llama-server`: prints a
 //!   fake adapter table and exits *without* serving). The number of
 //!   adapters comes from the `FAKE_LLAMA_DEVICES` env var, default `0`
@@ -57,6 +62,10 @@ struct Args {
   mode: Mode,
   health_delay_ms: u64,
   trap_sigterm: bool,
+  // Only read under cfg(unix): Windows has no SIGTERM to delay.
+  #[cfg_attr(not(unix), allow(dead_code))]
+  sigterm_exit_delay_ms: Option<u64>,
+  print_env: Vec<String>,
   /// Set when launched with `--spec-type draft-mtp` (MTP speculative decoding).
   /// Makes the fixture print a `draft acceptance = …` slot-timing line to
   /// stderr at startup so the daemon's log ring buffer carries it, exactly like
@@ -118,6 +127,8 @@ fn parse_args() -> Args {
   let mut mode = Mode::Chat;
   let mut health_delay_ms: u64 = 0;
   let mut trap_sigterm = false;
+  let mut sigterm_exit_delay_ms = None;
+  let mut print_env = Vec::new();
   let mut spec_mtp = false;
   while let Some(arg) = args.next() {
     match arg.as_str() {
@@ -135,6 +146,10 @@ fn parse_args() -> Args {
         health_delay_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0);
       }
       "--trap-sigterm" => trap_sigterm = true,
+      "--sigterm-exit-delay-ms" => {
+        sigterm_exit_delay_ms = args.next().and_then(|v| v.parse().ok());
+      }
+      "--print-env" => print_env.extend(args.next()),
       // Silently ignore unknown flags so the supervisor can pass
       // through reasoning bundles + advanced overrides without
       // teaching the fixture every llama-server flag.
@@ -150,6 +165,8 @@ fn parse_args() -> Args {
     mode,
     health_delay_ms,
     trap_sigterm,
+    sigterm_exit_delay_ms,
+    print_env,
     spec_mtp,
   }
 }
@@ -202,6 +219,26 @@ async fn main() {
         eprintln!("fake-llama-server: ignoring SIGTERM (test mode)");
       }
     });
+  }
+
+  #[cfg(unix)]
+  if let Some(ms) = args.sigterm_exit_delay_ms {
+    tokio::spawn(async move {
+      let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install sigterm handler");
+      if sig.recv().await.is_some() {
+        eprintln!("fake-llama-server: SIGTERM, exiting in {ms} ms");
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        std::process::exit(0);
+      }
+    });
+  }
+  if std::env::args().any(|a| a == "--print-argv") {
+    let rest: Vec<String> = std::env::args().skip(1).collect();
+    println!("argv {}", rest.join(" "));
+  }
+  for var in &args.print_env {
+    println!("env {var}={}", std::env::var(var).unwrap_or_default());
   }
 
   let bind_addr = format!("{}:{}", args.host, args.port);

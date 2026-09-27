@@ -364,6 +364,8 @@ impl Ds4Backend {
       // reason to see — least-privilege applies at least as strongly to a
       // young third-party binary as to llama-server.
       env_remove: CREDENTIAL_ENV_STRIP.to_vec(),
+      env: Vec::new(),
+      min_stop_grace: std::time::Duration::ZERO,
       readiness: readiness(),
       probe,
     }

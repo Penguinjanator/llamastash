@@ -172,6 +172,9 @@ pub enum ModelSource {
   /// `ModelSource::Backend(id)` refactor (pluggable, name-free) is the
   /// deferred option.
   Lemonade,
+  /// A model server declared in `config.yaml` rather than found on disk. The
+  /// row's `supported_backends` names the backend that runs it.
+  Config,
 }
 
 impl ModelSource {
@@ -182,6 +185,7 @@ impl ModelSource {
       ModelSource::Ollama => "ollama",
       ModelSource::LmStudio => "lm-studio",
       ModelSource::Lemonade => "lemonade",
+      ModelSource::Config => "config",
     }
   }
 
@@ -196,6 +200,7 @@ impl ModelSource {
       "ollama" => Some(ModelSource::Ollama),
       "lm-studio" => Some(ModelSource::LmStudio),
       "lemonade" => Some(ModelSource::Lemonade),
+      "config" => Some(ModelSource::Config),
       _ => None,
     }
   }
@@ -208,11 +213,19 @@ impl ModelSource {
   pub fn backend_id(&self) -> &'static str {
     match self {
       ModelSource::Lemonade => crate::backend::lemonade::LEMONADE_BACKEND_ID,
-      ModelSource::UserPath
+      // A config row always carries its backend in `supported_backends`; this
+      // is only the fallback when that backend is unavailable.
+      ModelSource::Config
+      | ModelSource::UserPath
       | ModelSource::HuggingFace
       | ModelSource::Ollama
       | ModelSource::LmStudio => crate::backend::DEFAULT_BACKEND_ID,
     }
+  }
+
+  /// Whether rows from this source point at a file llamastash can delete.
+  pub fn has_local_file(&self) -> bool {
+    !matches!(self, ModelSource::Lemonade | ModelSource::Config)
   }
 }
 

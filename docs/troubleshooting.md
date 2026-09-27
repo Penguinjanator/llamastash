@@ -325,6 +325,22 @@ Same cause and fix as vLLM above: detection is a filesystem check for a `sglang`
 
 **The token cap came out smaller than `--ctx`.** On a tight host the shared budget divided by a large model's per-token cost can be fewer tokens than the requested window; the launch proceeds with the warning rather than refusing. Raise `max_total_tokens` if the host can take it, or lower `--ctx`.
 
+## Generic server returns 404 `model_not_found`
+
+Some engines (gufo) answer only to the name they were started with. Pass `{name}` to the engine's served-name flag (`--served-model-name "{name}"`), and send the model's full id: a partial name the proxy resolves still reaches the engine as you typed it, since the proxy does not rewrite `model`.
+
+## Generic entry edits don't show up
+
+Entries and their knobs are read when a process starts. Run `llamastash daemon restart` and reopen the TUI after editing `backend.generic`. A daemon and a TUI started on different versions of the file disagree about which knobs exist.
+
+## Generic launch leaves a container or process behind
+
+llamastash sends one SIGTERM to the launch's process group and SIGKILLs after `stop_grace_secs`. A wrapper that runs `docker run` in the foreground and gets SIGKILLed leaves the container running. Use the wrapper shape in `docs/usage.md` § Generic backend (`docker run -d`, a `trap` that runs `docker stop`, `docker wait` in the foreground), set `stop_grace_secs` above your `docker stop -t`, and remove leftovers at wrapper start (`docker rm -f "llamastash-<engine>-$port"`). There is no orphan adoption for generic launches after a daemon crash.
+
+## Generic server is reachable from the LAN
+
+llamastash can't see what a foreign binary binds. Pass `{host}` (always `127.0.0.1`) to the engine's bind flag. For a container whose server binds `0.0.0.0` inside (Halogen 0.14.0's `all` mode does), publish the port on loopback only (`-p 127.0.0.1:$port:<inner>`) instead of `--network host`. Check with `ss -ltn | grep <port>`.
+
 ## HuggingFace pull
 
 `llamastash pull <owner/repo[:filename.gguf]>` downloads a GGUF into the HuggingFace cache layout the scanner already reads, so the model shows up in `list` / the TUI right after. The TUI's `d` HuggingFace dialog is the interactive face of the same worker. If a download stalls, check network / egress and that the repo + filename resolve on huggingface.co; a failed pull exits `69` (`PULL_FAILED`). The per-file cap is 512 GiB (raised for ds4's single-file DeepSeek-V4 GGUFs).

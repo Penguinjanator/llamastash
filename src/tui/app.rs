@@ -1411,6 +1411,16 @@ impl App {
       .and_then(|r| r.path().map(|p| p.to_path_buf()))
   }
 
+  /// Whether `path` names a file on disk that a delete can unlink. A path the
+  /// catalog does not know is treated as a local file.
+  pub fn has_local_file(&self, path: &Path) -> bool {
+    self
+      .models
+      .iter()
+      .find(|m| m.path == path)
+      .is_none_or(|m| m.source.has_local_file())
+  }
+
   /// Friendly display label for `path` if the discovery layer
   /// supplied one (Ollama's `<name>:<tag>`). Right-pane / info-pane
   /// callers fall back to `util::paths::model_display_name` when this
@@ -1629,7 +1639,17 @@ impl App {
     let default_binary = self.daemon_info.server_path.as_deref().map(Path::new);
     let mut out = Vec::new();
     for backend_id in &backends {
-      let of_backend = || self.servers.iter().filter(|s| &s.backend_id == backend_id);
+      let owner = crate::backend::Backends::all()
+        .into_iter()
+        .find(|b| crate::backend::Backend::id(b) == backend_id);
+      let of_backend = || {
+        self.servers.iter().filter(|s| {
+          &s.backend_id == backend_id
+            && owner
+              .as_ref()
+              .is_none_or(|b| crate::backend::Backend::server_serves(b, &s.id, path))
+        })
+      };
       let default_id = crate::backend::default_server(of_backend(), default_binary)
         .map(|s| s.id.clone())
         .unwrap_or_default();
@@ -1655,6 +1675,7 @@ impl App {
       .map(|p| self.managed.iter().filter(|m| &m.path == p).count())
       .unwrap_or(0);
     let mut state = LaunchPickerState::for_model(name);
+    state.model_path = path.clone();
     if let Some(p) = &path {
       // Gate the ctx quick-picks to the focused model's trained window.
       state.native_ctx = self
@@ -1749,6 +1770,8 @@ impl App {
         name: np.name.clone(),
         knobs: preset_body_from_launch_params(&np.params).knobs,
         extras: np.params.extras.clone(),
+        server: np.params.server.clone(),
+        backend: np.params.backend.explicit_id().map(str::to_string),
       })
       .collect();
     let default_stop = if eff.default_is_auto() {

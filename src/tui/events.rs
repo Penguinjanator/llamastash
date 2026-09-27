@@ -1206,6 +1206,9 @@ fn delete_refusal_reason(app: &App) -> Option<&'static str> {
     if crate::backend::lemonade::registry_name_from_path(&path).is_some() {
       return Some("model is managed by Lemonade — delete it via Lemonade");
     }
+    if !app.has_local_file(&path) {
+      return Some("model is declared in config.yaml — remove it there");
+    }
   }
   if let Some(managed) = app.focused_managed() {
     return Some(match managed.state {
@@ -2118,12 +2121,17 @@ async fn handle_restart_daemon(
   socket: &std::path::Path,
   daemon_opts: Option<crate::daemon::DaemonOptions>,
 ) {
+  let mut grace_secs = 0;
   match Client::connect(socket).await {
-    Ok(mut client) => {
-      if let Err(e) = client.call("shutdown", None).await {
-        log::warn!("restart: shutdown call failed: {e}");
+    Ok(mut client) => match client.call("shutdown", None).await {
+      Ok(resp) => {
+        grace_secs = resp
+          .get("stop_grace_secs")
+          .and_then(|v| v.as_u64())
+          .unwrap_or(0);
       }
-    }
+      Err(e) => log::warn!("restart: shutdown call failed: {e}"),
+    },
     Err(e) => log::warn!("restart: connect-for-shutdown failed: {e}"),
   }
   let opts = match daemon_opts {
@@ -2136,11 +2144,11 @@ async fn handle_restart_daemon(
       }
     },
   };
-  // Wait for the old daemon to fully release its lockfile. 8s covers
-  // the worst case (2s connection drain + 5s `stop_all_managed`
-  // grace + cleanup margin); children that stop cleanly return well
-  // before the grace deadline.
-  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+  // Wait for the old daemon to fully release its lockfile: the longest child
+  // stop grace it reported plus drain and cleanup margin, same bound as
+  // `daemon stop`. Children that stop cleanly return well before it.
+  let wait = grace_secs.saturating_add(5).max(10);
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
   while std::time::Instant::now() < deadline {
     if crate::daemon::existing_daemon_pid(&opts.state_dir).is_none() {
       break;
@@ -2758,6 +2766,22 @@ mod tests {
       toast.contains("Lemonade"),
       "expected a Lemonade-delete toast, got `{toast}`"
     );
+  }
+
+  #[test]
+  fn ctrl_d_on_config_declared_model_refuses_with_toast() {
+    let mut app = App::new(Default::default());
+    let mut row = fake_model_for_events("cfg://my-server", "cfg://");
+    row.source = crate::discovery::ModelSource::Config;
+    app.models = vec![row];
+    app.go_top();
+    pump_input(&mut app, key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert!(
+      app.confirm_dialog.is_none(),
+      "config-declared row must not stage a delete"
+    );
+    let toast = app.toast_message().unwrap_or("");
+    assert!(toast.contains("config.yaml"), "got `{toast}`");
   }
 
   #[test]

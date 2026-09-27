@@ -47,14 +47,14 @@ pub fn project_dirs() -> Option<ProjectDirs> {
 /// field, right-pane title, launch picker, logs) — the shared fallback when
 /// the live catalog has no `display_label` for the path.
 ///
-/// A Lemonade registry path (`lemonade://qwen3.5-4b-FLM`) is synthetic: the
-/// whole string after the scheme is the name, so `file_stem` is wrong there —
-/// it mistakes the `.5-4b-FLM` for a file extension and returns `qwen3`. Return
-/// the full registry name for those, so a Lemonade model reads identically
-/// whether or not the catalog match landed (it transiently misses while the
-/// umbrella is mid-load / errored).
+/// A synthetic `<scheme>://<name>` path (`lemonade://qwen3.5-4b-FLM`) is not a
+/// file: the whole string after the scheme is the name, so `file_stem` is wrong
+/// there — it mistakes the `.5-4b-FLM` for a file extension and returns
+/// `qwen3`. Return the full name for those, so such a model reads identically
+/// whether or not the catalog match landed (it transiently misses while a
+/// Lemonade umbrella is mid-load / errored).
 pub fn model_display_name(path: &Path) -> String {
-  if let Some(name) = crate::backend::lemonade::registry_name_from_path(path) {
+  if let Some((_, name)) = path.to_str().and_then(|s| s.split_once("://")) {
     return name.to_string();
   }
   let label = model_file_label(path);

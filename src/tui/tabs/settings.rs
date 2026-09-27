@@ -154,10 +154,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &Palette) {
   // no chip, since a live value has no inheritance layer to name.
   let resolved_ctx = managed.map(|m| {
     m.resolved_ctx.or_else(|| {
-      let id = m
-        .backend
-        .as_deref()
-        .unwrap_or(crate::backend::DEFAULT_BACKEND_ID);
+      let id = crate::backend::knob_scope_by_id(
+        m.backend
+          .as_deref()
+          .unwrap_or(crate::backend::DEFAULT_BACKEND_ID),
+        &m.path,
+        m.server.as_deref(),
+      );
       crate::launch::knobs::def_for_backend_concept(
         id,
         crate::launch::knobs::Concept::ContextLength,
@@ -177,10 +180,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &Palette) {
     Some(pv) => pv.visible_groups(),
     None => {
       let m = managed.expect("read-only view implies a managed row");
-      let id = m
-        .backend
-        .as_deref()
-        .unwrap_or(crate::backend::DEFAULT_BACKEND_ID);
+      let id = crate::backend::knob_scope_by_id(
+        m.backend
+          .as_deref()
+          .unwrap_or(crate::backend::DEFAULT_BACKEND_ID),
+        &m.path,
+        m.server.as_deref(),
+      );
       // The read-only view answers the same group gates the editor does, from
       // the running launch rather than the form: a placement group is noise on
       // a one-GPU server either way, and so is a speculation group on a model
