@@ -332,6 +332,12 @@ places.
   - [x] ~~**A user-set pool fraction is projected against free memory and the gate adds the weights on top.**~~ Fixed: `projected_cache_bytes` takes a `DemandInputs` carrying the pool total and the weights the gate counts, and both engines share `admission::pool_fraction_beyond_weights`. One correction to the original note — the two errors pull _opposite_ ways, so this did not fail safe: free is always under the pool total, so `free × fraction` **understated** the allocation and admitted launches that could freeze the host (PR #79 review, RV7).
   - [x] ~~**`cli::daemon::build_options` takes ten positional bools.**~~ Landed on main post-merge as `BuildOptionsArgs` (spread over `BuildOptionsArgs::new(cli, config)`, since the `cli` / `config` borrows rule out `Default`); the four backend force flags are one `BTreeMap<String, bool>` OR-ed with each backend's `LLAMASTASH_*` var via the `FORCE_FLAG_ENV` table (PR #79 review, RV8).
 
+## R11 (v0.5.0 checklist)
+
+- [ ] add a restart command for daemon
+- [ ] **`start --device none` is silently dropped and the model launches on the GPU.** `none` is not in the server's `--list-devices` catalog, so [`launch_service`](src/daemon/launch_service.rs) removes the selector as stale and spawns without `-dev`. The user asked for CPU-only and gets a full offload with no warning. `-- -dev none` works. Either accept `none` as a device value or refuse it with a message. Found 2026-09-27 testing #83 in an LXC container.
+- [ ] **Admission prices the `--fit-ctx` floor, not the context `--fit` picks.** Qwen3.8-27B Q6_K (20.5 GiB) was projected at 25.0 GiB, then `--fit` chose 262144 ctx and GTT use reached 86.4 GiB. Documented on [`project_demand`](src/launch/admission.rs) as "a floor, not a ceiling", but a second launch admitted on the floor figure can then run out of memory. Found 2026-09-27 testing #83.
+
 ## General Roadmap
 
 ### High priority
