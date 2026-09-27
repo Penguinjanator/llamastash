@@ -642,7 +642,7 @@ backend:
         model: "Qwen3.8-Flash-Next-UD-Q4_K_XL*"
         binary: /opt/gufo/build/release/gufo
         # Placeholders: {port} (llamastash reserves it), {host} (always
-        # 127.0.0.1), {name} (the launch's model id, `id@launch` when named),
+        # 127.0.0.1), {name} (the id /v1/models publishes, `id@launch` when named),
         # {model} (the chosen GGUF path, required with `model`) and
         # {<knob id>}. Knobs, then `start -- …` extras, follow.
         args: [serve, --host, "{host}", --port, "{port}", llm,

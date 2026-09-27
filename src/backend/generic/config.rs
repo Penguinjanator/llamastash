@@ -239,7 +239,10 @@ impl GenericConfig {
         return Err(entry("duplicate `name`".into()));
       }
       let raw_binary = s.binary.to_string_lossy();
-      if !(s.binary.is_absolute() || raw_binary.starts_with("~/")) {
+      // `has_root`, not `is_absolute`: the rule refuses cwd-relative paths,
+      // and a drive-less `/opt/x` on Windows resolves against the drive, not
+      // the cwd.
+      if !(s.binary.has_root() || raw_binary.starts_with("~/")) {
         return Err(entry(format!(
           "`binary` must be an absolute or `~/` path, got `{raw_binary}`"
         )));

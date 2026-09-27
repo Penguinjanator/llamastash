@@ -334,23 +334,27 @@ servers:
   async fn the_entry_grace_is_a_floor_under_every_stop() {
     let (mut client, daemon) = boot(opts(unique_temp("grace"), None)).await;
 
-    // Exits 2 s after SIGTERM; a 1 s caller grace must not SIGKILL it.
-    let id = start(&mut client, json!({"model_path": "generic://gen-a"})).await;
-    wait_state(&mut client, &id, "ready").await;
-    let took = stop_timed(&mut client, &id, 1).await;
-    assert!(
-      took >= Duration::from_millis(1900) && took < Duration::from_secs(6),
-      "clean exit after its own drain, not a 1 s kill: {took:?}"
-    );
+    // The fixture's SIGTERM delay and trap are unix-only; Windows has no SIGTERM.
+    #[cfg(unix)]
+    {
+      // Exits 2 s after SIGTERM; a 1 s caller grace must not SIGKILL it.
+      let id = start(&mut client, json!({"model_path": "generic://gen-a"})).await;
+      wait_state(&mut client, &id, "ready").await;
+      let took = stop_timed(&mut client, &id, 1).await;
+      assert!(
+        took >= Duration::from_millis(1900) && took < Duration::from_secs(6),
+        "clean exit after its own drain, not a 1 s kill: {took:?}"
+      );
 
-    // Ignores SIGTERM; the 3 s floor applies, then SIGKILL.
-    let id = start(&mut client, json!({"model_path": "generic://gen-trap"})).await;
-    wait_state(&mut client, &id, "ready").await;
-    let took = stop_timed(&mut client, &id, 1).await;
-    assert!(
-      took >= Duration::from_millis(2900) && took < Duration::from_secs(6),
-      "killed after the entry floor: {took:?}"
-    );
+      // Ignores SIGTERM; the 3 s floor applies, then SIGKILL.
+      let id = start(&mut client, json!({"model_path": "generic://gen-trap"})).await;
+      wait_state(&mut client, &id, "ready").await;
+      let took = stop_timed(&mut client, &id, 1).await;
+      assert!(
+        took >= Duration::from_millis(2900) && took < Duration::from_secs(6),
+        "killed after the entry floor: {took:?}"
+      );
+    }
 
     // `shutdown` reports the longest grace it will wait for.
     let id = start(&mut client, json!({"model_path": "generic://gen-a"})).await;
