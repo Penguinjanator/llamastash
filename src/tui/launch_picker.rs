@@ -71,6 +71,9 @@ pub struct PresetChoice {
   pub extras: Vec<std::ffi::OsString>,
   /// The preset's `server:` pin; `None` runs the row's default build.
   pub server: Option<String>,
+  /// The preset's `backend:` pin, applied through that backend's first
+  /// compatible server when `server` is unset.
+  pub backend: Option<String>,
 }
 
 /// Inline-edit state owned by [`LaunchPickerState`].
@@ -472,7 +475,16 @@ impl LaunchPickerState {
     if let Some(p) = self.presets.get(i) {
       self.user_knobs = p.knobs.clone();
       self.extras = p.extras.clone();
-      self.selected_server = p.server.clone();
+      // The picker sends its backend from the row's badge, so a backend pin
+      // only takes effect as a server of that backend.
+      self.selected_server = p.server.clone().or_else(|| {
+        let backend = p.backend.as_deref()?;
+        self
+          .servers
+          .iter()
+          .find(|s| s.backend_id == backend)
+          .map(|s| s.id.clone())
+      });
     }
   }
 
@@ -2085,7 +2097,34 @@ mod tests {
       knobs: crate::knobset! { ctx: ctx },
       extras: Vec::new(),
       server: None,
+      backend: None,
     }
+  }
+
+  #[test]
+  fn a_backend_pin_without_a_server_picks_that_backends_server() {
+    let mut s = LaunchPickerState::for_model("qwen");
+    s.servers = vec![
+      server("llamacpp-rocm", "llamacpp", "/rocm/llama-server", vec![]),
+      server("other-a", "other", "/a", vec![]),
+      server("other-b", "other", "/b", vec![]),
+    ];
+    let pinned = PresetChoice {
+      backend: Some("other".into()),
+      ..choice("pinned", 4096)
+    };
+    s.set_presets(vec![pinned], PresetStop::Named(0));
+    assert_eq!(s.selected_server.as_deref(), Some("other-a"));
+
+    let unknown = PresetChoice {
+      backend: Some("absent".into()),
+      ..choice("absent", 4096)
+    };
+    s.set_presets(vec![unknown], PresetStop::Named(0));
+    assert_eq!(
+      s.selected_server, None,
+      "no server of that backend: default build"
+    );
   }
 
   #[test]
@@ -2185,6 +2224,7 @@ mod tests {
       knobs: crate::knobset! { mode: "embedding" },
       extras: Vec::new(),
       server: None,
+      backend: None,
     };
     s.set_presets(vec![pinned], PresetStop::Named(0));
     assert_eq!(

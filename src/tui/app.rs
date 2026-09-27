@@ -1761,6 +1761,7 @@ impl App {
         knobs: preset_body_from_launch_params(&np.params).knobs,
         extras: np.params.extras.clone(),
         server: np.params.server.clone(),
+        backend: np.params.backend.explicit_id().map(str::to_string),
       })
       .collect();
     let default_stop = if eff.default_is_auto() {
