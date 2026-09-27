@@ -18,6 +18,8 @@ grace) and any fixes from the ultrareview.
 - Engines (real):
   - `llama-server` build 11200 (`81bc6b83f`, 0.5.0-dev; upstream latest tag v0.5.0)
   - gufo `d9a84f1` (2026-09-26), `release-gcc15` build
+  - Halogen `0.14.0` (latest image tag), Docker wrapper `~/.local/bin/halogen-serve`
+  - CIRU `3cf984c` (upstream HEAD), wrapper from the `docs/usage.md` example
 - Generic entries in the isolated `config.yaml`:
   - `ls-bound`: `llama-server`, `model: "Llama-3.2-1B*"`, args `--port {port} -m {model} --alias {name}`,
     knobs `{flag: --ctx-size, id: ls-ctx, ctx: true}`, `{flag: --seed, id: ls-seed}`,
@@ -51,6 +53,8 @@ grace) and any fixes from the ultrareview.
 | 18 | CLI stop | `daemon stop` waits for gufo's exit and prints `daemon: stopped` |
 | 19 | safety | `--host 0.0.0.0` in extras refused for a generic launch |
 | 20 | isolation | The user's `config.yaml` hash unchanged; their daemon still up on `:11435` |
+| 21 | Halogen | Own row via Docker: `{name}` and knobs reach the container env; loopback-only port; proxied chat 200; TUI restart with it loaded |
+| 22 | CIRU | Own row via an `exec` wrapper: knobs reach env and CIRU's argv; proxied chat 200; `stop` ends the engine |
 
 ## Rule
 
@@ -81,10 +85,12 @@ Llama-3.2-1B-Instruct-Q4_K_M (same file in two roots), Qwen3.8-Flash-Next-UD-Q4_
 | 14 | TUI picker pre-fills the generic server; `ls-seed` edited to 11 reached argv as `--seed 11` |
 | 15 | Running view: `generic`, `ls-ctx 3072`, `ls-temp 0.7`, matching argv |
 | 16 | gufo got `--served-model-name Qwen3.8-Flash-Next-UD-Q4_K_XL` (the published id); proxied chat 200. gufo answers a mismatched name with 404 `model_not_found` |
-| 17 | TUI `Ctrl+r` restart with gufo loaded: new daemon up, 0 launches. gufo stopped in ~5 s, so the >8 s path of the restart wait was not exercised live |
+| 17 | TUI `Ctrl+r` restart with gufo loaded: new daemon up, 0 launches. gufo stopped in ~5 s and Halogen (case 21) in 4.2 s, so no real engine exercised the >8 s path of the restart wait |
 | 18 | `daemon stop` printed `stopped` only after gufo exited |
 | 19 | `--host` / `--api-key` in extras refused, exit 64 |
-| 20 | User `config.yaml` hash unchanged; user daemon pid unchanged |
+| 20 | User `config.yaml` hash unchanged; user daemon pid unchanged (rechecked after 21-22) |
+| 21 | Ready in 100 s (cold). Container env: `HALOGEN_MODEL_ID=flash-next-halogen`, `HALOGEN_CTX` / `HALOGEN_KV_POOL_POSITIONS=16384`, `HALOGEN_TEMPERATURE=1.0`, `HALOGEN_MTP_DEPTH=3`; port `127.0.0.1:21500` only. Proxied chat 200. `status`: `stop_grace_secs: 90`. TUI `Ctrl+r`: engine and old daemon gone 4.2 s after confirm, new daemon up, container removed |
+| 22 | Ready in 115 s. The wrapper `exec`s CIRU's own `llama-server` (same pid) on `127.0.0.1:21500`; env `PORT`, `CONTEXT_SIZE=16384`, `MTP_DEPTH=3` became `-c 16384 --spec-draft-n-max 3`. Proxied chat to `flash-next-ciru` 200 (CIRU answers as its own alias and ignores `model`). `stop` returned in 0.7 s with the engine gone |
 
 One defect found and fixed here (with a regression test that fails without the fix):
 
