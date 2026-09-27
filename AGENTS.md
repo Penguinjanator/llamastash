@@ -20,8 +20,6 @@ Read the relevant doc before non-trivial work in that area; don't re-derive from
 | Real-hardware UAT | `docs/testing/hardware-uat.md` |
 | Built-in `(arch, gpu_backend)` defaults table | `src/launch/AGENTS.md` (loads when working under `src/launch/`) |
 
-v1's nine Implementation Units (1 scaffold, 2 daemon/IPC, 3 GGUF, 4 discovery, 5 launch/supervisor, 6 TUI shell, 7 right-pane tabs, 8 CLI, 9 release) are defined in `docs/plans/2026-05-13-001-feat-llamatui-v1-launcher-plan.md`. Identify the unit before a non-trivial change; commit subjects use `feat(unit5):` / `fix(unit3):`.
-
 ## Rules
 
 **Docs ship with code.** Any change to user-visible behavior, the CLI/IPC surface, config shape, install paths, exit codes, dependencies, scope, or architecture updates the affected docs in the **same commit**. Check for drift in: `README.md`, this file, `INSTALL.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, `config.example.yaml`, `Cargo.toml`, `TODO.md`, and the `docs/` files in the table above. Tick the matching `- [ ]` → `- [x]` in the feature's plan. If a change makes a doc statement wrong, fix or delete it — don't leave the contradiction. New user-facing concept: add a section to the closest existing doc, don't spawn a file.
@@ -38,7 +36,7 @@ v1's nine Implementation Units (1 scaffold, 2 daemon/IPC, 3 GGUF, 4 discovery, 5
 
 **TUI glyphs are single-cell text-presentation BMP symbols.** Emoji-presentation codepoints (`⚡` U+26A1, anything in an emoji block or carrying a default emoji variation selector) render double-width and colored, which breaks column alignment. Pick from the geometric / arrow / symbol text ranges already in `src/tui/glyphs.rs` and eyeball it with `--render` before committing.
 
-**Style:** plain facts and numbers over jargon. Conventional-commit prefixes (`feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`), unit-scoped where it fits.
+**Style:** plain facts and numbers over jargon. Conventional-commit prefixes (`feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`), scoped by feature or area (`tui`, `proxy`, `vllm`, `generic`, …). The `unitN` scopes in older history are the v1 plan's units and are not used for new work.
 
 ## Build, test, lint
 
