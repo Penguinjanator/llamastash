@@ -732,9 +732,20 @@ pub(crate) async fn compose_and_spawn(
     }
     None => None,
   };
+  // A server is one backend's binary, so the pick decides the backend. The
+  // TUI sends the row's default backend beside the pick; honouring that over
+  // the server ran one engine's argv against another engine's binary.
   if let Some(server) = &picked_server {
-    if launch_params.backend == crate::launch::params::BackendChoice::Auto {
-      launch_params.backend = crate::launch::params::BackendChoice::from_id(&server.backend_id);
+    let from_server = crate::launch::params::BackendChoice::from_id(&server.backend_id);
+    if launch_params.backend != from_server {
+      if launch_params.backend != crate::launch::params::BackendChoice::Auto {
+        log::info!(
+          "server {} belongs to backend {}; overriding the requested backend",
+          server.id,
+          server.backend_id
+        );
+      }
+      launch_params.backend = from_server;
     }
   }
 

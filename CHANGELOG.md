@@ -11,6 +11,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 ### Fixed
 
 - **Launches inside an LXC container on an AMD APU are checked against the GTT pool instead of the container RAM limit** when every layer is offloaded, and the TUI VRAM gauge shows the full GTT pool there. CPU-side launches keep the RAM check, since the container limit applies to them. Thanks [@Ramon-Balaguer](https://github.com/Ramon-Balaguer) ([#83](https://github.com/llamastash/llamastash/pull/83)).
+- A launch whose server binds only after loading (gufo, ds4) could fail with `bind() failed`: the readiness probe sometimes connected to its own port. A picked server now also decides the backend, so a TUI launch on a non-default server no longer gets the default engine's argv.
 
 ## [0.4.0] — 2026-09-16
 

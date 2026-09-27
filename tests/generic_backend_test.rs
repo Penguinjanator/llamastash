@@ -482,16 +482,31 @@ servers:
       !rows.to_string().contains("generic://gen-gguf"),
       "no row of its own"
     );
-    let status = client.call("status", None).await.unwrap();
-    assert!(
-      status["servers"].to_string().contains("generic-gen-gguf"),
-      "listed as a server: {}",
-      status["servers"]
-    );
+    // The server catalog fills in the background after boot.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+      let status = client.call("status", None).await.unwrap();
+      if status["servers"].to_string().contains("generic-gen-gguf") {
+        break;
+      }
+      assert!(
+        Instant::now() < deadline,
+        "never listed as a server: {}",
+        status["servers"]
+      );
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     let id = start(
       &mut client,
-      json!({"model_path": served, "server": "generic-gen-gguf", "knobs": {"gguf-knob": "v"}}),
+      // The TUI sends the row's default backend beside the server pick; the
+      // server decides.
+      json!({
+        "model_path": served,
+        "backend": "llamacpp",
+        "server": "generic-gen-gguf",
+        "knobs": {"gguf-knob": "v"},
+      }),
     )
     .await;
     let r = wait_state(&mut client, &id, "ready").await;
