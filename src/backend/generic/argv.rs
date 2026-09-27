@@ -93,6 +93,7 @@ pub fn compose(
   argv.extend(crate::launch::params::strip_forbidden_extras(
     extras,
     &[],
+    &[],
     "generic",
   ));
 

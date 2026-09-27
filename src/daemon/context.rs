@@ -175,7 +175,9 @@ impl PersistedState {
 /// optional fields on `MethodContext`.
 #[derive(Clone)]
 pub struct LaunchEnv {
-  pub binary: PathBuf,
+  /// The default backend's resolved server binary. `None` on a host without
+  /// one; backends that bring their own binary still launch.
+  pub binary: Option<PathBuf>,
   pub port_range: PortRange,
   pub log_dir: PathBuf,
   pub probe: ProbeOptions,

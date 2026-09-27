@@ -104,6 +104,17 @@ pub const DS4_ALIAS_PREFIX: &str = "deepseek-v4-";
 /// `--host`/`--listen` are already covered by the base set.
 pub const DS4_FORBIDDEN_EXTRA_HEADS: &[&str] = &["--cors", "--dist-"];
 
+/// Denylisted heads whose value count isn't one (`ds4_server.c`,
+/// `ds4_distributed.c`): `--listen` takes a host and a port.
+const DS4_FORBIDDEN_EXTRA_VALUES: &[(&str, crate::launch::params::FlagValues)] = {
+  use crate::launch::params::FlagValues::{Exactly, None};
+  &[
+    ("--cors", None),
+    ("--dist-replay-check", None),
+    ("--listen", Exactly(2)),
+  ]
+};
+
 /// `doctor` finding id: a ds4-compatible DeepSeek-V4 GGUF is present but
 /// `ds4-server` is unavailable. Info-tier — the model still *runs* (llama.cpp
 /// fallback), so the advice is "install the purpose-built engine", not an error.
@@ -425,15 +436,12 @@ pub fn ds4_argv(params: &LaunchParams, port: u16) -> Vec<std::ffi::OsString> {
   // `compose_and_spawn` already refused a banned head with a clear error;
   // this defensive strip is the belt-and-suspenders that guarantees no
   // banned flag reaches ds4-server even if a path skipped the fail-fast.
-  for e in &params.extras {
-    let lossy = e.to_string_lossy();
-    let head = lossy.split('=').next().unwrap_or(&lossy);
-    if crate::launch::params::is_forbidden_head_ext(head, DS4_FORBIDDEN_EXTRA_HEADS) {
-      log::warn!("ds4_argv: stripping forbidden extra {head:?}");
-      continue;
-    }
-    argv.push(e.clone());
-  }
+  argv.extend(crate::launch::params::strip_forbidden_extras(
+    &params.extras,
+    DS4_FORBIDDEN_EXTRA_HEADS,
+    DS4_FORBIDDEN_EXTRA_VALUES,
+    "ds4_argv",
+  ));
   argv
 }
 
@@ -582,6 +590,17 @@ impl Backend for Ds4Backend {
       && resolve_ds4_binary(ctx.backend.ds4.primary_binary()).is_some()
   }
 
+  fn enabled_in_config(
+    &self,
+    config: &super::BackendConfig,
+    force: &std::collections::BTreeMap<String, bool>,
+  ) -> bool {
+    config
+      .ds4
+      .intends_enabled(force.get(DS4_BACKEND_ID).copied().unwrap_or(false))
+      && resolve_ds4_binary(config.ds4.primary_binary()).is_some()
+  }
+
   fn installed(&self, ctx: &MethodContext) -> bool {
     // Presence of the binary, independent of the enablement toggle.
     resolve_ds4_binary(ctx.backend.ds4.primary_binary()).is_some()
@@ -626,7 +645,7 @@ impl Backend for Ds4Backend {
   fn resolve_launch_binary(
     &self,
     ctx: &MethodContext,
-    _default_binary: PathBuf,
+    _default_binary: Option<PathBuf>,
     port: u16,
   ) -> Result<(PathBuf, u16), String> {
     // ds4 spawns `ds4-server` (not the device-owning `llama-server`) on the
@@ -1131,19 +1150,19 @@ mod tests {
       OsString::from("--host"),
       OsString::from("0.0.0.0"),
       OsString::from("--cors"),
-      OsString::from("--dist-worker"),
+      OsString::from("--dist-replay-check"),
+      OsString::from("--listen"),
+      OsString::from("0.0.0.0"),
+      OsString::from("9000"),
       OsString::from("--power"),
       OsString::from("70"),
     ];
     let a = argv_strings(&p, 8000);
-    // Forbidden heads gone; the benign `--power 70` survives.
+    // Forbidden heads and their values gone; the benign `--power 70` survives.
     assert!(!a.contains(&"--cors".to_string()));
-    assert!(!a.contains(&"--dist-worker".to_string()));
-    // The security property: no rebind head survives — the only `--host` in
-    // argv is our own loopback one. (An orphaned `0.0.0.0` value token is
-    // inert without its `--host` flag; the real guard is the fail-fast
-    // `forbidden_in_extras_ext` refusal in `compose_and_spawn`, which never
-    // lets such extras reach here in production.)
+    assert!(!a.contains(&"--dist-replay-check".to_string()));
+    assert!(!a.contains(&"0.0.0.0".to_string()));
+    assert!(!a.contains(&"9000".to_string()));
     assert_eq!(a.iter().filter(|s| *s == "--host").count(), 1);
     assert!(a.windows(2).any(|w| w == ["--host", "127.0.0.1"]));
     assert!(a.windows(2).any(|w| w == ["--power", "70"]));

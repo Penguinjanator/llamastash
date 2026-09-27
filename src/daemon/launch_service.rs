@@ -191,7 +191,8 @@ pub struct LaunchExec {
   pub(crate) reserved_port: u16,
   /// The device-owning default binary the orchestrator chose; a backend with its
   /// own server overrides via [`crate::backend::Backend::resolve_launch_binary`].
-  pub(crate) default_binary: PathBuf,
+  /// `None` when the host has no default server binary.
+  pub(crate) default_binary: Option<PathBuf>,
   /// Size-scaled probe budget.
   pub(crate) probe: crate::daemon::probe::ProbeOptions,
   pub(crate) id: ModelId,
@@ -271,10 +272,10 @@ fn pick_launch_binary(
   picked_server: Option<&crate::backend::Server>,
   selector: Option<&str>,
   servers: &[crate::backend::Server],
-  default_binary: &Path,
-) -> PathBuf {
+  default_binary: Option<&Path>,
+) -> Option<PathBuf> {
   if let Some(server) = picked_server {
-    return server.binary.clone();
+    return Some(server.binary.clone());
   }
   match selector {
     Some(sel) => match servers
@@ -290,7 +291,7 @@ fn pick_launch_binary(
         if launch_params.backend == crate::launch::params::BackendChoice::Auto {
           launch_params.backend = crate::launch::params::BackendChoice::from_id(&srv.backend_id);
         }
-        srv.binary.clone()
+        Some(srv.binary.clone())
       }
       None => {
         // Stale persisted selector or the catalog probe failed. Drop the
@@ -299,14 +300,13 @@ fn pick_launch_binary(
         // `--device` the default binary would reject, and spawn the default
         // binary with auto-select.
         log::warn!(
-          "device selector {sel:?} not in server catalog; dropping it and spawning default binary {}",
-          default_binary.display()
+          "device selector {sel:?} not in server catalog; dropping it and spawning the default binary"
         );
         launch_params.knobs.remove_by_name("device");
-        default_binary.to_path_buf()
+        default_binary.map(Path::to_path_buf)
       }
     },
-    None => default_binary.to_path_buf(),
+    None => default_binary.map(Path::to_path_buf),
   }
 }
 
@@ -1017,13 +1017,15 @@ pub(crate) async fn compose_and_spawn(
     picked_server.as_ref(),
     selector.as_deref(),
     &servers_snapshot[..],
-    &env.binary,
+    env.binary.as_deref(),
   );
   // Facts about the *binary* this launch resolved, which only its own backend
   // can interpret — a flag whose spelling differs between builds of the same
   // engine. Runs here because the binary is not known until `pick_launch_binary`
   // returns, and it must land before `compose` reads `launch_config`.
-  inference_backend.seed_binary_caps(&launch_binary, &servers_snapshot[..], &mut launch_params);
+  if let Some(binary) = launch_binary.as_deref() {
+    inference_backend.seed_binary_caps(binary, &servers_snapshot[..], &mut launch_params);
+  }
   drop(servers_snapshot);
 
   // `inference_backend` was resolved up front (before the last_params gate).
@@ -1992,9 +1994,9 @@ mod tests {
       None,
       Some("ROCm0"),
       std::slice::from_ref(&rocm),
-      &default,
+      Some(&default),
     );
-    assert_eq!(binary, PathBuf::from("/bin/llama-server-rocm"));
+    assert_eq!(binary, Some(PathBuf::from("/bin/llama-server-rocm")));
     assert_eq!(params.server.as_deref(), Some("llamacpp-rocm"));
     assert_eq!(
       params.backend,
@@ -2024,9 +2026,9 @@ mod tests {
       Some(&rocm),
       Some("ROCm0"),
       std::slice::from_ref(&rocm),
-      &default,
+      Some(&default),
     );
-    assert_eq!(binary, PathBuf::from("/bin/llama-server-rocm"));
+    assert_eq!(binary, Some(PathBuf::from("/bin/llama-server-rocm")));
   }
 
   /// A stale selector (no server owns it) drops the `device` knob and falls
@@ -2039,8 +2041,8 @@ mod tests {
     );
     params.knobs.set_by_name("device", "ROCm0");
     let default = PathBuf::from("/bin/llama-server");
-    let binary = pick_launch_binary(&mut params, None, Some("ROCm0"), &[], &default);
-    assert_eq!(binary, default);
+    let binary = pick_launch_binary(&mut params, None, Some("ROCm0"), &[], Some(&default));
+    assert_eq!(binary, Some(default));
     assert!(params.server.is_none());
     assert!(params.knobs.text_by_name("device").is_none());
   }
@@ -2256,7 +2258,7 @@ mod tests {
     let env = LaunchEnv {
       // Never spawned on this path — the managed-multiplexer arm errors out
       // before any process launch.
-      binary: PathBuf::from("/nonexistent/llama-server"),
+      binary: Some(PathBuf::from("/nonexistent/llama-server")),
       port_range: range,
       log_dir: dir.path().to_path_buf(),
       probe: ProbeOptions::default(),
@@ -2344,7 +2346,7 @@ mod tests {
     std::fs::write(&model_path, build_minimal_gguf("llama")).expect("write gguf");
 
     let env = LaunchEnv {
-      binary: PathBuf::from("/nonexistent/llama-server"),
+      binary: Some(PathBuf::from("/nonexistent/llama-server")),
       port_range: crate::test_support::allocate_port_range(8),
       log_dir: dir.path().to_path_buf(),
       probe: ProbeOptions::default(),
@@ -2543,7 +2545,7 @@ mod tests {
     std::fs::set_permissions(&binary, std::os::unix::fs::PermissionsExt::from_mode(0o755))
       .expect("chmod stub");
     if let Some(env) = ctx.launch.as_mut() {
-      env.binary = binary;
+      env.binary = Some(binary);
     }
 
     let started = compose_and_spawn(

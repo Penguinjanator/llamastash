@@ -112,6 +112,18 @@ pub const VLLM_FORBIDDEN_EXTRA_HEADS: &[&str] = &[
   "--config",
 ];
 
+/// Denylisted heads whose value count isn't one (vLLM 0.30.0 `arg_utils.py`,
+/// `launchers/cli_args.py`).
+const VLLM_FORBIDDEN_EXTRA_VALUES: &[(&str, crate::launch::params::FlagValues)] = {
+  use crate::launch::params::FlagValues::{None, OneOrMore};
+  &[
+    ("--api-key", OneOrMore),
+    ("--data-parallel-hybrid-lb", None),
+    ("--data-parallel-external-lb", None),
+    ("--data-parallel-multi-port-external-lb", None),
+  ]
+};
+
 /// Config-projected launch key, not a native knob: it carries a posture
 /// decision from `backend.vllm.cors`, so it belongs nowhere near the picker.
 const VLLM_KNOB_CORS: &str = "cors";
@@ -341,7 +353,7 @@ impl Backend for VllmBackend {
   fn resolve_launch_binary(
     &self,
     ctx: &MethodContext,
-    _default_binary: PathBuf,
+    _default_binary: Option<PathBuf>,
     port: u16,
   ) -> Result<(PathBuf, u16), String> {
     // The default binary is the device-owning llama.cpp server; vLLM has to
@@ -679,6 +691,7 @@ fn vllm_argv(params: &LaunchParams, port: u16) -> Vec<std::ffi::OsString> {
   argv.extend(crate::launch::params::strip_forbidden_extras(
     &params.extras,
     VLLM_FORBIDDEN_EXTRA_HEADS,
+    VLLM_FORBIDDEN_EXTRA_VALUES,
     "vllm_argv",
   ));
   argv

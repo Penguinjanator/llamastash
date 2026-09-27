@@ -472,7 +472,7 @@ impl Backend for LemonadeBackend {
   fn resolve_launch_binary(
     &self,
     ctx: &MethodContext,
-    _default_binary: PathBuf,
+    _default_binary: Option<PathBuf>,
     _port: u16,
   ) -> Result<(PathBuf, u16), String> {
     // The umbrella supervises its own `lemond` executable on its own configured

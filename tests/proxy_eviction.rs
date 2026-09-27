@@ -105,7 +105,7 @@ async fn build_state(registry: SupervisorRegistry, log_dir: &Path) -> Arc<ProxyS
   let catalog = ModelCatalog::new();
   let token = ShutdownToken::new();
   let env = LaunchEnv {
-    binary: fake_binary(),
+    binary: Some(fake_binary()),
     port_range: allocate_port_range(),
     log_dir: log_dir.to_path_buf(),
     probe: fast_probe(),

@@ -331,6 +331,34 @@ servers:
   }
 
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn an_entry_launches_on_a_host_without_llama_server() {
+    let opts = DaemonOptions {
+      binary: None,
+      ..opts(unique_temp("no-llama"), None)
+    };
+    let (mut client, daemon) = boot(opts).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let id = loop {
+      match client
+        .call(
+          "start_model",
+          Some(json!({"model_path": "generic://gen-a"})),
+        )
+        .await
+      {
+        Ok(resp) => break resp["launch_id"].as_str().unwrap().to_string(),
+        Err(e) => {
+          assert!(Instant::now() < deadline, "start_model never accepted: {e}");
+          tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+      }
+    };
+    let r = wait_state(&mut client, &id, "ready").await;
+    assert_eq!(r["backend"], "generic", "{r}");
+    shutdown(client, daemon).await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn the_entry_grace_is_a_floor_under_every_stop() {
     let (mut client, daemon) = boot(opts(unique_temp("grace"), None)).await;
 

@@ -201,7 +201,7 @@ async fn start_model_replies_promptly_and_records_preload_outcome() {
   let port = allocate_port();
   let env = LaunchEnv {
     // Never spawned: every launch in this test delegates to the umbrella.
-    binary: PathBuf::from("/nonexistent/llama-server"),
+    binary: Some(PathBuf::from("/nonexistent/llama-server")),
     port_range: PortRange {
       start: 41000,
       end: 41999,

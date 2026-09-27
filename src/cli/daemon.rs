@@ -187,8 +187,9 @@ async fn handle_start(foreground: bool, force: bool, args: BuildOptionsArgs<'_>)
 }
 
 /// Fail-fast gate for `daemon start`: refuse to come up silently degraded when
-/// an *indicated* backend can't initialize. llama.cpp is always indicated, so a
-/// missing `llama-server` fails; Lemonade is indicated only when enabled, so a
+/// an *indicated* backend can't initialize. llama.cpp is indicated unless
+/// another backend is enabled, so a missing `llama-server` fails only on a host
+/// with nothing else to launch; Lemonade is indicated only when enabled, so a
 /// missing `lemond` binary or an already-held umbrella port fails. `--force`
 /// skips this whole gate and starts degraded. The port check is a fast
 /// bind-probe (not a readiness wait), so it never delays startup; every message
@@ -200,7 +201,12 @@ async fn handle_start(foreground: bool, force: bool, args: BuildOptionsArgs<'_>)
 /// render each backend's failure separately.
 pub(crate) fn precheck_indicated_backends(opts: &DaemonOptions) -> std::result::Result<(), String> {
   let mut failures: Vec<String> = Vec::new();
-  if opts.binary.is_none() {
+  let other_backend_enabled = crate::backend::Backends::all().iter().any(|b| {
+    use crate::backend::Backend as _;
+    b.id() != crate::backend::DEFAULT_BACKEND_ID
+      && b.enabled_in_config(&opts.backend, &opts.backend_force)
+  });
+  if opts.binary.is_none() && !other_backend_enabled {
     failures.push(
       "llama-server binary not found — point `--llama-server` / `LLAMASTASH_LLAMA_SERVER` at it, \
        run `llamastash init` to install one, or `llamastash daemon start --force` to start without \
@@ -1811,6 +1817,20 @@ mod tests {
     ids.sort_unstable();
     ids.dedup();
     assert_eq!(ids.len(), before, "duplicate id in FORCE_FLAG_ENV");
+  }
+
+  #[test]
+  fn precheck_needs_llama_server_only_when_no_other_backend_is_enabled() {
+    let dir = crate::test_support::unique_temp_dir("ls-precheck", "no-llama");
+    let mut opts = DaemonOptions::rooted_at(dir);
+    assert!(opts.binary.is_none());
+    let err = precheck_indicated_backends(&opts).expect_err("nothing to launch");
+    assert!(err.contains("llama-server"), "{err}");
+
+    opts.backend.generic =
+      yaml_serde::from_str("servers:\n  - {name: only, binary: /opt/only/serve, ready: /health}\n")
+        .expect("generic config");
+    precheck_indicated_backends(&opts).expect("a generic entry can launch without llama-server");
   }
 
   #[test]

@@ -600,10 +600,12 @@ pub trait Backend {
   fn resolve_launch_binary(
     &self,
     _ctx: &MethodContext,
-    default_binary: PathBuf,
+    default_binary: Option<PathBuf>,
     port: u16,
   ) -> Result<(PathBuf, u16), String> {
-    Ok((default_binary, port))
+    default_binary
+      .map(|b| (b, port))
+      .ok_or_else(|| format!("no `{}` server binary found", self.id()))
   }
 
   /// Resolve this backend's **Auto** native knobs for a launch given live host
@@ -1228,7 +1230,7 @@ impl Backend for Backends {
   fn resolve_launch_binary(
     &self,
     ctx: &MethodContext,
-    default_binary: PathBuf,
+    default_binary: Option<PathBuf>,
     port: u16,
   ) -> Result<(PathBuf, u16), String> {
     for_each_backend!(self, b => b.resolve_launch_binary(ctx, default_binary, port))

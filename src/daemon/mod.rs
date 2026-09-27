@@ -414,59 +414,58 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
     .with_external(external_combined)
     .with_proxy_status(std::sync::Arc::clone(&proxy_status_cell))
     .with_backend(opts.backend.clone(), opts.backend_force.clone());
-  if let Some(binary) = opts.binary.clone() {
-    if let Err(e) = std::fs::create_dir_all(&opts.log_dir) {
-      log::warn!(
-        "could not create log dir {}: {e}; logs may fail to open",
-        opts.log_dir.display()
-      );
-    }
-    let probe = match opts.probe_timeout_secs {
-      Some(secs) => ProbeOptions {
-        timeout: std::time::Duration::from_secs(secs),
-        ..ProbeOptions::default()
-      },
-      None => ProbeOptions::default(),
-    };
-    // The server catalog is populated in the background: each backend's
-    // `configured_servers` + per-binary `--list-devices` probe is best-effort
-    // I/O we must keep off the startup critical path so the detached-start
-    // parent's `runtime.json` wait never trips. The cell starts empty and flips
-    // to the full set once the probe finishes; a launch in that window falls
-    // back to the default `binary`.
-    let servers = Arc::new(tokio::sync::RwLock::new(Vec::new()));
-    ctx = ctx.with_launch_env(LaunchEnv {
-      binary,
-      port_range: opts.port_range,
-      log_dir: opts.log_dir.clone(),
-      probe,
-      arch_defaults: opts.arch_defaults.clone(),
-      servers: Arc::clone(&servers),
-      default_launch_mode: opts.default_launch_mode,
-    });
-    // Build the neutral server catalog generically over `Backends::all()` —
-    // `configured_servers` (per backend) → `probe_devices` (per binary) → id
-    // derivation. Reads `ctx.launch.binary`, so it runs after `with_launch_env`.
-    {
-      let cell = Arc::clone(&servers);
-      let ctx_for_probe = ctx.clone();
-      tokio::spawn(async move {
-        let built =
-          tokio::task::spawn_blocking(move || crate::backend::build_server_catalog(&ctx_for_probe))
-            .await
-            .unwrap_or_default();
-        log::info!(
-          "server catalog: {} server(s), {} device(s)",
-          built.len(),
-          built.iter().map(|s| s.devices.len()).sum::<usize>()
-        );
-        *cell.write().await = built;
-      });
-    }
-  } else {
+  if opts.binary.is_none() {
     log::info!(
-      "daemon started without `llama-server` binary resolved; `start_model` will return an error until one is configured"
+      "daemon started without the default server binary; only backends with their own binary can launch"
     );
+  }
+  if let Err(e) = std::fs::create_dir_all(&opts.log_dir) {
+    log::warn!(
+      "could not create log dir {}: {e}; logs may fail to open",
+      opts.log_dir.display()
+    );
+  }
+  let probe = match opts.probe_timeout_secs {
+    Some(secs) => ProbeOptions {
+      timeout: std::time::Duration::from_secs(secs),
+      ..ProbeOptions::default()
+    },
+    None => ProbeOptions::default(),
+  };
+  // The server catalog is populated in the background: each backend's
+  // `configured_servers` + per-binary `--list-devices` probe is best-effort
+  // I/O we must keep off the startup critical path so the detached-start
+  // parent's `runtime.json` wait never trips. The cell starts empty and flips
+  // to the full set once the probe finishes; a launch in that window falls
+  // back to the default `binary`.
+  let servers = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+  ctx = ctx.with_launch_env(LaunchEnv {
+    binary: opts.binary.clone(),
+    port_range: opts.port_range,
+    log_dir: opts.log_dir.clone(),
+    probe,
+    arch_defaults: opts.arch_defaults.clone(),
+    servers: Arc::clone(&servers),
+    default_launch_mode: opts.default_launch_mode,
+  });
+  // Build the neutral server catalog generically over `Backends::all()` —
+  // `configured_servers` (per backend) → `probe_devices` (per binary) → id
+  // derivation. Reads `ctx.launch.binary`, so it runs after `with_launch_env`.
+  {
+    let cell = Arc::clone(&servers);
+    let ctx_for_probe = ctx.clone();
+    tokio::spawn(async move {
+      let built =
+        tokio::task::spawn_blocking(move || crate::backend::build_server_catalog(&ctx_for_probe))
+          .await
+          .unwrap_or_default();
+      log::info!(
+        "server catalog: {} server(s), {} device(s)",
+        built.len(),
+        built.iter().map(|s| s.devices.len()).sum::<usize>()
+      );
+      *cell.write().await = built;
+    });
   }
 
   // 8a. Per-backend boot infrastructure supervision (opt-in). A managed

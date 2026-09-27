@@ -142,7 +142,7 @@ async fn build_state(
   }
   let token = ShutdownToken::new();
   let env = LaunchEnv {
-    binary: fake_binary(),
+    binary: Some(fake_binary()),
     port_range,
     log_dir: log_dir.to_path_buf(),
     probe: fast_probe(),

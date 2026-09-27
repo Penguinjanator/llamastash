@@ -60,38 +60,64 @@ pub(crate) fn is_forbidden_head_ext(head: &str, extra: &[&str]) -> bool {
   is_forbidden_head(head) || head_hits_prefixes(head, extra)
 }
 
+/// How many tokens after a forbidden flag are its values. A denylisted head
+/// takes exactly one unless its backend lists it otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlagValues {
+  None,
+  Exactly(usize),
+  /// One value, then every following token that doesn't start with `-`
+  /// (an argparse `nargs="+"` list).
+  OneOrMore,
+}
+
 /// `extras` with every forbidden head — base denylist plus `extra` — and its
-/// value removed. Both spellings: `--host 0.0.0.0` drops the following token
-/// too, `--host=0.0.0.0` is one token.
+/// values removed. `values` lists the heads whose value count isn't one, taken
+/// from each engine's own parser. A value is dropped even when it starts with
+/// `-`, so `--api-key -secret` doesn't leave `-secret` in argv. The equals form
+/// (`--host=0.0.0.0`) carries its first value inline.
 ///
 /// `compose_and_spawn` already refused a banned head with a clear error; this
 /// strip is the belt-and-suspenders a process-spawning backend applies right
 /// before argv so none reaches the launcher even if some path skipped the
-/// fail-fast. Without the value drop, the space-separated form left `0.0.0.0`
-/// dangling in argv, which a launcher reads as a stray positional and refuses
-/// the launch over.
+/// fail-fast.
 pub(crate) fn strip_forbidden_extras(
   extras: &[std::ffi::OsString],
   extra: &[&str],
+  values: &[(&str, FlagValues)],
   log_tag: &str,
 ) -> Vec<std::ffi::OsString> {
   let mut out = Vec::with_capacity(extras.len());
-  let mut skip_value = false;
-  for e in extras {
+  let mut iter = extras.iter().peekable();
+  while let Some(e) = iter.next() {
     let lossy = e.to_string_lossy();
-    if skip_value {
-      skip_value = false;
-      if !lossy.starts_with('-') {
-        continue;
-      }
-    }
     let head = lossy.split('=').next().unwrap_or(&lossy);
-    if is_forbidden_head_ext(head, extra) {
-      log::warn!("{log_tag}: stripping forbidden extra {head:?}");
-      skip_value = !lossy.contains('=');
+    if !is_forbidden_head_ext(head, extra) {
+      out.push(e.clone());
       continue;
     }
-    out.push(e.clone());
+    log::warn!("{log_tag}: stripping forbidden extra {head:?}");
+    let lower = head.to_ascii_lowercase();
+    let count = values
+      .iter()
+      .find(|(h, _)| *h == lower)
+      .map_or(FlagValues::Exactly(1), |(_, v)| *v);
+    let (fixed, open) = match count {
+      FlagValues::None => (0, false),
+      FlagValues::Exactly(n) => (n, false),
+      FlagValues::OneOrMore => (1, true),
+    };
+    for _ in 0..fixed.saturating_sub(usize::from(lossy.contains('='))) {
+      iter.next();
+    }
+    if open {
+      while iter
+        .peek()
+        .is_some_and(|t| !t.to_string_lossy().starts_with('-'))
+      {
+        iter.next();
+      }
+    }
   }
   out
 }
@@ -624,6 +650,32 @@ pub(crate) fn bench_disable_defaults_from_env() -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  fn os(v: &[&str]) -> Vec<OsString> {
+    v.iter().map(OsString::from).collect()
+  }
+
+  #[test]
+  fn strip_drops_a_value_that_starts_with_a_dash() {
+    let out = strip_forbidden_extras(&os(&["--api-key", "-secret", "--keep"]), &[], &[], "t");
+    assert_eq!(out, os(&["--keep"]));
+  }
+
+  #[test]
+  fn strip_follows_each_flags_value_count() {
+    let values = [
+      ("--switch-x", FlagValues::None),
+      ("--pair-x", FlagValues::Exactly(2)),
+      ("--list-x", FlagValues::OneOrMore),
+    ];
+    let heads = ["--switch-x", "--pair-x", "--list-x"];
+    let strip = |v: &[&str]| strip_forbidden_extras(&os(v), &heads, &values, "t");
+    assert_eq!(strip(&["--switch-x", "kept"]), os(&["kept"]));
+    assert_eq!(strip(&["--pair-x", "h", "-1", "kept"]), os(&["kept"]));
+    assert_eq!(strip(&["--list-x", "-a", "b", "--next"]), os(&["--next"]));
+    assert_eq!(strip(&["--list-x=a", "b", "--next"]), os(&["--next"]));
+    assert_eq!(strip(&["--host=0.0.0.0", "kept"]), os(&["kept"]));
+  }
 
   fn base_params() -> LaunchParams {
     LaunchParams::new(PathBuf::from("/m/model.gguf"), LaunchMode::Chat)

@@ -282,14 +282,31 @@ impl Backend for LlamaCppBackend {
     ctx
       .launch
       .as_ref()
-      .map(|e| e.binary.exists())
-      .unwrap_or(false)
+      .and_then(|e| e.binary.as_ref())
+      .is_some_and(|b| b.exists())
+  }
+
+  fn resolve_launch_binary(
+    &self,
+    _ctx: &MethodContext,
+    default_binary: Option<PathBuf>,
+    port: u16,
+  ) -> Result<(PathBuf, u16), String> {
+    default_binary.map(|b| (b, port)).ok_or_else(|| {
+      "llama-server binary not found — point `--llama-server` / `LLAMASTASH_LLAMA_SERVER` at it \
+       or run `llamastash init` to install one"
+        .to_string()
+    })
   }
 
   fn binary_path(&self, ctx: &MethodContext) -> Option<String> {
     // The daemon-resolved server path, surfaced verbatim (present even when the
     // file is missing, so `status` can show *what* it looked for vs `installed`).
-    ctx.launch.as_ref().map(|e| e.binary.display().to_string())
+    ctx
+      .launch
+      .as_ref()
+      .and_then(|e| e.binary.as_ref())
+      .map(|b| b.display().to_string())
   }
 
   fn configured_servers(&self, ctx: &MethodContext) -> Vec<super::ServerSpec> {
@@ -297,9 +314,9 @@ impl Backend for LlamaCppBackend {
     let mut out = Vec::new();
     // Primary server = the daemon-resolved binary (CLI flag > env > config >
     // PATH); its name hint comes from the first configured `servers` entry.
-    if let Some(env) = ctx.launch.as_ref() {
+    if let Some(binary) = ctx.launch.as_ref().and_then(|e| e.binary.clone()) {
       out.push(super::ServerSpec {
-        binary: env.binary.clone(),
+        binary,
         name: cfg.servers.first().and_then(|s| s.name.clone()),
       });
     }

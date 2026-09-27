@@ -101,6 +101,20 @@ pub const SGLANG_FORBIDDEN_EXTRA_HEADS: &[&str] = &[
   "--served-model-name",
 ];
 
+/// Denylisted heads whose value count isn't one (SGLang 0.5.20
+/// `srt/arg_groups`: a `bool` field is `store_true`, a `List` is `nargs="+"`).
+const SGLANG_FORBIDDEN_EXTRA_VALUES: &[(&str, crate::launch::params::FlagValues)] = {
+  use crate::launch::params::FlagValues::{None, OneOrMore};
+  &[
+    ("--enable-ssl-refresh", None),
+    ("--grpc-mode", None),
+    ("--smg-grpc-mode", None),
+    ("--disaggregation-decode-enable-radix-cache", None),
+    ("--disaggregation-decode-enable-offload-kvcache", None),
+    ("--sidecar-args", OneOrMore),
+  ]
+};
+
 /// Resolve the launcher, by existence only — see
 /// [`super::resolve_launcher_by_existence`] for why it is never executed.
 pub fn resolve_sglang_binary(configured: Option<&Path>) -> Option<PathBuf> {
@@ -306,7 +320,7 @@ impl Backend for SglangBackend {
   fn resolve_launch_binary(
     &self,
     ctx: &MethodContext,
-    _default_binary: PathBuf,
+    _default_binary: Option<PathBuf>,
     port: u16,
   ) -> Result<(PathBuf, u16), String> {
     // The default binary is the device-owning llama.cpp server; SGLang has to
@@ -560,6 +574,7 @@ fn sglang_argv(params: &LaunchParams, port: u16) -> Vec<std::ffi::OsString> {
   argv.extend(crate::launch::params::strip_forbidden_extras(
     &params.extras,
     SGLANG_FORBIDDEN_EXTRA_HEADS,
+    SGLANG_FORBIDDEN_EXTRA_VALUES,
     "sglang_argv",
   ));
   argv

@@ -385,7 +385,8 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
       "server_path": ctx
         .launch
         .as_ref()
-        .map(|env| env.binary.display().to_string()),
+        .and_then(|env| env.binary.as_ref())
+        .map(|b| b.display().to_string()),
       "ipc_url": ctx.ipc_url,
     },
   });
