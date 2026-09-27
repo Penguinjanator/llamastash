@@ -144,6 +144,55 @@ fn terminate_child_tree(child: &mut Child) {
   let _ = child.kill();
 }
 
+/// Whether `root` carries an LXC container signature: `run/systemd/container`,
+/// the `container=` entry in `proc/1/environ` (root-only), or an LXC cgroup
+/// path in `proc/1/cgroup` (empty under a cgroup namespace).
+pub(crate) fn linux_lxc_container_at(root: &std::path::Path) -> bool {
+  let container = std::fs::read_to_string(root.join("run/systemd/container")).ok();
+  let environ = std::fs::read_to_string(root.join("proc/1/environ")).ok();
+  let cgroup = std::fs::read_to_string(root.join("proc/1/cgroup")).ok();
+
+  is_lxc_container_signatures(container.as_deref(), environ.as_deref(), cgroup.as_deref())
+}
+
+/// Whether this process runs inside an LXC container. Read once: the TUI
+/// calls it every frame and admission on every launch.
+pub fn linux_lxc_container() -> bool {
+  static IN_LXC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+  *IN_LXC
+    .get_or_init(|| cfg!(target_os = "linux") && linux_lxc_container_at(std::path::Path::new("/")))
+}
+
+const LXC_CONTAINER_VALUES: &[&str] = &["lxc", "lxc-libvirt"];
+
+pub(crate) fn is_lxc_container_signatures(
+  systemd_container: Option<&str>,
+  proc_environ: Option<&str>,
+  proc_cgroup: Option<&str>,
+) -> bool {
+  let systemd = systemd_container.is_some_and(|c| LXC_CONTAINER_VALUES.contains(&c.trim()));
+  let environ = proc_environ.is_some_and(|env| {
+    env
+      .split('\0')
+      .filter_map(|entry| entry.strip_prefix("container="))
+      .any(|v| LXC_CONTAINER_VALUES.contains(&v))
+  });
+  // `<id>:<controllers>:<path>` per line; LXC names its cgroups `lxc/<name>`
+  // (legacy), `lxc.payload.<name>` or `lxc.monitor.<name>`.
+  let cgroup = proc_cgroup.is_some_and(|cg| {
+    cg.lines()
+      .filter_map(|line| line.splitn(3, ':').nth(2))
+      .flat_map(|path| path.split('/'))
+      .any(|seg| {
+        seg == "lxc"
+          || seg == "lxc.monitor"
+          || seg.starts_with("lxc.payload.")
+          || seg.starts_with("lxc.monitor.")
+      })
+  });
+  systemd || environ || cgroup
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -217,5 +266,139 @@ mod tests {
     let cmd = Command::new("/nonexistent/path/to/some-binary");
     let err = run_with_drain_and_timeout(cmd, Duration::from_secs(1)).unwrap_err();
     assert!(matches!(err, RunError::Spawn(_)));
+  }
+
+  #[test]
+  fn detects_lxc_from_systemd_container() {
+    assert!(is_lxc_container_signatures(Some("lxc\n"), None, None));
+    assert!(!is_lxc_container_signatures(Some("lxcfs"), None, None));
+    assert!(is_lxc_container_signatures(Some("lxc-libvirt"), None, None));
+    assert!(!is_lxc_container_signatures(Some("docker"), None, None));
+    assert!(!is_lxc_container_signatures(Some(""), None, None));
+    assert!(!is_lxc_container_signatures(None, None, None));
+  }
+
+  #[test]
+  fn detects_lxc_from_proc_environ() {
+    assert!(is_lxc_container_signatures(
+      None,
+      Some("PATH=/usr/bin\0container=lxc\0USER=root"),
+      None
+    ));
+    assert!(is_lxc_container_signatures(
+      None,
+      Some("container=lxc-libvirt"),
+      None
+    ));
+    assert!(!is_lxc_container_signatures(
+      None,
+      Some("PATH=/usr/bin\0container=docker\0USER=root"),
+      None
+    ));
+    assert!(!is_lxc_container_signatures(
+      None,
+      Some("container=podman"),
+      None
+    ));
+    assert!(!is_lxc_container_signatures(
+      None,
+      Some("PATH=/usr/bin:/opt/lxc-tools/bin\0HOME=/root"),
+      None
+    ));
+  }
+
+  #[test]
+  fn detects_lxc_from_cgroup_paths() {
+    assert!(is_lxc_container_signatures(
+      None,
+      None,
+      Some("0::/lxc/100/init.scope")
+    ));
+    assert!(is_lxc_container_signatures(
+      None,
+      None,
+      Some("1:name=systemd:/lxc.monitor/100")
+    ));
+    assert!(is_lxc_container_signatures(
+      None,
+      None,
+      Some("0::/lxc.payload.100")
+    ));
+    assert!(!is_lxc_container_signatures(
+      None,
+      None,
+      Some("0::/docker/e4b9d3f1a0")
+    ));
+    assert!(!is_lxc_container_signatures(
+      None,
+      None,
+      Some("0::/user.slice/user-1000.slice")
+    ));
+    assert!(!is_lxc_container_signatures(
+      None,
+      None,
+      Some("0::/system.slice/lxcfs.service")
+    ));
+  }
+
+  #[test]
+  fn linux_lxc_container_at_detects_systemd_container() {
+    let dir = crate::util::test_temp::unique_temp_dir("lxc-detect-systemd");
+    let container_dir = dir.join("run/systemd");
+    std::fs::create_dir_all(&container_dir).expect("create run/systemd");
+    std::fs::write(container_dir.join("container"), "lxc\n").expect("write container");
+
+    assert!(linux_lxc_container_at(&dir));
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn linux_lxc_container_at_detects_proc_environ() {
+    let dir = crate::util::test_temp::unique_temp_dir("lxc-detect-environ");
+    let proc_dir = dir.join("proc/1");
+    std::fs::create_dir_all(&proc_dir).expect("create proc/1");
+    std::fs::write(
+      proc_dir.join("environ"),
+      "PATH=/usr/bin\0container=lxc\0HOME=/root",
+    )
+    .expect("write environ");
+
+    assert!(linux_lxc_container_at(&dir));
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn linux_lxc_container_at_detects_cgroup() {
+    let dir = crate::util::test_temp::unique_temp_dir("lxc-detect-cgroup");
+    let proc_dir = dir.join("proc/1");
+    std::fs::create_dir_all(&proc_dir).expect("create proc/1");
+    std::fs::write(
+      proc_dir.join("cgroup"),
+      "0::/lxc/100/init.scope\n1:name=systemd:/lxc/100\n",
+    )
+    .expect("write cgroup");
+
+    assert!(linux_lxc_container_at(&dir));
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn linux_lxc_container_at_returns_false_for_non_lxc() {
+    let dir = crate::util::test_temp::unique_temp_dir("lxc-detect-non-lxc");
+    let container_dir = dir.join("run/systemd");
+    std::fs::create_dir_all(&container_dir).expect("create run/systemd");
+    std::fs::write(container_dir.join("container"), "docker\n").expect("write container");
+
+    let proc_dir = dir.join("proc/1");
+    std::fs::create_dir_all(&proc_dir).expect("create proc/1");
+    std::fs::write(
+      proc_dir.join("environ"),
+      "PATH=/usr/bin\0container=docker\0HOME=/root",
+    )
+    .expect("write environ");
+    std::fs::write(proc_dir.join("cgroup"), "0::/docker/e4b9d3f1a0\n").expect("write cgroup");
+
+    assert!(!linux_lxc_container_at(&dir));
+    std::fs::remove_dir_all(&dir).ok();
   }
 }

@@ -307,9 +307,16 @@ pub fn dir_weight_bytes(dir: &std::path::Path) -> u64 {
 /// exists to project. Under-projection is the direction that takes the host
 /// down, so the conservative total stays until the same reading is taken on
 /// an ROCm APU. Tracked in `TODO.md`.
-pub fn engine_pool_total_bytes(snap: &HostMetricsSnapshot) -> u64 {
+///
+/// The one exception is `gtt_only` from [`gtt_only_budget`]: the free side is
+/// then GTT free alone, and container `MemTotal` can be a fraction of the GTT
+/// pool, so the total has to be the GTT pool too or a fraction is priced
+/// against 8 GiB and admitted against ~96 GiB.
+pub fn engine_pool_total_bytes(snap: &HostMetricsSnapshot, gtt_only: bool) -> u64 {
   let unified = snap.unified || snap.gpu_backend == HostMetricsSnapshot::BACKEND_APPLE_METAL;
-  if unified {
+  if let (true, Some(gtt_total)) = (gtt_only, snap.uma_shared_total_bytes) {
+    gtt_total
+  } else if unified {
     snap.ram_total_bytes
   } else {
     snap.gpu_mem_total_bytes.unwrap_or(0)
@@ -383,7 +390,38 @@ pub fn pool_fraction_beyond_weights(host: &DemandInputs, fraction: f64) -> u64 {
 /// system RAM is the tighter constraint. Apple Silicon has no GTT carve
 /// (it leaves `uma_shared_*` unset), so it falls back to `ram_free` with
 /// its 0.75 headroom.
+///
+/// This is the host-wide figure. A launch uses [`effective_free_bytes_for`]
+/// with [`gtt_only_budget`], which differs only inside an LXC container.
 pub fn effective_free_bytes(snap: &HostMetricsSnapshot) -> u64 {
+  effective_free_bytes_for(snap, false)
+}
+
+/// Whether a launch budgets GTT free alone instead of
+/// `min(ram_free, gtt_free)`.
+///
+/// Inside an LXC container on an AMD APU, `MemTotal` is the container's
+/// memory limit, which can be far below the host's GTT pool. amdgpu GTT
+/// allocations are not charged to the container's cgroup `memory.max`
+/// (measured on a Strix Halo: a 20 GiB model with every layer offloaded
+/// loaded and served under an 8 GiB limit), so `ram_free` does not bound
+/// them. CPU-side memory is charged (the same model on the CPU was
+/// OOM-killed at 8 GiB), so only a launch that keeps nothing on the CPU
+/// (`gpu_resident`, from [`crate::backend::Backend::gpu_resident`]) gets
+/// the exception.
+pub fn gtt_only_budget(snap: &HostMetricsSnapshot, gpu_resident: bool) -> bool {
+  gpu_resident && lxc_amd_uma(snap, crate::util::process::linux_lxc_container())
+}
+
+fn lxc_amd_uma(snap: &HostMetricsSnapshot, in_lxc: bool) -> bool {
+  in_lxc
+    && snap.gpu_backend == HostMetricsSnapshot::BACKEND_AMD
+    && snap.unified
+    && snap.uma_shared_total_bytes.is_some()
+}
+
+/// [`effective_free_bytes`], with `gtt_only` from [`gtt_only_budget`].
+pub fn effective_free_bytes_for(snap: &HostMetricsSnapshot, gtt_only: bool) -> u64 {
   let ram_free = snap.ram_total_bytes.saturating_sub(snap.ram_used_bytes);
   // Apple is unified by construction (the `|| apple_metal` just guards
   // it); the host-pane VRAM gauge keys off the same `unified` flag.
@@ -392,7 +430,11 @@ pub fn effective_free_bytes(snap: &HostMetricsSnapshot) -> u64 {
     let pool_free = match snap.uma_shared_total_bytes {
       Some(gtt_total) => {
         let gtt_free = gtt_total.saturating_sub(snap.uma_shared_used_bytes.unwrap_or(0));
-        ram_free.min(gtt_free)
+        if gtt_only {
+          gtt_free
+        } else {
+          ram_free.min(gtt_free)
+        }
       }
       None => ram_free,
     };
@@ -570,10 +612,18 @@ mod tests {
       gpu_mem_total_bytes: Some(16 * GB),
       ..Default::default()
     };
-    assert_eq!(engine_pool_total_bytes(&s), 121 * GB, "unified: the pool");
+    assert_eq!(
+      engine_pool_total_bytes(&s, false),
+      121 * GB,
+      "unified: the pool"
+    );
 
     s.unified = false;
-    assert_eq!(engine_pool_total_bytes(&s), 16 * GB, "discrete: VRAM");
+    assert_eq!(
+      engine_pool_total_bytes(&s, false),
+      16 * GB,
+      "discrete: VRAM"
+    );
 
     // Apple is unified by construction even without the flag.
     let apple = HostMetricsSnapshot {
@@ -582,7 +632,7 @@ mod tests {
       ram_total_bytes: 64 * GB,
       ..Default::default()
     };
-    assert_eq!(engine_pool_total_bytes(&apple), 64 * GB);
+    assert_eq!(engine_pool_total_bytes(&apple, false), 64 * GB);
 
     // A discrete host with no VRAM reading cannot say.
     let blind = HostMetricsSnapshot {
@@ -591,7 +641,7 @@ mod tests {
       ram_total_bytes: 32 * GB,
       ..Default::default()
     };
-    assert_eq!(engine_pool_total_bytes(&blind), 0);
+    assert_eq!(engine_pool_total_bytes(&blind, false), 0);
   }
 
   /// The reserve covers the engine's own overhead, which the flat 8 GiB did
@@ -743,6 +793,31 @@ mod tests {
     // IntegratedUma 1.0 fraction.
     let s = snap(HostMetricsSnapshot::BACKEND_AMD, true, 128 * GIB, 28 * GIB);
     assert_eq!(effective_free_bytes(&s), 100 * GIB);
+  }
+
+  #[test]
+  fn amd_lxc_uma_budgets_gtt_when_container_ram_is_smaller() {
+    // 8 GiB container on a host with a 96 GiB GTT pool.
+    let mut s = snap(HostMetricsSnapshot::BACKEND_AMD, true, 8 * GIB, 2 * GIB);
+    s.uma_shared_total_bytes = Some(96 * GIB);
+    s.uma_shared_used_bytes = Some(0);
+    assert_eq!(effective_free_bytes_for(&s, true), 96 * GIB);
+    assert_eq!(effective_free_bytes_for(&s, false), 6 * GIB);
+    assert_eq!(engine_pool_total_bytes(&s, true), 96 * GIB);
+    assert_eq!(engine_pool_total_bytes(&s, false), 8 * GIB);
+  }
+
+  #[test]
+  fn gtt_only_budget_needs_lxc_amd_uma_and_gtt_data() {
+    let mut s = snap(HostMetricsSnapshot::BACKEND_AMD, true, 8 * GIB, 2 * GIB);
+    assert!(!lxc_amd_uma(&s, true), "no GTT data");
+    s.uma_shared_total_bytes = Some(96 * GIB);
+    assert!(lxc_amd_uma(&s, true));
+    assert!(!lxc_amd_uma(&s, false), "bare metal");
+    s.gpu_backend = HostMetricsSnapshot::BACKEND_APPLE_METAL.into();
+    assert!(!lxc_amd_uma(&s, true), "not AMD");
+    // CPU-side memory is charged to the container limit.
+    assert!(!gtt_only_budget(&s, false));
   }
 
   #[test]

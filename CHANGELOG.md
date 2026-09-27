@@ -4,6 +4,10 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ## [Unreleased]
 
+### Fixed
+
+- **Launches inside an LXC container on an AMD APU are checked against the GTT pool instead of the container RAM limit** when every layer is offloaded, and the TUI VRAM gauge shows the full GTT pool there. CPU-side launches keep the RAM check, since the container limit applies to them. Thanks [@Ramon-Balaguer](https://github.com/Ramon-Balaguer) ([#83](https://github.com/llamastash/llamastash/pull/83)).
+
 ## [0.4.0] — 2026-09-16
 
 This release adds **SGLang** as a second engine for the safetensors HuggingFace repos in your cache, next to vLLM. A repo both engines can serve is one catalog row listing both, `auto` picks vLLM, and `--backend sglang` picks SGLang. On unified-memory hosts SGLang's KV pool is capped in tokens, since it has no byte-level cap.

@@ -650,6 +650,16 @@ pub trait Backend {
     false
   }
 
+  /// Whether this launch keeps its weights and cache in GPU allocations only,
+  /// with nothing placed on the CPU. `layer_count` is the model's block count
+  /// when the caller has a header. Feeds
+  /// [`crate::launch::admission::gtt_only_budget`]: CPU-side memory counts
+  /// against a container's RAM limit, GPU allocations do not. Default `false`
+  /// keeps the RAM check.
+  fn gpu_resident(&self, _params: &LaunchParams, _layer_count: Option<u64>) -> bool {
+    false
+  }
+
   /// Whether the backend's executable is present on this host (the `status`
   /// `installed` signal), independent of the enablement toggle. Default
   /// [`Self::available`]; a backend with a separate enablement config overrides
@@ -1171,6 +1181,10 @@ impl Backend for Backends {
 
   fn bypasses_admission(&self, params: &LaunchParams) -> bool {
     for_each_backend!(self, b => b.bypasses_admission(params))
+  }
+
+  fn gpu_resident(&self, params: &LaunchParams, layer_count: Option<u64>) -> bool {
+    for_each_backend!(self, b => b.gpu_resident(params, layer_count))
   }
 
   fn projected_cache_bytes(
