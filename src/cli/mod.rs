@@ -85,9 +85,14 @@ pub async fn dispatch(mut cli: Cli, config: LoadedConfig) -> Result<i32> {
     if repair {
       log::warn!("{warning}");
     } else {
-      eprintln!("config error: {warning}");
       log::error!("config error: {warning}");
-      return Ok(exit_codes::USAGE);
+      return Ok(report(
+        Err(CliExit::new(
+          exit_codes::USAGE,
+          format!("config error: {warning}"),
+        )),
+        cli.json,
+      ));
     }
   }
   // Sticky `--llama-server`: when the user passes the flag explicitly,
@@ -136,7 +141,7 @@ pub async fn dispatch(mut cli: Cli, config: LoadedConfig) -> Result<i32> {
     #[cfg(feature = "uat")]
     Some(Command::Uat(args)) => uat::handle(args, &cli, resolved_config).await,
   };
-  Ok(report(outcome))
+  Ok(report(outcome, cli.json))
 }
 
 /// Persist `--llama-server <PATH>` back into the user's YAML config so
@@ -235,16 +240,22 @@ fn map_anyhow(r: Result<()>) -> CliResult {
   }
 }
 
-/// Print any error message and return the exit code.
-fn report(result: CliResult) -> i32 {
+/// Print any error message and return the exit code. Under `--json` the
+/// message goes to stdout as `{"error": {"code", "message"}}`.
+fn report(result: CliResult, json: bool) -> i32 {
   match result {
     Ok(()) => exit_codes::SUCCESS,
     Err(exit) => {
       if let Some(msg) = &exit.message {
-        // Single render site for all CLI failures — wrapping in
-        // `colors::error` adds the standard ✗ prefix and red colouring
-        // when the global color policy allows.
-        eprintln!("{}", colors::error(msg));
+        if json {
+          let body = serde_json::json!({"error": {"code": exit.code, "message": msg}});
+          println!(
+            "{}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+          );
+        } else {
+          eprintln!("{}", colors::error(msg));
+        }
       }
       exit.code
     }

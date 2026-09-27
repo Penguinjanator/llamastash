@@ -75,6 +75,11 @@ pub struct Cli {
   #[arg(long, global = true, action = ArgAction::SetTrue)]
   pub no_colors: bool,
 
+  /// Whether the subcommand was given `--json`, so a failure prints a JSON
+  /// error body instead of the human line. Set by [`parse_cli`].
+  #[arg(skip)]
+  pub json: bool,
+
   /// Render one frame of the TUI to stdout as plain text and exit
   /// instead of entering the interactive loop. Connects to (or auto-
   /// spawns) the daemon, primes `list_models` + `status`, draws one
@@ -171,7 +176,16 @@ pub fn parse_cli() -> Result<Cli, clap::Error> {
     ColorChoice::Auto
   };
   let matches = Cli::command().color(choice).try_get_matches()?;
-  Cli::from_arg_matches(&matches)
+  let mut cli = Cli::from_arg_matches(&matches)?;
+  cli.json = wants_json(&matches);
+  Ok(cli)
+}
+
+/// Whether any subcommand level set its `--json` flag. Read from the matches
+/// rather than the typed args so a new command with `--json` needs no edit.
+fn wants_json(m: &clap::ArgMatches) -> bool {
+  matches!(m.try_get_one::<bool>("json"), Ok(Some(true)))
+    || m.subcommand().is_some_and(|(_, sub)| wants_json(sub))
 }
 
 #[derive(Subcommand, Debug)]
@@ -1378,6 +1392,20 @@ pub enum UatMode {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn wants_json_reads_the_flag_at_any_subcommand_depth() {
+    use clap::CommandFactory;
+    let json = |args: &[&str]| {
+      let argv = std::iter::once("llamastash").chain(args.iter().copied());
+      wants_json(&Cli::command().try_get_matches_from(argv).unwrap())
+    };
+    assert!(json(&["start", "m", "--json"]));
+    assert!(json(&["presets", "m", "list", "--json"]));
+    assert!(json(&["daemon", "status", "--json"]));
+    assert!(!json(&["start", "m"]));
+    assert!(!json(&["start", "m", "--", "--json"]));
+  }
 
   /// Pretty-prints a `Vec<InitStep>` so assertions in `cli_init_parse.rs`
   /// and the inline tests below share the same canonical form.

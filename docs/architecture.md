@@ -310,6 +310,10 @@ request can say *which* copy it wants. The rules, all in one place:
   it is an explicit choice, not a default. Scoped to `LaunchOrigin::AutoStart`:
   a request body carries only `model`, so the address is a client's only
   channel, while `start --name` and the TUI already have `--preset`.
+- **A plain reference to a model that runs more than once** goes to a Ready
+  unnamed launch before a named one (a named launch has its own address), then
+  to the newest by `L#` counter (`route::pick_ready_launch`). The counter is
+  compared as a number, so `L10` is newer than `L9`.
 - **The published ids** come from two different places by design. Catalog rows
   are published through `published_id_index` (`util::paths`); named rows come
   from the live launch registry, and take their model half out of that same

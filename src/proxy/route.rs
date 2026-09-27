@@ -25,6 +25,7 @@ use std::sync::Arc;
 use http_body_util::{BodyExt, Limited};
 use hyper::body::{Bytes, Incoming};
 
+use crate::daemon::registry::LaunchId;
 use crate::daemon::supervisor::ManagedState;
 use crate::discovery::DiscoveredModel;
 use crate::gguf::identity::ModelId;
@@ -307,17 +308,16 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
     return decide_umbrella_route(state, requested, &resolved).await;
   }
 
-  // Walk the supervisor snapshot for a Ready entry serving the
-  // resolved row's path. Two HashMap lookups + one state read each
-  // — well within the hot-path budget the plan asks for.
-  let sup_snap = state.ctx.supervisors.snapshot().await;
-  // When a name is present we must map a launch's port back to its name to
+  // Walk the supervisor snapshot for Ready entries serving the resolved row's
+  // path. When a name is present we must map a launch back to its name to
   // confirm the match; read the state snapshot once (not per-iteration).
-  let state_snap = if name.is_some() {
+  let sup_snap = state.ctx.supervisors.snapshot().await;
+  let mut state_snap = if name.is_some() {
     Some(state.ctx.state.snapshot().await)
   } else {
     None
   };
+  let mut ready = Vec::new();
   for (launch_id, model) in sup_snap.into_iter() {
     if !same_path(&model.id().path, &resolved.path) {
       continue;
@@ -333,15 +333,24 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
       }
     }
     if matches!(model.state().await, ManagedState::Ready) {
-      return RouteDecision::ReadyAt {
-        port: model.port(),
-        served_model_id: served_name_for_row(&resolved),
-        served_model_key: model.id().clone(),
-        upstream_path_prefix: None,
-        fallback: false,
-        fallback_reason: None,
-      };
+      ready.push((launch_id, model));
     }
+  }
+  if ready.len() > 1 && state_snap.is_none() {
+    state_snap = Some(state.ctx.state.snapshot().await);
+  }
+  let running = state_snap.as_ref().map_or(&[][..], |s| &s.running[..]);
+  let keys: Vec<(LaunchId, u16)> = ready.iter().map(|(id, m)| (id.clone(), m.port())).collect();
+  if let Some(i) = pick_ready_launch(&keys, running) {
+    let model = &ready[i].1;
+    return RouteDecision::ReadyAt {
+      port: model.port(),
+      served_model_id: served_name_for_row(&resolved),
+      served_model_key: model.id().clone(),
+      upstream_path_prefix: None,
+      fallback: false,
+      fallback_reason: None,
+    };
   }
 
   // Catalog matched but no supervisor is in Ready state — dispatch
@@ -354,6 +363,29 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
     arch,
     name,
   }
+}
+
+/// Which of several Ready launches of one model a request goes to: an unnamed
+/// launch over a named one (a named launch has its own address), then the
+/// newest (highest `L#`). Returns an index into `ready`, `None` when it is empty.
+fn pick_ready_launch(
+  ready: &[(LaunchId, u16)],
+  running: &[crate::daemon::state_store::RunningSnapshot],
+) -> Option<usize> {
+  let named = |id: &LaunchId, port: u16| {
+    running.iter().any(|r| {
+      r.name.is_some()
+        && match &r.launch_id {
+          Some(mine) => mine == id,
+          None => r.port == port,
+        }
+    })
+  };
+  ready
+    .iter()
+    .enumerate()
+    .max_by_key(|(_, (id, port))| (!named(id, *port), id.counter().unwrap_or(0)))
+    .map(|(i, _)| i)
 }
 
 /// Routing decision for a managed-multiplexer-backed model. A managed
@@ -760,6 +792,31 @@ async fn collect_fallback_candidates(state: &Arc<ProxyState>) -> Vec<FallbackCan
 #[cfg(test)]
 mod tests {
   use super::fallback_reason_for;
+
+  #[test]
+  fn pick_ready_launch_prefers_unnamed_then_newest() {
+    use super::{pick_ready_launch, LaunchId};
+    let l = |n: u64| (LaunchId::from_counter(n), 41000 + n as u16);
+    let named = |n: u64, name: &str| crate::daemon::state_store::RunningSnapshot {
+      launch_id: Some(LaunchId::from_counter(n)),
+      port: 41000 + n as u16,
+      name: Some(name.to_string()),
+      ..crate::test_support::running_row("/m.gguf").build()
+    };
+    // Numeric, not lexicographic: L10 is newer than L9.
+    assert_eq!(pick_ready_launch(&[l(9), l(10)], &[]), Some(1));
+    // An unnamed launch beats a newer named one.
+    assert_eq!(
+      pick_ready_launch(&[l(2), l(5)], &[named(5, "coder")]),
+      Some(0)
+    );
+    // All named: the newest.
+    assert_eq!(
+      pick_ready_launch(&[l(3), l(4)], &[named(3, "a"), named(4, "b")]),
+      Some(1)
+    );
+    assert_eq!(pick_ready_launch(&[], &[]), None);
+  }
 
   // ─── 413 envelope ──────────────────────────────────────────────
   //

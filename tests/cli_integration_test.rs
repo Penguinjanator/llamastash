@@ -282,6 +282,7 @@ fn build_cli(model_dir: &Path, command: Command) -> (Cli, LoadedConfig) {
     verbose: false,
     quiet: false,
     no_colors: false,
+    json: false,
     render: false,
     render_size: None,
     mouse_focus: false,
@@ -1259,9 +1260,14 @@ presets:
           n_gpu_layers: 1
 "#,
   );
-  let (code, _, err) = run_cli(&h.socket, &["run", file.to_str().unwrap(), "--json"]);
-  assert_eq!(code, exit_codes::MODEL_NOT_FOUND, "stderr: {err}");
-  assert!(err.contains("ghost.gguf"), "stderr: {err}");
+  let (code, out, _) = run_cli(&h.socket, &["run", file.to_str().unwrap(), "--json"]);
+  assert_eq!(code, exit_codes::MODEL_NOT_FOUND, "stdout: {out}");
+  assert!(json_error(&out).contains("ghost.gguf"), "stdout: {out}");
+}
+
+/// The `message` of the `{"error": …}` body a failing `--json` command prints.
+fn json_error(body: &serde_json::Value) -> &str {
+  body["error"]["message"].as_str().unwrap_or_default()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1285,9 +1291,12 @@ presets:
           n_gpu_layers: 2
 "#,
   );
-  let (code, _, err) = run_cli(&h.socket, &["run", file.to_str().unwrap(), "--json"]);
-  assert_eq!(code, exit_codes::USAGE, "stderr: {err}");
-  assert!(err.contains("must name exactly one"), "stderr: {err}");
+  let (code, out, _) = run_cli(&h.socket, &["run", file.to_str().unwrap(), "--json"]);
+  assert_eq!(code, exit_codes::USAGE, "stdout: {out}");
+  assert!(
+    json_error(&out).contains("must name exactly one"),
+    "stdout: {out}"
+  );
 }
 
 /// A bad value on a good knob id dropped as silently as a bad id until the
@@ -1308,9 +1317,9 @@ presets:
           ctx_size: 8k
 "#,
   );
-  let (code, _, err) = run_cli(&h.socket, &["run", file.to_str().unwrap(), "--json"]);
-  assert_eq!(code, exit_codes::USAGE, "stderr: {err}");
-  assert!(err.contains("ctx_size"), "stderr: {err}");
+  let (code, out, _) = run_cli(&h.socket, &["run", file.to_str().unwrap(), "--json"]);
+  assert_eq!(code, exit_codes::USAGE, "stdout: {out}");
+  assert!(json_error(&out).contains("ctx_size"), "stdout: {out}");
 }
 
 /// `<<: *anchor` has to reach the launch, not parse as an empty preset that
@@ -1365,9 +1374,9 @@ presets:
         backendd: llamacpp
 "#,
   );
-  let (code, _, err) = run_cli(&h.socket, &["run", file.to_str().unwrap(), "--json"]);
-  assert_eq!(code, exit_codes::USAGE, "stderr: {err}");
-  assert!(err.contains("backendd"), "stderr: {err}");
+  let (code, out, _) = run_cli(&h.socket, &["run", file.to_str().unwrap(), "--json"]);
+  assert_eq!(code, exit_codes::USAGE, "stdout: {out}");
+  assert!(json_error(&out).contains("backendd"), "stdout: {out}");
 }
 
 /// The file is rejected before the daemon is contacted, so a typo costs no
@@ -1381,7 +1390,7 @@ async fn run_launch_file_rejects_a_bad_file_with_no_daemon_running() {
     "presets:\n  m.gguf:\n    entries:\n      fast:\n        knobs:\n          n_gpu_layerz: 1\n",
   )
   .unwrap();
-  let (code, _, err) = run_cli(dir.path(), &["run", file.to_str().unwrap(), "--json"]);
-  assert_eq!(code, exit_codes::USAGE, "stderr: {err}");
-  assert!(err.contains("n_gpu_layerz"), "stderr: {err}");
+  let (code, out, _) = run_cli(dir.path(), &["run", file.to_str().unwrap(), "--json"]);
+  assert_eq!(code, exit_codes::USAGE, "stdout: {out}");
+  assert!(json_error(&out).contains("n_gpu_layerz"), "stdout: {out}");
 }

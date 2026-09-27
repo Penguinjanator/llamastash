@@ -279,7 +279,7 @@ These work on every subcommand (clap marks them `global`):
 -v, --verbose              Debug logging.
 ```
 
-The colored-output policy OR-es three off-conditions: `--no-colors`, `NO_COLOR` env (non-empty), or non-TTY stdout. Any one silences colors. `--json` output is byte-stable regardless — pin agents against `--json`, not against the human form. `--help` follows the same policy: it shows styled section headers and flags on a TTY and stays plain bytes when piped, `NO_COLOR` is set, or `--no-colors` is passed.
+The colored-output policy OR-es three off-conditions: `--no-colors`, `NO_COLOR` env (non-empty), or non-TTY stdout. Any one silences colors. `--json` output is byte-stable regardless — pin agents against `--json`, not against the human form. A command run with `--json` that fails prints `{"error": {"code": <exit code>, "message": "..."}}` on stdout instead of the `✗` line on stderr, and exits with the same code. `--help` follows the same policy: it shows styled section headers and flags on a TTY and stays plain bytes when piped, `NO_COLOR` is set, or `--no-colors` is passed.
 
 Report-style commands (`list`, `status`, `presets list`, `favorites list`, `last-params`, `daemon status`) render padded + colored tables on a TTY and plain tab-separated rows when piped. The padded form is purely a human affordance; the TSV path stays byte-stable so existing `awk -F\t` / `column -t` pipelines keep working unchanged. Action-style commands (`daemon start/stop`, `start`, `stop`) keep their single-line shape but pick up value-color highlights on launch-id / port / pid / state when colors are enabled.
 
@@ -961,6 +961,8 @@ When two models would publish the same plain id, each takes the shortest longer 
 3. **The full canonical path**, when even that collides — the same file name in two subdirectories of one repo, reached through one source.
 
 A **named launch** publishes one more id: the model's published id, an `@`, and the launch name (`Qwen3.8-27B-Q4_K_M@coder`). These come from the live launch registry rather than the disk catalog, so they appear while the launch runs and drop when it stops, and the model half is the same disambiguated id the catalog row publishes. Sending a named id that has no live launch auto-starts one carrying that name, so a client holding a cached id recovers instead of erroring. That auto-start also reads the name as a preset: if the model has a preset called `coder`, `qwen3@coder` launches under it, otherwise under the model's `default:` preset as before. A request body carries nothing but `model`, so this is the only way a client picks a preset — it applies to proxy auto-starts only, never to `start --name` or the TUI, where `--preset` already chooses one. A model file whose own name contains an `@` still resolves whole, and the split is taken at the last `@`.
+
+A request for the plain model id while it runs more than once goes to an unnamed launch before a named one, and among those to the newest (highest `L#`).
 
 The resolver accepts every form for every model, collision or not, and each qualified form in both the published spelling and the `.gguf` filename spelling. It also accepts a partial repo reference (`unsloth/Qwen3.8`), which the raw cache path (`models--unsloth--Qwen3.8-…`) never matched. Sending any form two models share — the bare name, or a repo-qualified form that does not separate them — returns `400 ambiguous_model`, and its `matches` array lists the published id of each candidate, every one of which routes, so resend one verbatim.
 
