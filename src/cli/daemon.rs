@@ -1005,6 +1005,20 @@ mod tests {
   use crate::config::Config;
   use crate::discovery::ModelSource;
 
+  /// The env lock, with every `LLAMASTASH_*` variable the shell exported
+  /// cleared: `build_options` reads them, so an exported
+  /// `LLAMASTASH_NO_SCAN=1` failed every test here. Tests set what they need
+  /// after taking it.
+  fn hermetic_env() -> std::sync::MutexGuard<'static, ()> {
+    let guard = crate::cli::test_lock::serialize();
+    for (key, _) in std::env::vars_os() {
+      if key.to_string_lossy().starts_with("LLAMASTASH_") {
+        std::env::remove_var(key);
+      }
+    }
+    guard
+  }
+
   fn parse_cli(args: &[&str]) -> Cli {
     Cli::try_parse_from(std::iter::once("llamastash").chain(args.iter().copied())).expect("parse")
   }
@@ -1193,7 +1207,7 @@ mod tests {
 
   #[test]
   fn build_options_threads_config_proxy_block_into_daemon_options() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     // Regression: before this wiring landed, config.proxy.port was
     // parsed and validated but `build_options` never copied it onto
     // DaemonOptions.proxy. The daemon silently ran with
@@ -1226,7 +1240,7 @@ mod tests {
 
   #[test]
   fn build_options_threads_the_daemon_and_gpu_blocks_into_daemon_options() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["daemon", "start"]);
     let config = Config {
       daemon: crate::config::DaemonConfig {
@@ -1257,7 +1271,7 @@ mod tests {
   /// zero-second tick would busy-loop.
   #[test]
   fn build_options_resolves_zero_valued_daemon_and_gpu_keys() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["daemon", "start"]);
     let config = Config {
       daemon: crate::config::DaemonConfig {
@@ -1286,7 +1300,7 @@ mod tests {
 
   #[test]
   fn build_options_clamps_an_out_of_range_metrics_interval() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["daemon", "start"]);
     let config = Config {
       daemon: crate::config::DaemonConfig {
@@ -1301,7 +1315,7 @@ mod tests {
 
   #[test]
   fn build_options_threads_auto_fit_options_from_config() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     std::env::remove_var("LLAMASTASH_DEFAULT_LAUNCH_MODE");
     std::env::remove_var("LLAMASTASH_FIT_CTX_FLOOR");
     std::env::remove_var("LLAMASTASH_STRICT_FIT");
@@ -1329,7 +1343,7 @@ mod tests {
 
   #[test]
   fn build_options_auto_fit_env_overrides_config() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["daemon", "start"]);
     let config = Config {
       default_launch_mode: DefaultLaunchMode::Auto,
@@ -1360,7 +1374,7 @@ mod tests {
 
   #[test]
   fn build_options_fit_ctx_floor_out_of_range_falls_back_to_factory() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     std::env::remove_var("LLAMASTASH_FIT_CTX_FLOOR");
     let cli = parse_cli(&["daemon", "start"]);
     for bad in [0u32, 2_000_000] {
@@ -1384,7 +1398,7 @@ mod tests {
 
   #[test]
   fn build_options_proxy_port_cli_overrides_config_value() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["daemon", "start"]);
     let config = Config {
       proxy: crate::config::loader::ProxyConfig {
@@ -1413,7 +1427,7 @@ mod tests {
 
   #[test]
   fn build_options_no_cli_override_falls_back_to_config_then_default() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     // Defaults all the way down: no CLI override, no proxy block in
     // config → daemon uses ProxyConfig::default(), which resolves to
     // 11435 (default mode) when nothing pins `port` explicitly.
@@ -1427,7 +1441,7 @@ mod tests {
 
   #[test]
   fn build_options_ollama_compat_cli_flag_flips_mode_and_default_port() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["daemon", "start"]);
     let config = Config::default();
     let opts = build_options(BuildOptionsArgs {
@@ -1444,7 +1458,7 @@ mod tests {
 
   #[test]
   fn build_options_ollama_compat_or_combines_config_cli_env() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     // Config-only: config says compat=true, CLI flag off → enabled.
     let cli = parse_cli(&["daemon", "start"]);
     let config_compat = Config {
@@ -1475,7 +1489,7 @@ mod tests {
 
   #[test]
   fn build_options_proxy_host_cli_overrides_config() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["daemon", "start"]);
     let config = Config {
       proxy: crate::config::loader::ProxyConfig {
@@ -1500,7 +1514,7 @@ mod tests {
 
   #[test]
   fn build_options_proxy_host_from_config_when_no_cli() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["daemon", "start"]);
     let config = Config {
       proxy: crate::config::loader::ProxyConfig {
@@ -1516,7 +1530,7 @@ mod tests {
 
   #[test]
   fn build_options_insecure_no_auth_or_combines_config_cli() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["daemon", "start"]);
     // CLI flag on, config off → on.
     let opts_cli = build_options(BuildOptionsArgs {
@@ -1544,7 +1558,7 @@ mod tests {
 
   #[test]
   fn build_options_proxy_host_and_key_from_env() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let prev_host = std::env::var_os("LLAMASTASH_PROXY_HOST");
     let prev_key = std::env::var_os("LLAMASTASH_PROXY_API_KEY");
     std::env::set_var("LLAMASTASH_PROXY_HOST", "0.0.0.0");
@@ -1578,7 +1592,7 @@ mod tests {
     // backstop (is_none) stayed silent.
     // Serialize + clear the proxy env overrides so a concurrent
     // env-driven test can't leak a key into this one.
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let prev_key = std::env::var_os("LLAMASTASH_PROXY_API_KEY");
     std::env::remove_var("LLAMASTASH_PROXY_API_KEY");
     let cli = parse_cli(&["daemon", "start"]);
@@ -1723,7 +1737,7 @@ mod tests {
 
   #[test]
   fn build_options_no_proxy_fallback_cli_flag_clears_fallback_enabled() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["daemon", "start"]);
     let config = Config::default();
     // Default is fallback_enabled = true.
@@ -1741,7 +1755,7 @@ mod tests {
 
   #[test]
   fn build_options_no_proxy_fallback_or_combines_config_cli() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     // Config-only: config has fallback_enabled=false, CLI off → disabled.
     let cli = parse_cli(&["daemon", "start"]);
     let config_off_fallback = Config {
@@ -1919,7 +1933,7 @@ mod tests {
     // `LLAMASTASH_NO_SCAN` tests: process-global env vars race across
     // parallel test threads (one test's set_var landing between
     // another's remove_var and read), which flaked CI on Windows.
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     // Drive the production helper directly. Two paths joined with the
     // platform separator must round-trip. `join_paths` is the inverse
     // of `split_paths`, so this also documents the public contract
@@ -1938,7 +1952,7 @@ mod tests {
 
   #[test]
   fn env_model_paths_unset_returns_empty() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let prev = std::env::var_os("LLAMASTASH_MODEL_PATHS");
     std::env::remove_var("LLAMASTASH_MODEL_PATHS");
     let parsed = env_model_paths();
@@ -1950,7 +1964,7 @@ mod tests {
 
   #[test]
   fn build_options_rejects_disable_scan_with_no_paths() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     // The dead-end combo: scanning off, zero user paths anywhere.
     // Today this would leave the catalog empty forever — the
     // validator must turn it into a startup error so the user sees
@@ -1968,7 +1982,7 @@ mod tests {
 
   #[test]
   fn build_options_accepts_disable_scan_when_cli_path_supplied() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["--no-scan", "--model-path", "/work/keep", "daemon", "start"]);
     let config = Config::default();
     assert!(
@@ -1979,7 +1993,7 @@ mod tests {
 
   #[test]
   fn build_options_accepts_disable_scan_when_config_path_supplied() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["--no-scan", "daemon", "start"]);
     let config = Config {
       model_paths: vec![PathBuf::from("/work/cfg")],
@@ -1993,7 +2007,7 @@ mod tests {
 
   #[test]
   fn env_no_scan_accepts_documented_truthy_values() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     // `1` is what the README documents; `true`/`yes`/`on` ride along
     // because every other LLAMASTASH_* bool in this binary accepts
     // them, and a script that already uses LLAMASTASH_OFFLINE=true
