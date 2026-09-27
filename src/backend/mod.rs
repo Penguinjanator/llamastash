@@ -1431,7 +1431,7 @@ pub fn runtime_knob_scope(path: &Path, server: Option<&str>) -> Option<&'static 
 /// Whether config itself declares models to list, so a daemon with
 /// scanning off still has a catalog.
 pub fn config_declares_models(config: &BackendConfig) -> bool {
-  !config.generic.servers.is_empty()
+  config.generic.declares_rows()
 }
 
 /// Map a model's [`ModelIdentity`] to the backend that runs it.

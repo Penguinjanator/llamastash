@@ -220,6 +220,12 @@ fn name_is_wellformed(name: &str) -> bool {
 }
 
 impl GenericConfig {
+  /// Whether any entry is a catalog row of its own. A `model:` entry only
+  /// attaches to rows found elsewhere.
+  pub fn declares_rows(&self) -> bool {
+    self.servers.iter().any(|s| s.model.is_none())
+  }
+
   /// Every config-load refusal, as one error naming the entry. `taken` says
   /// whether a knob id is already a built-in knob id, alias or neutral
   /// spelling.
@@ -513,5 +519,15 @@ servers:
       !e("*").serves(Path::new("generic://e")),
       "never another entry's row"
     );
+  }
+
+  #[test]
+  fn only_entries_without_model_declare_rows() {
+    let attached =
+      parse("servers:\n  - {name: a, binary: /bin/a, model: 'qwen*', ready: /health}\n");
+    assert!(!attached.declares_rows());
+    let own = parse("servers:\n  - {name: b, binary: /bin/b, ready: /health}\n");
+    assert!(own.declares_rows());
+    assert!(!GenericConfig::default().declares_rows());
   }
 }
