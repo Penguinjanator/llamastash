@@ -720,15 +720,28 @@ pub(crate) async fn compose_and_spawn(
     Some(server_id) => {
       let servers = env.servers.read().await;
       let found = servers.iter().find(|s| &s.id == server_id).cloned();
-      if found.is_none() {
+      // An inherited server must not override an explicit `--backend`: the
+      // user asked for that backend, so take its default binary instead.
+      let requested = parsed.backend.as_ref().and_then(|b| b.explicit_id());
+      let foreign = parsed.server.is_none()
+        && found
+          .as_ref()
+          .zip(requested)
+          .is_some_and(|(s, want)| s.backend_id != want);
+      if foreign {
+        launch_params.server = None;
+        None
+      } else if found.is_none() {
         // A typed `--server` was already rejected up front. Reaching here
         // means the id came from a preset or a remembered launch and the
         // build is gone (rebuilt llama.cpp, moved machine) — warn and take
         // the default rather than failing a launch the user did not pin.
         log::warn!("server {server_id:?} not in catalog; using the default binary");
         launch_params.server = None;
+        None
+      } else {
+        found
       }
-      found
     }
     None => None,
   };

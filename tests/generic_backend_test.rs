@@ -578,4 +578,52 @@ servers:
     assert!(argv.contains("/dup-served "), "qualified id: {argv}");
     shutdown(client, daemon).await;
   }
+
+  /// A server inherited from the last launch must not override an explicit
+  /// backend: `start --backend llamacpp` after a generic launch ran generic.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn an_explicit_backend_beats_an_inherited_server() {
+    let models = unique_temp("explicit-models");
+    std::fs::write(
+      models.join("c-served.gguf"),
+      llamastash::gguf::test_fixtures::build_minimal_gguf("llama"),
+    )
+    .unwrap();
+    let mut o = opts(unique_temp("explicit"), None);
+    o.discovery.scan_roots = vec![llamastash::discovery::scanner::ScanRoot {
+      path: models.clone(),
+      source: llamastash::discovery::ModelSource::UserPath,
+    }];
+    let (mut client, daemon) = boot(o).await;
+    wait_server(&mut client, "generic-gen-gguf").await;
+
+    let served = models.join("c-served.gguf").display().to_string();
+    let id = start(
+      &mut client,
+      json!({"model_path": served, "server": "generic-gen-gguf"}),
+    )
+    .await;
+    let r = wait_state(&mut client, &id, "ready").await;
+    assert_eq!(r["backend"], "generic", "{r}");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+      let lp = client.call("last_params_list", None).await.unwrap();
+      if lp.to_string().contains("generic-gen-gguf") {
+        break;
+      }
+      assert!(Instant::now() < deadline, "server never persisted: {lp}");
+      tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    stop_timed(&mut client, &id, 5).await;
+
+    let id = start(
+      &mut client,
+      json!({"model_path": served, "backend": "llamacpp"}),
+    )
+    .await;
+    let r = wait_state(&mut client, &id, "ready").await;
+    assert_eq!(r["backend"], "llamacpp", "{r}");
+    assert!(r["params"]["server"].is_null(), "{r}");
+    shutdown(client, daemon).await;
+  }
 }
