@@ -561,7 +561,17 @@ servers:
 
     wait_server(&mut client, "generic-gen-gguf").await;
 
-    let served = roots[0].join("dup-served.gguf").display().to_string();
+    // Sent through a symlink, as macOS's `/tmp` is: the catalog keys the
+    // canonical path, and the lookup must still find the published id.
+    #[cfg(unix)]
+    let sent_root = {
+      let link = unique_temp("dup-link").join("root");
+      std::os::unix::fs::symlink(&roots[0], &link).unwrap();
+      link
+    };
+    #[cfg(not(unix))]
+    let sent_root = roots[0].clone();
+    let served = sent_root.join("dup-served.gguf").display().to_string();
     let id = start(
       &mut client,
       json!({"model_path": served, "server": "generic-gen-gguf"}),

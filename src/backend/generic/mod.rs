@@ -499,8 +499,16 @@ impl Backend for GenericBackend {
     // The proxy forwards `body.model` unchanged, so `{name}` must be the id
     // `/v1/models` publishes, which qualifies a stem another row shares.
     let snap = ctx.catalog.snapshot().await;
-    let model_id = crate::proxy::router::published_ids(&snap)
-      .remove(exec.params.model_path.to_string_lossy().as_ref())
+    let ids = crate::proxy::router::published_ids(&snap);
+    let id_for = |p: &Path| ids.get(p.to_string_lossy().as_ref()).cloned();
+    // The catalog keys canonical paths; a caller may send a symlinked one
+    // (`/tmp` is `/private/tmp` on macOS).
+    let model_id = id_for(&exec.params.model_path)
+      .or_else(|| {
+        crate::util::paths::canonicalize(&exec.params.model_path)
+          .ok()
+          .and_then(|c| id_for(&c))
+      })
       .unwrap_or_else(|| match entry.server.model {
         Some(_) => crate::util::paths::model_display_name(&exec.params.model_path),
         None => entry.server.name.clone(),

@@ -62,6 +62,8 @@ struct Args {
   mode: Mode,
   health_delay_ms: u64,
   trap_sigterm: bool,
+  // Only read under cfg(unix): Windows has no SIGTERM to delay.
+  #[cfg_attr(not(unix), allow(dead_code))]
   sigterm_exit_delay_ms: Option<u64>,
   print_env: Vec<String>,
   /// Set when launched with `--spec-type draft-mtp` (MTP speculative decoding).
