@@ -496,14 +496,17 @@ impl Backend for GenericBackend {
         binary.display()
       )));
     }
-    // The model's own id when the entry runs a catalog model, else the entry
-    // name its row is published under.
-    let model_id = match entry.server.model {
-      Some(_) => crate::util::paths::model_display_name(&exec.params.model_path),
-      None => entry.server.name.clone(),
-    };
+    // The proxy forwards `body.model` unchanged, so `{name}` must be the id
+    // `/v1/models` publishes, which qualifies a stem another row shares.
+    let snap = ctx.catalog.snapshot().await;
+    let model_id = crate::proxy::router::published_ids(&snap)
+      .remove(exec.params.model_path.to_string_lossy().as_ref())
+      .unwrap_or_else(|| match entry.server.model {
+        Some(_) => crate::util::paths::model_display_name(&exec.params.model_path),
+        None => entry.server.name.clone(),
+      });
     let published = match exec.name.as_deref() {
-      Some(n) => format!("{model_id}@{n}"),
+      Some(n) => crate::launch::resolve::join_named_reference(&model_id, n),
       None => model_id,
     };
     exec

@@ -218,6 +218,23 @@ servers:
     }
   }
 
+  /// The server catalog fills in the background after boot.
+  async fn wait_server(client: &mut Client, server: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+      let status = client.call("status", None).await.unwrap();
+      if status["servers"].to_string().contains(server) {
+        return;
+      }
+      assert!(
+        Instant::now() < deadline,
+        "never listed as a server: {}",
+        status["servers"]
+      );
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+  }
+
   async fn stop_timed(client: &mut Client, launch_id: &str, grace: u64) -> Duration {
     let t = Instant::now();
     client
@@ -482,20 +499,7 @@ servers:
       !rows.to_string().contains("generic://gen-gguf"),
       "no row of its own"
     );
-    // The server catalog fills in the background after boot.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-      let status = client.call("status", None).await.unwrap();
-      if status["servers"].to_string().contains("generic-gen-gguf") {
-        break;
-      }
-      assert!(
-        Instant::now() < deadline,
-        "never listed as a server: {}",
-        status["servers"]
-      );
-      tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_server(&mut client, "generic-gen-gguf").await;
 
     let id = start(
       &mut client,
@@ -519,6 +523,59 @@ servers:
     );
     assert!(argv.contains(&format!("--model-file {served}")), "{argv}");
     assert!(argv.contains("--gguf-knob v"), "{argv}");
+    shutdown(client, daemon).await;
+  }
+
+  /// `{name}` is the id `/v1/models` publishes: two same-stem GGUFs publish
+  /// qualified ids, and the proxy forwards `body.model` unchanged, so the bare
+  /// stem would 404 on an engine that checks it.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn name_placeholder_is_the_published_id_when_stems_collide() {
+    let roots = [unique_temp("dup-a"), unique_temp("dup-b")];
+    for root in &roots {
+      std::fs::write(
+        root.join("dup-served.gguf"),
+        llamastash::gguf::test_fixtures::build_minimal_gguf("llama"),
+      )
+      .unwrap();
+    }
+    let mut o = opts(unique_temp("dup"), None);
+    o.discovery.scan_roots = roots
+      .iter()
+      .map(|r| llamastash::discovery::scanner::ScanRoot {
+        path: r.clone(),
+        source: llamastash::discovery::ModelSource::UserPath,
+      })
+      .collect();
+    let (mut client, daemon) = boot(o).await;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+      let rows = client.call("list_models", None).await.unwrap()["models"].clone();
+      if rows.to_string().matches("dup-served").count() >= 2 {
+        break;
+      }
+      assert!(Instant::now() < deadline, "models never listed");
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    wait_server(&mut client, "generic-gen-gguf").await;
+
+    let served = roots[0].join("dup-served.gguf").display().to_string();
+    let id = start(
+      &mut client,
+      json!({"model_path": served, "server": "generic-gen-gguf"}),
+    )
+    .await;
+    let r = wait_state(&mut client, &id, "ready").await;
+    assert_eq!(r["backend"], "generic", "{r}");
+    let argv = log_lines(&mut client, &id, "argv ").await;
+    let argv = argv.first().expect("argv line");
+    assert!(
+      !argv.contains("-m dup-served "),
+      "the ambiguous stem must not be sent: {argv}"
+    );
+    assert!(argv.contains("/dup-served "), "qualified id: {argv}");
     shutdown(client, daemon).await;
   }
 }
