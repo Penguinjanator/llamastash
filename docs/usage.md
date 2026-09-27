@@ -846,15 +846,28 @@ llamastash start Qwen3.8-Flash-Next-UD-Q4_K_XL --server generic-gufo -- --seed 7
           - {flag: --ctx-window, id: halogen-ctx, ctx: true, default: "131072"}
           - {flag: --halogen-temperature, id: halogen-temp, default: "1.0"}
           - {flag: --halogen-mtp-depth, id: halogen-mtp-depth, default: "3"}
+          - {flag: --halogen-reasoning-effort, id: halogen-effort, default: xhigh}
         env:
           HALOGEN_MODEL_ID: "{name}"
           HALOGEN_CTX: "{halogen-ctx}"
           HALOGEN_KV_POOL_POSITIONS: "{halogen-ctx}"
           HALOGEN_TEMPERATURE: "{halogen-temp}"
           HALOGEN_MTP_DEPTH: "{halogen-mtp-depth}"
+          HALOGEN_REASONING_EFFORT: "{halogen-effort}"
         ready: /v1/models
         stop_grace_secs: 90
         ready_timeout_secs: 600
+
+presets:
+  flash-next-halogen:
+    entries:
+      halogen-medium:
+        knobs:
+          halogen-effort: medium   # shorter thinking, faster turns
+```
+
+```bash
+llamastash start flash-next-halogen --preset halogen-medium
 ```
 
 `~/bin/halogen-serve.sh`:
@@ -876,7 +889,7 @@ docker run -d --rm --name "$name" -p "127.0.0.1:$port:8080" \
   -e HALOGEN_API_PORT=8080 -e HALOGEN_MODEL_ID \
   -e HALOGEN_CHECKPOINT="$hg/qwen38-flash-next-w4b.hgn" \
   -e HALOGEN_MTP_HEAD="$hg/qwen38-flash-next-mtp.hgn" -e HALOGEN_TOKENIZER="$hg/tokenizer" \
-  -e HALOGEN_CTX -e HALOGEN_KV_POOL_POSITIONS -e HALOGEN_MTP_DEPTH \
+  -e HALOGEN_CTX -e HALOGEN_KV_POOL_POSITIONS -e HALOGEN_MTP_DEPTH -e HALOGEN_REASONING_EFFORT \
   -e HALOGEN_MAX_TOKENS_DEFAULT=16384 -e HALOGEN_TEMPERATURE -e HALOGEN_TOP_P=0.95 -e HALOGEN_TOP_K=20 \
   ghcr.io/peonist-ai/halogen-flash-server:0.14.0 >/dev/null || exit 1
 # One clean stop: SIGTERM from llamastash becomes `docker stop`, which the
@@ -890,6 +903,7 @@ wait $!
 - `docker run -d` plus `docker wait` keeps the wrapper in the foreground while the container never sees the process-group SIGTERM directly, so the engine gets exactly one signal. Keep `docker stop -t` above the image's 30 s and `stop_grace_secs` above `-t`.
 - Halogen 0.14.0's `all` mode binds its API on `0.0.0.0` whatever `HALOGEN_BIND` says (that variable covers only the internal engine port). Hence the bridge port published on `127.0.0.1` instead of `--network host`, which also keeps two launches' internal engine ports apart.
 - It does not check the request's `model` field. Cold load took 93-105 s here, about 6 s when the weights are still in page cache.
+- `HALOGEN_REASONING_EFFORT` sets the default thinking effort: `minimal`, `low`, `medium`, `high` or `xhigh`, mapped to the template's `low`, `medium` and `xhigh`. Unset, the template's own default applies, which is `xhigh`. A request that sends `reasoning_effort` still wins. The wrapper has to pass the variable through (`-e HALOGEN_REASONING_EFFORT`), or the preset has no effect.
 
 **CIRU**: a `run-server.sh` launcher configured by env vars that `exec`s its own llama-server build and passes extra args through. The wrapper exports the fixed variables; per-launch values go in the entry's `env`.
 
