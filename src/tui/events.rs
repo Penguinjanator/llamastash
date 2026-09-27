@@ -2103,36 +2103,42 @@ pub fn spawn_writer(
   tx
 }
 
-/// Two-phase daemon restart: ask the running daemon to shut down,
-/// wait until it has fully released its lockfile, then
-/// `start_detached` a fresh daemon with the same options the parent
-/// dispatcher resolved. Best-effort throughout — every failure logs
-/// and the TUI keeps running so the user can retry from the keymap.
+/// Two-phase daemon restart: the shared graceful stop
+/// ([`crate::daemon::restart::shutdown_and_wait`] — the same one
+/// `llamastash daemon restart` runs), then `start_detached` a fresh daemon
+/// with the same options the parent dispatcher resolved. Best-effort
+/// throughout — every failure logs and the TUI keeps running so the user can
+/// retry from the keymap.
 ///
-/// Why poll the lockfile and not just the socket: the daemon's
-/// cleanup sequence is (1) accept-loop exit, (2) up to 2s connection
-/// drain, (3) `stop_all_managed`, (4) remove socket file,
-/// (5) drop lockfile. Waiting only for the socket to become
-/// unconnectable can return before step 5, so the replacement child's
-/// `acquire` contends on the still-held `flock`, exits with
-/// `AlreadyRunning`, and `start_detached` reports a failure. The user
-/// then sees "daemon connecting…" indefinitely until they retry.
+/// Why wait on the lockfile and not just the socket: the daemon's cleanup
+/// sequence is (1) accept-loop exit, (2) up to 2s connection drain, (3)
+/// `stop_all_managed`, (4) remove socket file, (5) drop lockfile. Returning on
+/// "socket no longer connectable" can happen before step 5, so the replacement
+/// child's `acquire` contends on the still-held `flock`, exits with
+/// `AlreadyRunning`, and `start_detached` reports a failure. The user then
+/// sees "daemon connecting…" indefinitely until they retry.
 async fn handle_restart_daemon(
   socket: &std::path::Path,
   daemon_opts: Option<crate::daemon::DaemonOptions>,
 ) {
-  let mut grace_secs = 0;
-  match Client::connect(socket).await {
-    Ok(mut client) => match client.call("shutdown", None).await {
-      Ok(resp) => {
-        grace_secs = resp
-          .get("stop_grace_secs")
-          .and_then(|v| v.as_u64())
-          .unwrap_or(0);
-      }
-      Err(e) => log::warn!("restart: shutdown call failed: {e}"),
-    },
-    Err(e) => log::warn!("restart: connect-for-shutdown failed: {e}"),
+  use crate::daemon::restart::StopOutcome;
+
+  // The state dir to wait on: the resolved options carry it, and `socket` is
+  // the attach dir the TUI itself opened with.
+  let state_dir = daemon_opts
+    .as_ref()
+    .map(|o| o.state_dir.clone())
+    .unwrap_or_else(|| socket.to_path_buf());
+  match crate::daemon::restart::shutdown_and_wait(&state_dir).await {
+    Ok(StopOutcome::Stopped) | Ok(StopOutcome::NoChannel) => {}
+    Ok(StopOutcome::StillExiting { pid }) => {
+      log::warn!("restart: pid {pid} still exiting; did not spawn a replacement");
+      return;
+    }
+    Err(e) => {
+      log::warn!("restart: shutdown request failed: {e}");
+      return;
+    }
   }
   let opts = match daemon_opts {
     Some(o) => o,
@@ -2144,17 +2150,6 @@ async fn handle_restart_daemon(
       }
     },
   };
-  // Wait for the old daemon to fully release its lockfile: the longest child
-  // stop grace it reported plus drain and cleanup margin, same bound as
-  // `daemon stop`. Children that stop cleanly return well before it.
-  let wait = grace_secs.saturating_add(5).max(10);
-  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
-  while std::time::Instant::now() < deadline {
-    if crate::daemon::existing_daemon_pid(&opts.state_dir).is_none() {
-      break;
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-  }
   match crate::daemon::start_detached(opts) {
     Ok(crate::daemon::StartOutcome::AlreadyRunning(_)) => {
       log::warn!("restart: daemon is still running; restart did not spawn a new process");

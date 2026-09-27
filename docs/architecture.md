@@ -390,6 +390,27 @@ dies with it and nothing external respawns it, so an agent pointed at the
 proxy URL sees a dead port until something re-attaches. Proxy traffic
 counts as activity precisely so that doesn't happen mid-session.
 
+## Daemon stop and restart
+
+`daemon stop`, `daemon restart`, and the TUI's `Ctrl+R` all go through one
+function, `daemon::restart::shutdown_and_wait`: call the `shutdown` RPC, then
+poll the lockfile until the old process is gone. The RPC only *requests*
+teardown — the daemon still has to drain connections, stop every managed
+launch, and drop its `flock` — so a caller that returns on the answer races
+the replacement launch into "already running". The window is the longest child
+stop grace the daemon reported plus 5 s, floored at 10 s. It reports
+`Stopped`, `NoChannel` (nothing reachable over IPC — the caller then decides
+between "genuinely down" and a stale PID that needs signalling), or
+`StillExiting { pid }`. `daemon restart` refuses to spawn on that last one;
+plain `stop` calls it success.
+
+The restart's start half is the CLI's `daemon start` path unchanged — same
+flag set (`DaemonStartArgs`), same config migration, LAN proxy-key
+provisioning, and backend precheck. The TUI's restart skips that half: it
+re-spawns the `DaemonOptions` its own dispatch resolved when the TUI opened,
+passed through as the child's argv. The daemon that comes up re-reads
+`config.yaml` either way.
+
 ## Model identity
 
 `(canonical absolute path, BLAKE3 of GGUF header bytes)`. The header is small (up to ~1 MB); hashing it gives an identity that survives renames but doesn't fingerprint the whole weight file.

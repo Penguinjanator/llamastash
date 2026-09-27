@@ -20,7 +20,9 @@ use crate::cli::cli_args::{Cli, DaemonAction, DaemonStartArgs};
 use crate::config::{Config, DefaultLaunchMode, DEFAULT_FIT_CTX_FLOOR, MAX_CTX_TOKENS};
 use crate::daemon::discovery_task::DiscoveryOptions;
 use crate::daemon::{
-  existing_daemon_pid, run_foreground, runtime_file, start_detached, DaemonOptions, StartOutcome,
+  existing_daemon_pid,
+  restart::{shutdown_and_wait, StopOutcome},
+  run_foreground, runtime_file, start_detached, DaemonOptions, StartOutcome,
 };
 use crate::discovery::known_caches::{default_set, RootResolution};
 use crate::ipc::{Client, ClientError};
@@ -51,7 +53,7 @@ async fn handle_restart(args: &DaemonStartArgs, cli: &Cli, config: &Config) -> R
       "daemon restart: pid {pid} was still exiting when the wait window closed; \
        run `llamastash daemon stop --force` and retry"
     )),
-    StopOutcome::Stopped | StopOutcome::NotRunning => handle_start(args, cli, config).await,
+    StopOutcome::Stopped | StopOutcome::NoChannel => handle_start(args, cli, config).await,
   }
 }
 
@@ -399,67 +401,30 @@ fn print_provisioned_key(host: IpAddr, port: u16, key: &str, persisted: bool) {
   );
 }
 
-/// What a stop request ended up doing.
-enum StopOutcome {
-  /// The daemon is gone.
-  Stopped,
-  /// Nothing was running.
-  NotRunning,
-  /// Teardown was requested but the process was still alive when the wait
-  /// window closed. `daemon stop` treats this as success; `daemon restart`
-  /// refuses to spawn on top of it.
-  StillExiting { pid: i32 },
-}
-
-/// `daemon stop`: ask the daemon to shut down over IPC, then fall back to a
-/// PID signal when there is no usable IPC channel. Shared with `daemon
-/// restart`, which has to know whether the old daemon really left.
+/// `daemon stop`: the shared graceful shutdown
+/// ([`crate::daemon::restart::shutdown_and_wait`]), falling back to a PID
+/// signal when there is no usable IPC channel. `daemon restart` reuses the
+/// same call so both surfaces wait the same way for the old process to let go
+/// of its lockfile.
 async fn stop_daemon(force: bool) -> Result<StopOutcome> {
   let attach_dir = state_dir().context("could not resolve state directory")?;
   if !force {
-    match Client::connect(&attach_dir).await {
-      Ok(mut client) => {
-        let resp = client.call("shutdown", None).await?;
-        // Wait (bounded) for the process to actually exit. `shutdown`
-        // only *requests* teardown; returning while the old daemon
-        // still holds the lockfile (and its `lemond` umbrella is still
-        // dying) makes a chained `daemon stop && daemon start` race
-        // straight into "already running" / a half-released umbrella
-        // port. The daemon reports the longest child stop grace; wait
-        // that plus a margin for its own teardown, at least 10 s. On
-        // timeout we fall back to the old fire-and-forget message.
-        let grace = resp
-          .get("stop_grace_secs")
-          .and_then(|v| v.as_u64())
-          .unwrap_or(0);
-        let wait = Duration::from_secs(grace.saturating_add(5).max(10));
-        let deadline = std::time::Instant::now() + wait;
-        loop {
-          match existing_daemon_pid(&attach_dir) {
-            None => {
-              println!("{}", crate::cli::colors::success("daemon: stopped"));
-              return Ok(StopOutcome::Stopped);
-            }
-            Some(pid) => {
-              if std::time::Instant::now() >= deadline {
-                return Ok(StopOutcome::StillExiting { pid });
-              }
-              tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-          }
-        }
+    match shutdown_and_wait(&attach_dir).await? {
+      StopOutcome::Stopped => {
+        println!("{}", crate::cli::colors::success("daemon: stopped"));
+        return Ok(StopOutcome::Stopped);
       }
+      exiting @ StopOutcome::StillExiting { .. } => return Ok(exiting),
       // No IPC channel — either the daemon is genuinely down, or it's
       // a stale process that didn't publish runtime.json. The
       // `existing_daemon_pid` check below distinguishes the two.
-      Err(ClientError::Connect(_)) => {}
-      Err(other) => return Err(other).context("daemon stop"),
+      StopOutcome::NoChannel => {}
     }
   }
   match existing_daemon_pid(&attach_dir) {
     None => {
       println!("{}", crate::cli::colors::dim("daemon: not running"));
-      Ok(StopOutcome::NotRunning)
+      Ok(StopOutcome::NoChannel)
     }
     Some(pid) => force_stop_via_pid(pid, &attach_dir),
   }
