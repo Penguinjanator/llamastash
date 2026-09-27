@@ -133,14 +133,14 @@ pub fn umbrella_process_spec(port: u16, binary: PathBuf, probe: ProbeOptions) ->
 /// Resolve the `lemond` executable the daemon should supervise.
 ///
 /// Resolution order (matches `docs/lemonade-setup.md`):
-///   1. the explicit `lemonade.binary` path, if it points at a file;
+///   1. the explicit `backend.lemonade.servers` entry, if it points at a file;
 ///   2. otherwise `lemond` then `lemonade` on `PATH`.
 ///
 /// Returns the resolved *canonical absolute* path, or `None` when nothing is
 /// found — llamastash never installs `lemond`, so a missing binary is a clean
 /// "backend unavailable" rather than an error to recover from.
 ///
-/// The path is canonicalized so a relative `lemonade.binary` (or a relative
+/// The path is canonicalized so a relative `servers` binary (or a relative
 /// PATH entry) still yields an absolute path: the umbrella is spawned and
 /// registered under this path (it doubles as the supervisor's synthetic model
 /// id), so it must not depend on the daemon's CWD.
@@ -157,7 +157,7 @@ pub fn resolve_lemond_binary(cfg: &crate::config::LemonadeConfig) -> Option<Path
   // test-fixtures build: integration tests spawn the real daemon subprocess,
   // which (with Lemonade default-on) would otherwise pick up — and leak — the
   // developer's system `lemond`. Tests point at an explicit fake
-  // `lemonade.binary` instead.
+  // `servers` binary instead.
   #[cfg(feature = "test-fixtures")]
   {
     None
@@ -480,7 +480,7 @@ impl Backend for LemonadeBackend {
     match resolve_lemond_binary(&ctx.backend.lemonade) {
       Some(bin) => Ok((bin, ctx.backend.lemonade.port)),
       None => Err(
-        "lemonade backend selected but no `lemond` binary found; set `lemonade.binary` \
+        "lemonade backend selected but no `lemond` binary found; set `backend.lemonade.servers` \
          or put `lemond` on PATH (see docs/lemonade-setup.md)"
           .to_string(),
       ),

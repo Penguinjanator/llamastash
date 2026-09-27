@@ -239,7 +239,7 @@ llama.cpp is the direct, zero-overhead default backend. For engines llama.cpp ca
 
 Lemonade is a *managed-multiplexer* — one long-lived umbrella process serving many models behind an OpenAI-compatible API. LlamaStash:
 
-- **finds** `lemond` (explicit `lemonade.binary` or `PATH`) and **supervises** the shared umbrella — it never downloads or installs it;
+- **finds** `lemond` (`backend.lemonade.servers` or `PATH`) and **supervises** the shared umbrella — it never downloads or installs it;
 - **discovers** the umbrella's models from `/api/v1/models` and tags them with the `lemonade` backend (list-only);
 - **routes** inference for a Lemonade model through the loopback proxy to the umbrella (`/api/v1/...`);
 - **evicts** idle Lemonade models by API unload (the umbrella stays up and autoloads on the next request), never SIGTERM.

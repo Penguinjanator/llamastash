@@ -74,7 +74,7 @@ fn lemonade_model(name: &str) -> DiscoveredModel {
   DiscoveredModel {
     path: PathBuf::from(format!("/lemonade/{name}")),
     parent: PathBuf::from("/lemonade"),
-    source: ModelSource::Lemonade,
+    source: ModelSource::Backend("lemonade"),
     metadata: None,
     parse_error: None,
     split_siblings: Vec::new(),

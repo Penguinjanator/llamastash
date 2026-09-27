@@ -2644,7 +2644,7 @@ mod tests {
       "display_label": "qwen3.5-4b-FLM",
     });
     let parsed = parse_list_models_row(&row).expect("row parses");
-    assert_eq!(parsed.source, ModelSource::Lemonade);
+    assert_eq!(parsed.source, ModelSource::Backend("lemonade"));
     assert_eq!(parsed.source.backend_id(), "lemonade");
   }
 
@@ -2657,7 +2657,7 @@ mod tests {
     use crate::tui::launch_picker::PickerField;
     let mut app = App::new(AppOptions::default());
     let mut row = fake("lemonade://qwen3.5-4b-FLM", "lemonade://");
-    row.source = ModelSource::Lemonade;
+    row.source = ModelSource::Backend("lemonade");
     row.display_label = Some("qwen3.5-4b-FLM".into());
     app.models = vec![row];
     // The picker now reads the daemon's per-row prediction (as `ingest_list_models`

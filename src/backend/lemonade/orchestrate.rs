@@ -28,7 +28,9 @@ use crate::backend::ProcessLaunchSpec;
 use crate::config::LemonadeConfig;
 use crate::daemon::probe::ProbeOptions;
 use crate::daemon::registry::{LaunchId, SupervisorRegistry};
-use crate::daemon::supervisor::{spawn, LaunchOrigin, ManagedModel, ManagedSpawn, SpawnError};
+use crate::daemon::supervisor::{
+  spawn, LaunchOrigin, ManagedModel, ManagedSpawn, ManagedState, SpawnError,
+};
 use crate::gguf::identity::ModelId;
 use crate::launch::mode::LaunchMode;
 use crate::launch::params::LaunchParams;
@@ -56,9 +58,11 @@ fn umbrella_model_id(binary: &Path) -> ModelId {
 }
 
 /// Ensure the `lemond` umbrella is supervised and ready, returning its
-/// [`ManagedModel`] handle. **Idempotent**: if an umbrella is already
+/// [`ManagedModel`] handle. **Idempotent**: if a live umbrella is already
 /// registered under [`umbrella_launch_id`], it is reused and `port` +
-/// `umbrella` are ignored (one umbrella per daemon).
+/// `umbrella` are ignored (one umbrella per daemon). A registered umbrella
+/// that has exited (`Error` / `Stopped`) is dropped and respawned, so a crashed
+/// `lemond` doesn't fail every later start until the daemon restarts.
 ///
 /// `port` is the loopback port the umbrella's [`ProcessLaunchSpec`] was
 /// built to bind (the supervisor probes it for `/live` readiness). On a
@@ -77,7 +81,12 @@ pub async fn ensure_umbrella(
   let _guard = ENSURE_LOCK.lock().await;
   let id = umbrella_launch_id();
   if let Some(existing) = registry.get(&id).await {
-    return Ok(existing);
+    match existing.state().await {
+      ManagedState::Error { .. } | ManagedState::Stopped => {
+        registry.remove(&id).await;
+      }
+      _ => return Ok(existing),
+    }
   }
   // Not yet supervised, so we must bind `port` ourselves to start the umbrella.
   // If another process already holds it (a hand-started `lemond`, a stale
@@ -128,7 +137,7 @@ pub fn supervise_umbrella_at_boot(
     // binary to resolve); kept as a belt-and-suspenders warning for a TOCTOU
     // where the binary vanished between the two resolves.
     log::warn!(
-      "lemonade enabled but no `lemond` binary found (set `lemonade.binary` or put `lemond` on PATH); skipping umbrella supervision"
+      "lemonade enabled but no `lemond` binary found (set `backend.lemonade.servers` or put `lemond` on PATH); skipping umbrella supervision"
     );
     return;
   };

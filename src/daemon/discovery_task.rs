@@ -279,12 +279,12 @@ fn merge_by_path(rows: impl IntoIterator<Item = DiscoveredModel>) -> Vec<Discove
 fn watch_mode_for(source: ModelSource) -> WatchMode {
   match source {
     ModelSource::HuggingFace => WatchMode::Shallow,
-    // Lemonade models come from the `lemond` API, not a filesystem root, so
-    // this is never reached for them in practice; default to recursive.
+    // Backend-sourced models come from that backend's API, not a filesystem
+    // root, so this is never reached for them in practice.
     ModelSource::Ollama
     | ModelSource::LmStudio
     | ModelSource::UserPath
-    | ModelSource::Lemonade
+    | ModelSource::Backend(_)
     | ModelSource::Config => WatchMode::Recursive,
   }
 }

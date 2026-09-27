@@ -55,7 +55,7 @@ fn row_for(entry: &ModelEntry) -> DiscoveredModel {
   DiscoveredModel {
     path: synthetic_path(name),
     parent: PathBuf::from(crate::backend::lemonade::LEMONADE_PATH_SCHEME),
-    source: ModelSource::Lemonade,
+    source: ModelSource::Backend(super::LEMONADE_BACKEND_ID),
     metadata: Some(ModelMetadata {
       arch: None,
       total_parameters: None,
@@ -146,7 +146,9 @@ mod tests {
       .collect();
     assert_eq!(names, vec!["Qwen2.5-0.5B-Instruct", "Llama-3.1-8B"]);
     // Every row is tagged Lemonade with a synthetic (file-less) path.
-    assert!(rows.iter().all(|r| r.source == ModelSource::Lemonade));
+    assert!(rows
+      .iter()
+      .all(|r| r.source == ModelSource::Backend("lemonade")));
     assert_eq!(
       rows[0].path,
       PathBuf::from("lemonade://Qwen2.5-0.5B-Instruct")

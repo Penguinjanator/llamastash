@@ -221,7 +221,7 @@ pub(crate) fn precheck_indicated_backends(opts: &DaemonOptions) -> std::result::
     if crate::backend::lemonade::resolve_lemond_binary(&opts.backend.lemonade).is_none() {
       if lemonade_explicit {
         failures.push(
-          "lemonade is enabled but no `lemond` binary was found — set `lemonade.binary` or put \
+          "lemonade is enabled but no `lemond` binary was found — set `backend.lemonade.servers` or put \
            `lemond` on PATH (see docs/lemonade-setup.md), or `llamastash daemon start --force` to \
            start without it."
             .to_string(),

@@ -987,7 +987,7 @@ mod tests {
     // A selected (not-running) Lemonade-registry model badges from its source.
     let mut sel_app = App::new(AppOptions::default());
     let mut m = fake_model();
-    m.source = crate::discovery::ModelSource::Lemonade;
+    m.source = crate::discovery::ModelSource::Backend("lemonade");
     let model_path = m.path.clone();
     sel_app.models = vec![m];
     // Land the cursor on the model row (past any section headers).
