@@ -1422,3 +1422,146 @@ fn a_parse_error_under_json_prints_a_json_error() {
   assert_eq!(code, exit_codes::USAGE);
   assert!(out.is_null(), "stdout: {out}");
 }
+
+/// `daemon restart` with nothing running behaves like `start`.
+///
+/// Drives the shipped binary so the real detached re-exec path runs; the
+/// in-process `run_foreground` harness can't cover a daemon that spawns its
+/// own replacement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_restart_from_nothing_starts_a_daemon() {
+  let state = unique_temp("rst-cold-state");
+  let models = unique_temp("rst-cold-models");
+  let guard = DetachedDaemon::new(state.clone());
+  let proxy = free_port().to_string();
+  let models_arg = models.to_str().unwrap();
+
+  let (code, _, err) = run_cli(
+    &state,
+    &[
+      "daemon",
+      "restart",
+      "--proxy-port",
+      &proxy,
+      "--model-path",
+      models_arg,
+    ],
+  );
+  assert_eq!(code, exit_codes::SUCCESS, "stderr: {err}");
+
+  let pid = wait_for_daemon_pid(&state, None)
+    .await
+    .expect("pid after restart");
+  assert!(pid > 0, "daemon reported pid {pid}");
+  assert_proxy_listening(proxy.parse().unwrap());
+  drop(guard);
+  stop_daemon(&state);
+  std::fs::remove_dir_all(&state).ok();
+  std::fs::remove_dir_all(&models).ok();
+}
+
+/// The restart swap: the old daemon is gone, a new pid owns the state dir,
+/// and the proxy is back on the same port.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_restart_replaces_the_running_daemon() {
+  let state = unique_temp("rst-hot-state");
+  let models = unique_temp("rst-hot-models");
+  let guard = DetachedDaemon::new(state.clone());
+  let proxy = free_port().to_string();
+  let models_arg = models.to_str().unwrap();
+  let args = ["--proxy-port", &proxy, "--model-path", models_arg];
+
+  let (code, _, err) = run_cli(&state, &daemon_argv("start", &args));
+  assert_eq!(code, exit_codes::SUCCESS, "stderr: {err}");
+  let first = wait_for_daemon_pid(&state, None)
+    .await
+    .expect("pid after start");
+
+  let (code, _, err) = run_cli(&state, &daemon_argv("restart", &args));
+  assert_eq!(code, exit_codes::SUCCESS, "stderr: {err}");
+  let second = wait_for_daemon_pid(&state, Some(first))
+    .await
+    .expect("a different pid after restart");
+  assert_ne!(second, first);
+  assert_proxy_listening(proxy.parse().unwrap());
+
+  drop(guard);
+  std::fs::remove_dir_all(&state).ok();
+  std::fs::remove_dir_all(&models).ok();
+}
+
+/// `daemon <verb> <flags...>` as an argv slice.
+fn daemon_argv<'a>(verb: &'static str, flags: &[&'a str]) -> Vec<&'a str> {
+  let mut argv = vec!["daemon", verb];
+  argv.extend_from_slice(flags);
+  argv
+}
+
+/// Claim an unused TCP port for the test daemon's proxy listener so the run
+/// never touches the default 11435 the user's real daemon may hold.
+fn free_port() -> u16 {
+  let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+  let port = l.local_addr().unwrap().port();
+  drop(l);
+  port
+}
+
+/// Poll `daemon status --json` until it reports a pid other than `previous`.
+async fn wait_for_daemon_pid(state: &Path, previous: Option<i32>) -> Option<i32> {
+  let deadline = Instant::now() + Duration::from_secs(20);
+  loop {
+    let (_, json, _) = run_cli(state, &["daemon", "status", "--json"]);
+    let pid = json["pid"].as_i64().map(|p| p as i32);
+    if let Some(p) = pid {
+      if Some(p) != previous {
+        return Some(p);
+      }
+    }
+    assert!(
+      Instant::now() < deadline,
+      "daemon status never reported a pid other than {previous:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+  }
+}
+
+fn assert_proxy_listening(port: u16) {
+  let deadline = Instant::now() + Duration::from_secs(20);
+  loop {
+    if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+      return;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "proxy never came back up on port {port}"
+    );
+    std::thread::sleep(Duration::from_millis(100));
+  }
+}
+
+fn stop_daemon(state: &Path) {
+  let _ = best_effort_sync_shutdown(state);
+  let runtime = llamastash::daemon::runtime_file::path(state);
+  let deadline = Instant::now() + Duration::from_secs(10);
+  while runtime.exists() && Instant::now() < deadline {
+    std::thread::sleep(Duration::from_millis(50));
+  }
+}
+
+/// Cleans up a detached daemon when a test panics before its own stop, so a
+/// failure can't leave an init-owned daemon holding a proxy port.
+struct DetachedDaemon {
+  state: PathBuf,
+}
+
+impl DetachedDaemon {
+  fn new(state: PathBuf) -> Self {
+    Self { state }
+  }
+}
+
+impl Drop for DetachedDaemon {
+  fn drop(&mut self) {
+    stop_daemon(&self.state);
+  }
+}

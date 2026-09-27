@@ -8,6 +8,7 @@
 //! stdout/stderr. The historical complaint was that bare `daemon start`
 //! ran in the foreground and looked stuck.
 //! `stop` — connect to the daemon and call `shutdown`.
+//! `restart` — the `stop` path, then the `start` path with the same flags.
 //! `status` — connect to the daemon and report PID + uptime; emits "not
 //! running" if the socket is missing or the connection fails.
 
@@ -15,7 +16,7 @@ use std::{collections::BTreeMap, net::IpAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 
-use crate::cli::cli_args::{Cli, DaemonAction};
+use crate::cli::cli_args::{Cli, DaemonAction, DaemonStartArgs};
 use crate::config::{Config, DefaultLaunchMode, DEFAULT_FIT_CTX_FLOOR, MAX_CTX_TOKENS};
 use crate::daemon::discovery_task::DiscoveryOptions;
 use crate::daemon::{
@@ -27,49 +28,57 @@ use crate::launch::binary::{locate as locate_binary, LocateInputs};
 use crate::util::paths::{home_dir, state_dir};
 
 /// Top-level dispatch for `daemon <action>`. The full `Cli` and merged
-/// `Config` flow through so `handle_start` can resolve discovery roots
-/// from user flags + config; status / stop ignore them.
+/// `Config` flow through so the start path can resolve discovery roots
+/// from user flags + config; status ignores them, stop only needs the
+/// state directory.
 pub async fn handle(action: DaemonAction, cli: &Cli, config: &Config) -> Result<()> {
   match action {
-    DaemonAction::Start {
-      foreground,
-      state_dir,
-      proxy_port,
-      ollama_compat,
-      no_proxy_fallback,
-      proxy_host,
-      insecure_no_auth,
-      lemonade,
-      vllm,
-      sglang,
-      force,
-    } => {
-      let force_flags = [
-        (crate::backend::lemonade::LEMONADE_BACKEND_ID, lemonade),
-        (crate::backend::vllm::VLLM_BACKEND_ID, vllm),
-        (crate::backend::sglang::SGLANG_BACKEND_ID, sglang),
-      ];
-      handle_start(
-        foreground,
-        force,
-        BuildOptionsArgs {
-          state_dir,
-          proxy_port,
-          proxy_host,
-          ollama_compat,
-          no_proxy_fallback,
-          insecure_no_auth,
-          backend_force: force_flags
-            .into_iter()
-            .map(|(id, on)| (id.to_string(), on))
-            .collect(),
-          ..BuildOptionsArgs::new(cli, config)
-        },
-      )
-      .await
-    }
+    DaemonAction::Start(args) => handle_start(&args, cli, config).await,
+    DaemonAction::Restart(args) => handle_restart(&args, cli, config).await,
     DaemonAction::Stop { force } => handle_stop(force).await,
     DaemonAction::Status { json } => handle_status(json).await,
+  }
+}
+
+/// `daemon restart`: stop the running daemon, then run the same start path
+/// with the flags this command was given. A daemon that is still hanging
+/// around when the stop window closes is an error here, not a start — starting
+/// on top of a half-dead daemon would just surface the confusing
+/// "already running" line instead of the real problem.
+async fn handle_restart(args: &DaemonStartArgs, cli: &Cli, config: &Config) -> Result<()> {
+  match stop_daemon(false).await? {
+    StopOutcome::StillExiting { pid } => Err(anyhow::anyhow!(
+      "daemon restart: pid {pid} was still exiting when the wait window closed; \
+       run `llamastash daemon stop --force` and retry"
+    )),
+    StopOutcome::Stopped | StopOutcome::NotRunning => handle_start(args, cli, config).await,
+  }
+}
+
+/// Assemble the [`BuildOptionsArgs`] shared by `daemon start` and
+/// `daemon restart`, including the per-backend force flags.
+fn start_build_args<'a>(
+  args: &DaemonStartArgs,
+  cli: &'a Cli,
+  config: &'a Config,
+) -> BuildOptionsArgs<'a> {
+  let force_flags = [
+    (crate::backend::lemonade::LEMONADE_BACKEND_ID, args.lemonade),
+    (crate::backend::vllm::VLLM_BACKEND_ID, args.vllm),
+    (crate::backend::sglang::SGLANG_BACKEND_ID, args.sglang),
+  ];
+  BuildOptionsArgs {
+    state_dir: args.state_dir.clone(),
+    proxy_port: args.proxy_port,
+    proxy_host: args.proxy_host,
+    ollama_compat: args.ollama_compat,
+    no_proxy_fallback: args.no_proxy_fallback,
+    insecure_no_auth: args.insecure_no_auth,
+    backend_force: force_flags
+      .into_iter()
+      .map(|(id, on)| (id.to_string(), on))
+      .collect(),
+    ..BuildOptionsArgs::new(cli, config)
   }
 }
 
@@ -97,17 +106,17 @@ fn migrate_knob_config(cli: &Cli) -> Option<Config> {
   }
 }
 
-/// `daemon start`: the two flags that steer this function, plus the overrides
-/// it hands straight to [`build_options`].
-async fn handle_start(foreground: bool, force: bool, args: BuildOptionsArgs<'_>) -> Result<()> {
-  let cli = args.cli;
+/// `daemon start` (and the second half of `daemon restart`).
+async fn handle_start(args: &DaemonStartArgs, cli: &Cli, config: &Config) -> Result<()> {
+  let foreground = args.foreground;
+  let force = args.force;
   // Bring a pre-registry `config.yaml` to the unified knob shape before
   // anything reads it. The daemon owns config writes, so this is the one
   // place it can run; a plain CLI command must never rewrite the user's file.
   // Idempotent, backs the original up first, and preserves comments.
   let migrated_config = migrate_knob_config(cli);
 
-  let mut opts = build_options(args)?;
+  let mut opts = build_options(start_build_args(args, cli, config))?;
   if let Some(fresh) = migrated_config {
     // `config` was parsed from the pre-migration text, so its preset blocks
     // are in the old shape. Take the rewritten file's.
@@ -390,7 +399,22 @@ fn print_provisioned_key(host: IpAddr, port: u16, key: &str, persisted: bool) {
   );
 }
 
-async fn handle_stop(force: bool) -> Result<()> {
+/// What a stop request ended up doing.
+enum StopOutcome {
+  /// The daemon is gone.
+  Stopped,
+  /// Nothing was running.
+  NotRunning,
+  /// Teardown was requested but the process was still alive when the wait
+  /// window closed. `daemon stop` treats this as success; `daemon restart`
+  /// refuses to spawn on top of it.
+  StillExiting { pid: i32 },
+}
+
+/// `daemon stop`: ask the daemon to shut down over IPC, then fall back to a
+/// PID signal when there is no usable IPC channel. Shared with `daemon
+/// restart`, which has to know whether the old daemon really left.
+async fn stop_daemon(force: bool) -> Result<StopOutcome> {
   let attach_dir = state_dir().context("could not resolve state directory")?;
   if !force {
     match Client::connect(&attach_dir).await {
@@ -414,17 +438,11 @@ async fn handle_stop(force: bool) -> Result<()> {
           match existing_daemon_pid(&attach_dir) {
             None => {
               println!("{}", crate::cli::colors::success("daemon: stopped"));
-              return Ok(());
+              return Ok(StopOutcome::Stopped);
             }
             Some(pid) => {
               if std::time::Instant::now() >= deadline {
-                println!(
-                  "{} ({} {})",
-                  crate::cli::colors::success("daemon: shutdown requested"),
-                  crate::cli::colors::dim("still exiting, pid"),
-                  pid
-                );
-                return Ok(());
+                return Ok(StopOutcome::StillExiting { pid });
               }
               tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -441,10 +459,24 @@ async fn handle_stop(force: bool) -> Result<()> {
   match existing_daemon_pid(&attach_dir) {
     None => {
       println!("{}", crate::cli::colors::dim("daemon: not running"));
-      Ok(())
+      Ok(StopOutcome::NotRunning)
     }
     Some(pid) => force_stop_via_pid(pid, &attach_dir),
   }
+}
+
+/// `daemon stop`: reports the outcome of [`stop_daemon`] the way the
+/// standalone command always has.
+async fn handle_stop(force: bool) -> Result<()> {
+  if let StopOutcome::StillExiting { pid } = stop_daemon(force).await? {
+    println!(
+      "{} ({} {})",
+      crate::cli::colors::success("daemon: shutdown requested"),
+      crate::cli::colors::dim("still exiting, pid"),
+      pid
+    );
+  }
+  Ok(())
 }
 
 /// Best-effort PID-based shutdown. Used when the IPC channel is
@@ -452,7 +484,7 @@ async fn handle_stop(force: bool) -> Result<()> {
 /// Sends `SIGTERM` via [`ProcessControl`], waits up to ~3s for the
 /// lockfile to release, then surfaces a clear next-step (`SIGKILL`)
 /// if the daemon ignores the signal.
-fn force_stop_via_pid(pid: i32, attach_dir: &std::path::Path) -> Result<()> {
+fn force_stop_via_pid(pid: i32, attach_dir: &std::path::Path) -> Result<StopOutcome> {
   use crate::util::process_control::{platform_default, SignalTarget};
   use std::time::{Duration, Instant};
   if pid <= 0 {
@@ -471,7 +503,7 @@ fn force_stop_via_pid(pid: i32, attach_dir: &std::path::Path) -> Result<()> {
       "{}",
       crate::cli::colors::dim(&format!("daemon: pid {pid} already exited"))
     );
-    return Ok(());
+    return Ok(StopOutcome::Stopped);
   }
   pc.signal_graceful(SignalTarget::SinglePid(pid_u));
   let deadline = Instant::now() + Duration::from_secs(3);
@@ -488,7 +520,7 @@ fn force_stop_via_pid(pid: i32, attach_dir: &std::path::Path) -> Result<()> {
         "{}",
         crate::cli::colors::success(&format!("daemon: stopped (pid {pid})"))
       );
-      return Ok(());
+      return Ok(StopOutcome::Stopped);
     }
     std::thread::sleep(Duration::from_millis(50));
   }

@@ -558,6 +558,7 @@ Each row's `params` object carries a `knobs` map — every knob the launch dispa
 
 ```
 llamastash daemon start [--foreground|-f]
+llamastash daemon restart [--foreground|-f]
 llamastash daemon stop  [--force|-f]
 llamastash daemon status [--json]   # PID + uptime + connections + managed launches
 ```
@@ -565,6 +566,8 @@ llamastash daemon status [--json]   # PID + uptime + connections + managed launc
 `daemon start` detaches into the background by default and returns once the socket is bound. Pass `--foreground` (or `-f`) to keep the daemon attached to the terminal — useful when a process supervisor (systemd, runit, container `CMD`) owns the lifecycle and needs to see stdout/stderr directly.
 
 Without `llama-server`, `daemon start` refuses unless another backend is enabled (Lemonade, vLLM, SGLang, or a `backend.generic` entry). On such a host those backends launch as usual and only llama.cpp launches fail. `--force` starts the daemon either way.
+
+`daemon restart` is `stop` followed by `start`: it shuts the running daemon down over IPC, waits for that process to exit, then brings a new one up. It takes the same flag set as `daemon start` (`--proxy-port`, `--ollama-compat`, `--proxy-host`, the backend opt-ins, `--force`, `--foreground`), and that is how the new daemon is configured — those flags are per-invocation, so repeat the ones the running daemon was started with. Use it after hand-editing `config.yaml`, which the daemon only reads at boot. Two differences from typing the pair yourself: with nothing running it is just `start`, and if the old daemon is still exiting when the stop window closes it fails instead of starting on top of a daemon that has not let go of the lockfile (`daemon stop --force`, then retry). Running models go down with the old daemon and are not brought back — `start` what you need afterwards.
 
 `daemon stop` calls the IPC `shutdown` RPC, then waits (up to 10 s) for the daemon process to actually exit before printing `daemon: stopped` — so `daemon stop && daemon start` never races the dying daemon's lockfile or its managed `lemond` umbrella. If teardown outlives the wait it falls back to `daemon: shutdown requested (still exiting, pid N)`. When `runtime.json` is missing (the IPC channel can't be opened because a stale daemon from an older version is holding the lockfile) pass `--force` (or `-f`) to fall back to a `SIGTERM` on the PID recorded in `daemon.pid`. The CLI auto-detects this state on every command and prints the exact `kill` / `--force` invocation needed.
 
