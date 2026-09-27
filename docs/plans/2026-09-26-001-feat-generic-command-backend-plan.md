@@ -346,11 +346,9 @@ Verified against llamastash `ae9ee213`, gufo upstream `990fdce` (local build
   concept.** `--ctx`, the ctx ring, the TUI Context row, `status` ctx and
   concept carry-over all write or read `Scalar::U32`. Making it a string
   would need changes across all of them. Every other config knob is `Str`.
-- **KTD7 CLI:** no top-level flags. `start <name> -- --<id> <value>` works
-  because the daemon, not the CLI, lifts extras: for a generic launch, an
-  extras token `--<id>` (or `--<id>=v`) naming one of the entry's knobs moves
-  into the user knob layer before resolution. That works the same for the
-  CLI, IPC agents and presets. `--ctx` keeps working through KTD6.
+- **KTD7 CLI (dropped, see Deviations):** no top-level flags. The planned
+  daemon-side lift of `--<id>` extras into the user knob layer was not built;
+  `-- --flag v` reaches argv as a plain engine flag. `--ctx` works through KTD6.
 - **KTD8 The `model` field is not rewritten.** `{name}` expands to the launch's
   exact published id, and the entry passes it to the engine. A client sending
   a partial name the resolver accepts will 404 at an engine that validates
@@ -408,8 +406,7 @@ flowchart TD
   CFG -->|pass 2: presets, rest| PRE[preset KnobSets]
   TBL --> PRE
   TBL --> ST[state.json last_params]
-  START[start name -- --speculative mtp] --> LIFT[daemon lifts --id extras into user knobs]
-  LIFT --> RES[resolve layers by scope]
+  START[start name --ctx N / TUI / IPC knobs] --> RES[resolve layers by scope]
   PRE --> RES
   ST --> RES
   RES --> ARGV[argv = binary + args + knobs + extras<br/>env with placeholders]
@@ -428,7 +425,7 @@ flowchart LR
   U2 --> U4[4 catalog hook]
   U2 --> U5[5 stop grace]
   U2 --> U6[6 admission + readiness]
-  U3 --> U7[7 surfaces: TUI, CLI lift, presets]
+  U3 --> U7[7 surfaces: TUI, CLI, presets]
   U4 --> U8[8 docs]
   U5 --> U8
   U6 --> U8
@@ -637,7 +634,7 @@ probe.
 **Verification:** `status --json` shows the declared memory for a generic
 launch.
 
-- [x] **Unit 7: Surfaces: TUI, CLI lift, presets**
+- [x] **Unit 7: Surfaces: TUI, CLI, presets**
 
 **Goal:** Config knobs show and edit everywhere a built-in knob does.
 
@@ -647,19 +644,18 @@ launch.
 
 **Files:**
 - Modify: `src/tui/launch_picker.rs`, `src/tui/tabs/settings.rs`,
-  `src/cli/knobs_cmd.rs`, `src/daemon/launch_service.rs` (extras lift),
-  `src/launch/presets.rs`
+  `src/cli/knobs_cmd.rs`, `src/launch/presets.rs`
 - Test: `tests/preset_config_ipc_test.rs`, `tests/start_model_ipc_test.rs`,
   TUI golden snapshots under `tests/golden/`
 
 **Approach:** The TUI picker and settings tab look up knobs by the selected
-model's scope. The daemon lifts `--<id>` extras (KTD7). Presets keyed by the
+model's scope. No extras lift (KTD7 dropped). Presets keyed by the
 entry `name` resolve through the scope. The `knobs` listing shows generic
 knobs grouped by entry.
 
 **Test scenarios:**
-- Happy path: `start flash-next-gufo -- --speculative none` → knob set, not in
-  extras; `last_params` records `speculative: none`.
+- Happy path: `start flash-next-gufo -- --speculative none` → stays in extras,
+  reaches argv as-is, not remembered (KTD7 dropped).
 - Happy path: preset `flash-next-gufo: entries: fast: knobs: {speculative:
   none}` → applied on `start --preset fast`.
 - Happy path: TUI picker on a generic row shows Context, speculative,

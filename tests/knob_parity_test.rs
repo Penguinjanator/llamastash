@@ -159,9 +159,9 @@ fn every_config_declared_knob_reaches_every_surface() {
     let id = def.knob_id();
     let raw = sample_for(def);
 
-    // CLI: no top-level flag. A `--` tail token stays in extras, because the
-    // same spelling is a plain engine flag on every other model; the daemon
-    // lifts it for the model that declares it (`generic_backend_test`).
+    // CLI: no top-level flag. A `--` tail token stays in extras and reaches
+    // the engine as-is, because the same spelling is a plain engine flag on
+    // every other model.
     let token = OsString::from(format!("--{}={raw}", def.id));
     let (parsed, extras) =
       llamastash::cli::tail_args::parse_tail_args(std::slice::from_ref(&token)).unwrap();
