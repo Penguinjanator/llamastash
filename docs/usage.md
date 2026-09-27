@@ -752,7 +752,7 @@ With vLLM installed too, a repo lists both engines in `supported_backends` and a
 
 **Experimental.** Runs any OpenAI-compatible server llamastash has no dedicated backend for, declared under `backend.generic.servers` in `config.yaml`. llamastash reserves the port, polls the readiness path, routes the proxy, and stops the process. It knows nothing else about the engine: flags, env and weights live in the entry or in a wrapper script you write. Config-only on purpose, since `binary` runs as you; no CLI flag or IPC method sets one. Entries are read at process start, so run `llamastash daemon restart` (and reopen the TUI) after editing them.
 
-Tested on 2026-09-26 with gufo `d9a84f1`, Halogen `0.14.0` (Docker image) and CIRU `3cf984c` on a Strix Halo host (config in `config.example.yaml`).
+Tested on 2026-09-26 with gufo `d9a84f1`, Halogen `0.14.0` (Docker image) and CIRU `3cf984c` on a Strix Halo host. Full configs are in § Examples below.
 
 Two shapes:
 
@@ -795,34 +795,134 @@ These are documented, not checked. Break one and the launch fails or misbehaves 
 - **Answer to `{name}`** if the engine checks the request's `model` field (gufo does). A client sending a partial name the proxy accepts will get the engine's 404.
 - **`--server generic-<name>` is not checked against `model`.** Only the TUI Server row filters by it; the CLI and presets run whatever you pick.
 
-### Docker wrapper (Halogen)
+### Examples: gufo, Halogen, CIRU
+
+Three Qwen3.8 Flash-Next engines, tested on a Strix Halo box with gufo `d9a84f1`, Halogen `0.14.0` and CIRU `3cf984c`. Replace the `/path/to/...` parts with your own paths. Each takes 80-100 GB, so run one at a time.
+
+**gufo**: a native binary that runs a catalog GGUF directly, so it uses `model` and needs no wrapper. It checks the request's `model` field, hence `--served-model-name "{name}"`. Loads in about 22 s; `/ready` returns 503 until then.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: gufo                                  # server id: generic-gufo
+        model: Qwen3.8-Flash-Next-UD-Q4_K_XL        # a model id; globs work too
+        binary: /path/to/gufo/build/release/gufo
+        args: [serve, --host, "{host}", --port, "{port}", --sessions, "1", llm,
+               --served-model-name, "{name}", --model, "{model}",
+               --mtp-model, /path/to/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf,
+               --top-p, "0.95", --top-k, "20"]
+        knobs:
+          - {flag: --context, ctx: true, default: "131072"}
+          - {flag: --speculative, default: mtp}
+          - {flag: --temperature, default: "1.0"}
+          - --seed
+        ready: /ready
+        stop_grace_secs: 60
+
+presets:
+  Qwen3.8-Flash-Next-*:
+    entries:
+      gufo-128k:
+        server: generic-gufo       # the preset picks the engine
+        knobs:
+          context: 131072
+          speculative: mtp
+          temperature: '1.0'
+```
+
+```bash
+llamastash start Qwen3.8-Flash-Next-UD-Q4_K_XL --preset gufo-128k
+llamastash start Qwen3.8-Flash-Next-UD-Q4_K_XL --server generic-gufo -- --seed 7
+```
+
+**Halogen**: a Docker image configured by `HALOGEN_*` env vars, with its own `.hgn` weights (not a catalog GGUF), so it is its own row. Its knobs feed the container through `env`.
+
+```yaml
+      - name: flash-next-halogen
+        binary: ~/bin/halogen-serve.sh
+        args: ["{port}"]
+        knobs:
+          - {flag: --ctx-window, id: halogen-ctx, ctx: true, default: "131072"}
+          - {flag: --halogen-temperature, id: halogen-temp, default: "1.0"}
+          - {flag: --halogen-mtp-depth, id: halogen-mtp-depth, default: "3"}
+        env:
+          HALOGEN_MODEL_ID: "{name}"
+          HALOGEN_CTX: "{halogen-ctx}"
+          HALOGEN_KV_POOL_POSITIONS: "{halogen-ctx}"
+          HALOGEN_TEMPERATURE: "{halogen-temp}"
+          HALOGEN_MTP_DEPTH: "{halogen-mtp-depth}"
+        ready: /v1/models
+        stop_grace_secs: 90
+        ready_timeout_secs: 600
+```
+
+`~/bin/halogen-serve.sh`:
 
 ```sh
 #!/bin/sh
-# $1 = port. HALOGEN_* come from the entry's env.
+# llamastash generic wrapper for Halogen 0.14.0. Bridge network published on
+# loopback only: the image's API binds 0.0.0.0 inside the container.
+# $1 = port; HALOGEN_* come from the entry env.
 port="$1"
-name="llamastash-halogen-$port"               # per port, so launches don't collide
-docker rm -f "$name" >/dev/null 2>&1          # leftover from a crashed daemon
-# Bridge network, published on loopback only: the image's API binds 0.0.0.0.
+name="llamastash-halogen-$port"          # per port, so two launches don't collide
+docker rm -f "$name" >/dev/null 2>&1      # leftover from a crashed daemon
+hub=/path/to/huggingface/hub
+hg=/hub/models--peonist-ai--halogen-qwen3.8-flash-next/snapshots/<revision>
 docker run -d --rm --name "$name" -p "127.0.0.1:$port:8080" \
   --device /dev/kfd --device /dev/dri \
-  --group-add "$(getent group video | cut -d: -f3)" \
-  --group-add "$(getent group render | cut -d: -f3)" \
-  --ipc=host --ulimit memlock=-1:-1 -v /path/to/hf-hub:/hub:ro \
-  -e HALOGEN_API_PORT=8080 -e HALOGEN_MODEL_ID -e HALOGEN_CTX -e HALOGEN_KV_POOL_POSITIONS \
-  -e HALOGEN_CHECKPOINT=/hub/.../qwen38-flash-next-w4b.hgn \
+  --group-add "$(getent group video | cut -d: -f3)" --group-add "$(getent group render | cut -d: -f3)" \
+  --ipc=host --ulimit memlock=-1:-1 -v "$hub":/hub:ro \
+  -e HALOGEN_API_PORT=8080 -e HALOGEN_MODEL_ID \
+  -e HALOGEN_CHECKPOINT="$hg/qwen38-flash-next-w4b.hgn" \
+  -e HALOGEN_MTP_HEAD="$hg/qwen38-flash-next-mtp.hgn" -e HALOGEN_TOKENIZER="$hg/tokenizer" \
+  -e HALOGEN_CTX -e HALOGEN_KV_POOL_POSITIONS -e HALOGEN_MTP_DEPTH \
+  -e HALOGEN_MAX_TOKENS_DEFAULT=16384 -e HALOGEN_TEMPERATURE -e HALOGEN_TOP_P=0.95 -e HALOGEN_TOP_K=20 \
   ghcr.io/peonist-ai/halogen-flash-server:0.14.0 >/dev/null || exit 1
-# SIGTERM becomes one `docker stop`; the image gives its engine 30 s before
-# its own SIGKILL, so keep -t above 30 and stop_grace_secs above -t.
+# One clean stop: SIGTERM from llamastash becomes `docker stop`, which the
+# image turns into an engine shutdown (its own SIGKILL comes 30 s later).
 trap 'docker stop -t 60 "$name" >/dev/null 2>&1' TERM INT
-docker logs -f "$name" 2>&1 &                 # container output into the llamastash log
+docker logs -f "$name" 2>&1 &
 docker wait "$name" >/dev/null &
 wait $!
 ```
 
-`docker run -d` plus `docker wait` keeps the wrapper in the foreground while the container never sees the process-group SIGTERM directly, so the engine gets exactly one signal. Halogen 0.14.0's `all` mode binds its API on `0.0.0.0` whatever `HALOGEN_BIND` says (that variable covers only the internal engine port), which is why the wrapper uses a loopback-published bridge port instead of `--network host`. It does not check the request's `model` field. Cold load took 94-105 s here.
+- `docker run -d` plus `docker wait` keeps the wrapper in the foreground while the container never sees the process-group SIGTERM directly, so the engine gets exactly one signal. Keep `docker stop -t` above the image's 30 s and `stop_grace_secs` above `-t`.
+- Halogen 0.14.0's `all` mode binds its API on `0.0.0.0` whatever `HALOGEN_BIND` says (that variable covers only the internal engine port). Hence the bridge port published on `127.0.0.1` instead of `--network host`, which also keeps two launches' internal engine ports apart.
+- It does not check the request's `model` field. Cold load took 93-105 s here, about 6 s when the weights are still in page cache.
 
-A launcher script configured by env (CIRU's `run-server.sh`) needs only a two-line wrapper that exports the fixed variables and `exec`s it; per-launch values (`PORT: "{port}"`, `CONTEXT_SIZE: "{ctx-knob}"`) go in the entry's `env`.
+**CIRU**: a `run-server.sh` launcher configured by env vars that `exec`s its own llama-server build and passes extra args through. The wrapper exports the fixed variables; per-launch values go in the entry's `env`.
+
+```yaml
+      - name: flash-next-ciru
+        binary: ~/bin/ciru-serve.sh
+        knobs:
+          - {flag: --ciru-ctx, id: ciru-ctx, ctx: true, default: "65536"}
+          - {flag: --mtp-depth, id: mtp-depth, default: "3"}
+        env:
+          PORT: "{port}"
+          CONTEXT_SIZE: "{ciru-ctx}"
+          MTP_DEPTH: "{mtp-depth}"
+        ready: /health
+        stop_grace_secs: 60
+        ready_timeout_secs: 600
+```
+
+`~/bin/ciru-serve.sh`:
+
+```sh
+#!/bin/sh
+# llamastash generic wrapper for CIRU (3cf984c). Env comes from the entry;
+# extra args pass through to llama-server.
+export ROCM_ROOT=/path/to/ciru/.venv-rocm/lib/python3.12/site-packages/_rocm_sdk_devel
+export CIRU_RUNTIME_ROOT=/path/to/ciru/runtime
+export MODEL_DIR=/path/to/huggingface/hub/models--jcbtc--Qwen3.8-Flash-CIRU-STRIX-IU4/snapshots/<revision>
+export ENABLE_UI=0 HOST=127.0.0.1
+exec /path/to/ciru/scripts/ciru/run-server.sh "$@"
+```
+
+- `exec` hands the PID to llama-server, so llamastash's one SIGTERM reaches the engine directly.
+- CIRU answers under its own alias (`Qwen3.8-Flash-CIRU-STRIX-IU4`) and does not check the request's `model` field. Loads in about 115 s.
 
 ## Proxy (OpenAI-compatible listener)
 
