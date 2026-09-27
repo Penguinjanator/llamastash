@@ -1760,6 +1760,7 @@ impl App {
         name: np.name.clone(),
         knobs: preset_body_from_launch_params(&np.params).knobs,
         extras: np.params.extras.clone(),
+        server: np.params.server.clone(),
       })
       .collect();
     let default_stop = if eff.default_is_auto() {

@@ -69,6 +69,8 @@ pub struct PresetChoice {
   /// there is no longer a separate native-knob channel to seed.
   pub knobs: KnobSet,
   pub extras: Vec<std::ffi::OsString>,
+  /// The preset's `server:` pin; `None` runs the row's default build.
+  pub server: Option<String>,
 }
 
 /// Inline-edit state owned by [`LaunchPickerState`].
@@ -199,6 +201,7 @@ pub struct LaunchPickerState {
   /// last-used params, or empty). Restored when cycling back to `last used`.
   preset_baseline_knobs: KnobSet,
   preset_baseline_extras: Vec<std::ffi::OsString>,
+  preset_baseline_server: Option<String>,
   /// Row offset clipped from the top of the rendered line list so the
   /// focused row stays visible on small viewports. Recomputed on each
   /// render using the actual area height — the `Cell` lets the
@@ -270,6 +273,7 @@ impl LaunchPickerState {
       mtp_capable: false,
       preset_baseline_knobs: KnobSet::new(),
       preset_baseline_extras: Vec::new(),
+      preset_baseline_server: None,
       scroll_offset: Cell::new(0),
     }
   }
@@ -414,6 +418,7 @@ impl LaunchPickerState {
   pub fn set_presets(&mut self, presets: Vec<PresetChoice>, default_stop: PresetStop) {
     self.preset_baseline_knobs = self.user_knobs.clone();
     self.preset_baseline_extras = self.extras.clone();
+    self.preset_baseline_server = self.selected_server.clone();
     self.presets = presets;
     self.default_stop = match default_stop {
       PresetStop::Named(i) if i < self.presets.len() => PresetStop::Named(i),
@@ -440,6 +445,7 @@ impl LaunchPickerState {
       PresetStop::LastUsed => {
         self.user_knobs = self.preset_baseline_knobs.clone();
         self.extras = self.preset_baseline_extras.clone();
+        self.selected_server = self.preset_baseline_server.clone();
       }
       PresetStop::Auto => self.apply_auto(),
       PresetStop::Named(i) => self.seed_from_preset(i),
@@ -458,12 +464,15 @@ impl LaunchPickerState {
       }
     }
     self.extras.clear();
+    // The daemon's `auto` selection inherits no server either.
+    self.selected_server = None;
   }
 
   fn seed_from_preset(&mut self, i: usize) {
     if let Some(p) = self.presets.get(i) {
       self.user_knobs = p.knobs.clone();
       self.extras = p.extras.clone();
+      self.selected_server = p.server.clone();
     }
   }
 
@@ -2075,7 +2084,35 @@ mod tests {
       name: name.into(),
       knobs: crate::knobset! { ctx: ctx },
       extras: Vec::new(),
+      server: None,
     }
+  }
+
+  #[test]
+  fn a_presets_server_pin_replaces_the_last_used_server() {
+    // Last launch ran on one server; the default preset pins another. The
+    // Server row must show (and send) the preset's pin, not the last-used one,
+    // and a preset with no pin must not pick up the last-used one either.
+    let mut s = LaunchPickerState::for_model("qwen");
+    s.selected_server = Some("last-used-srv".into());
+    let pinned = PresetChoice {
+      server: Some("preset-srv".into()),
+      ..choice("pinned", 4096)
+    };
+    s.set_presets(vec![pinned, choice("unpinned", 8192)], PresetStop::Named(0));
+    assert_eq!(s.selected_server.as_deref(), Some("preset-srv"));
+
+    s.cycle_preset(true);
+    assert_eq!(
+      s.selected_server, None,
+      "last-used values show only on the last-used stop"
+    );
+    s.cycle_preset(true);
+    assert_eq!(s.preset_stop, PresetStop::LastUsed);
+    assert_eq!(s.selected_server.as_deref(), Some("last-used-srv"));
+    s.cycle_preset(true);
+    assert_eq!(s.preset_stop, PresetStop::Auto);
+    assert_eq!(s.selected_server, None, "auto inherits no server");
   }
 
   #[test]
@@ -2147,6 +2184,7 @@ mod tests {
       name: "emb".into(),
       knobs: crate::knobset! { mode: "embedding" },
       extras: Vec::new(),
+      server: None,
     };
     s.set_presets(vec![pinned], PresetStop::Named(0));
     assert_eq!(
