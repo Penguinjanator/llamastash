@@ -1351,10 +1351,13 @@ async fn named_preset_launch_does_not_inherit_stale_last_params() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn start_model_returns_error_when_binary_unconfigured() {
-  // Production daemon resolves the binary at startup; if it wasn't
-  // resolved (e.g. user has no `llama-server` on PATH), `start_model`
-  // must surface a clear error rather than blowing up internally.
+  // Without a resolved `llama-server`, a GGUF launch on llama.cpp must say
+  // which binary is missing rather than blowing up internally.
   let state = unique_temp("no-binary");
+  let model_dir = unique_temp("no-binary-models");
+  std::fs::create_dir_all(&model_dir).unwrap();
+  let model_path = model_dir.join("m.gguf");
+  std::fs::write(&model_path, build_minimal_gguf("llama")).unwrap();
   let opts = DaemonOptions::rooted_at(state.clone());
   let socket = opts.state_dir.clone();
   let daemon = tokio::spawn(async move { run_foreground(opts).await });
@@ -1362,21 +1365,16 @@ async fn start_model_returns_error_when_binary_unconfigured() {
 
   let mut client = Client::connect(&socket).await.expect("connect");
   let err = client
-    .call(
-      "start_model",
-      Some(json!({"model_path": "/nowhere/m.gguf"})),
-    )
+    .call("start_model", Some(json!({"model_path": model_path})))
     .await
     .expect_err("must error without binary");
   let msg = format!("{err}");
-  assert!(
-    msg.to_lowercase().contains("launch environment"),
-    "got: {msg}"
-  );
+  assert!(msg.contains("llama-server binary not found"), "got: {msg}");
 
   let _ = client.call("shutdown", None).await;
   let _ = timeout(Duration::from_secs(3), daemon).await;
   std::fs::remove_dir_all(&state).ok();
+  std::fs::remove_dir_all(&model_dir).ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
