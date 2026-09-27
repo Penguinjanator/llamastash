@@ -1206,6 +1206,9 @@ fn delete_refusal_reason(app: &App) -> Option<&'static str> {
     if crate::backend::lemonade::registry_name_from_path(&path).is_some() {
       return Some("model is managed by Lemonade — delete it via Lemonade");
     }
+    if !app.has_local_file(&path) {
+      return Some("model is declared in config.yaml — remove it there");
+    }
   }
   if let Some(managed) = app.focused_managed() {
     return Some(match managed.state {
@@ -2763,6 +2766,22 @@ mod tests {
       toast.contains("Lemonade"),
       "expected a Lemonade-delete toast, got `{toast}`"
     );
+  }
+
+  #[test]
+  fn ctrl_d_on_config_declared_model_refuses_with_toast() {
+    let mut app = App::new(Default::default());
+    let mut row = fake_model_for_events("cfg://my-server", "cfg://");
+    row.source = crate::discovery::ModelSource::Config;
+    app.models = vec![row];
+    app.go_top();
+    pump_input(&mut app, key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert!(
+      app.confirm_dialog.is_none(),
+      "config-declared row must not stage a delete"
+    );
+    let toast = app.toast_message().unwrap_or("");
+    assert!(toast.contains("config.yaml"), "got `{toast}`");
   }
 
   #[test]

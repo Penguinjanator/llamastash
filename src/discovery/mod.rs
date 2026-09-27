@@ -222,6 +222,11 @@ impl ModelSource {
       | ModelSource::LmStudio => crate::backend::DEFAULT_BACKEND_ID,
     }
   }
+
+  /// Whether rows from this source point at a file llamastash can delete.
+  pub fn has_local_file(&self) -> bool {
+    !matches!(self, ModelSource::Lemonade | ModelSource::Config)
+  }
 }
 
 #[cfg(test)]

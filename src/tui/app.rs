@@ -1411,6 +1411,16 @@ impl App {
       .and_then(|r| r.path().map(|p| p.to_path_buf()))
   }
 
+  /// Whether `path` names a file on disk that a delete can unlink. A path the
+  /// catalog does not know is treated as a local file.
+  pub fn has_local_file(&self, path: &Path) -> bool {
+    self
+      .models
+      .iter()
+      .find(|m| m.path == path)
+      .is_none_or(|m| m.source.has_local_file())
+  }
+
   /// Friendly display label for `path` if the discovery layer
   /// supplied one (Ollama's `<name>:<tag>`). Right-pane / info-pane
   /// callers fall back to `util::paths::model_display_name` when this
