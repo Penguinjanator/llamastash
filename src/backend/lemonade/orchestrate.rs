@@ -208,7 +208,7 @@ pub fn supervise_umbrella_at_boot(
         log::error!(
           "lemonade: 127.0.0.1:{port} is already in use — llamastash could not start its own \
            managed `lemond`. Stop whatever holds that port (e.g. a manually started `lemond`) or \
-           set `lemonade.port`; Lemonade model routing will return 503 until this is resolved."
+           set `backend.lemonade.port`; Lemonade model routing will return 503 until this is resolved."
         );
         return;
       }

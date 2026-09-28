@@ -215,7 +215,7 @@ pub(crate) fn precheck_indicated_backends(opts: &DaemonOptions) -> std::result::
     );
   }
   // Lemonade is flagged only when *explicitly* requested (`--lemonade` / env,
-  // or `lemonade.enabled: true`); the default-on-when-found path stays silent
+  // or `backend.lemonade.enabled: true`); the default-on-when-found path stays silent
   // when `lemond` is simply absent (zero footprint, like ds4).
   let lemonade_force = opts
     .backend_force
@@ -245,7 +245,7 @@ pub(crate) fn precheck_indicated_backends(opts: &DaemonOptions) -> std::result::
       // `daemon stop && daemon start --lemonade` fail for up to a minute.
       failures.push(format!(
         "lemonade umbrella port 127.0.0.1:{} is already in use — stop whatever holds it \
-         (e.g. a manually started `lemond`) or set `lemonade.port`, or `llamastash daemon start \
+         (e.g. a manually started `lemond`) or set `backend.lemonade.port`, or `llamastash daemon start \
          --force` to start without the managed umbrella.",
         opts.backend.lemonade.port
       ));

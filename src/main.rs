@@ -21,7 +21,8 @@ async fn main() -> Result<()> {
       }
       if cli::cli_args::argv_wants_json() {
         let text = err.render().to_string();
-        let message = text.trim().strip_prefix("error: ").unwrap_or(text.trim());
+        let first = text.lines().next().unwrap_or_default().trim();
+        let message = first.strip_prefix("error: ").unwrap_or(first);
         cli::output::print_json_error(cli::exit_codes::USAGE, message);
       } else {
         let _ = err.print();

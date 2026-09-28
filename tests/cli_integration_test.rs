@@ -1401,7 +1401,11 @@ fn a_parse_error_under_json_prints_a_json_error() {
   let (code, out, err) = run_cli(dir.path(), &["list", "--bogus", "--json"]);
   assert_eq!(code, exit_codes::USAGE, "stderr: {err}");
   assert_eq!(out["error"]["code"], exit_codes::USAGE, "stdout: {out}");
-  assert!(json_error(&out).contains("--bogus"), "stdout: {out}");
+  assert_eq!(
+    json_error(&out),
+    "unexpected argument '--bogus' found",
+    "stdout: {out}"
+  );
   assert!(err.is_empty(), "stderr: {err}");
 
   // After `--`, `--json` belongs to the engine, not to us.

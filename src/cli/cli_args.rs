@@ -359,7 +359,7 @@ pub enum DaemonAction {
     insecure_no_auth: bool,
     /// Enable the opt-in **experimental** Lemonade (`lemond`) backend for
     /// this daemon: run Lemonade discovery and supervise/route to the
-    /// `lemond` umbrella. OR-ed with `lemonade.enabled: true` in
+    /// `lemond` umbrella. OR-ed with `backend.lemonade.enabled: true` in
     /// `config.yaml` and the `LLAMASTASH_LEMONADE` env var
     /// (`1`/`true`/`yes`/`on`) — any of the three turns it on. Experimental:
     /// behaviour and config may change. llamastash never installs `lemond`;
