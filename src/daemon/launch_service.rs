@@ -1027,7 +1027,13 @@ pub(crate) async fn compose_and_spawn(
     .knobs
     .text_by_name("device")
     .filter(|s| !s.is_empty());
-  let servers_snapshot = env.servers.loaded().await;
+  // Only a device selector needs the catalog; `seed_binary_caps` probes a binary
+  // the catalog does not list yet, so a plain launch need not wait for it.
+  let servers_snapshot = if selector.is_some() {
+    env.servers.loaded().await
+  } else {
+    env.servers.current().await
+  };
   let launch_binary = pick_launch_binary(
     &mut launch_params,
     picked_server.as_ref(),

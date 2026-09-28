@@ -3,8 +3,8 @@
 //!
 //! Events are coalesced (e.g., copying a split-shard set, or `hf-hub`
 //! writing many `.part` files in quick succession) into one event per
-//! debounce window — 500 ms by default per the plan. Each event surfaces to the caller as a [`WatchEvent`]
-//! over an `mpsc::Receiver`; the daemon's discovery task consumes
+//! debounce window — 500 ms by default per the plan. Each event surfaces
+//! to the caller as a [`WatchEvent`] over an `mpsc::Receiver`; the daemon's discovery task consumes
 //! these and re-runs the affected scan slice to refresh
 //! `list_models`.
 //!
@@ -156,21 +156,36 @@ fn debounce_loop(
       }
       Err(std_mpsc::RecvTimeoutError::Timeout) => {
         deadline = None;
-        let paths: Vec<PathBuf> = std::mem::take(&mut pending).into_iter().collect();
-        // `try_send` so a slow consumer can't pin this thread; a dropped
-        // burst is reconciled by the periodic rescan. Warn so watcher
-        // pressure shows in logs rather than as "models take 5 minutes to
-        // show up after a download spike".
-        match tx.try_send(WatchEvent::Changed { paths }) {
-          Ok(()) => {}
-          Err(mpsc::error::TrySendError::Full(_)) => {
-            log::warn!("watcher channel full; dropping fs event burst (will reconcile on next periodic rescan)");
-          }
-          Err(mpsc::error::TrySendError::Closed(_)) => return,
+        if !flush(&tx, &mut pending) {
+          return;
         }
       }
-      Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
+      Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+        flush(&tx, &mut pending);
+        return;
+      }
     }
+  }
+}
+
+/// Send `pending` as one event. `false` once the consumer is gone.
+fn flush(tx: &mpsc::Sender<WatchEvent>, pending: &mut BTreeSet<PathBuf>) -> bool {
+  if pending.is_empty() {
+    return true;
+  }
+  let paths: Vec<PathBuf> = std::mem::take(pending).into_iter().collect();
+  // `try_send` so a slow consumer can't pin this thread; a dropped burst is
+  // reconciled by the periodic rescan. Warn so watcher pressure shows in logs
+  // rather than as "models take 5 minutes to show up after a download spike".
+  match tx.try_send(WatchEvent::Changed { paths }) {
+    Ok(()) => true,
+    Err(mpsc::error::TrySendError::Full(_)) => {
+      log::warn!(
+        "watcher channel full; dropping fs event burst (will reconcile on next periodic rescan)"
+      );
+      true
+    }
+    Err(mpsc::error::TrySendError::Closed(_)) => false,
   }
 }
 

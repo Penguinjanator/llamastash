@@ -253,17 +253,54 @@ async fn acquire_inflight_guard(
   None
 }
 
-/// `body` with its top-level `model` set to `model`. A body that is not a JSON
-/// object carrying `model` is returned unchanged.
+/// `body` with its top-level `model` set to `model`. Every other entry is
+/// copied as its raw bytes, in order, so key order and nested content survive
+/// and no `Value` tree is built for a multi-MB image body. A body that is not a
+/// JSON object carrying `model` is returned unchanged.
 fn with_model(body: Bytes, model: &str) -> Bytes {
-  let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_slice(&body) else {
-    return body;
-  };
-  if !obj.contains_key("model") {
-    return body;
+  use serde::de::{Deserializer as _, MapAccess, Visitor};
+  use serde_json::value::RawValue;
+
+  struct Entries;
+  impl<'de> Visitor<'de> for Entries {
+    type Value = Vec<(String, &'de RawValue)>;
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+      f.write_str("a JSON object")
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+      let mut entries = Vec::new();
+      while let Some(entry) = map.next_entry::<String, &'de RawValue>()? {
+        entries.push(entry);
+      }
+      Ok(entries)
+    }
   }
-  obj.insert("model".into(), model.into());
-  serde_json::to_vec(&obj).map_or(body, Bytes::from)
+
+  let mut de = serde_json::Deserializer::from_slice(&body);
+  let entries = match de
+    .deserialize_map(Entries)
+    .and_then(|e| de.end().map(|()| e))
+  {
+    Ok(e) if e.iter().any(|(k, _)| k == "model") => e,
+    _ => return body,
+  };
+  let mut out = Vec::with_capacity(body.len() + model.len());
+  out.push(b'{');
+  for (i, (key, value)) in entries.iter().enumerate() {
+    if i > 0 {
+      out.push(b',');
+    }
+    // Writing a `String` / `&str` into a `Vec` cannot fail.
+    let _ = serde_json::to_writer(&mut out, key);
+    out.push(b':');
+    if key == "model" {
+      let _ = serde_json::to_writer(&mut out, model);
+    } else {
+      out.extend_from_slice(value.get().as_bytes());
+    }
+  }
+  out.push(b'}');
+  Bytes::from(out)
 }
 
 /// Translate `reqwest::Response` into `hyper::Response`, preserving
@@ -466,6 +503,12 @@ mod tests {
     assert_eq!(v["model"], "q");
     assert_eq!(v["messages"][0]["model"], "keep");
     assert_eq!(v["stream"], true);
+
+    assert_eq!(
+      with_model(Bytes::from(r#"{"z":1,"model":"a","b":{"y":1,"x":2}}"#), "q"),
+      r#"{"z":1,"model":"q","b":{"y":1,"x":2}}"#.as_bytes(),
+      "key order survives the rewrite"
+    );
 
     for untouched in [r#"{"messages":[]}"#, "not json", "[1]", ""] {
       assert_eq!(

@@ -892,6 +892,11 @@ async fn parse_into_model(
   if let Some(c) = cache {
     if let Some(mut hit) = c.get(&path, mtime, size).await {
       if hit.split_siblings != siblings {
+        if siblings.is_empty() {
+          // The cached figures are shard sums; with no siblings left there is
+          // nothing to re-sum from, so re-read the first shard on its own.
+          return parse_uncached(path, parent, source, siblings, mtime, size, Some(c)).await;
+        }
         apply_split_shard_aggregates(&mut hit.metadata, &path, &siblings).await;
         hit.split_siblings = siblings.clone();
         c.put(path.clone(), mtime, size, hit.clone()).await;
@@ -913,6 +918,18 @@ async fn parse_into_model(
     }
   }
 
+  parse_uncached(path, parent, source, siblings, mtime, size, cache).await
+}
+
+async fn parse_uncached(
+  path: PathBuf,
+  parent: PathBuf,
+  source: ModelSource,
+  siblings: Vec<PathBuf>,
+  mtime: Option<std::time::SystemTime>,
+  size: u64,
+  cache: Option<&MetadataCache>,
+) -> DiscoveredModel {
   // On a cache miss, parse the model header and detect its mmproj
   // modality + separate MTP head together on one blocking-pool hop.
   // Detection runs only here (not on warm cache hits) so periodic
@@ -1852,6 +1869,13 @@ mod tests {
       params().await,
       Some(2_000_000),
       "an unchanged sibling list reuses the cached sum"
+    );
+
+    fs::remove_file(dir.join("m-00002-of-00002.gguf")).unwrap();
+    assert_eq!(
+      params().await,
+      Some(1_000_000),
+      "removing every sibling drops the cached sum"
     );
     fs::remove_dir_all(&dir).ok();
   }

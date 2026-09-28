@@ -51,7 +51,9 @@ pub struct CachedParse {
   pub mtp_head: Option<PathBuf>,
   /// The split siblings `metadata`'s shard-summed figures were read from. A hit
   /// with a different sibling list re-reads them; the entry is keyed on the
-  /// first shard alone, and a split set can still be downloading.
+  /// first shard alone, and a split set can still be downloading. A sibling
+  /// replaced under the same name, or unreadable when summed, stays stale until
+  /// the first shard changes, like `multimodal`.
   pub split_siblings: Vec<PathBuf>,
 }
 

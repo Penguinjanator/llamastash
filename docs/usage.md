@@ -773,7 +773,7 @@ Two shapes:
 | `memory_gib` | no | Admission demand for a row without `model` (a `model` launch is sized from its GGUF). Unset means no memory gating. |
 | `stop_grace_secs` | no | Minimum SIGTERM-to-SIGKILL grace on every stop path: `stop`, `stop --all`, idle eviction, daemon shutdown. A shorter `--grace` is raised to it. |
 | `ready_timeout_secs` | no | Readiness timeout, replacing the default probe budget. |
-| `rewrite_model` | no | `true` makes the proxy replace `body.model` with the launch's `{name}` value. Set it for a server that refuses any other model name (gufo's `--served-model-name`), so a plain id sent to a named launch, or `<model>@<other>` sent to the unnamed one, still reaches it. Default `false`: the body is forwarded unchanged. |
+| `rewrite_model` | no | `true` makes the proxy replace `body.model` with the launch's `{name}` value. Set it for a server that refuses any other model name (gufo's `--served-model-name`), so a plain id sent to a named launch, or `<model>@<other>` sent to the unnamed one, still reaches it. Default `false`: the body is forwarded unchanged. With it on, the proxy rebuilds each JSON body's top level (keys in their original order, nested values copied byte for byte), so a large body is held twice while it is rewritten. |
 
 **Placeholders** in `args` and `env`: `{port}`, `{host}` (always `127.0.0.1`), `{name}` (the id `/v1/models` publishes for the model, repo-qualified when another model shares its name; `id@launch` for a named launch), `{model}`, and `{<knob id>}`. An unknown placeholder is refused at config load. Braces that don't hold a plain identifier (`{"a": 1}`) stay literal.
 

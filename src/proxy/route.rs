@@ -348,7 +348,8 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
   // launch when that one is unnamed, instead of loading a second copy with the
   // same settings. A name that is one of the model's presets still auto-starts,
   // because it asks for different settings. A launch still loading is reached
-  // by dropping the name: the unnamed auto-start attaches to it and waits.
+  // by dropping the name: the unnamed auto-start attaches to it and waits. If
+  // that load then fails, the auto-start brings up an unnamed copy, not `@<name>`.
   if target.is_none() {
     if let (Some(n), Some(st), [(launch_id, model)]) = (&name, &state_snap, &same_model[..]) {
       let model_state = model.state().await;
