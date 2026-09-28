@@ -1823,13 +1823,26 @@ mod tests {
   fn precheck_needs_llama_server_only_when_no_other_backend_is_enabled() {
     let dir = crate::test_support::unique_temp_dir("ls-precheck", "no-llama");
     let mut opts = DaemonOptions::rooted_at(dir);
+    // Keep a developer's own engines on PATH out of the result.
+    opts.backend.ds4.enabled = Some(false);
+    opts.backend.vllm.enabled = Some(false);
+    opts.backend.sglang.enabled = Some(false);
+    opts.backend.lemonade.enabled = Some(false);
     assert!(opts.binary.is_none());
     let err = precheck_indicated_backends(&opts).expect_err("nothing to launch");
     assert!(err.contains("llama-server"), "{err}");
 
-    opts.backend.generic =
-      yaml_serde::from_str("servers:\n  - {name: only, binary: /opt/only/serve, ready: /health}\n")
-        .expect("generic config");
+    let entry = |binary: &str| {
+      yaml_serde::from_str(&format!(
+        "servers:\n  - {{name: only, binary: {binary}, ready: /health}}\n"
+      ))
+      .expect("generic config")
+    };
+    opts.backend.generic = entry("/nonexistent/only-serve");
+    precheck_indicated_backends(&opts).expect_err("an entry whose binary is missing can't launch");
+
+    let exe = std::env::current_exe().unwrap();
+    opts.backend.generic = entry(&exe.display().to_string());
     precheck_indicated_backends(&opts).expect("a generic entry can launch without llama-server");
   }
 

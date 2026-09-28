@@ -301,7 +301,11 @@ impl Backend for GenericBackend {
     config: &super::BackendConfig,
     _force: &BTreeMap<String, bool>,
   ) -> bool {
-    !config.generic.servers.is_empty()
+    config
+      .generic
+      .servers
+      .iter()
+      .any(|s| s.binary_path().is_file())
   }
 
   async fn config_catalog_rows(

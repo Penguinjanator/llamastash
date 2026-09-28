@@ -40,6 +40,9 @@ use crate::launch::params::LaunchParams;
 /// supervision racing an early `start_model`) can't both spawn an umbrella.
 static ENSURE_LOCK: Mutex<()> = Mutex::const_new(());
 
+/// How long a respawn waits for an exited umbrella to release its port.
+const EXITED_PORT_WAIT: Duration = Duration::from_secs(5);
+
 /// Reserved supervisor id for the single `lemond` umbrella. One umbrella
 /// per daemon, shared by all Lemonade-backed models.
 pub fn umbrella_launch_id() -> LaunchId {
@@ -84,6 +87,12 @@ pub async fn ensure_umbrella(
     match existing.state().await {
       ManagedState::Error { .. } | ManagedState::Stopped => {
         registry.remove(&id).await;
+        // A probe timeout reports `Error` right after SIGKILL, before the
+        // process has exited and released the port.
+        let deadline = std::time::Instant::now() + EXITED_PORT_WAIT;
+        while !super::umbrella_port_available(port) && std::time::Instant::now() < deadline {
+          tokio::time::sleep(Duration::from_millis(100)).await;
+        }
       }
       _ => return Ok(existing),
     }
