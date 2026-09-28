@@ -392,9 +392,14 @@ counts as activity precisely so that doesn't happen mid-session.
 
 ## Daemon stop and restart
 
-`daemon stop`, `daemon restart`, and the TUI's `Ctrl+R` all go through one
+Every path that brings the daemon down from the client side goes through one
 function, `daemon::restart::shutdown_and_wait`: call the `shutdown` RPC, then
-poll the lockfile until the old process is gone. The RPC only *requests*
+poll the lockfile until the old process is gone. Four callers — `daemon stop`,
+`daemon restart`, the TUI's `Ctrl+R`, and the `--llama-server` reconcile in
+`cli::client::connect_or_spawn`, which re-spawns the running daemon on a
+different `llama-server`. Waiting on the lockfile is the whole point: an earlier
+copy polled until the control-plane socket refused connections, and a daemon
+still draining inside that window answered `AlreadyRunning` to the replacement. The RPC only *requests*
 teardown — the daemon still has to drain connections, stop every managed
 launch, and drop its `flock` — so a caller that returns on the answer races
 the replacement launch into "already running". The window is the longest child
@@ -402,7 +407,8 @@ stop grace the daemon reported plus 5 s, floored at 10 s. It reports
 `Stopped`, `NoChannel` (nothing reachable over IPC — the caller then decides
 between "genuinely down" and a stale PID that needs signalling), or
 `StillExiting { pid }`. `daemon restart` refuses to spawn on that last one;
-plain `stop` calls it success.
+plain `stop` calls it success, and the reconcile logs and re-spawns anyway — a
+failed background reconcile should not fail the command that triggered it.
 
 The restart's start half is the CLI's `daemon start` path unchanged — same
 flag set (`DaemonStartArgs`), same config migration, LAN proxy-key

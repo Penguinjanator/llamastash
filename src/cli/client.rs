@@ -15,7 +15,9 @@ use crate::cli::cli_args::Cli;
 use crate::cli::exit_codes::{CliExit, DAEMON_UNREACHABLE};
 use crate::config::Config;
 use crate::daemon::{
-  existing_daemon_pid, runtime_file, start_detached, DaemonOptions, StartOutcome,
+  existing_daemon_pid,
+  restart::{shutdown_and_wait, StopOutcome},
+  runtime_file, start_detached, DaemonOptions, StartOutcome,
 };
 use crate::ipc::{Client, ClientError};
 use crate::util::paths::state_dir;
@@ -231,11 +233,19 @@ async fn reconcile_binary_with_running_daemon(
       .map(|p| p.display().to_string())
       .unwrap_or_else(|| "—".into())
   );
-  // Trigger shutdown on the existing daemon, then re-spawn with the
-  // CLI flag flowing through `build_spawn_options`.
-  let _ = client.call("shutdown", None).await;
+  // Re-spawn with the CLI flag flowing through `build_spawn_options`. The stop
+  // is the shared one (`daemon stop` / `daemon restart` / `Ctrl+R`): waiting on
+  // the lockfile instead of the socket going quiet is what keeps the
+  // replacement's `acquire` off a daemon that has not let go yet. Forgiving by
+  // design — a failed reconcile must not fail the command that triggered it.
   drop(client);
-  await_socket_gone(attach_dir, Duration::from_secs(3)).await;
+  match shutdown_and_wait(attach_dir).await {
+    Ok(StopOutcome::Stopped) | Ok(StopOutcome::NoChannel) => {}
+    Ok(StopOutcome::StillExiting { pid }) => {
+      log::warn!("daemon: pid {pid} still exiting; the re-spawn may keep the old daemon");
+    }
+    Err(e) => log::warn!("daemon: shutdown during --llama-server reconcile failed: {e}"),
+  }
   let opts = build_spawn_options(cli, config)?;
   let attach_for_poll = opts.state_dir.clone();
   match start_detached(opts) {
@@ -244,19 +254,6 @@ async fn reconcile_binary_with_running_daemon(
       DAEMON_UNREACHABLE,
       format!("daemon: restart for --llama-server failed: {e}"),
     )),
-  }
-}
-
-/// Poll until the daemon stops responding (or `total` elapses). Used
-/// after `shutdown` so the follow-up `start_detached` doesn't race
-/// with the old daemon's runtime.json teardown.
-async fn await_socket_gone(attach_dir: &std::path::Path, total: Duration) {
-  let deadline = std::time::Instant::now() + total;
-  while std::time::Instant::now() < deadline {
-    if Client::connect(attach_dir).await.is_err() {
-      return;
-    }
-    tokio::time::sleep(Duration::from_millis(50)).await;
   }
 }
 
