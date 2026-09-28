@@ -67,6 +67,18 @@ const MAX_ARRAY_LEN: u64 = 1_000_000;
 /// nested arrays in real GGUFs.
 const MAX_ARRAY_NEST_DEPTH: usize = 4;
 
+/// Tokenizer tables: 100k+ entries per model, stepped over without allocating.
+/// Parsing them into values cost tens of MiB per header read, and nothing reads
+/// them except [`TOKENS_KEY`], which keeps only the entries in
+/// [`crate::gguf::metadata::REASONING_MARKERS`].
+const SKIPPED_KEYS: &[&str] = &[
+  "tokenizer.ggml.scores",
+  "tokenizer.ggml.token_type",
+  "tokenizer.ggml.merges",
+  "tokenizer.ggml.precompiled_charsmap",
+];
+const TOKENS_KEY: &str = "tokenizer.ggml.tokens";
+
 /// Tunable knobs for [`read_path`] and [`read_reader`].
 #[derive(Debug, Clone, Copy)]
 pub struct HeaderReadOptions {
@@ -211,22 +223,36 @@ pub fn read_path<P: AsRef<Path>>(path: P, opts: HeaderReadOptions) -> GgufResult
   read_reader(file, opts)
 }
 
-/// Read and parse the header from any [`Read`] source. The reader is fully
-/// consumed (or hits the cap) before parsing; this keeps the BLAKE3 input
-/// byte-stable irrespective of reader-side chunk sizes.
-pub fn read_reader<R: Read>(reader: R, opts: HeaderReadOptions) -> GgufResult<ReadHeader> {
-  let cap = opts.cap_bytes.min(MAX_HEADER_CAP_BYTES);
-  let mut buf = Vec::new();
-  // +1 so we can detect that the file is longer than the cap (the read of
-  // the cap-plus-one byte either succeeds or returns 0).
-  let mut take = reader.take(cap + 1);
-  take.read_to_end(&mut buf)?;
-  let truncated_by_cap = buf.len() as u64 > cap;
-  if truncated_by_cap {
-    buf.truncate(cap as usize);
-  }
+/// First read window of [`read_reader`]; it doubles until the header fits.
+const INITIAL_READ_BYTES: usize = 1 << 20;
 
-  let mut cur = Cursor::new(&buf);
+/// Read and parse the header from any [`Read`] source, reading in growing
+/// windows up to the cap. Reading the whole cap up front cost a 32 MiB buffer
+/// per parse (`read_to_end` doubles past 16 MiB) for headers that are mostly
+/// under 8 MiB. `raw` is the bytes the parse consumed, so it does not depend on
+/// the window sizes.
+pub fn read_reader<R: Read>(mut reader: R, opts: HeaderReadOptions) -> GgufResult<ReadHeader> {
+  let cap = opts.cap_bytes.min(MAX_HEADER_CAP_BYTES) as usize;
+  let mut buf: Vec<u8> = Vec::new();
+  let mut want = INITIAL_READ_BYTES.min(cap);
+  loop {
+    buf.reserve_exact(want - buf.len());
+    (&mut reader)
+      .take((want - buf.len()) as u64)
+      .read_to_end(&mut buf)?;
+    let at_end = buf.len() < want;
+    match parse_header(&buf) {
+      // A window that cuts the header reads as either error.
+      Err(GgufError::Truncated { .. } | GgufError::BadStringLen(_)) if !at_end && want < cap => {
+        want = want.saturating_mul(2).min(cap);
+      }
+      result => return result,
+    }
+  }
+}
+
+fn parse_header(buf: &[u8]) -> GgufResult<ReadHeader> {
+  let mut cur = Cursor::new(buf);
   let magic = cur.read_bytes(4)?;
   if magic != GGUF_MAGIC {
     return Err(GgufError::BadMagic);
@@ -258,7 +284,15 @@ pub fn read_reader<R: Read>(reader: R, opts: HeaderReadOptions) -> GgufResult<Re
   for _ in 0..kv_count {
     let key = cur.read_gguf_string()?;
     let value_type = cur.read_u32_le()?;
-    let value = read_value(&mut cur, value_type, 0)?;
+    if SKIPPED_KEYS.contains(&key.as_str()) {
+      skip_value(&mut cur, value_type, 0)?;
+      continue;
+    }
+    let value = if key == TOKENS_KEY && value_type == 9 {
+      read_marker_tokens(&mut cur)?
+    } else {
+      read_value(&mut cur, value_type, 0)?
+    };
     metadata.insert(key, value);
   }
 
@@ -311,20 +345,7 @@ fn read_value(cur: &mut Cursor<'_>, value_type: u32, depth: usize) -> GgufResult
     7 => GgufValue::Bool(cur.read_u8()? != 0),
     8 => GgufValue::String(cur.read_gguf_string()?),
     9 => {
-      if depth >= MAX_ARRAY_NEST_DEPTH {
-        return Err(GgufError::ArrayNestingTooDeep {
-          depth: depth + 1,
-          cap: MAX_ARRAY_NEST_DEPTH,
-        });
-      }
-      let elem_ty = cur.read_u32_le()?;
-      let len = cur.read_u64_le()?;
-      if len > MAX_ARRAY_LEN {
-        return Err(GgufError::HeaderTooLarge {
-          advertised: len,
-          cap: MAX_ARRAY_LEN,
-        });
-      }
+      let (elem_ty, len) = read_array_head(cur, depth)?;
       // Vec pre-allocation must be bounded by what can actually be read
       // from the remaining header bytes. A malicious header can declare
       // `len = MAX_ARRAY_LEN` and then truncate — without this cap we
@@ -345,6 +366,71 @@ fn read_value(cur: &mut Cursor<'_>, value_type: u32, depth: usize) -> GgufResult
     12 => GgufValue::F64(f64::from_le_bytes(cur.read_array::<8>()?)),
     other => return Err(GgufError::BadValueType(other)),
   })
+}
+
+/// Advance past one value without building it. Same limits as [`read_value`].
+fn skip_value(cur: &mut Cursor<'_>, value_type: u32, depth: usize) -> GgufResult<()> {
+  let width = match value_type {
+    0 | 1 | 7 => 1,
+    2 | 3 => 2,
+    4..=6 => 4,
+    10..=12 => 8,
+    8 => {
+      cur.read_gguf_str_bytes()?;
+      return Ok(());
+    }
+    9 => {
+      let (elem_ty, len) = read_array_head(cur, depth)?;
+      for _ in 0..len {
+        skip_value(cur, elem_ty, depth + 1)?;
+      }
+      return Ok(());
+    }
+    other => return Err(GgufError::BadValueType(other)),
+  };
+  cur.read_bytes(width)?;
+  Ok(())
+}
+
+/// A string array with only the entries in
+/// [`crate::gguf::metadata::REASONING_MARKERS`] kept.
+fn read_marker_tokens(cur: &mut Cursor<'_>) -> GgufResult<GgufValue> {
+  let (elem_ty, len) = read_array_head(cur, 0)?;
+  let mut kept = Vec::new();
+  for _ in 0..len {
+    if elem_ty != 8 {
+      skip_value(cur, elem_ty, 1)?;
+      continue;
+    }
+    let bytes = cur.read_gguf_str_bytes()?;
+    if let Some(m) = crate::gguf::metadata::REASONING_MARKERS
+      .iter()
+      .find(|m| m.as_bytes() == bytes)
+    {
+      kept.push(GgufValue::String((*m).to_string()));
+    }
+  }
+  Ok(GgufValue::Array(kept))
+}
+
+/// An array's element type and length, checked against the nesting and
+/// length caps.
+fn read_array_head(cur: &mut Cursor<'_>, depth: usize) -> GgufResult<(u32, u64)> {
+  if depth >= MAX_ARRAY_NEST_DEPTH {
+    return Err(GgufError::ArrayNestingTooDeep {
+      depth: depth + 1,
+      cap: MAX_ARRAY_NEST_DEPTH,
+    });
+  }
+  let elem_ty = cur.read_u32_le()?;
+  let len = cur.read_u64_le()?;
+  if len > MAX_ARRAY_LEN {
+    return Err(GgufError::HeaderTooLarge {
+      advertised: len,
+      cap: MAX_ARRAY_LEN,
+    });
+  }
+  Ok((elem_ty, len))
 }
 
 /// Tiny byte-slice cursor with EOF-aware reads. Kept private so the parser
@@ -400,12 +486,16 @@ impl<'a> Cursor<'a> {
     Ok(u64::from_le_bytes(self.read_array::<8>()?))
   }
 
-  fn read_gguf_string(&mut self) -> GgufResult<String> {
+  fn read_gguf_str_bytes(&mut self) -> GgufResult<&'a [u8]> {
     let len = self.read_u64_le()?;
     if len > MAX_STRING_LEN || len as usize > self.remaining() {
       return Err(GgufError::BadStringLen(len));
     }
-    let bytes = self.read_bytes(len as usize)?;
+    self.read_bytes(len as usize)
+  }
+
+  fn read_gguf_string(&mut self) -> GgufResult<String> {
+    let bytes = self.read_gguf_str_bytes()?;
     std::str::from_utf8(bytes)
       .map(|s| s.to_owned())
       .map_err(|_| GgufError::BadUtf8)
@@ -417,6 +507,60 @@ mod tests {
   use super::*;
   use crate::gguf::test_fixtures::{build_minimal_gguf, FixtureBuilder};
   use std::io::Cursor as IoCursor;
+
+  #[test]
+  fn tokenizer_tables_are_skipped_and_tokens_keep_only_markers() {
+    let strings =
+      |v: &[&str]| GgufValue::Array(v.iter().map(|s| GgufValue::String(s.to_string())).collect());
+    let bytes = FixtureBuilder::new()
+      .with_arch("qwen3")
+      .with_kv(
+        "tokenizer.ggml.tokens",
+        strings(&["<bos>", "<think>", "hi"]),
+      )
+      .with_kv("tokenizer.ggml.merges", strings(&["a b", "c d"]))
+      .with_kv(
+        "tokenizer.ggml.scores",
+        GgufValue::Array(vec![GgufValue::F32(0.5), GgufValue::F32(1.0)]),
+      )
+      .with_kv("general.name", GgufValue::String("after".to_string()))
+      .with_tensor("token_embd.weight", &[4, 4], 0)
+      .build();
+    let read = read_reader(IoCursor::new(bytes.clone()), HeaderReadOptions::default()).unwrap();
+    let md = &read.header.metadata;
+    assert_eq!(
+      md.get("tokenizer.ggml.tokens"),
+      Some(&strings(&["<think>"]))
+    );
+    assert!(md.get("tokenizer.ggml.merges").is_none());
+    assert!(md.get("tokenizer.ggml.scores").is_none());
+    assert_eq!(read.header.string(&["general.name"]), Some("after"));
+    assert_eq!(read.header.tensors.len(), 1);
+    assert_eq!(
+      read.raw.len(),
+      bytes.len(),
+      "identity bytes still cover the whole header"
+    );
+  }
+
+  #[test]
+  fn a_header_past_the_first_read_window_parses_whole() {
+    let big = "x".repeat(3 * INITIAL_READ_BYTES / 2);
+    let bytes = FixtureBuilder::new()
+      .with_arch("qwen3")
+      .with_kv("general.description", GgufValue::String(big.clone()))
+      .with_kv("general.name", GgufValue::String("after".to_string()))
+      .with_tensor("token_embd.weight", &[4, 4], 0)
+      .build();
+    assert!(bytes.len() > INITIAL_READ_BYTES);
+    let read = read_reader(IoCursor::new(bytes.clone()), HeaderReadOptions::default()).unwrap();
+    assert_eq!(
+      read.header.string(&["general.description"]),
+      Some(big.as_str())
+    );
+    assert_eq!(read.header.string(&["general.name"]), Some("after"));
+    assert_eq!(read.raw, bytes);
+  }
 
   #[test]
   fn rejects_non_gguf_bytes() {

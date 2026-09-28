@@ -408,6 +408,8 @@ counts as activity precisely so that doesn't happen mid-session.
 
 The discovery scanner emits one entry per canonical path — symlinks dedupe to their target — so the same model file doesn't appear twice. Split GGUFs (`model-00001-of-00003.gguf`) collapse into a single entry whose launch target is shard 1.
 
+**Rescans.** The daemon rescans on a debounced filesystem event (500 ms) and every 5 minutes (`discovery::watcher`). Open and read-only close events are dropped, because the scan's own directory walk and header reads produce them; passing them on made each rescan trigger the next. A rescan re-reads a header only on a `metadata_cache` miss (changed mtime or size, or a changed split sibling list), and the header parser steps over the tokenizer tables (`tokenizer.ggml.tokens` keeps only its reasoning markers).
+
 **User-visible names** are derived, never stored, and all live in `util::paths`:
 
 | Rule | What it yields | Where it shows |

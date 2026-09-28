@@ -95,7 +95,7 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 ignore = "0.4"
 libc = "0.2"
 log = "0.4"
-notify-debouncer-mini = { version = "0.7", default-features = false }
+notify = "8.2"
 # OS-randomness source for the per-daemon bearer token. Already in
 # tree transitively via hf-hub; pulled to top-level so the auth
 # module owns its dep. We only use `rand::rngs::OsRng` + `fill_bytes`
