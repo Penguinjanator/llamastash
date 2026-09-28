@@ -21,8 +21,14 @@ async fn main() -> Result<()> {
       }
       if cli::cli_args::argv_wants_json() {
         let text = err.render().to_string();
-        let first = text.lines().next().unwrap_or_default().trim();
-        let message = first.strip_prefix("error: ").unwrap_or(first);
+        // The error is the first paragraph; the `Usage:` block follows a blank line.
+        let head = text
+          .lines()
+          .take_while(|l| !l.trim().is_empty())
+          .map(str::trim)
+          .collect::<Vec<_>>()
+          .join(" ");
+        let message = head.strip_prefix("error: ").unwrap_or(&head);
         cli::output::print_json_error(cli::exit_codes::USAGE, message);
       } else {
         let _ = err.print();

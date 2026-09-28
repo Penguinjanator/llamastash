@@ -1408,6 +1408,15 @@ fn a_parse_error_under_json_prints_a_json_error() {
   );
   assert!(err.is_empty(), "stderr: {err}");
 
+  // A missing argument's name sits on the lines after clap's first one.
+  let (code, out, _) = run_cli(dir.path(), &["show", "--json"]);
+  assert_eq!(code, exit_codes::USAGE);
+  assert_eq!(
+    json_error(&out),
+    "the following required arguments were not provided: <MODEL>",
+    "stdout: {out}"
+  );
+
   // After `--`, `--json` belongs to the engine, not to us.
   let (code, out, _) = run_cli(dir.path(), &["list", "--bogus", "--", "--json"]);
   assert_eq!(code, exit_codes::USAGE);
