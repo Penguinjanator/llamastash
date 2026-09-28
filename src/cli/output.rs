@@ -87,7 +87,7 @@ pub fn list_human(
   }
   // Show the BACKEND column when any model surfaces a backend beyond the
   // default `llamacpp` — either a non-default primary or more than one supported
-  // backend (such a file lists `vllm|llamacpp`). Matches the TUI's
+  // backend (a file two backends claim lists both, `<other>|llamacpp`). Matches the TUI's
   // `multi_backend` gate.
   let show_backend = rows.iter().any(|r| {
     r.supported_backends.len() > 1
@@ -214,7 +214,7 @@ fn addressable_name(row: &CatalogRow, run: Option<&RunningRow>) -> String {
 }
 
 /// Backend badge for a catalog row: every backend that can serve it,
-/// priority-ordered (`vllm|llamacpp`), else the daemon's single tag, else
+/// priority-ordered (`<other>|llamacpp`), else the daemon's single tag, else
 /// `placeholder`. Shared by the `list` BACKEND column and `show`'s header
 /// row so the two surfaces can never name different backends for one model.
 /// The table formatter clips the cell if it overflows.
@@ -1229,12 +1229,12 @@ mod tests {
   #[test]
   fn backend_badge_is_the_one_rule_both_surfaces_render() {
     // `list`'s BACKEND column and `show`'s header row share this helper, so a
-    // file two backends serve can never read `vllm|llamacpp` on one surface and
+    // file two backends serve can never read `other|llamacpp` on one surface and
     // `llamacpp` on the other.
     let mut multi = row("ds", "deepseek4", "IQ2_XXS", 8192);
-    multi.supported_backends = vec!["vllm".into(), "llamacpp".into()];
+    multi.supported_backends = vec!["other".into(), "llamacpp".into()];
     multi.backend = Some("llamacpp".into());
-    assert_eq!(backend_badge(&multi, "?"), "vllm|llamacpp");
+    assert_eq!(backend_badge(&multi, "?"), "other|llamacpp");
 
     // Untagged by the daemon → the caller's placeholder, not a guess from
     // the row's `source`.

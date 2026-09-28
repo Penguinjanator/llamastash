@@ -644,8 +644,8 @@ impl LaunchPickerState {
   // ------------------------------------------------------------- backend
 
   /// The model's concrete backend. An explicit server pick determines it (its
-  /// owning backend), so cycling to a llama.cpp server on a vLLM model swaps
-  /// the knob set; an unset pick falls through to the model's own backend.
+  /// owning backend), so cycling to another backend's server swaps the knob
+  /// set; an unset pick falls through to the model's own backend.
   /// Registry-driven — names no backend.
   fn resolved_backend(&self) -> crate::backend::Backends {
     use crate::backend::{Backend, Backends};
@@ -2060,7 +2060,7 @@ mod tests {
 
   #[test]
   fn the_selected_servers_backend_regenerates_the_whole_row_set() {
-    // A model with a vLLM server and a llama.cpp server.
+    // Two real backends so the knob sets differ; no model offers both today.
     let mut s = LaunchPickerState::for_model("Qwen3-8B");
     s.model_backend = BackendChoice::Explicit("vllm".into());
     s.servers = vec![

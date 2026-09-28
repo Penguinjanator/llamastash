@@ -924,11 +924,12 @@ The knob ids match the old backend's, so presets keep working. The exceptions ar
 
 **Migrating from the ds4 backend.** A config that still has `backend.ds4:` is rejected at load, and the error points here.
 
-1. Delete the `backend.ds4:` block, and drop `--ds4` / `LLAMASTASH_DS4` from your scripts.
-2. Add the `generic` entry above, with `binary` set to your `ds4-server`.
-3. Add `server: generic-ds4` to your ds4 presets. llama.cpp is now the default server for these GGUFs, so a preset or `--server generic-ds4` picks ds4.
-4. Set `mtp-model` in a preset to pair a draft head. The old backend found the MTP or DSpark file next to the model on its own; a generic entry doesn't.
-5. Run `llamastash daemon restart`.
+1. Stop every running ds4 model (`llamastash stop <model>`) **before** you upgrade. The new daemon can't re-adopt a `ds4-server` the old backend started: it keeps running and holds its port and memory, but `status` doesn't list it and `stop` can't reach it. If one is left over, find it with `pgrep -a ds4-server` and `kill` its PID.
+2. Delete the `backend.ds4:` block, and drop `--ds4` / `LLAMASTASH_DS4` from your scripts.
+3. Add the `generic` entry above, with `binary` set to your `ds4-server`.
+4. In your ds4 presets, replace `backend: ds4` with `server: generic-ds4`. llama.cpp is now the default server for these GGUFs, so a preset or `--server generic-ds4` picks ds4. A leftover `backend: ds4` with no `server:` doesn't fail: it runs the model on llama.cpp. The same goes for the remembered last launch of a ds4 model, until you launch it once with `--server generic-ds4`.
+5. Set `mtp-model` in a preset to pair a draft head. The old backend found the MTP or DSpark file next to the model on its own; a generic entry doesn't.
+6. Run `llamastash daemon restart`.
 
 What the dedicated backend did that the generic entry doesn't:
 
