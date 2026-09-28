@@ -40,8 +40,8 @@ pub struct WriteOutcome {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WriteError {
-  #[error("parent dir {} is not owner-only-writable (mode {mode:#o}); refuse to write a 0600 config there", path.display())]
-  ParentDirInsecure { path: PathBuf, mode: u32 },
+  #[error("parent dir {} {reason}; refusing to write a 0600 config there", path.display())]
+  ParentDirInsecure { path: PathBuf, reason: String },
   #[error("config write I/O at {}: {error}", path.display())]
   Io { path: PathBuf, error: String },
   #[error("config serialise: {0}")]
@@ -141,18 +141,13 @@ pub fn preflight(path: &Path) -> Result<PathBuf, WriteError> {
   let target = resolve_write_target(path);
   #[cfg(unix)]
   {
-    use crate::util::file_security::{dir_swap_surface, SwapSurface};
+    use crate::util::file_security::dir_swap_surface;
     if let Some(parent) = target.parent() {
       let our_uid = unsafe { libc::geteuid() };
       if let Some(surface) = dir_swap_surface(parent, our_uid) {
-        let mode = match surface {
-          SwapSurface::ForeignOwner { mode, .. }
-          | SwapSurface::WorldWritable { mode }
-          | SwapSurface::ForeignOwnerGroupWritable { mode, .. } => mode,
-        };
         return Err(WriteError::ParentDirInsecure {
           path: parent.to_path_buf(),
-          mode,
+          reason: surface.describe(our_uid),
         });
       }
     }
@@ -438,18 +433,31 @@ arch_defaults:
 
   #[cfg(unix)]
   #[test]
-  fn preflight_accepts_self_owned_group_writable_parent() {
-    // A group-writable config dir *we* own is not a swap surface — no
-    // other user can rename a 0600 file out of it. (Shares the owner-aware
-    // rule with the init binary-adoption check.)
+  fn preflight_self_owned_group_writable_parent_follows_the_private_group_rule() {
+    // A group-writable config dir *we* own is a swap surface only when its
+    // group is shared: with a user-private `user:user` group (the reported
+    // `mise` / 002-umask case) no other user can rename a 0600 file out of
+    // it. A shared group — macOS `staff`, a Linux `users` — refuses.
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
     let dir = temp_dir("perm-own-gw");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
     let target = dir.join("config.yaml");
-    assert!(
-      preflight(&target).is_ok(),
-      "a self-owned 0775 dir must not refuse the config write"
-    );
+    let our_uid = unsafe { libc::geteuid() };
+    let gid = fs::metadata(&dir).unwrap().gid();
+    if crate::util::file_security::is_user_private_group(gid, our_uid) {
+      assert!(
+        preflight(&target).is_ok(),
+        "a self-owned 0775 dir on a user-private group must not refuse the config write"
+      );
+    } else {
+      let err = preflight(&target).unwrap_err();
+      assert!(
+        matches!(err, WriteError::ParentDirInsecure { .. })
+          && err.to_string().contains("group-writable"),
+        "a self-owned 0775 dir on a shared group must refuse: {err}"
+      );
+    }
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
     fs::remove_dir_all(&dir).ok();
   }

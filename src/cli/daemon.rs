@@ -1656,8 +1656,8 @@ mod tests {
     // Detached daemon re-reads the key from config; if the write fails
     // the child can't see the key, hits the backstop, and drops the
     // proxy. provision must refuse to start rather than print a dead
-    // key. Force a write failure with a group/world-writable config dir
-    // (the writer refuses to drop a 0600 file into a permissive dir).
+    // key. Force a write failure with a world-writable config dir (the
+    // writer refuses to drop a 0600 file into a dir another user can write).
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();

@@ -242,16 +242,29 @@ mod tests {
 
   #[cfg(unix)]
   #[test]
-  fn accepts_binary_in_self_owned_group_writable_dir() {
-    // A group-writable directory *we* own (the home-dir default, e.g. a
-    // `mise` installs tree) has no other user who can write into it, so
-    // adopting a binary from it is safe — the reported false positive.
+  fn accepts_binary_in_self_owned_group_writable_dir_on_a_private_group() {
+    // A group-writable directory *we* own is safe only when its group is a
+    // user-private one (the home-dir default, e.g. a `mise` installs tree):
+    // no other user can write into it. That premise fails on macOS, where
+    // every local user's primary group is `staff`, so the answer here
+    // follows the host's actual primary group.
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
     let dir = temp_dir("perm-own-gw");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
     let bin = dir.join("llama-server");
     write_exec(&bin, b"#!/bin/sh\n");
-    install_from_custom_path(&bin).expect("accept a binary in a self-owned 0775 dir");
+    let our_uid = unsafe { libc::geteuid() };
+    let gid = fs::metadata(&dir).unwrap().gid();
+    if crate::util::file_security::is_user_private_group(gid, our_uid) {
+      install_from_custom_path(&bin).expect("accept a binary in a self-owned 0775 dir");
+    } else {
+      let err = install_from_custom_path(&bin).unwrap_err();
+      assert!(
+        matches!(err, InstallError::Integrity(ref msg) if msg.contains("group-writable")),
+        "a 0775 dir on a shared group must refuse: {err:?}"
+      );
+    }
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
     fs::remove_dir_all(&dir).ok();
   }

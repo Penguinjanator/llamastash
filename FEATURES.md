@@ -269,7 +269,7 @@ The GH Releases `llama-server` extractor enforces an entry-count cap, total unco
 
 ### Atomic, mode-checked config + state writes
 
-Every persisted file (config, state, snapshot) goes through temp-file + rename. The write refuses symlinks and parent directories another user could write into (world-writable, or group-writable on a dir not owned by you), and the final file lands at mode `0600`. A corrupt `state.json` is quarantined to `state.json.broken-<ts>` and the daemon boots clean rather than refusing to start — your favorites and last-params get one shot at recovery from the quarantine file (presets live in `config.yaml`, untouched by a `state.json` quarantine).
+Every persisted file (config, state, snapshot) goes through temp-file + rename. The write refuses symlinks and parent directories another user could write into (world-writable, or group-writable on a group that isn't your own user-private one — `user:user`, not macOS `staff`), and the final file lands at mode `0600`. A corrupt `state.json` is quarantined to `state.json.broken-<ts>` and the daemon boots clean rather than refusing to start — your favorites and last-params get one shot at recovery from the quarantine file (presets live in `config.yaml`, untouched by a `state.json` quarantine).
 
 ### Side-by-side daemons
 

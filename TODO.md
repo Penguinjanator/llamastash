@@ -408,6 +408,7 @@ places.
 
 ### Low priority
 
+- [ ] **Confirm the user-private-group swap-surface rule on macOS.** [`is_user_private_group`](src/util/file_security.rs) is exercised on Linux only (uid 1000 / gid 1000, a private group). On macOS every local user's primary group is `staff`, so a self-owned `0775` dir now refuses — a real behavior change for a `002`-umask macOS host, verified here by simulating the shape with `chgrp adm` rather than on a Mac. Walk [`docs/testing/hardware-uat.md`](docs/testing/hardware-uat.md) § Apple Silicon Metal with a `chmod g+w` config dir and confirm the refusal names the shared group.
 - [ ] **Need brainstorm/plan**: **SSE for `logs_tail` streaming.** Today the CLI polls `logs_tail` every 250 ms over HTTP and de-dupes (works correctly; not a regression). SSE would collapse N polls/sec into one long-lived connection. Unit 3 of the 0.0.2 plan was explicitly deferred — needs its own brainstorm + plan.
 - [ ] **Follow-ups (deferred from PR #28):**
   - [ ] `status` "installed" check honoring `lemonade.servers` (not just PATH); single-flight hardening of the umbrella spawn.
