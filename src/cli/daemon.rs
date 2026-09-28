@@ -42,18 +42,21 @@ pub async fn handle(action: DaemonAction, cli: &Cli, config: &Config) -> Result<
   }
 }
 
-/// `daemon restart`: stop the running daemon, then run the same start path
-/// with the flags this command was given. A daemon that is still hanging
-/// around when the stop window closes is an error here, not a start — starting
-/// on top of a half-dead daemon would just surface the confusing
-/// "already running" line instead of the real problem.
+/// `daemon restart`: resolve the new daemon's options first, then stop the
+/// running daemon and run the same start path with them. Resolving first is
+/// what keeps a bad flag or a broken `config.yaml` from taking the running
+/// daemon down for nothing. A daemon that is still hanging around when the
+/// stop window closes is an error here, not a start — starting on top of a
+/// half-dead daemon would just surface the confusing "already running" line
+/// instead of the real problem.
 async fn handle_restart(args: &DaemonStartArgs, cli: &Cli, config: &Config) -> Result<()> {
-  match stop_daemon(false).await? {
+  let opts = prepare_start(args, cli, config)?;
+  match stop_daemon(&opts.state_dir, false).await? {
     StopOutcome::StillExiting { pid } => Err(anyhow::anyhow!(
       "daemon restart: pid {pid} was still exiting when the wait window closed; \
        run `llamastash daemon stop --force` and retry"
     )),
-    StopOutcome::Stopped | StopOutcome::NoChannel => handle_start(args, cli, config).await,
+    StopOutcome::Stopped | StopOutcome::NoChannel => launch_start(opts, args.foreground).await,
   }
 }
 
@@ -108,10 +111,17 @@ fn migrate_knob_config(cli: &Cli) -> Option<Config> {
   }
 }
 
-/// `daemon start` (and the second half of `daemon restart`).
+/// `daemon start`: resolve the options, then bring the daemon up.
 async fn handle_start(args: &DaemonStartArgs, cli: &Cli, config: &Config) -> Result<()> {
-  let foreground = args.foreground;
-  let force = args.force;
+  let opts = prepare_start(args, cli, config)?;
+  launch_start(opts, args.foreground).await
+}
+
+/// Resolve the `daemon start` / `daemon restart` flags into the options the
+/// daemon boots with. Everything that can fail on user input or config lives
+/// here, and it starts nothing, so `daemon restart` runs it while the old
+/// daemon is still up and a failure leaves that daemon alone.
+fn prepare_start(args: &DaemonStartArgs, cli: &Cli, config: &Config) -> Result<DaemonOptions> {
   // Bring a pre-registry `config.yaml` to the unified knob shape before
   // anything reads it. The daemon owns config writes, so this is the one
   // place it can run; a plain CLI command must never rewrite the user's file.
@@ -128,9 +138,16 @@ async fn handle_start(args: &DaemonStartArgs, cli: &Cli, config: &Config) -> Res
   // in the parent (or the foreground process) so the generated key is
   // printed to the user's terminal; the detached child re-reads it
   // from config. No-op for loopback / pre-set key / --insecure-no-auth.
-  provision_proxy_key(&mut opts, cli, foreground)?;
+  provision_proxy_key(&mut opts, cli, args.foreground)?;
   // Ride `--force` through to the detached child so it skips the precheck too.
-  opts.force = force;
+  opts.force = args.force;
+  Ok(opts)
+}
+
+/// Bring the daemon up from [`prepare_start`]'s options, detached by default,
+/// or report the one already running.
+async fn launch_start(opts: DaemonOptions, foreground: bool) -> Result<()> {
+  let force = opts.force;
   // Fail-fast: refuse to come up silently degraded when an *indicated* backend
   // can't initialize. `--force` opts out (start degraded; the failed backend is
   // simply unavailable). Skipped when a daemon is already running — that call
@@ -405,11 +422,11 @@ fn print_provisioned_key(host: IpAddr, port: u16, key: &str, persisted: bool) {
 /// ([`crate::daemon::restart::shutdown_and_wait`]), falling back to a PID
 /// signal when there is no usable IPC channel. `daemon restart` reuses the
 /// same call so both surfaces wait the same way for the old process to let go
-/// of its lockfile.
-async fn stop_daemon(force: bool) -> Result<StopOutcome> {
-  let attach_dir = state_dir().context("could not resolve state directory")?;
+/// of its lockfile. `attach_dir` comes from the caller so a `daemon restart
+/// --state-dir X` waits on X and not on whatever the ambient env resolves to.
+async fn stop_daemon(attach_dir: &std::path::Path, force: bool) -> Result<StopOutcome> {
   if !force {
-    match shutdown_and_wait(&attach_dir).await? {
+    match shutdown_and_wait(attach_dir).await? {
       StopOutcome::Stopped => {
         println!("{}", crate::cli::colors::success("daemon: stopped"));
         return Ok(StopOutcome::Stopped);
@@ -421,19 +438,20 @@ async fn stop_daemon(force: bool) -> Result<StopOutcome> {
       StopOutcome::NoChannel => {}
     }
   }
-  match existing_daemon_pid(&attach_dir) {
+  match existing_daemon_pid(attach_dir) {
     None => {
       println!("{}", crate::cli::colors::dim("daemon: not running"));
       Ok(StopOutcome::NoChannel)
     }
-    Some(pid) => force_stop_via_pid(pid, &attach_dir),
+    Some(pid) => force_stop_via_pid(pid, attach_dir),
   }
 }
 
 /// `daemon stop`: reports the outcome of [`stop_daemon`] the way the
 /// standalone command always has.
 async fn handle_stop(force: bool) -> Result<()> {
-  if let StopOutcome::StillExiting { pid } = stop_daemon(force).await? {
+  let attach_dir = state_dir().context("could not resolve state directory")?;
+  if let StopOutcome::StillExiting { pid } = stop_daemon(&attach_dir, force).await? {
     println!(
       "{} ({} {})",
       crate::cli::colors::success("daemon: shutdown requested"),

@@ -410,6 +410,14 @@ between "genuinely down" and a stale PID that needs signalling), or
 plain `stop` calls it success, and the reconcile logs and re-spawns anyway — a
 failed background reconcile should not fail the command that triggered it.
 
+`daemon restart` resolves the new daemon's options (`prepare_start`) before it
+stops anything, so a flag or a `config.yaml` that cannot produce a daemon
+fails while the old one is still up. It then waits on the state dir those
+options resolved to rather than the ambient one, so a restart driven with
+`--state-dir` acts on that daemon. `shutdown_and_wait` also drops its IPC
+client before it polls: the control plane drains down to zero active
+connections, and a client left attached makes that drain run its full 2 s.
+
 The restart's start half is the CLI's `daemon start` path unchanged — same
 flag set (`DaemonStartArgs`), same config migration, LAN proxy-key
 provisioning, and backend precheck. The TUI's restart skips that half: it
