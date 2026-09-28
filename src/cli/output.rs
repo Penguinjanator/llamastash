@@ -1104,13 +1104,16 @@ mod tests {
     );
     // A non-`llamacpp` prediction flips it on.
     let mut other = row("qwen", "qwen3", "Q4_K", 4096);
-    other.backend = Some("vllm".to_string());
+    other.backend = Some("enginex".to_string());
     let multi = list_human(&[llama, other], &HashMap::new(), false);
     assert!(
       multi.contains("BACKEND"),
       "multi-backend host shows the column"
     );
-    assert!(multi.contains("vllm"), "the vllm value renders: {multi:?}");
+    assert!(
+      multi.contains("enginex"),
+      "the enginex value renders: {multi:?}"
+    );
   }
 
   #[test]

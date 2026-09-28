@@ -102,10 +102,19 @@ pub const VLLM_FORBIDDEN_EXTRA_HEADS: &[&str] = &[
   "--data-parallel-",
   // Ray is selected through this, not through a `--ray` flag.
   "--distributed-executor-backend",
-  // Short aliases for the two parallel heads above. The matcher compares whole
-  // heads, so the long forms do not cover them (vLLM 0.27.1 arg_utils.py).
+  // Short aliases for the parallel heads above. The matcher compares whole
+  // heads, so the long forms do not cover them (vLLM 0.30.0 arg_utils.py).
   "-pp",
   "-dp",
+  "-dpn",
+  "-dpr",
+  "-dpl",
+  "-dpa",
+  "-dpp",
+  "-dpb",
+  "-dph",
+  "-dpe",
+  "-dpm",
   // Reads further flags out of a YAML file and splices them in ahead of ours,
   // so every head above — and `--trust-remote-code`, which belongs to the
   // visible knob channel — would be settable through it.
@@ -121,6 +130,9 @@ const VLLM_FORBIDDEN_EXTRA_VALUES: &[(&str, crate::launch::params::FlagValues)] 
     ("--data-parallel-hybrid-lb", None),
     ("--data-parallel-external-lb", None),
     ("--data-parallel-multi-port-external-lb", None),
+    ("-dph", None),
+    ("-dpe", None),
+    ("-dpm", None),
   ]
 };
 
@@ -1206,11 +1218,32 @@ mod tests {
       // above do not cover them.
       "-dp",
       "-pp",
+      "-dpn",
+      "-dpr",
+      "-dpl",
+      "-dpa",
+      "-dpp",
+      "-dpb",
     ] {
       let mut p = params("/c/models--o--n/snapshots/rev");
       p.extras = vec![smuggle.into(), "2".into()];
       let argv = argv_strings(&p, 1).join(" ");
       assert!(!argv.contains(smuggle), "`{smuggle}` survived: {argv}");
+      assert!(
+        !argv.split(' ').any(|a| a == "2"),
+        "`{smuggle}`'s value survived: {argv}"
+      );
+    }
+    // The load-balancer aliases take no value, so the flag after them stays.
+    for switch in ["-dph", "-dpe", "-dpm"] {
+      let mut p = params("/c/models--o--n/snapshots/rev");
+      p.extras = vec![switch.into(), "--enforce-eager".into()];
+      let argv = argv_strings(&p, 1).join(" ");
+      assert!(!argv.contains(switch), "`{switch}` survived: {argv}");
+      assert!(
+        argv.contains("--enforce-eager"),
+        "`{switch}` ate the next flag: {argv}"
+      );
     }
   }
 

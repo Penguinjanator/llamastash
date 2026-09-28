@@ -276,7 +276,7 @@ pub enum BackendChoice {
 impl BackendChoice {
   /// Stable lowercase label for CLI parsing / JSON projection — `"auto"` or the
   /// backend id. The wire form (the custom [`serde::Serialize`] below) is
-  /// exactly this string, so a persisted `"vllm"` / `"llamacpp"` round-trips
+  /// exactly this string, so a persisted `"lemonade"` / `"llamacpp"` round-trips
   /// byte-for-byte with the old enum encoding.
   /// The pinned backend id, or `None` when this is `Auto`. Callers that need
   /// "which backend's knobs apply" resolve `None` to the default themselves.
@@ -306,7 +306,7 @@ impl BackendChoice {
   }
 }
 
-// Persisted / wired as the bare id string (`"auto"`, `"vllm"`, `"llamacpp"`, …),
+// Persisted / wired as the bare id string (`"auto"`, `"lemonade"`, `"llamacpp"`, …),
 // identical to the old externally-tagged unit-variant encoding, so `state.json`
 // and preset rows stay byte-stable across this refactor.
 impl serde::Serialize for BackendChoice {
@@ -508,7 +508,7 @@ pub struct LaunchParams {
   #[serde(default)]
   pub backend: BackendChoice,
   /// Chosen **server** id — a build/binary of a backend (`llamacpp·vulkan`,
-  /// `vllm`). Determines which binary the launch spawns; persisted in
+  /// `lemonade`). Determines which binary the launch spawns; persisted in
   /// last-params so a relaunch reuses the build. `None` = no pick (default
   /// binary). `#[serde(default)]` keeps pre-server-abstraction rows loading.
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -703,7 +703,7 @@ mod tests {
       BackendChoice::Auto,
       BackendChoice::Explicit("llamacpp".into()),
       BackendChoice::Explicit("lemonade".into()),
-      BackendChoice::Explicit("vllm".into()),
+      BackendChoice::Explicit("enginex".into()),
     ] {
       let s = serde_json::to_string(&c).unwrap();
       let back: BackendChoice = serde_json::from_str(&s).unwrap();
@@ -720,8 +720,8 @@ mod tests {
       "\"llamacpp\""
     );
     assert_eq!(
-      serde_json::from_str::<BackendChoice>("\"vllm\"").unwrap(),
-      BackendChoice::Explicit("vllm".into())
+      serde_json::from_str::<BackendChoice>("\"enginex\"").unwrap(),
+      BackendChoice::Explicit("enginex".into())
     );
   }
 

@@ -837,7 +837,9 @@ mod tests {
     use ratatui::Terminal;
     let mut app = App::new(AppOptions::default());
     let mut picker = LaunchPickerState::for_model("Qwen3-8B");
-    picker.model_backend = crate::launch::params::BackendChoice::Explicit("vllm".into());
+    picker.model_backend = crate::launch::params::BackendChoice::Explicit(
+      crate::test_support::backend_declaring("kv-cache-memory-bytes").into(),
+    );
     app.launch_picker = Some(picker);
     let palette = app.palette();
     let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
@@ -853,12 +855,12 @@ mod tests {
       })
       .collect();
     let row_of = |needle: &str| rows.iter().position(|r| r.contains(needle));
-    // vLLM's own tunables are ordinary rows: they sit under the same group
-    // headers llama.cpp's do, keyed by the flag vLLM itself takes, with the
+    // A non-default backend's own tunables are ordinary rows: they sit under
+    // the same group headers llama.cpp's do, keyed by the flag it takes, with the
     // free-text extras row last of all.
     let header = row_of(crate::launch::knobs::Group::Memory.title())
-      .expect("the shared group header vLLM's memory knobs declare");
-    let ssd = row_of("kv-cache-memory-bytes").expect("a vLLM knob row");
+      .expect("the shared group header its memory knobs declare");
+    let ssd = row_of("kv-cache-memory-bytes").expect("its knob row");
     let extras = row_of("extras").expect("extras row");
     assert!(header < ssd, "group header precedes its knobs");
     assert!(ssd < extras, "extras comes last");

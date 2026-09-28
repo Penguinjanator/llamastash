@@ -2,9 +2,9 @@
 //!
 //! Terminology (see the server-abstraction plan):
 //!
-//! - a **backend** is an inference *engine* (`llamacpp` / `vllm` / `lemonade`);
+//! - a **backend** is an inference *engine* (`llamacpp` / `lemonade`);
 //! - a **server** is one *build/binary* of a backend (llama.cpp's ROCm build,
-//!   its Vulkan build, `vllm`, `lemond`). A backend has 1..N servers;
+//!   its Vulkan build, `lemond`). A backend has 1..N servers;
 //! - a **device** is a GPU a server can target, identified by the exact
 //!   `--device` selector that server's own probe reports. The compute backend
 //!   (`ROCm` / `Vulkan` / `CUDA` / `Metal`) is a *property of the device*,
@@ -88,17 +88,17 @@ pub struct ServerSpec {
 /// A resolved server: one build/binary of a backend, with its probed devices.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Server {
-  /// Stable selection / persistence key (`llamacpp-rocm`, `vllm`). Also the
+  /// Stable selection / persistence key (`llamacpp-rocm`, `lemonade`). Also the
   /// display label — derived once by [`build_server_catalog`].
   pub id: String,
-  /// The backend that owns this server (`llamacpp` / `vllm` / `lemonade`).
+  /// The backend that owns this server (`llamacpp` / `lemonade`).
   pub backend_id: String,
   /// Absolute path to the server binary the supervisor spawns.
   pub binary: PathBuf,
   /// Human-readable display name (same string as [`Self::id`] today).
   pub name: String,
   /// Devices this server can target (`--device` selectors). Empty for a
-  /// backend with no device probe (vLLM / Lemonade) or a CPU-only build.
+  /// backend with no device probe (Lemonade) or a CPU-only build.
   pub devices: Vec<Device>,
   /// Build-specific flag spellings, from [`Backend::probe_caps`]. Opaque here:
   /// the owning backend writes the keys and is the only thing that reads them,
@@ -249,10 +249,10 @@ fn binary_dir_tag(binary: &Path) -> String {
 /// `<backend>-` comes from, in order: an explicit `name:` → the unique
 /// `<gpu_backend>` a device probe reveals (`rocm` / `vulkan` / `cuda` /
 /// `metal`) → the `<binary-dir>` basename when that gpu tag collides (two ROCm
-/// builds). A **device-less** server (vLLM / Lemonade / a CPU-only build — no
-/// detectable compute type) gets the **bare backend id** (`vllm`, `lemonade`),
+/// builds). A **device-less** server (Lemonade / a CPU-only build — no
+/// detectable compute type) gets the **bare backend id** (`lemonade`),
 /// disambiguated `-N` only when several collide; an explicit `name:` (`rocm`,
-/// `cuda`) is the way to label those (`vllm-rocm`). Input pairs are
+/// `cuda`) is the way to label those (`lemonade-npu`). Input pairs are
 /// `(spec, probed devices)`.
 fn derive_servers(backend_id: &str, probed: Vec<(ServerSpec, Vec<Device>)>) -> Vec<Server> {
   // Provisional gpu tag per device-bearing, name-less server — used only to
@@ -405,7 +405,7 @@ pub fn missing_configured_servers(config: &crate::config::Config) -> Vec<(String
 /// single-GPU host. Sibling of the host-metrics simulator
 /// (`host_metrics::debug_fake_multi_gpu`), which independently fans out the
 /// display GPUs — this one is the launch-selector list. A device-less server
-/// (vLLM / Lemonade / CPU-only build) has nothing to fan out and is left as-is.
+/// (Lemonade / CPU-only build) has nothing to fan out and is left as-is.
 #[cfg(debug_assertions)]
 fn debug_fake_multi_gpu(devices: Vec<Device>) -> Vec<Device> {
   let n: usize = match std::env::var("LLAMASTASH_DEBUG_FAKE_GPUS")
@@ -722,10 +722,10 @@ mod tests {
 
   #[test]
   fn single_deviceless_server_is_the_bare_backend_id() {
-    // vLLM / Lemonade / a CPU-only build: no probe, no detectable compute type
+    // Lemonade / a CPU-only build: no probe, no detectable compute type
     // → the bare backend id, not a misleading `-cpu`.
-    let servers = derive_servers("vllm", vec![(spec("/x/vllm", None), vec![])]);
-    assert_eq!(servers[0].id, "vllm");
+    let servers = derive_servers("enginex", vec![(spec("/x/engine", None), vec![])]);
+    assert_eq!(servers[0].id, "enginex");
   }
 
   #[test]
@@ -733,21 +733,21 @@ mod tests {
     // Two device-less builds with no names → bare id then `-N` (the compute
     // type isn't knowable; a `name:` override is how you label them).
     let servers = derive_servers(
-      "vllm",
+      "enginex",
       vec![
-        (spec("/a/one/vllm", None), vec![]),
-        (spec("/a/two/vllm", None), vec![]),
+        (spec("/a/one/engine", None), vec![]),
+        (spec("/a/two/engine", None), vec![]),
       ],
     );
-    assert_eq!(servers[0].id, "vllm");
-    assert_eq!(servers[1].id, "vllm-2");
+    assert_eq!(servers[0].id, "enginex");
+    assert_eq!(servers[1].id, "enginex-2");
   }
 
   #[test]
   fn deviceless_server_honors_explicit_name() {
     // The compute type for a device-less backend comes from `name:` (`rocm`).
-    let servers = derive_servers("vllm", vec![(spec("/x/vllm", Some("rocm")), vec![])]);
-    assert_eq!(servers[0].id, "vllm-rocm");
+    let servers = derive_servers("enginex", vec![(spec("/x/engine", Some("rocm")), vec![])]);
+    assert_eq!(servers[0].id, "enginex-rocm");
   }
 
   #[test]

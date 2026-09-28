@@ -206,7 +206,7 @@ fn server_row<'a>(app: &'a App, budget: usize, palette: &'a Palette) -> Line<'a>
   // Build one `(path, tag)` entry per backend. Prefer the neutral server
   // catalog once probed — each backend's first server binary, tagged with its
   // compute backends joined by `|` (`(rocm|vulkan)`) or the backend id when it
-  // exposes no devices (`(lemonade)`, `(vllm)`). Before the probe lands, fall
+  // exposes no devices (`(lemonade)`). Before the probe lands, fall
   // back to the default `llama-server` + the per-backend binaries from
   // `status.backends`. Every entry gets an equal share of the width; paths
   // left-truncate (`…/`) so the binary name — the discriminating part —

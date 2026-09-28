@@ -411,11 +411,15 @@ mod tests {
   /// the preset launched at the engine default instead of the size asked for.
   #[test]
   fn a_preset_context_window_survives_whichever_key_it_lands_under() {
+    let other = crate::test_support::backend_declaring("max-model-len");
     for (backend_id, yaml) in [
-      ("vllm", "knobs:\n  ctx: 8192\nbackend: vllm\n"),
-      ("llamacpp", "knobs:\n  ctx: 8192\nbackend: llamacpp\n"),
+      (other, format!("knobs:\n  ctx: 8192\nbackend: {other}\n")),
+      (
+        "llamacpp",
+        "knobs:\n  ctx: 8192\nbackend: llamacpp\n".to_string(),
+      ),
     ] {
-      let body: crate::config::PresetBody = yaml_serde::from_str(yaml).expect("parse");
+      let body: crate::config::PresetBody = yaml_serde::from_str(&yaml).expect("parse");
       let np = materialize_preset("p", &body, PathBuf::from("/m/x.gguf"));
       assert_eq!(
         np.params.ctx,

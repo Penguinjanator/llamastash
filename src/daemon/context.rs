@@ -105,12 +105,12 @@ pub struct MethodContext {
   pub ipc_url: Option<String>,
   /// All backend configuration, grouped under `backend:` in `config.yaml`.
   /// Each backend reads its own typed sub-config (`backend.llamacpp` /
-  /// `backend.lemonade` / `backend.vllm`) through its `available`/`installed`/
+  /// `backend.lemonade` and the other engines) through its `available`/`installed`/
   /// launch hooks; the generic context names no backend. Defaults to the
   /// factory config, so catalog-only tests never touch an external binary.
   pub backend: crate::backend::BackendConfig,
   /// Per-backend force-enable flags keyed by backend id (`--lemonade` /
-  /// `LLAMASTASH_LEMONADE`, `--vllm` / `LLAMASTASH_VLLM`). A backend folds its own
+  /// `LLAMASTASH_LEMONADE`, and the same for each optional engine). A backend folds its own
   /// entry into its `available` predicate alongside the config `enabled`
   /// tri-state; an absent key means "not forced". Keyed by id so the type names
   /// no backend.

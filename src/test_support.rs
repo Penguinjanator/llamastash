@@ -205,3 +205,14 @@ impl RunningRow {
     self.0
   }
 }
+
+/// The id of the registered backend that declares knob `knob_id`, for tests
+/// that need a real non-default backend without naming one.
+pub fn backend_declaring(knob_id: &str) -> &'static str {
+  use crate::backend::Backend;
+  crate::backend::Backends::all()
+    .into_iter()
+    .find(|b| b.knobs().iter().any(|k| k.id == knob_id))
+    .map(|b| b.id())
+    .unwrap_or_else(|| panic!("no backend declares knob `{knob_id}`"))
+}

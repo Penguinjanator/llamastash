@@ -140,7 +140,7 @@ mod tests {
     // `mlock` / `no-mmap` folded into the `load-mode` enum when llama.cpp
     // replaced their flags — so this exercises the emission rule on a backend
     // that still has one.
-    let backend = crate::backend::vllm::VLLM_BACKEND_ID;
+    let backend = crate::test_support::backend_declaring("enforce-eager");
     let mut on = KnobSet::new();
     on.set_scalar(id("enforce-eager"), Scalar::Bool(true));
     assert_eq!(strs(emit_argv(backend, &on, &[])), vec!["--enforce-eager"]);

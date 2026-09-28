@@ -77,7 +77,7 @@ pub struct RunningRow {
   pub preset_count: u32,
   /// Default preset name (config-only) for this model, or `None`.
   pub preset_default: Option<String>,
-  /// Backend this launch resolved to (`llamacpp` / `vllm` / `lemonade`),
+  /// Backend this launch resolved to (`llamacpp` / `lemonade`),
   /// mirrored from the IPC `status` row's `backend` field. `None` on a row
   /// the daemon didn't tag; defaults to `llamacpp` semantics downstream.
   pub backend: Option<String>,
@@ -794,9 +794,9 @@ mod tests {
     assert!(!multi_device(&serde_json::json!({})));
     assert!(!multi_device(&Value::Array(vec![])));
     // A server row with no `devices` key at all.
-    assert!(!multi_device(&serde_json::json!([{"id": "vllm"}])));
+    assert!(!multi_device(&serde_json::json!([{"id": "enginex"}])));
     assert!(!multi_device(
-      &serde_json::json!([{"id": "vllm", "devices": null}])
+      &serde_json::json!([{"id": "enginex", "devices": null}])
     ));
   }
 

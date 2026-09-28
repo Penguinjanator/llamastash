@@ -115,7 +115,7 @@ pub async fn route(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyRespo
     (&Method::POST, "/v1/messages") => forward_request(state, req).await,
     (&Method::POST, "/v1/messages/count_tokens") => forward_request(state, req).await,
     // OpenAI Responses API. llama-server speaks it natively
-    // (`POST /v1/responses` + `/v1/responses/input_tokens`), as do vLLM and ds4-server,
+    // (`POST /v1/responses` + `/v1/responses/input_tokens`), as do other engines,
     // so the proxy byte-pipes it like any other `/v1` route (same body-`model`
     // resolution, same streaming). Agents that prefer the Responses surface
     // attach through the one stable proxy URL.

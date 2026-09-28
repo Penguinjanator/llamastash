@@ -647,7 +647,7 @@ Three behaviours differ from the GGUF backends and are worth knowing:
 - **Detection never runs the binary.** vLLM builds its argument parser through a device probe and fails with `Failed to infer device type` on a host with no usable accelerator, so LlamaStash checks only that the configured path exists. That is also why a container wrapper script works as the `binary`.
 - **Startup is slow and readiness waits for it.** Engine init (memory profiling plus KV-cache build) ran 10-27 s on a 0.5B and takes longer on real models. Readiness requires `/v1/models` to advertise the model, not just an answering port.
 
-`--ctx` maps to vLLM's own `--max-model-len`, which is the knob's declared name. Nine further vLLM tunables are declared (`kv-cache-memory-bytes`, `gpu-memory-utilization`, `max-num-seqs`, `tensor-parallel-size`, `dtype`, `kv-cache-dtype`, `quantization`, `enforce-eager`, `trust-remote-code`), each reachable from the CLI, the TUI and presets alike; the rest of vLLM's ~240 flags ride the `-- <extras>` tail, minus a denylist that keeps the launch loopback-only and reapable.
+`--ctx` maps to vLLM's own `--max-model-len`, which is the knob's declared name. Nine further vLLM tunables are declared (`kv-cache-memory-bytes`, `gpu-memory-utilization`, `max-num-seqs`, `tensor-parallel-size`, `dtype`, `kv-cache-dtype`, `quantization`, `enforce-eager`, `trust-remote-code`), each reachable from the CLI, the TUI and presets alike. Flags that start extra processes or listeners, like pipeline and data parallelism (`--data-parallel-*`, `-dp`, `-dpm` and the other short aliases), are refused in the extras tail; the full list is in [vLLM setup](vllm-setup.md). The rest of vLLM's ~240 flags ride the `-- <extras>` tail.
 
 **On unified-memory hosts (APUs), the KV cache is capped automatically.** GPU memory is system RAM there, and vLLM sizes its KV cache against the pool rather than the model — the default has exhausted RAM and frozen a 121 GB machine. When neither `kv_cache_memory_bytes` nor `gpu_memory_utilization` is set, the launcher caps the cache from live free memory, keeping a reserve that covers the engine's own footprint as well as the OS, and passes a `--gpu-memory-utilization` sized to the launch so vLLM's startup check lets the capped launch through. See [vLLM setup](vllm-setup.md#notes-and-limitations).
 
@@ -1571,7 +1571,8 @@ it; Backspace resets the row. Selectors are passed through verbatim
 (comma-joined for a multi-GPU pick, e.g. `ROCm0,ROCm1`), so only devices
 the server's binary exposes are offered — the list rescopes when you
 cycle the `server` row. On the CLI, `start --device ROCm0,ROCm1` takes
-the same comma-separated list.
+the same comma-separated list, and `start --device none` offloads nothing
+(CPU only), as llama-server's own `--device none` does.
 
 Two gates decide whether any of this is shown, both scoped to the server
 the launch is on (the selected one while editing, the one serving the

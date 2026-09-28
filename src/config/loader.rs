@@ -95,7 +95,7 @@ pub struct Config {
   pub proxy: ProxyConfig,
   /// All backend configuration, grouped under `backend:`. Holds the always-on
   /// llama.cpp settings (`binary`, `additional_binaries`, `jinja`,
-  /// `strict_fit`, `fit_ctx_floor`) plus the optional Lemonade / vLLM engines
+  /// `strict_fit`, `fit_ctx_floor`) plus the optional engines
   /// (each default-on when its binary resolves). Each backend owns its own
   /// typed struct in its own module; see [`crate::backend::BackendConfig`].
   #[serde(default)]
@@ -1825,7 +1825,7 @@ proxy:
     assert!(loaded.warning.is_none());
     assert_eq!(
       loaded.config.backend.lemonade.enabled, None,
-      "lemonade `enabled` defaults to unset (on-when-found intent, like vLLM)"
+      "lemonade `enabled` defaults to unset (on-when-found intent)"
     );
     assert!(loaded.config.backend.lemonade.servers.is_empty());
     assert_eq!(loaded.config.backend.lemonade.port, 13305);

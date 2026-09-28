@@ -174,7 +174,7 @@ pub struct LaunchPickerState {
   /// position 0, so a list seeded in some other order would make the row name
   /// one build while the daemon launched another.
   pub servers: Vec<crate::backend::Server>,
-  /// The user's chosen server id (`llamacpp-vulkan`, `vllm`), or `None` for
+  /// The user's chosen server id (`llamacpp-vulkan`, `llamacpp-rocm`), or `None` for
   /// the default build ([`Self::servers`]`[0]`). Sent verbatim as
   /// [`crate::launch::params::LaunchParams::server`]; seeded from last_params.
   pub selected_server: Option<String>,
@@ -2060,11 +2060,12 @@ mod tests {
 
   #[test]
   fn the_selected_servers_backend_regenerates_the_whole_row_set() {
+    let other = crate::test_support::backend_declaring("enforce-eager");
     // Two real backends so the knob sets differ; no model offers both today.
     let mut s = LaunchPickerState::for_model("Qwen3-8B");
-    s.model_backend = BackendChoice::Explicit("vllm".into());
+    s.model_backend = BackendChoice::Explicit(other.into());
     s.servers = vec![
-      server("vllm", "vllm", "/v/vllm", vec![]),
+      server(other, other, "/v/engine", vec![]),
       server(
         "llamacpp-rocm",
         "llamacpp",
@@ -2073,8 +2074,8 @@ mod tests {
       ),
     ];
     s.field = PickerField::Server;
-    assert_eq!(s.active_backend_id(), "vllm");
-    // vLLM's own tunables are rows here, and llama.cpp's are not.
+    assert_eq!(s.active_backend_id(), other);
+    // That backend's own tunables are rows here, and llama.cpp's are not.
     assert!(s.field_visible(row("enforce-eager")));
     assert!(!s.field_visible(row("n-gpu-layers")));
     // Pick the llama.cpp server → the row set swaps wholesale.
@@ -2086,14 +2087,15 @@ mod tests {
 
   #[test]
   fn a_backend_switch_carries_shared_concepts_and_drops_the_rest() {
+    let other = crate::test_support::backend_declaring("enforce-eager");
     let mut s = LaunchPickerState::for_model("Qwen3-8B");
-    s.model_backend = BackendChoice::Explicit("vllm".into());
+    s.model_backend = BackendChoice::Explicit(other.into());
     s.servers = vec![
-      server("vllm", "vllm", "/v/vllm", vec![]),
+      server(other, other, "/v/engine", vec![]),
       server("llamacpp-rocm", "llamacpp", "/rocm/llama-server", vec![]),
     ];
     s.field = PickerField::Server;
-    // A shared concept (context) and a vLLM-only knob.
+    // A shared concept (context) and a knob only that backend declares.
     s.user_knobs
       .set(kid("max-model-len"), KnobValue::Set(Scalar::U32(8192)));
     s.user_knobs
@@ -2109,23 +2111,24 @@ mod tests {
 
   #[test]
   fn a_preset_keyed_for_another_backend_shows_in_the_scope_in_play() {
+    let other = crate::test_support::backend_declaring("enforce-eager");
     // A preset saved on llama.cpp (`ctx-size`) that pins another backend: its
     // context window must show on that backend's own context row.
     let mut s = LaunchPickerState::for_model("Qwen3-8B");
     s.servers = vec![
       server("llamacpp-rocm", "llamacpp", "/rocm/llama-server", vec![]),
-      server("vllm", "vllm", "/v/vllm", vec![]),
+      server(other, other, "/v/engine", vec![]),
     ];
     let mut knobs = KnobSet::new();
     knobs.set(kid("ctx-size"), KnobValue::Set(Scalar::U32(8192)));
     let pinned = PresetChoice {
       knobs,
-      backend: Some("vllm".into()),
+      backend: Some(other.into()),
       ..choice("pinned", 0)
     };
     s.set_presets(vec![pinned], PresetStop::Named(0));
-    assert_eq!(s.active_backend_id(), "vllm");
-    let ctx = knobs::def_for_backend_concept("vllm", knobs::Concept::ContextLength)
+    assert_eq!(s.active_backend_id(), other);
+    let ctx = knobs::def_for_backend_concept(other, knobs::Concept::ContextLength)
       .unwrap()
       .knob_id();
     assert_eq!(s.user_knobs.u32(ctx), Some(8192));
@@ -2133,13 +2136,14 @@ mod tests {
 
   #[test]
   fn a_backend_switch_moves_a_stranded_cursor_back_to_a_real_row() {
+    let other = crate::test_support::backend_declaring("enforce-eager");
     let mut s = LaunchPickerState::for_model("Qwen3-8B");
-    s.model_backend = BackendChoice::Explicit("vllm".into());
+    s.model_backend = BackendChoice::Explicit(other.into());
     s.servers = vec![
-      server("vllm", "vllm", "/v/vllm", vec![]),
+      server(other, other, "/v/engine", vec![]),
       server("llamacpp-rocm", "llamacpp", "/rocm/llama-server", vec![]),
     ];
-    // Sit on a vLLM-only row, then switch away from vLLM through the Server row.
+    // Sit on a row only that backend has, then switch away through the Server row.
     s.field = PickerField::Server;
     s.cycle_focused_value_next();
     assert_eq!(s.active_backend_id(), "llamacpp");

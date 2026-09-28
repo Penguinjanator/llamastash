@@ -267,6 +267,9 @@ fn is_pure_fit(selection: LaunchSelection, default_is_auto: bool) -> bool {
 /// selector resolves to a server, stamp its id (and, when the backend is still
 /// `Auto`, its owning backend) so status and Ctrl+P capture report it instead
 /// of falling back to the default.
+/// The device selector that asks for no offload at all.
+const NO_DEVICE_SELECTOR: &str = "none";
+
 fn pick_launch_binary(
   launch_params: &mut LaunchParams,
   picked_server: Option<&crate::backend::Server>,
@@ -278,6 +281,12 @@ fn pick_launch_binary(
     return Some(server.binary.clone());
   }
   match selector {
+    // `none` means "offload nothing" (CPU only). It is in no server's device
+    // list, so it would otherwise be dropped as stale and the launch would
+    // offload to the GPU.
+    Some(sel) if sel.trim().eq_ignore_ascii_case(NO_DEVICE_SELECTOR) => {
+      default_binary.map(Path::to_path_buf)
+    }
     Some(sel) => match servers
       .iter()
       .find(|s| s.devices.iter().any(|d| d.selector == sel))
@@ -807,8 +816,8 @@ pub(crate) async fn compose_and_spawn(
     .map(|e| (e.params.clone(), e.resolved_backend.clone()));
   // D-contamination: the implicit LastUsed layer + extras inheritance apply
   // only when the stored launch resolved to the *same* backend, so llama.cpp
-  // extras (`--rope-freq-base …`) can't poison a vLLM spawn of the same
-  // model (and vice versa). Explicit config (presets, inline extras) is
+  // extras (`--rope-freq-base …`) can't poison a spawn of the same model on
+  // another backend (and vice versa). Explicit config (presets, inline extras) is
   // untouched. A legacy row with no tag reads as `llamacpp`.
   let last_params_backend_ok = last_params_entry
     .as_ref()
@@ -841,7 +850,7 @@ pub(crate) async fn compose_and_spawn(
   // Native knobs (not layered by the typed-knob resolver): explicit inline
   // values win verbatim; else a no-selection relaunch inherits the last-used
   // native knobs — but only through the backend-matched `last_params` gate
-  // above (D-contamination), so a vLLM relaunch re-applies its own knobs
+  // above (D-contamination), so a relaunch re-applies its backend's own knobs
   // while a cross-backend run inherits nothing. Empty for
   // llama.cpp / Lemonade.
   // Seed the resolved backend's config-derived launch knobs into
@@ -1101,7 +1110,7 @@ pub(crate) async fn compose_and_spawn(
   };
   // Dropped-knob surfacing (R6): typed knobs the user set that the resolved
   // backend can't honor are silently dropped from argv — tell the user which.
-  // A `--flash-attn` on a vLLM-routed model warns, for example.
+  // A llama.cpp-only knob on a model another backend serves warns, for example.
   //
   // Against the **user** layer, not the resolved set. The resolved set carries
   // the resolver's own answers (a model-default `reasoning`, an arch default),
@@ -2025,6 +2034,34 @@ mod tests {
     );
   }
 
+  /// `none` asks for no offload. It is in no server's device list, and must
+  /// reach argv rather than be dropped as a stale selector.
+  #[test]
+  fn pick_launch_binary_keeps_the_no_offload_selector() {
+    let mut params = LaunchParams::new(
+      PathBuf::from("/m/a.gguf"),
+      crate::launch::mode::LaunchMode::Chat,
+    );
+    params.knobs.set_by_name("device", "none");
+    let binary = pick_launch_binary(
+      &mut params,
+      None,
+      Some("none"),
+      &[],
+      Some(Path::new("/bin/llama-server")),
+    );
+    assert_eq!(binary, Some(PathBuf::from("/bin/llama-server")));
+    assert_eq!(params.knobs.text_by_name("device"), Some("none".into()));
+    assert!(params.server.is_none());
+
+    params.knobs.set_by_name("device", "Vulkan9");
+    pick_launch_binary(&mut params, None, Some("Vulkan9"), &[], None);
+    assert!(
+      params.knobs.text_by_name("device").is_none(),
+      "a real stale selector is still dropped"
+    );
+  }
+
   /// An explicit server pick wins outright and is not re-derived from the
   /// device selector.
   #[test]
@@ -2094,10 +2131,11 @@ mod tests {
     // A process launch stamps its `L#` + resolved backend on the running
     // snapshot, so `backend_for_launch` hands the stop to the launch's *real*
     // backend rather than defaulting — the guard for a process-per-model backend
-    // that overrides `stop`. (llama.cpp and vLLM share the default stop today, so
+    // that overrides `stop`. (llama.cpp and that backend share the default stop today, so
     // this is latent-correctness, not observable yet.)
+    let other = crate::test_support::backend_declaring("enforce-eager");
     let ctx = MethodContext::new(ShutdownToken::new());
-    let push = |id_path: &'static str, lid: &'static str, backend: &'static str, port: u16| {
+    let push = |id_path: &'static str, lid: &'static str, backend: &str, port: u16| {
       let identity = ModelIdentity::Gguf(crate::gguf::identity::compute(id_path, b"hdr"));
       let params = LaunchParams::new(PathBuf::from(id_path), LaunchMode::Chat);
       crate::test_support::running_row(id_path)
@@ -2111,7 +2149,7 @@ mod tests {
     ctx
       .state
       .mutate(|s| {
-        s.running.push(push("/m/vllm-model", "L1", "vllm", 41100));
+        s.running.push(push("/m/other-model", "L1", other, 41100));
         s.running
           .push(push("/m/llama.gguf", "L2", "llamacpp", 41101));
       })
@@ -2121,8 +2159,8 @@ mod tests {
       backend_for_launch(&ctx, &LaunchId("L1".to_string()))
         .await
         .id(),
-      "vllm",
-      "a vllm-tagged process launch resolves to vllm, not the default backend"
+      other,
+      "a launch tagged with another backend resolves to it, not the default"
     );
     assert_eq!(
       backend_for_launch(&ctx, &LaunchId("L2".to_string()))

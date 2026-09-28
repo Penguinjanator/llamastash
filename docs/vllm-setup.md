@@ -139,8 +139,15 @@ vLLM has ~240 flags; the rest ride the `-- <extras>` tail. A handful are
 refused there because they would undo the loopback-only posture or spawn
 processes the supervisor cannot reap: `--api-key`, `--allowed-origins`,
 `--allowed-local-media-path`, `--pipeline-parallel-size` (and its `-pp` alias),
-the `--data-parallel-*` family (and `-dp`), and `--distributed-executor-backend`
-(which is how Ray is selected), plus the shared `--host` / `--ssl-*` denylist.
+the `--data-parallel-*` family, and `--distributed-executor-backend` (which is
+how Ray is selected), plus the shared `--host` / `--ssl-*` denylist.
+
+The data-parallel short aliases are refused too: `-dp`, `-dpn`, `-dpr`, `-dpl`,
+`-dpa`, `-dpp`, `-dpb`, `-dph`, `-dpe` and `-dpm` (vLLM 0.30.0). Data-parallel
+mode starts extra API servers and engine processes on ports LlamaStash never
+reserved (`-dpm` runs a supervisor that launches one API server per rank), so
+LlamaStash couldn't track, stop or keep them on loopback. The denylist compares
+whole flag names, so each short spelling is listed on its own.
 
 `--config` is refused as well. It points vLLM at a YAML file whose flags are
 spliced in ahead of the launcher's own, so anything in that file would override

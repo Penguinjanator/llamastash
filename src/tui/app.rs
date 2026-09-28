@@ -118,8 +118,8 @@ pub struct ManagedRow {
   /// live `status` `params.extras`). Empty for external rows. Lets
   /// `Ctrl+P` save-from-running carry the advanced args into the preset.
   pub extras: Vec<String>,
-  /// Backend this launch actually resolved to (`status` `backend`): `vllm`
-  /// when the launch dispatched to vLLM, else `llamacpp` / `lemonade`. Keyed
+  /// Backend this launch actually resolved to (`status` `backend`): the
+  /// engine the launch dispatched to (`llamacpp`, `lemonade`, and so on). Keyed
   /// on by the backend badge / knob panel so a running row reflects the real
   /// backend, not the `list_models` routing prediction. `None` when untagged.
   pub backend: Option<String>,
@@ -294,7 +294,7 @@ pub struct App {
   pub focus: Focus,
   pub models: Vec<DiscoveredModel>,
   /// The daemon's per-model `list_models` `backend` prediction, keyed by
-  /// canonical path (`llamacpp` / `lemonade` / `vllm`). The daemon already
+  /// canonical path (`llamacpp` / `lemonade`). The daemon already
   /// applied each backend's availability + routing predicate and the source
   /// mapping, so this is the single source of truth for "where would a plain
   /// launch of this model route" — it drives the launch picker's
@@ -872,8 +872,8 @@ impl App {
     self.clamp_cursor();
   }
 
-  /// The daemon's predicted backend for `path` (`llamacpp` / `lemonade` /
-  /// `vllm`), or `None` when the model isn't in the current catalog.
+  /// The daemon's predicted backend for `path` (`llamacpp`, `lemonade`, and
+  /// so on), or `None` when the model isn't in the current catalog.
   pub fn predicted_backend(&self, path: &std::path::Path) -> Option<&str> {
     self.backend_by_path.get(path).map(String::as_str)
   }
@@ -1931,7 +1931,7 @@ impl App {
       .unwrap_or_else(|| crate::util::paths::model_file_label(&path));
 
     // Capture knobs + extras + launch identity from whichever surface is in
-    // view. One map now, so a vLLM launch's `--enforce-eager` rides with the
+    // view. One map now, so a backend's own knobs ride with the
     // rest, and the identity (which engine / build) pins the preset to the
     // run it was captured from. A running row carries the *resolved*
     // identity; a picker carries the *intended* one (its concrete engine and
@@ -2364,7 +2364,7 @@ fn discovered_from_catalog_row(cr: &crate::launch::resolve::CatalogRow) -> Disco
     split_siblings: cr.split_siblings.iter().map(PathBuf::from).collect(),
     display_label: cr.display_label.clone(),
     multimodal: cr.multimodal,
-    // Priority-ordered backends this model can run on (`vllm`, `llamacpp`, …).
+    // Priority-ordered backends this model can run on (`llamacpp`, `lemonade`, and so on).
     // Feeds the launch picker's Server row (filters the server catalog).
     supported_backends: cr.supported_backends.clone(),
     mtp_head,
@@ -2756,12 +2756,12 @@ mod tests {
     assert!(!app.multi_backend(), "all-llamacpp is single-backend");
     app
       .backend_by_path
-      .insert(PathBuf::from("/m/b.gguf"), "vllm".into());
+      .insert(PathBuf::from("/m/b.gguf"), "enginex".into());
     assert!(app.multi_backend(), "a non-default backend row flips it on");
     // The per-path backend prediction comes straight off the daemon's badge.
     assert_eq!(
       app.predicted_backend(&PathBuf::from("/m/b.gguf")),
-      Some("vllm")
+      Some("enginex")
     );
     assert_eq!(
       app.predicted_backend(&PathBuf::from("/m/a.gguf")),
