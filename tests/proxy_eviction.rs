@@ -110,7 +110,7 @@ async fn build_state(registry: SupervisorRegistry, log_dir: &Path) -> Arc<ProxyS
     log_dir: log_dir.to_path_buf(),
     probe: fast_probe(),
     arch_defaults: BTreeMap::new(),
-    servers: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+    servers: Default::default(),
     default_launch_mode: Default::default(),
   };
   let ctx = MethodContext::with_catalog(token, catalog)

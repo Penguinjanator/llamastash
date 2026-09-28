@@ -366,7 +366,7 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
   // tools), so what the picker offers is precisely what `llama-server` accepts.
   // Empty array when no binary is configured.
   let servers = match ctx.launch.as_ref() {
-    Some(env) => serde_json::to_value(&*env.servers.read().await).unwrap_or(Value::Null),
+    Some(env) => serde_json::to_value(&*env.servers.current().await).unwrap_or(Value::Null),
     None => Value::Array(Vec::new()),
   };
   let backends = backends_status(ctx).await;
@@ -413,7 +413,7 @@ async fn backends_status(ctx: &MethodContext) -> Value {
   let device_accels: Vec<crate::backend::Accelerator> = match ctx.launch.as_ref() {
     Some(env) => env
       .servers
-      .read()
+      .current()
       .await
       .iter()
       .flat_map(|s| s.devices.iter())

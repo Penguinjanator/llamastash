@@ -432,27 +432,22 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
     },
     None => ProbeOptions::default(),
   };
-  // The server catalog is populated in the background: each backend's
-  // `configured_servers` + per-binary `--list-devices` probe is best-effort
-  // I/O we must keep off the startup critical path so the detached-start
-  // parent's `runtime.json` wait never trips. The cell starts empty and flips
-  // to the full set once the probe finishes; a launch in that window falls
-  // back to the default `binary`.
-  let servers = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+  // Filled in the background; see `ServerCatalog`.
+  let servers = crate::daemon::context::ServerCatalog::pending();
   ctx = ctx.with_launch_env(LaunchEnv {
     binary: opts.binary.clone(),
     port_range: opts.port_range,
     log_dir: opts.log_dir.clone(),
     probe,
     arch_defaults: opts.arch_defaults.clone(),
-    servers: Arc::clone(&servers),
+    servers: servers.clone(),
     default_launch_mode: opts.default_launch_mode,
   });
   // Build the neutral server catalog generically over `Backends::all()` —
   // `configured_servers` (per backend) → `probe_devices` (per binary) → id
   // derivation. Reads `ctx.launch.binary`, so it runs after `with_launch_env`.
   {
-    let cell = Arc::clone(&servers);
+    let cell = servers.clone();
     let ctx_for_probe = ctx.clone();
     tokio::spawn(async move {
       let built =
@@ -464,7 +459,7 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
         built.len(),
         built.iter().map(|s| s.devices.len()).sum::<usize>()
       );
-      *cell.write().await = built;
+      cell.fill(built).await;
     });
   }
 

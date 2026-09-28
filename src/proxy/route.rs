@@ -266,7 +266,7 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
   // both the model (path) and the name; the name is threaded through to
   // `auto_start` so a second named launch of the same model gets its own
   // flight and its own addressable id.
-  let (name, resolved) = match resolve_model_with_candidates(&rows, &requested) {
+  let (mut name, resolved) = match resolve_model_with_candidates(&rows, &requested) {
     Ok(r) => (None, r),
     Err(_) => {
       let (m, n) = match parse_named_reference(&requested) {
@@ -345,13 +345,18 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
   let mut target = pick_ready_launch(&keys, running).map(|i| ready[i].1.clone());
 
   // A `<model>@<name>` with no launch of that name goes to the model's only
-  // launch when that one is unnamed and Ready, instead of loading a second copy
-  // with the same settings. A name that is one of the model's presets still
-  // auto-starts, because it asks for different settings.
+  // launch when that one is unnamed, instead of loading a second copy with the
+  // same settings. A name that is one of the model's presets still auto-starts,
+  // because it asks for different settings. A launch still loading is reached
+  // by dropping the name: the unnamed auto-start attaches to it and waits.
   if target.is_none() {
     if let (Some(n), Some(st), [(launch_id, model)]) = (&name, &state_snap, &same_model[..]) {
+      let model_state = model.state().await;
       if !is_named(&st.running, launch_id, model.port())
-        && matches!(model.state().await, ManagedState::Ready)
+        && matches!(
+          model_state,
+          ManagedState::Launching | ManagedState::Loading | ManagedState::Ready
+        )
         && crate::daemon::launch_service::model_presets(
           &state.ctx,
           std::path::Path::new(&resolved.path),
@@ -361,7 +366,11 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
         .named(n)
         .is_none()
       {
-        target = Some(model.clone());
+        if model_state == ManagedState::Ready {
+          target = Some(model.clone());
+        } else {
+          name = None;
+        }
       }
     }
   }

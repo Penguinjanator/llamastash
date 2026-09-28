@@ -317,9 +317,11 @@ request can say *which* copy it wants. The rules, all in one place:
   a duplicate `--name`. A preset name that is not a launch name, or a managed
   multiplexer model, leaves the launch unnamed.
 - **A named reference with no launch of that name** goes to the model's only
-  launch when that launch is unnamed and Ready and the name is not one of the
-  model's presets (`route::decide`), instead of loading a second copy with the
-  same settings. A name that is a preset still auto-starts under it.
+  launch when that launch is unnamed and the name is not one of the model's
+  presets (`route::decide`), instead of loading a second copy with the same
+  settings. A Ready launch is forwarded to; a loading one is reached by dropping
+  the name, so the unnamed auto-start attaches to it and waits. A name that is a
+  preset still auto-starts under it.
 - **A server that accepts one `model` value** (a generic entry with
   `rewrite_model: true`) sets `backend::REQUEST_MODEL_KEY` in its
   `launch_config`; `forward_to_upstream` then writes that value into

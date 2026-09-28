@@ -193,18 +193,70 @@ pub struct LaunchEnv {
   /// looks the chosen `knobs.str(crate::launch::knobs::kid("device"))` selector up here to decide *which* server
   /// binary to spawn; `status` projects it so the TUI picker offers exactly the
   /// selectors `--device` will accept.
-  ///
-  /// Behind a shared `RwLock` because it is populated by a background
-  /// task *after* the daemon binds its listeners — probing each binary
-  /// with `--list-devices` is best-effort I/O we never want on the
-  /// startup critical path (the detached-start parent only waits a few
-  /// seconds for `runtime.json`). Reads start empty and flip to the
-  /// full set once the probe completes; a launch in that brief window
-  /// finds no selector match and falls back to the default `binary`.
-  pub servers: Arc<RwLock<Vec<crate::backend::Server>>>,
+  pub servers: ServerCatalog,
   /// Seed mode for knobs no layer filled. Sourced from
   /// `Config.default_launch_mode` (+ `LLAMASTASH_DEFAULT_LAUNCH_MODE`).
   pub default_launch_mode: crate::config::DefaultLaunchMode,
+}
+
+/// How long a launch waits for the server catalog before reading it as it is.
+const SERVER_CATALOG_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The server catalog, filled once by a background task *after* the daemon
+/// binds its listeners: probing each binary with `--list-devices` stays off the
+/// startup critical path (the detached-start parent only waits a few seconds
+/// for `runtime.json`). Launches read it through [`Self::loaded`], so a request
+/// that lands before the probe finishes still sees a preset's `server:` pin.
+/// `Default` is an empty catalog that counts as loaded.
+#[derive(Clone, Debug)]
+pub struct ServerCatalog {
+  servers: Arc<RwLock<Vec<crate::backend::Server>>>,
+  loaded: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Default for ServerCatalog {
+  fn default() -> Self {
+    Self::with_loaded(true)
+  }
+}
+
+impl ServerCatalog {
+  /// An empty catalog that [`Self::loaded`] waits on until [`Self::fill`] runs.
+  pub fn pending() -> Self {
+    Self::with_loaded(false)
+  }
+
+  fn with_loaded(loaded: bool) -> Self {
+    Self {
+      servers: Default::default(),
+      loaded: Arc::new(tokio::sync::watch::Sender::new(loaded)),
+    }
+  }
+
+  pub async fn fill(&self, servers: Vec<crate::backend::Server>) {
+    *self.servers.write().await = servers;
+    self.loaded.send_replace(true);
+  }
+
+  /// The catalog as it stands, loaded or not. For display.
+  pub async fn current(&self) -> tokio::sync::RwLockReadGuard<'_, Vec<crate::backend::Server>> {
+    self.servers.read().await
+  }
+
+  /// The catalog once loaded, or as it stands after `SERVER_CATALOG_WAIT`.
+  pub async fn loaded(&self) -> tokio::sync::RwLockReadGuard<'_, Vec<crate::backend::Server>> {
+    let mut loaded = self.loaded.subscribe();
+    if tokio::time::timeout(SERVER_CATALOG_WAIT, loaded.wait_for(|l| *l))
+      .await
+      .is_err()
+    {
+      log::warn!(
+        "server catalog still loading after {}s; launching without it",
+        SERVER_CATALOG_WAIT.as_secs()
+      );
+    }
+    self.servers.read().await
+  }
 }
 
 impl MethodContext {
@@ -347,6 +399,34 @@ mod tests {
   use crate::backend::lemonade::{LemonadeBackend, LEMONADE_BACKEND_ID};
   use crate::backend::{Backend, BackendConfig};
   use crate::daemon::shutdown::ShutdownToken;
+
+  #[tokio::test]
+  async fn a_launch_read_waits_for_the_server_catalog_to_load() {
+    let catalog = ServerCatalog::pending();
+    let filler = catalog.clone();
+    tokio::spawn(async move {
+      tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+      filler
+        .fill(vec![crate::backend::Server {
+          id: "s".into(),
+          backend_id: "b".into(),
+          binary: "/b".into(),
+          name: "s".into(),
+          devices: Vec::new(),
+          caps: Default::default(),
+        }])
+        .await;
+    });
+    assert!(
+      catalog.current().await.is_empty(),
+      "display reads do not wait"
+    );
+    assert_eq!(catalog.loaded().await.len(), 1);
+    assert!(
+      ServerCatalog::default().loaded().await.is_empty(),
+      "the default counts as loaded"
+    );
+  }
 
   /// The force-enable map key must match each backend's own id const, or the
   /// `--ds4` / `--lemonade` (and env) force can never override an explicit

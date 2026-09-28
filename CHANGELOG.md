@@ -13,10 +13,11 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 ### Changed
 
 - A launch started from a named preset without `--name` takes the preset's name, so `start --preset coder` answers at `<model>@coder` like a proxy auto-start of that preset.
-- A `<model>@<name>` request with no launch of that name goes to the model's only launch when it is unnamed and `<name>` is not a preset, instead of loading a second copy.
+- A `<model>@<name>` request with no launch of that name goes to the model's only launch when it is unnamed and `<name>` is not a preset, instead of loading a second copy, also while that launch is still loading.
 
 ### Fixed
 
+- A launch right after `daemon start` waits for the server list, so a preset's `server:` pin or a typed `--server` is no longer dropped for the default binary.
 - **Launches inside an LXC container on an AMD APU are checked against the GTT pool instead of the container RAM limit** when every layer is offloaded, and the TUI VRAM gauge shows the full GTT pool there. CPU-side launches keep the RAM check, since the container limit applies to them. Thanks [@Ramon-Balaguer](https://github.com/Ramon-Balaguer) ([#83](https://github.com/llamastash/llamastash/pull/83)).
 - A launch whose server binds only after loading (gufo, ds4) could fail with `bind() failed`: the readiness probe sometimes connected to its own port. A picked server now also decides the backend, so a TUI launch on a non-default server no longer gets the default engine's argv.
 - `start --backend <id>` no longer runs on a remembered or preset server that belongs to another backend.

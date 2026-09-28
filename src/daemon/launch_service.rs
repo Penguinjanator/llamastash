@@ -634,12 +634,11 @@ pub(crate) async fn compose_and_spawn(
 
   // Reject an unknown `--server` id up front — before any port/admission
   // reservation — so a typo errors cleanly instead of silently launching on
-  // the default binary with a bogus `params.server` recorded. The catalog
-  // fills in the background at boot, so only reject once it is populated; an
-  // empty catalog means "not known yet" and keeps the id as a best-effort hint
-  // (resolved to the default binary below).
+  // the default binary with a bogus `params.server` recorded. An empty catalog
+  // (nothing probed, or still loading after the wait) keeps the id as a
+  // best-effort hint, resolved to the default binary below.
   if let Some(server_id) = &parsed.server {
-    let servers = env.servers.read().await;
+    let servers = env.servers.loaded().await;
     if !servers.is_empty() && !servers.iter().any(|s| &s.id == server_id) {
       let valid = servers
         .iter()
@@ -735,7 +734,7 @@ pub(crate) async fn compose_and_spawn(
   launch_params.server = parsed.server.clone().or(identity_default.server);
   let picked_server: Option<crate::backend::Server> = match &launch_params.server {
     Some(server_id) => {
-      let servers = env.servers.read().await;
+      let servers = env.servers.loaded().await;
       let found = servers.iter().find(|s| &s.id == server_id).cloned();
       // An inherited server must not override an explicit `--backend`: the
       // user asked for that backend, so take its default binary instead.
@@ -1028,7 +1027,7 @@ pub(crate) async fn compose_and_spawn(
     .knobs
     .text_by_name("device")
     .filter(|s| !s.is_empty());
-  let servers_snapshot = env.servers.read().await;
+  let servers_snapshot = env.servers.loaded().await;
   let launch_binary = pick_launch_binary(
     &mut launch_params,
     picked_server.as_ref(),
@@ -2280,7 +2279,7 @@ mod tests {
       log_dir: dir.path().to_path_buf(),
       probe: ProbeOptions::default(),
       arch_defaults: Default::default(),
-      servers: Arc::new(RwLock::new(Vec::new())),
+      servers: Default::default(),
       default_launch_mode: Default::default(),
     };
 
@@ -2368,7 +2367,7 @@ mod tests {
       log_dir: dir.path().to_path_buf(),
       probe: ProbeOptions::default(),
       arch_defaults: Default::default(),
-      servers: Arc::new(RwLock::new(Vec::new())),
+      servers: Default::default(),
       default_launch_mode: Default::default(),
     };
     let ctx = MethodContext::new(ShutdownToken::new())
@@ -2652,16 +2651,15 @@ mod tests {
       .as_ref()
       .unwrap()
       .servers
-      .write()
-      .await
-      .push(crate::backend::Server {
+      .fill(vec![crate::backend::Server {
         id: "llamacpp-rocm".into(),
         backend_id: "llamacpp".into(),
         binary: PathBuf::from("/nonexistent/llama-server"),
         name: "llamacpp-rocm".into(),
         devices: Vec::new(),
         caps: Default::default(),
-      });
+      }])
+      .await;
     let parsed = StartParams {
       model_path,
       server: Some("nope".into()),

@@ -147,7 +147,7 @@ async fn build_state(
     log_dir: log_dir.to_path_buf(),
     probe: fast_probe(),
     arch_defaults: BTreeMap::new(),
-    servers: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+    servers: Default::default(),
     default_launch_mode: Default::default(),
   };
   let ctx = MethodContext::with_catalog(token, catalog)
@@ -510,6 +510,48 @@ async fn request_during_load_window_attaches_instead_of_duplicating() {
     1,
     "proxy must attach to the in-flight launch, not start a second one"
   );
+
+  stop_all(&ctx).await;
+  shutdown_listener(shutdown, listener_handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `qwen3@other` names no launch and no preset, so it goes to the model's only
+/// launch even while that one is still loading, rather than starting a second.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn named_request_during_load_window_attaches_to_the_unnamed_launch() {
+  let dir = unique_temp("attach-named");
+  let log_dir = dir.join("logs");
+  std::fs::create_dir_all(&log_dir).unwrap();
+  let model_path = write_gguf(&dir, "qwen3.gguf", "qwen3");
+  let (state, ctx) = build_state(
+    vec![discovered(&model_path, Some("qwen3"), "qwen3")],
+    &log_dir,
+    allocate_wide_port_range(),
+  )
+  .await;
+  let (addr, shutdown, listener_handle) = spawn_listener(Arc::clone(&state)).await;
+
+  ipc_start_model(
+    &ctx,
+    serde_json::json!({
+      "model_path": model_path.to_string_lossy(),
+      "extras": ["--health-delay-ms", "1500"],
+    }),
+  )
+  .await;
+  use llamastash::daemon::supervisor::ManagedState;
+  let pre = ctx.supervisors.snapshot().await;
+  assert!(!matches!(pre[0].1.state().await, ManagedState::Ready));
+
+  let body = r#"{"model":"qwen3@other","messages":[{"role":"user","content":"hi"}]}"#;
+  let (status, _h, _b) = http_post(addr, "/v1/chat/completions", body).await;
+  assert_eq!(status, 200);
+
+  let after = ctx.supervisors.snapshot().await;
+  assert_eq!(after.len(), 1, "must attach, not start a second launch");
+  let snap = ctx.state.snapshot().await;
+  assert!(snap.running.iter().all(|r| r.name.is_none()));
 
   stop_all(&ctx).await;
   shutdown_listener(shutdown, listener_handle).await;
