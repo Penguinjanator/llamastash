@@ -17,7 +17,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ### Fixed
 
-- An idle daemon no longer rescans the model folders about three times a second; its own folder reads were triggering the file watcher. Idle CPU drops from about a third of a core to 0%, and memory from about 1 GiB to about 200 MiB on 17 models.
+- An idle daemon no longer rescans the model folders about three times a second; its own folder reads were triggering the file watcher. Idle CPU drops from about a third of a core to 0%, and memory from about 1 GiB to 65-135 MiB on 17 models (Linux, with glibc limited to 2 malloc arenas in the LlamaStash process only).
 - A launch right after `daemon start` waits for the server list, so a preset's `server:` pin or a typed `--server` is no longer dropped for the default binary.
 - **Launches inside an LXC container on an AMD APU are checked against the GTT pool instead of the container RAM limit** when every layer is offloaded, and the TUI VRAM gauge shows the full GTT pool there. CPU-side launches keep the RAM check, since the container limit applies to them. Thanks [@Ramon-Balaguer](https://github.com/Ramon-Balaguer) ([#83](https://github.com/llamastash/llamastash/pull/83)).
 - A launch whose server binds only after loading (gufo, ds4) could fail with `bind() failed`: the readiness probe sometimes connected to its own port. A picked server now also decides the backend, so a TUI launch on a non-default server no longer gets the default engine's argv.

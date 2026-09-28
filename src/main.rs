@@ -1,8 +1,31 @@
 use anyhow::Result;
 use llamastash::{cli, config::loader, util::logging};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+  limit_malloc_arenas();
+  tokio::runtime::Builder::new_multi_thread()
+    .enable_all()
+    .build()?
+    .block_on(run())
+}
+
+/// glibc's default of 8 arenas per core kept ~140 MiB that the startup scan's
+/// parallel header parses had freed; 2 brings an idle daemon from ~215 to
+/// ~75 MiB. Set in-process rather than through `MALLOC_ARENA_MAX` so spawned
+/// model servers keep glibc's default, and before the runtime starts so no
+/// worker thread has taken an arena yet.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn limit_malloc_arenas() {
+  // SAFETY: `mallopt` only sets an allocator parameter; no pointers involved.
+  unsafe {
+    libc::mallopt(libc::M_ARENA_MAX, 2);
+  }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn limit_malloc_arenas() {}
+
+async fn run() -> Result<()> {
   // Translate `LLAMASTASH_OFFLINE=1`/`0`/empty into the `true`/unset clap's
   // boolean env binding accepts, before parsing argv (see the fn doc).
   cli::cli_args::normalize_offline_env();

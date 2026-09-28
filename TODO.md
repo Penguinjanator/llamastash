@@ -335,7 +335,7 @@ places.
 ## R11 (v0.5.0 checklist)
 
 - [ ] add a restart command for daemon
-- [x] LlamaStash memory use grew to more than 1 GB: the rescan loop below re-parsed full GGUF headers (tokenizer tables, 32 MiB read buffers, split shards on every cache hit) about 3 times a second. Idle RSS on 17 models is now about 214 MiB (debug build), against 51 MiB with scanning off; the rest is glibc keeping memory freed by the startup scan.
+- [x] LlamaStash memory use grew to more than 1 GB: the rescan loop below re-parsed full GGUF headers (tokenizer tables, 32 MiB read buffers, split shards on every cache hit) about 3 times a second. Idle RSS on 17 models is now 65-135 MiB (release build, 3 runs) with the process capped at 2 glibc malloc arenas (`mallopt` in `main`, not the env var, so model servers keep the default); 208-261 MiB without the cap.
 - [x] Frequent model path scanning: the file watcher passed on open events from the scan's own reads, so each rescan triggered the next. Open and read-only close events are now dropped.
 - [x] **gufo 404s on a `model` other than its `--served-model-name`.** An `@<preset>` auto-start already names the launch, so that id works. A plain id sent to a named launch, or `@<other>` sent to the unnamed one, got 404 (verified live on gufo 2026-09-28). Fixed by the generic entry flag `rewrite_model: true`, which makes the proxy send the launch's `{name}`.
 - [ ] Denylist entries the upstream parsers show are missing: vLLM 0.30.0's `-dpm` alias for `--data-parallel-multi-port-external-lb`, and ds4's `--coordinator HOST PORT` (distributed mode). Decide whether to refuse them.
