@@ -823,6 +823,12 @@ impl LaunchPickerState {
       return Ok(());
     }
     match knobs::parse_value(def, trimmed) {
+      // Accepting the config default the unset row was seeded with keeps it
+      // unset, so a later `default:` change in config still reaches the model.
+      Ok(v) if self.effective(id).is_none() && self.config_default(id).as_ref() == Some(&v) => {
+        self.user_knobs.clear(id);
+        Ok(())
+      }
       Ok(v) => {
         self.user_knobs.set(id, v);
         Ok(())

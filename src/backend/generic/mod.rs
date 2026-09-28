@@ -567,6 +567,11 @@ mod tests {
       "4096",
       "`e` edits from the default"
     );
+    s.commit_text(id("pd-ctx"), "4096").unwrap();
+    assert!(
+      s.shows_config_default(id("pd-ctx")),
+      "accepting the unchanged default keeps the row unset"
+    );
     assert_eq!(s.value_label(id("pd-seed")), INHERITED_LABEL, "no default");
     assert!(!s.shows_config_default(id("pd-seed")));
     s.commit_text(id("pd-ctx"), "8192").unwrap();
