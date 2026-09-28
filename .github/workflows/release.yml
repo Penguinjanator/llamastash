@@ -307,7 +307,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
-      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908  # cross
+      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172  # cross
         if: matrix.use_cross
       - uses: taiki-e/setup-cross-toolchain-action@12b7ad4acfa95a1476779d6c06699b96ec1691f8  # v1
         if: matrix.use_cross
