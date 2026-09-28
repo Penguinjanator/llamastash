@@ -552,15 +552,28 @@ mod tests {
     let mut s = LaunchPickerState::for_model("picker-dflt");
     s.model_path = Some(PathBuf::from("generic://picker-dflt"));
     s.model_backend = crate::launch::params::BackendChoice::from_id(GENERIC_BACKEND_ID);
+    let scope = s.knob_scope();
     let id = |name: &str| {
-      crate::launch::knobs::registry::for_backend(s.knob_scope())
+      crate::launch::knobs::registry::for_backend(scope)
         .iter()
         .find(|d| d.id == name)
         .unwrap()
         .knob_id()
     };
     assert_eq!(s.value_label(id("pd-ctx")), "4096");
+    assert!(s.shows_config_default(id("pd-ctx")));
+    assert_eq!(
+      s.buffer_seed(id("pd-ctx")),
+      "4096",
+      "`e` edits from the default"
+    );
     assert_eq!(s.value_label(id("pd-seed")), INHERITED_LABEL, "no default");
+    assert!(!s.shows_config_default(id("pd-seed")));
+    s.commit_text(id("pd-ctx"), "8192").unwrap();
+    assert!(
+      !s.shows_config_default(id("pd-ctx")),
+      "a set value is not muted"
+    );
   }
 
   #[test]
