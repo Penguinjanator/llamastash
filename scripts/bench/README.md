@@ -61,3 +61,19 @@ is about ds4 itself rather than about llamastash's flag composition.
 Note the deliberate omission of a pre-0731 + DSpark row: the DSpark support GGUF
 is checkpoint-specific to Flash 0731 and drafts nothing (`proposed=0`) against
 an older checkpoint.
+
+## `proxy/concurrency.py` — concurrent load on the proxy
+
+```sh
+python3 scripts/bench/proxy/concurrency.py --url http://127.0.0.1:11435 \
+    --model <id> --workload chat|models|bigbody --concurrency 16 --requests 160
+```
+
+The overhead suite sends one request at a time; this drives N concurrent
+clients and prints one JSON line with req/s, latency p50/p99 and, for `chat`,
+streamed chunks/s and TTFT. `models` hits `GET /v1/models`, which the proxy
+answers itself; `bigbody` pads a `max_tokens: 1` chat request with 2 MiB. One
+Python client tops out near 700 req/s on `models`, so run several processes in
+parallel and read the daemon's CPU time per request
+(`/proc/<daemon pid>/stat`) rather than req/s alone. Use it to compare two
+daemon builds on the same upstream, alternating builds between rounds.
