@@ -58,6 +58,11 @@ pub async fn shutdown_and_wait(state_dir: &Path) -> Result<StopOutcome> {
     .call("shutdown", None)
     .await
     .context("daemon shutdown request")?;
+  // Close the pooled keep-alive before waiting for the exit. The control plane
+  // drains by polling its active-connection count down to zero, so a client
+  // still holding a connection open here makes the daemon sit out the whole
+  // drain window before it gets to `stop_all_managed` and the lockfile.
+  drop(client);
   let grace = resp
     .get("stop_grace_secs")
     .and_then(|v| v.as_u64())
