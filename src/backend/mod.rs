@@ -43,7 +43,6 @@
 //! file-less backend-registry model rides the same persisted maps as GGUF
 //! rows — reusable by any future backend.
 
-pub mod ds4;
 pub mod generic;
 pub mod identity;
 pub mod lemonade;
@@ -75,7 +74,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::backend::ds4::Ds4Backend;
 use crate::backend::generic::GenericBackend;
 use crate::backend::identity::ModelIdentity;
 use crate::backend::lemonade::LemonadeBackend;
@@ -134,11 +132,11 @@ pub enum Readiness {
   /// the probe waiting until its timeout — matching today's behavior.
   HttpPoll { path: String, ready_status: u16 },
   /// Poll `path` until it returns `ready_status` **and** the JSON body
-  /// advertises a model id in `expect_model_ids`. ds4 needs this because it
-  /// leaves its reserved port *unbound* for the entire multi-minute load, so
-  /// a status-only 200 could come from any process that grabbed the port
-  /// meanwhile — matching the advertised alias confirms the real backend
-  /// bound. Falls back to the timeout if the id never matches.
+  /// advertises a model id in `expect_model_ids`. For a server that leaves its
+  /// reserved port *unbound* for a long load, where a status-only 200 could
+  /// come from any process that grabbed the port meanwhile — matching the
+  /// advertised id confirms the real server bound. Falls back to the timeout
+  /// if the id never matches.
   HttpPollModelId {
     path: String,
     ready_status: u16,
@@ -149,8 +147,7 @@ pub enum Readiness {
 /// The HF-credential subset stripped from a backend child's environment.
 /// `HF_*` are llamastash's own pull tokens/config, which a launched inference
 /// server has no reason to see — stripping them keeps the credential blast
-/// radius small. This is the whole strip set ds4 needs (it reads no env
-/// config); llama.cpp's [`crate::backend::llama_cpp::LLAMA_ENV_STRIP`] carries
+/// radius small. llama.cpp's [`crate::backend::llama_cpp::LLAMA_ENV_STRIP`] carries
 /// the same four vars plus its `LLAMA_ARG_*` argv-override guards.
 pub const CREDENTIAL_ENV_STRIP: &[&str] = &[
   "HF_TOKEN",
@@ -344,7 +341,7 @@ pub trait Backend {
   /// Network-affecting flag heads this backend refuses in `extras` /
   /// native-knob values **on top of** the base loopback/credential denylist
   /// ([`crate::launch::params::FORBIDDEN_ADVANCED_PREFIXES`]). Default empty:
-  /// llama.cpp and Lemonade add nothing. ds4 adds `--cors` / `--dist-`.
+  /// llama.cpp and Lemonade add nothing.
   fn forbidden_extra_heads(&self) -> &'static [&'static str] {
     &[]
   }
@@ -430,8 +427,8 @@ pub trait Backend {
   /// The model ids a backend's `/v1/models` may advertise for one of its
   /// launches — the adoption/readiness id contract (D-adopt / D-ready).
   /// Empty (the default) means "match by the recorded file path/basename"
-  /// (llama.cpp's rule, applied by the orphan sweep). ds4 returns its fixed
-  /// alias set, since it never echoes the path.
+  /// (llama.cpp's rule, applied by the orphan sweep). A server that reports a
+  /// fixed alias instead of the path returns that alias set.
   fn adoption_model_ids(&self) -> &'static [&'static str] {
     &[]
   }
@@ -442,10 +439,9 @@ pub trait Backend {
   ///
   /// Default (llama.cpp): the `/v1/models` id matches the recorded path or its
   /// basename (`crate::daemon::orphans::models_endpoint_matches`); `argv` is
-  /// unused. ds4 overrides — it echoes a fixed alias, never the path, so it
-  /// cross-checks `argv`'s `-m` against `recorded_path` **and** confirms the
-  /// endpoint advertises a ds4 alias. Names no backend at the call site; the
-  /// sweep resolves the recorded backend tag and calls this.
+  /// unused. A server that reports a fixed alias instead of the path overrides
+  /// this to cross-check `argv` against `recorded_path`. Names no backend at
+  /// the call site; the sweep resolves the recorded backend tag and calls this.
   async fn adoption_matches(
     &self,
     recorded_path: &Path,
@@ -457,7 +453,8 @@ pub trait Backend {
   }
 
   /// Whether this backend **auto-claims** `header` beyond the default identity
-  /// rule — the header-level routing predicate (ds4's arch + quant contract).
+  /// rule — a header-level routing predicate (for example an arch plus a quant
+  /// contract).
   ///
   /// Default `false`: llama.cpp (runs every GGUF) and a registry backend
   /// (Lemonade) claim nothing *specially* here. Discovery records the first
@@ -559,7 +556,7 @@ pub trait Backend {
 
   /// Probe one server binary for the GPU **devices** it can target (the exact
   /// `--device` selectors it accepts). Default empty — a backend with no
-  /// device-selection surface (ds4 / lemonade). llama.cpp overrides with its
+  /// device-selection surface (Lemonade). llama.cpp overrides with its
   /// `--list-devices` probe.
   fn probe_devices(&self, _binary: &Path) -> Vec<Device> {
     Vec::new()
@@ -589,7 +586,7 @@ pub trait Backend {
   /// Default-ordering weight among the servers a model supports (higher first).
   /// Orders both the launch **server** knob and `supported_backends`, and picks
   /// the no-selection default. Default `0`; a purpose-built backend that should
-  /// win the auto-route (ds4 over llama.cpp) returns a higher value.
+  /// win the auto-route over llama.cpp returns a higher value.
   fn launch_priority(&self) -> i32 {
     0
   }
@@ -719,8 +716,8 @@ pub trait Backend {
   /// [`Config`](crate::config::Config). Default: none. `doctor` collects across
   /// [`Backends::all`] so its check flow names no backend; each finding carries
   /// a stable string id (kept additive, so `schema_version` never bumps for a
-  /// new backend). A backend with host-specific diagnostics (ds4's "compatible
-  /// model present but the engine is unavailable") overrides this and builds its
+  /// new backend). A backend with host-specific diagnostics ("compatible model
+  /// present but the engine is unavailable") overrides this and builds its
   /// findings via [`Finding::from_parts`](crate::init::doctor::Finding::from_parts).
   /// `config`-only (not `ctx`) because `doctor` runs CLI-side with no
   /// [`MethodContext`]; a backend reads its own sub-config + does its own scan.
@@ -874,21 +871,6 @@ pub trait Backend {
         .any(|m| basename_matches_marker(&name, m))
   }
 
-  /// A backend-specific KV-cache byte model for `header`, or `None` to use the
-  /// generic GQA/MLA estimate.
-  ///
-  /// Keyed on the **header** (arch + shape), not on which backend actually runs
-  /// the model: KV geometry is a property of the weights, so
-  /// [`crate::gguf::memory::kv_bytes`] consults every backend's override and a
-  /// `deepseek4` GGUF gets ds4's compressed-cache figure even when it falls
-  /// back to llama.cpp. Default `None` — llama.cpp / Lemonade use the generic
-  /// path. `arch` is the resolved `general.architecture` the estimator keys on
-  /// (passed alongside the header so the gate matches the pre-seam behavior
-  /// exactly, independent of what the header's own arch key says).
-  fn kv_bytes(&self, _header: &GgufHeader, _arch: Option<&str>, _ctx_len: u64) -> Option<u64> {
-    None
-  }
-
   /// The accelerator classes this backend can run models on.
   ///
   /// A *static, backend-intrinsic* floor — llama.cpp always runs CPU (GPU
@@ -999,7 +981,6 @@ pub trait Backend {
 pub struct BackendConfig {
   pub llamacpp: crate::backend::llama_cpp::LlamaCppConfig,
   pub lemonade: crate::backend::lemonade::LemonadeConfig,
-  pub ds4: crate::backend::ds4::Ds4Config,
   pub vllm: crate::backend::vllm::VllmConfig,
   pub sglang: crate::backend::sglang::SglangConfig,
   pub generic: crate::backend::generic::GenericConfig,
@@ -1017,8 +998,6 @@ pub enum Backends {
   LlamaCpp(LlamaCppBackend),
   /// Lemonade (`lemond`) managed-multiplexer — one umbrella, many models.
   Lemonade(LemonadeBackend),
-  /// ds4 (DwarfStar) — direct process-per-model for DeepSeek V4 GGUFs.
-  Ds4(Ds4Backend),
   /// vLLM — direct process-per-model for safetensors HF repos.
   Vllm(VllmBackend),
   /// SGLang — direct process-per-model for safetensors HF repos.
@@ -1040,7 +1019,6 @@ macro_rules! for_each_backend {
     match $self {
       Backends::LlamaCpp($b) => $body,
       Backends::Lemonade($b) => $body,
-      Backends::Ds4($b) => $body,
       Backends::Vllm($b) => $body,
       Backends::Sglang($b) => $body,
       Backends::Generic($b) => $body,
@@ -1060,7 +1038,6 @@ impl Backends {
     vec![
       Backends::LlamaCpp(LlamaCppBackend::new()),
       Backends::Lemonade(LemonadeBackend::new()),
-      Backends::Ds4(Ds4Backend::new()),
       Backends::Vllm(VllmBackend::new()),
       Backends::Sglang(SglangBackend::new()),
       Backends::Generic(GenericBackend::new()),
@@ -1083,8 +1060,7 @@ pub fn routed_backend_for(header: &GgufHeader) -> Option<String> {
 /// Every backend that can serve a disk GGUF with `header`, **priority-ordered**
 /// (highest [`Backend::launch_priority`] first, ties broken by registration
 /// order). The first entry is the auto-route default. A backend is included when
-/// it `auto_routes` the header (special routing, e.g. ds4 for a compatible
-/// DeepSeek-V4) **or** it is the identity-default backend for a plain GGUF
+/// it `auto_routes` the header (special routing) **or** it is the identity-default backend for a plain GGUF
 /// ([`DEFAULT_BACKEND_ID`], always able to run a local file). Discovery records
 /// this per model; the `list` badge / right-pane badges show all of them, and
 /// launch routing prefers the first available one. Names no backend beyond the
@@ -1094,7 +1070,7 @@ pub fn supported_backends_for(header: &GgufHeader) -> Vec<String> {
     .into_iter()
     .filter(|b| b.auto_routes(header) || b.id() == DEFAULT_BACKEND_ID)
     .collect();
-  // Stable sort by priority descending — ds4 (20) before llamacpp (10).
+  // Stable sort by priority descending.
   backends.sort_by_key(|b| std::cmp::Reverse(b.launch_priority()));
   backends.into_iter().map(|b| b.id().to_string()).collect()
 }
@@ -1168,10 +1144,6 @@ impl Backend for Backends {
     probe_timeout: std::time::Duration,
   ) -> bool {
     for_each_backend!(self, b => b.adoption_matches(recorded_path, argv, port, probe_timeout).await)
-  }
-
-  fn kv_bytes(&self, header: &GgufHeader, arch: Option<&str>, ctx_len: u64) -> Option<u64> {
-    for_each_backend!(self, b => b.kv_bytes(header, arch, ctx_len))
   }
 
   fn auto_routes(&self, header: &GgufHeader) -> bool {
@@ -1745,7 +1717,7 @@ pub fn resolve_identity_for_path(
 /// only.
 ///
 /// A bare `contains` was safe while every marker was a long compound basename
-/// (`llama-server`, `ds4-server`), where a `-cuda` / `-vulkan` build suffix is
+/// (`llama-server`, `lemond`), where a `-cuda` / `-vulkan` build suffix is
 /// certainly the same program and `comm`'s 15-char cap can truncate it. It
 /// stops being safe once a backend registers a short single-token marker: a
 /// four-character token is a substring of unrelated tools on the host, and
@@ -1836,8 +1808,8 @@ pub fn resolve_backend_for_launch(
   match choice {
     BackendChoice::Auto => {
       // Walk the priority-ordered supported list; take the first backend that
-      // is available and serves this mode (so a compatible ds4 model falls back
-      // to llama.cpp when ds4 is absent, or on an embedding/rerank launch).
+      // is available and serves this mode (so a model falls back to llama.cpp
+      // when its preferred engine is absent, or on an embedding/rerank launch).
       for id in supported_backends {
         if let Some(b) = Backends::all().into_iter().find(|b| b.id() == id.as_str()) {
           if b.available(ctx) && b.serves_mode(mode) {
@@ -2117,7 +2089,7 @@ mod tests {
     let ids: Vec<&str> = Backends::all().iter().map(|b| b.id()).collect();
     assert_eq!(
       ids,
-      vec!["llamacpp", "lemonade", "ds4", "vllm", "sglang", "generic"]
+      vec!["llamacpp", "lemonade", "vllm", "sglang", "generic"]
     );
     // Forwarding through the macro reaches each variant's real lifecycle.
     let by_id: std::collections::BTreeMap<&str, Lifecycle> = Backends::all()
@@ -2126,7 +2098,6 @@ mod tests {
       .collect();
     assert_eq!(by_id["llamacpp"], Lifecycle::ProcessPerModel);
     assert_eq!(by_id["lemonade"], Lifecycle::ManagedMultiplexer);
-    assert_eq!(by_id["ds4"], Lifecycle::ProcessPerModel);
     assert_eq!(by_id["vllm"], Lifecycle::ProcessPerModel);
     assert_eq!(by_id["sglang"], Lifecycle::ProcessPerModel);
   }
@@ -2194,58 +2165,8 @@ mod tests {
     );
   }
 
-  fn ds4_header() -> GgufHeader {
-    use crate::gguf::header::{GgufValue, TensorInfo};
-    use std::collections::HashMap;
-    let mut metadata = HashMap::new();
-    metadata.insert(
-      "general.architecture".to_string(),
-      GgufValue::String("deepseek4".to_string()),
-    );
-    GgufHeader {
-      version: 3,
-      tensor_count: 2,
-      metadata,
-      tensors: vec![
-        TensorInfo {
-          name: "blk.0.ffn_gate_exps.weight".to_string(),
-          dims: vec![4096, 4096],
-          ggml_type: 16, // IQ2_XXS — a routed-expert quant ds4 accepts
-        },
-        TensorInfo {
-          name: "token_embd.weight".to_string(),
-          dims: vec![4096, 4096],
-          ggml_type: 1, // F16
-        },
-      ],
-    }
-  }
-
   #[test]
-  fn backends_forward_defaulted_methods_to_variants() {
-    // Regression guard: `Backends` must forward every *defaulted* trait method
-    // to the active variant, else it silently returns the trait default rather
-    // than the override. Two cheap sentinels: serves_mode (a variant overrides
-    // Embedding → false; the default is true) and auto_routes (drives routing,
-    // reached through routed_backend_for).
-    let ds4 = Backends::Ds4(Ds4Backend::new());
-    assert!(
-      !ds4.serves_mode(LaunchMode::Embedding),
-      "Backends must forward serves_mode to the variant"
-    );
-    assert!(ds4.serves_mode(LaunchMode::Chat));
-    assert!(Backends::LlamaCpp(LlamaCppBackend::new()).serves_mode(LaunchMode::Embedding));
-
-    // routed_backend_for exercises Backends::auto_routes forwarding end to end:
-    // a compatible header resolves to the claiming backend's id.
-    let h = ds4_header();
-    assert!(
-      ds4.auto_routes(&h),
-      "Backends must forward auto_routes to the variant"
-    );
-    assert_eq!(routed_backend_for(&h), Some("ds4".to_string()));
-
-    // A plain header claims no special routing → falls back to identity.
+  fn a_plain_header_claims_no_special_routing() {
     use crate::gguf::header::GgufValue;
     use std::collections::HashMap;
     let mut m = HashMap::new();

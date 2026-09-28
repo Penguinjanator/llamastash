@@ -74,6 +74,9 @@ pub struct KnobSpec {
   pub default: Option<String>,
   #[serde(default)]
   pub ctx: bool,
+  /// An on/off knob: `true` sends the bare `flag`, `false` sends nothing.
+  #[serde(default)]
+  pub switch: bool,
   #[serde(default)]
   pub label: Option<String>,
   #[serde(default)]
@@ -325,6 +328,20 @@ impl GenericConfig {
         if !ids.insert(id.clone()) {
           return Err(entry(format!("duplicate knob id `{id}`")));
         }
+        if spec.switch {
+          if spec.ctx {
+            return Err(entry(format!(
+              "knob `{id}` cannot be both `ctx` and `switch`"
+            )));
+          }
+          if let Some(d) = &spec.default {
+            if !matches!(d.trim(), "true" | "false") {
+              return Err(entry(format!(
+                "`switch: true` knob `{id}` needs a `true` or `false` default, got `{d}`"
+              )));
+            }
+          }
+        }
         if spec.ctx {
           ctx_count += 1;
           if let Some(d) = &spec.default {
@@ -458,6 +475,14 @@ servers:
       ("{name: e@x, binary: /b, ready: /h}", "`name`"),
       ("{name: e, binary: rel/b, ready: /h}", "absolute"),
       ("{name: e, binary: /b, ready: /h, knobs: [{flag: --x, id: port}]}", "reserved"),
+      (
+        "{name: e, binary: /b, ready: /h, knobs: [{flag: --x, switch: true, ctx: true}]}",
+        "both `ctx` and `switch`",
+      ),
+      (
+        "{name: e, binary: /b, ready: /h, knobs: [{flag: --x, switch: true, default: yes}]}",
+        "`true` or `false` default",
+      ),
     ];
     for (entry, want) in cases {
       let msg = refusal(&format!("servers:\n  - {entry}\n"));

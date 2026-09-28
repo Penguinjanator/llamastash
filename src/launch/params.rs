@@ -54,7 +54,7 @@ pub(crate) fn is_forbidden_head(head: &str) -> bool {
 }
 
 /// [`is_forbidden_head`] extended with a backend's own network-affecting
-/// heads (ds4 adds `--cors` / `--dist-`). A prefix ending in `-` matches by
+/// heads (for example `--cors`). A prefix ending in `-` matches by
 /// `starts_with`; everything else matches exactly — same rule as the base set.
 pub(crate) fn is_forbidden_head_ext(head: &str, extra: &[&str]) -> bool {
   is_forbidden_head(head) || head_hits_prefixes(head, extra)
@@ -196,7 +196,7 @@ pub fn forbidden_in_extras(extras: &[OsString]) -> Vec<String> {
 }
 
 /// [`forbidden_in_extras`] extended with a backend's own network-affecting
-/// heads (ds4 adds `--cors` / `--dist-`), so a ds4 launch that spells one of
+/// heads, so a launch on that backend that spells one of
 /// those in `--` extras is refused with a clear error rather than silently
 /// stripped at spawn.
 pub fn forbidden_in_extras_ext(extras: &[OsString], extra_forbidden: &[&str]) -> Vec<String> {
@@ -276,7 +276,7 @@ pub enum BackendChoice {
 impl BackendChoice {
   /// Stable lowercase label for CLI parsing / JSON projection — `"auto"` or the
   /// backend id. The wire form (the custom [`serde::Serialize`] below) is
-  /// exactly this string, so a persisted `"ds4"` / `"llamacpp"` round-trips
+  /// exactly this string, so a persisted `"vllm"` / `"llamacpp"` round-trips
   /// byte-for-byte with the old enum encoding.
   /// The pinned backend id, or `None` when this is `Auto`. Callers that need
   /// "which backend's knobs apply" resolve `None` to the default themselves.
@@ -306,7 +306,7 @@ impl BackendChoice {
   }
 }
 
-// Persisted / wired as the bare id string (`"auto"`, `"ds4"`, `"llamacpp"`, …),
+// Persisted / wired as the bare id string (`"auto"`, `"vllm"`, `"llamacpp"`, …),
 // identical to the old externally-tagged unit-variant encoding, so `state.json`
 // and preset rows stay byte-stable across this refactor.
 impl serde::Serialize for BackendChoice {
@@ -508,7 +508,7 @@ pub struct LaunchParams {
   #[serde(default)]
   pub backend: BackendChoice,
   /// Chosen **server** id — a build/binary of a backend (`llamacpp·vulkan`,
-  /// `ds4·ds4`). Determines which binary the launch spawns; persisted in
+  /// `vllm`). Determines which binary the launch spawns; persisted in
   /// last-params so a relaunch reuses the build. `None` = no pick (default
   /// binary). `#[serde(default)]` keeps pre-server-abstraction rows loading.
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -703,7 +703,7 @@ mod tests {
       BackendChoice::Auto,
       BackendChoice::Explicit("llamacpp".into()),
       BackendChoice::Explicit("lemonade".into()),
-      BackendChoice::Explicit("ds4".into()),
+      BackendChoice::Explicit("vllm".into()),
     ] {
       let s = serde_json::to_string(&c).unwrap();
       let back: BackendChoice = serde_json::from_str(&s).unwrap();
@@ -720,8 +720,8 @@ mod tests {
       "\"llamacpp\""
     );
     assert_eq!(
-      serde_json::from_str::<BackendChoice>("\"ds4\"").unwrap(),
-      BackendChoice::Explicit("ds4".into())
+      serde_json::from_str::<BackendChoice>("\"vllm\"").unwrap(),
+      BackendChoice::Explicit("vllm".into())
     );
   }
 
@@ -1020,10 +1020,10 @@ mod tests {
     );
     // Set → the key carries the map, with the same shape the TUI parses back.
     let mut with_knob = base_params();
-    with_knob.knobs.set_by_name("kv-disk-dir", "/tmp/kv");
+    with_knob.knobs.set_by_name("kv-cache-memory-bytes", "8G");
     assert_eq!(
-      with_knob.to_wire()["knobs"]["kv-disk-dir"],
-      serde_json::json!("/tmp/kv"),
+      with_knob.to_wire()["knobs"]["kv-cache-memory-bytes"],
+      serde_json::json!("8G"),
       "a backend's own knob round-trips into the row like any other"
     );
   }

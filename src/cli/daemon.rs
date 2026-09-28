@@ -40,14 +40,12 @@ pub async fn handle(action: DaemonAction, cli: &Cli, config: &Config) -> Result<
       proxy_host,
       insecure_no_auth,
       lemonade,
-      ds4,
       vllm,
       sglang,
       force,
     } => {
       let force_flags = [
         (crate::backend::lemonade::LEMONADE_BACKEND_ID, lemonade),
-        (crate::backend::ds4::DS4_BACKEND_ID, ds4),
         (crate::backend::vllm::VLLM_BACKEND_ID, vllm),
         (crate::backend::sglang::SGLANG_BACKEND_ID, sglang),
       ];
@@ -216,7 +214,7 @@ pub(crate) fn precheck_indicated_backends(opts: &DaemonOptions) -> std::result::
   }
   // Lemonade is flagged only when *explicitly* requested (`--lemonade` / env,
   // or `backend.lemonade.enabled: true`); the default-on-when-found path stays silent
-  // when `lemond` is simply absent (zero footprint, like ds4).
+  // when `lemond` is simply absent (zero footprint, like vLLM).
   let lemonade_force = opts
     .backend_force
     .get(crate::backend::lemonade::LEMONADE_BACKEND_ID)
@@ -250,28 +248,6 @@ pub(crate) fn precheck_indicated_backends(opts: &DaemonOptions) -> std::result::
         opts.backend.lemonade.port
       ));
     }
-  }
-  // ds4 is indicated only when *explicitly* requested (`--ds4` / env, or
-  // `ds4.enabled: true`) — the default-on-when-found path stays silent when
-  // the binary is simply absent (zero footprint, D4). An explicit request
-  // with no resolvable binary fails fast, naming the configured path.
-  let ds4_force = opts
-    .backend_force
-    .get(crate::backend::ds4::DS4_BACKEND_ID)
-    .copied()
-    .unwrap_or(false);
-  let ds4_explicit = ds4_force || opts.backend.ds4.enabled == Some(true);
-  if ds4_explicit
-    && crate::backend::ds4::resolve_ds4_binary(opts.backend.ds4.primary_binary()).is_none()
-  {
-    let where_ = match opts.backend.ds4.primary_binary() {
-      Some(p) => format!("`ds4.servers` ({})", p.display()),
-      None => "`ds4-server` on PATH".to_string(),
-    };
-    failures.push(format!(
-      "ds4 was requested but no `ds4-server` binary was found at {where_} — build ds4-server and \
-       add it to `backend.ds4.servers` (see docs/usage.md), or `llamastash daemon start --force` to start without it."
-    ));
   }
   if failures.is_empty() {
     Ok(())
@@ -525,13 +501,12 @@ fn force_stop_via_pid(pid: i32, attach_dir: &std::path::Path) -> Result<()> {
 /// Every backend that can be force-enabled, paired with the env var that does
 /// it alongside its CLI flag. The one place in the daemon CLI that names
 /// backends, which is the sanctioned boundary: the flags are user-facing
-/// surface (`--lemonade`, `--ds4`, `--vllm`, `--sglang`).
+/// surface (`--lemonade`, `--vllm`, `--sglang`).
 const FORCE_FLAG_ENV: &[(&str, &str)] = &[
   (
     crate::backend::lemonade::LEMONADE_BACKEND_ID,
     "LLAMASTASH_LEMONADE",
   ),
-  (crate::backend::ds4::DS4_BACKEND_ID, "LLAMASTASH_DS4"),
   (crate::backend::vllm::VLLM_BACKEND_ID, "LLAMASTASH_VLLM"),
   (
     crate::backend::sglang::SGLANG_BACKEND_ID,
@@ -682,7 +657,7 @@ pub(crate) fn build_options(args: BuildOptionsArgs<'_>) -> Result<DaemonOptions>
     }
   }
   // Backend config: clone the whole `backend:` block (llama.cpp knobs +
-  // lemonade + ds4), then apply the `LLAMASTASH_*` env overrides + range clamp
+  // lemonade + vLLM + SGLang + generic), then apply the `LLAMASTASH_*` env overrides + range clamp
   // onto the llama.cpp fit knobs. `jinja` stays config-only (factory `true`) —
   // unlike the opt-in booleans below it defaults *on* and the `"1"`-truthy env
   // contract can't express "force off" — so it rides through from the clone.
@@ -1824,7 +1799,6 @@ mod tests {
     let dir = crate::test_support::unique_temp_dir("ls-precheck", "no-llama");
     let mut opts = DaemonOptions::rooted_at(dir);
     // Keep a developer's own engines on PATH out of the result.
-    opts.backend.ds4.enabled = Some(false);
     opts.backend.vllm.enabled = Some(false);
     opts.backend.sglang.enabled = Some(false);
     opts.backend.lemonade.enabled = Some(false);
@@ -1857,7 +1831,7 @@ mod tests {
         .copied()
         .unwrap_or(false)
     };
-    // Default: enablement intent is on (default-on-when-found, like ds4), the
+    // Default: enablement intent is on (default-on-when-found, like vLLM), the
     // config `enabled` stays unset, and no force flag is captured.
     let baseline =
       build_options(BuildOptionsArgs::new(&cli, &config)).expect("build_options baseline");

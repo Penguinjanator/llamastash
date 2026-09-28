@@ -13,7 +13,7 @@ license = "MIT"
 edition = "2021"
 rust-version = "1.95"
 # `cargo run` (without --bin) targets the real binary. The fixture
-# `[[bin]]` entries (fake_llama_server, fake_ds4_server) are only built
+# `[[bin]]` fixture entries (fake_llama_server, …) are only built
 # for tests under the `test-fixtures` feature, but cargo's run-target
 # picker checks the manifest before feature resolution, so we still need
 # this hint.
@@ -289,17 +289,6 @@ doc = false
 [[bin]]
 name = "fake_lemond"
 path = "tests/fixtures/fake_lemond.rs"
-required-features = ["test-fixtures"]
-bench = false
-test = false
-doc = false
-
-# Fake `ds4-server` for the ds4 backend integration tests — mirrors the real
-# load-before-listen + fixed-alias + no-/health contract. Spawned via
-# `CARGO_BIN_EXE_fake_ds4_server`; injected as `ds4.binary` per-test.
-[[bin]]
-name = "fake_ds4_server"
-path = "tests/fixtures/fake_ds4_server.rs"
 required-features = ["test-fixtures"]
 bench = false
 test = false

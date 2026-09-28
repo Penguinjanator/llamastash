@@ -3,7 +3,7 @@
 SGLang serves **safetensors HuggingFace repos** — the non-GGUF half of your
 model cache — the same rows the vLLM backend serves. It sits alongside
 llama.cpp rather than competing for the same files: a GGUF still binds
-llama.cpp (or ds4), and a safetensors repo binds a safetensors engine.
+llama.cpp, and a safetensors repo binds a safetensors engine.
 
 LlamaStash never installs SGLang. You supply the launcher; the backend is on by
 default whenever a `sglang` is found, and contributes nothing when it isn't.
@@ -195,7 +195,7 @@ for a name the server never advertises.
   one served name and does not validate the `model` field of a request
   (verified on 0.5.18: an unregistered name is served), so no aliases are
   registered and any name the proxy resolves reaches the model.
-- **No GGUF on SGLang.** A GGUF binds llama.cpp (or ds4). SGLang claims
+- **No GGUF on SGLang.** A GGUF binds llama.cpp. SGLang claims
   safetensors repos only.
 - **Single-host only.** Tensor parallel across local GPUs is exposed;
   multi-node, data parallel and prefill/decode disaggregation are out of scope.

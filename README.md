@@ -19,7 +19,7 @@
 
 **Zero-overhead, terminal-native local-LLM manager.**
 
-A fast TUI **and** CLI with init wizard for managing local LLMs. One Rust binary that's a TUI, a CLI, a daemon, and an OpenAI-compatible proxy. [llama.cpp](https://github.com/ggml-org/llama.cpp) is the direct, zero-overhead default backend (vs raw `llama-server`), plus [Lemonade](https://github.com/lemonade-sdk/lemonade) for NPU / multi-engine inference, [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang) for safetensors, [ds4](https://github.com/antirez/ds4) for DeepSeek-V4, and a generic backend that runs any OpenAI-compatible server you declare in config. See [benchmarks](docs/benchmarks.md).
+A fast TUI **and** CLI with init wizard for managing local LLMs. One Rust binary that's a TUI, a CLI, a daemon, and an OpenAI-compatible proxy. [llama.cpp](https://github.com/ggml-org/llama.cpp) is the direct, zero-overhead default backend (vs raw `llama-server`), plus [Lemonade](https://github.com/lemonade-sdk/lemonade) for NPU / multi-engine inference, [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang) for safetensors, and a generic backend that runs any other OpenAI-compatible server you declare in config, like [ds4](https://github.com/antirez/ds4) for DeepSeek-V4. See [benchmarks](docs/benchmarks.md).
 
 ![TUI Gif](https://raw.githubusercontent.com/llamastash/llamastash/main/assets/tui.gif)
 
@@ -213,20 +213,20 @@ Full detail per feature in [`FEATURES.md`](FEATURES.md) — including trade-offs
 ### [NPU & multi-engine via Lemonade (experimental)](docs/lemonade-setup.md)
 
 - **⚠️ Experimental** — new and lightly road-tested; behaviour and config may change. llama.cpp stays the stable default.
-- **A pluggable backend seam.** llama.cpp is the direct, zero-overhead default; [Lemonade](https://github.com/lemonade-sdk/lemonade) (`lemond`) plugs in as a second backend for engines llama.cpp can't reach — **NPU inference** on AMD Ryzen AI / XDNA, plus ROCm / ONNX / others. Default-on when the `lemond` binary resolves (like ds4); force via `--lemonade` / `LLAMASTASH_LEMONADE=1`, or set `backend.lemonade.enabled: false` to opt out. Zero footprint when the binary is absent.
+- **A pluggable backend seam.** llama.cpp is the direct, zero-overhead default; [Lemonade](https://github.com/lemonade-sdk/lemonade) (`lemond`) plugs in as a second backend for engines llama.cpp can't reach — **NPU inference** on AMD Ryzen AI / XDNA, plus ROCm / ONNX / others. Default-on when the `lemond` binary resolves (like vLLM); force via `--lemonade` / `LLAMASTASH_LEMONADE=1`, or set `backend.lemonade.enabled: false` to opt out. Zero footprint when the binary is absent.
 - **You install Lemonade; LlamaStash drives it.** No auto-install — LlamaStash finds `lemond` (PATH or `backend.lemonade.servers`), supervises the shared umbrella, discovers its models, routes inference through the proxy, and evicts idle models by API unload. See **[Lemonade setup](docs/lemonade-setup.md)**.
 
 ### [vLLM — safetensors HuggingFace repos (experimental)](docs/vllm-setup.md)
 
 - **⚠️ Experimental** — validated against vLLM 0.27.1 on a single Strix Halo / ROCm box; behaviour and config may change.
-- **The non-GGUF half of your cache.** Safetensors repos sitting in `~/.cache/huggingface` were invisible to LlamaStash before; now they appear in the catalog and launch through `vllm serve`. No competition with llama.cpp — a GGUF still binds llama.cpp (or ds4), and vLLM claims safetensors repos only.
+- **The non-GGUF half of your cache.** Safetensors repos sitting in `~/.cache/huggingface` were invisible to LlamaStash before; now they appear in the catalog and launch through `vllm serve`. No competition with llama.cpp — a GGUF still binds llama.cpp, and vLLM claims safetensors repos only.
 - **You install vLLM; LlamaStash drives it.** Default-on when a `vllm` launcher resolves (PATH or `backend.vllm.servers`); force with `--vllm` / `LLAMASTASH_VLLM=1`, opt out with `backend.vllm.enabled: false`. Zero footprint when absent. On ROCm, where vLLM ships only as a container, point the config at a small wrapper script — the recipe is in **[vLLM setup](docs/vllm-setup.md)**.
 - **Nine native knobs** (`--kv-cache-memory-bytes`, `--gpu-memory-utilization`, `--tensor-parallel-size`, `--dtype`, `--kv-cache-dtype`, `--quantization`, `--max-num-seqs`, `--enforce-eager`, `--trust-remote-code`) in the launch picker and presets; `--ctx` maps to `--max-model-len`.
 
 ### [SGLang — safetensors HuggingFace repos (experimental)](docs/sglang-setup.md)
 
 - **⚠️ Experimental** — validated against SGLang 0.5.18 on a single DGX Spark (GB10, unified memory); behaviour and config may change.
-- **The same rows vLLM serves.** Safetensors repos launch through `sglang serve`; a GGUF still binds llama.cpp (or ds4). With both engines installed a repo lists both and `auto` picks vLLM — `--backend sglang` selects SGLang.
+- **The same rows vLLM serves.** Safetensors repos launch through `sglang serve`; a GGUF still binds llama.cpp. With both engines installed a repo lists both and `auto` picks vLLM — `--backend sglang` selects SGLang.
 - **You install SGLang; LlamaStash drives it.** Default-on when a `sglang` launcher resolves (PATH or `backend.sglang.servers`); force with `--sglang` / `LLAMASTASH_SGLANG=1`, opt out with `backend.sglang.enabled: false`. Zero footprint when absent.
 - **A token cap, not a byte cap, on unified-memory hosts.** SGLang's only deterministic bound on its KV pool is `--max-total-tokens`, so the launcher divides the shared byte budget by the model's KV bytes per token, read from `config.json`. Eight native knobs in the launch picker and presets; `--ctx` maps to `--context-length`.
 
@@ -234,11 +234,7 @@ Full detail per feature in [`FEATURES.md`](FEATURES.md) — including trade-offs
 
 - **Engines LlamaStash has no backend for.** Declare a binary (or a wrapper script around `docker run`), its args with `{port}` / `{model}` placeholders, its readiness path and its own knobs in `config.yaml`. LlamaStash reserves the port, waits for ready, routes the proxy and stops it with a per-entry grace floor. Validated with gufo, Halogen (Docker) and CIRU on a Strix Halo box.
 - **Run a GGUF through another engine.** An entry with `model: "<glob>"` becomes a server option on the matching catalog rows, next to llama.cpp, in the TUI Server row, `--server`, and presets. Its knobs show up in the launch editor, presets and last-used like any other.
-
-### [ds4 (DwarfStar) — DeepSeek V4 GGUFs](docs/usage.md#ds4-backend)
-
-- **⚠️ Experimental** — new and lightly road-tested (validated on a single Strix Halo / ROCm box); behaviour, config, and defaults may change. llama.cpp stays the stable default and runs DeepSeek-V4 too on a current build (llama.cpp **b9840+**), so nothing depends on ds4.
-- **A third backend for antirez's [ds4](https://github.com/antirez/ds4).** ds4-server is the purpose-built engine for the DeepSeek-V4 Flash/PRO GGUFs (disk KV cache, SSD streaming). A ds4-compatible GGUF auto-routes to ds4 when the `ds4-server` binary is found, and **falls back to llama.cpp when it isn't** — a current llama.cpp (**b9840+**, the first release with DeepSeek-V4 support) runs these GGUFs too, so ds4 is preferred, never required. Older llama.cpp builds can't load them (`unknown model architecture: 'deepseek4'`). Default-on when the binary resolves; enable/force via `backend.ds4` config, `--ds4`, or `LLAMASTASH_DS4=1`. An SSD-streaming launch knob runs the 81–300+ GB models on below-floor RAM. See **[ds4 backend](docs/usage.md#ds4-backend)**.
+- **ds4 for DeepSeek-V4.** antirez's [ds4](https://github.com/antirez/ds4) (`ds4-server`) runs as a generic entry with its MTP, DSpark, SSD-streaming and disk KV cache flags as knobs. Same argv and speed as the dedicated backend it replaces. See **[Running ds4 as a generic server](docs/usage.md#running-ds4-as-a-generic-server)**.
 
 ### [Built to be safe to run](FEATURES.md#built-to-be-safe-to-run)
 

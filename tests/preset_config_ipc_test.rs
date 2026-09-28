@@ -191,9 +191,9 @@ async fn preset_crud_round_trips_through_config_and_survives_restart() {
   std::fs::remove_dir_all(&model_dir).ok();
 }
 
-/// `presets_save` carries the native (ds4) `backend_knobs` through to the
+/// `presets_save` carries a backend's own knobs through to the
 /// stored preset — the `Ctrl+P` save-from-running path relies on this so a
-/// ds4 launch's `--power` / `--ssd-streaming` are save-able, not just
+/// vLLM launch's `--max-num-seqs` / `--enforce-eager` are save-able, not just
 /// apply-able. Regression for the dropped `backend_knobs` in the save chain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn preset_save_carries_a_backends_own_knobs() {
@@ -214,16 +214,16 @@ async fn preset_save_carries_a_backends_own_knobs() {
       "model_path": model_path,
       "name": "streamy",
       // A backend's own tunables ride the one knob map now, like any other.
-      "knobs": { "ssd-streaming": true, "power": 60 },
+      "knobs": { "enforce-eager": true, "max-num-seqs": 60 },
     }),
   )
   .await;
   assert_eq!(
-    saved["saved"]["params"]["knobs"]["ssd-streaming"],
+    saved["saved"]["params"]["knobs"]["enforce-eager"],
     json!(true),
-    "saved preset must carry the ssd-streaming knob: {saved}"
+    "saved preset must carry the enforce-eager knob: {saved}"
   );
-  assert_eq!(saved["saved"]["params"]["knobs"]["power"], json!(60));
+  assert_eq!(saved["saved"]["params"]["knobs"]["max-num-seqs"], json!(60));
 
   // It round-trips through `presets_show` and lands in config.yaml.
   let shown = call(
@@ -233,7 +233,7 @@ async fn preset_save_carries_a_backends_own_knobs() {
   )
   .await;
   assert_eq!(
-    shown["preset"]["params"]["knobs"]["ssd-streaming"],
+    shown["preset"]["params"]["knobs"]["enforce-eager"],
     json!(true),
     "shown preset must carry the backend's own knobs: {shown}"
   );
@@ -243,7 +243,7 @@ async fn preset_save_carries_a_backends_own_knobs() {
   let stored = cfg.presets.get("coder.gguf").expect("model key present");
   let body = stored.entries.get("streamy").expect("preset entry present");
   assert!(
-    body.knobs.contains_by_name("ssd-streaming"),
+    body.knobs.contains_by_name("enforce-eager"),
     "a backend's own knobs must persist to config.yaml: {:?}",
     body.knobs
   );

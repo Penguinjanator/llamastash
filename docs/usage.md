@@ -66,8 +66,8 @@ model_paths: # Extra dirs to scan. Repeatable on the CLI as -p/--model-path.
   - /opt/llms
 
 backend: # Per-engine config, one block per backend. llama.cpp is the
-         # always-on default (no enable toggle); lemonade + ds4 are
-         # optional, each default-on when its own binary resolves.
+         # always-on default (no enable toggle); lemonade, vllm and sglang
+         # are optional, each default-on when its own binary resolves.
   llamacpp:
     servers: # Build/binary variants. First = default (auto/no-device launches),
              # and the target of --llama-server / LLAMASTASH_LLAMA_SERVER. Each is
@@ -81,13 +81,12 @@ backend: # Per-engine config, one block per backend. llama.cpp is the
     fit_ctx_floor: 16384 # Min --fit-ctx window. Env: LLAMASTASH_FIT_CTX_FLOOR.
     strict_fit: false # Refuse (vs degrade) an unplaceable --fit. Env: LLAMASTASH_STRICT_FIT.
     jinja: true # Emit --jinja every launch (tool calling). Config-only.
-  ds4: # See §"ds4 backend" below.
-    # servers: [{ binary: /opt/ds4/ds4-server }] # ds4-server path; else PATH.
-    # enabled: # tri-state: unset=auto, true=force on, false=force off.
   lemonade:
     # servers: [{ binary: /opt/lemonade/lemond }] # lemond path; else PATH.
-    # enabled: # tri-state (see ds4).
+    # enabled: # tri-state: unset=auto, true=force on, false=force off.
     # port: 13305 # lemond umbrella port.
+  generic: # Any other OpenAI-compatible server (ds4, gufo, Halogen). See §"Generic backend".
+    # servers: [{ name: ds4, model: "DeepSeek-V4-*", binary: /opt/ds4/ds4-server, ... }]
 
 disable_scan: false # Equivalent to LLAMASTASH_NO_SCAN=1.
 disable_default_cache_paths:
@@ -339,15 +338,15 @@ Launch a model. `run` is a visible alias for `start` — same flags, same behavi
 ```
 llamastash start <ref> [--name LABEL] [--preset NAME] [--ctx N] [--port N] [--wait] [--force]
                      [--reasoning on|off] [--mode chat|embedding|rerank]
-                     [--backend auto|ds4|llamacpp|lemonade|vllm|sglang] [--server <id>]
+                     [--backend auto|llamacpp|lemonade|vllm|sglang|generic] [--server <id>]
                      [--<advanced-knob> ...] [-- <llama-server-flags>...]
 ```
 
 `--name <label>` names this launch, so the same model can run several times at once and each copy stays addressable as `<model-ref>@<label>`. A name is trimmed and limited to letters, digits, `-` and `_` — anything else (a space, an `@`) is a usage error at parse time, because the address would not parse back to this launch; the daemon enforces the same rule for raw JSON-RPC callers. A second live launch of the *same* model under the *same* name is refused, and the refusal names the launch already holding it (`name `coder` is already running as L3`); the same name on a *different* model is fine. `--json` reports the accepted name back as `launch_name`, with or without `--wait`. Without `--name`, a launch from a named preset (`--preset coder`, a launch file, a TUI preset stop) takes the preset's name, so it gets the same `<model-ref>@coder` address a proxy request for that preset would auto-start; running that preset a second time on the same model is refused like a duplicate `--name`, so pass `--name` for another copy. Because a reference is only read as `<model>@<name>` when the name half follows that same rule, a mistyped `qwen3@my coder` is treated as a plain model reference and simply misses, rather than starting anything. Names are not config: they live as long as the launch and are gone once it stops. A `llamastash daemon stop` stops every managed launch with the daemon, so nothing is left to name; if the daemon *crashes*, its `llama-server` children keep serving and the next start surfaces each as a read-only `external` row that still carries its name — `status` shows `<model>@<name>` and `stop <name>` reaches it, but it is not re-published on `/v1/models` (routing needs a supervisor, and there is none), so the next proxy request for that address starts a fresh launch beside it.
 
-`--backend` defaults to `auto` (picks the engine by model identity — a DeepSeek-V4 GGUF routes to the [ds4 backend](#ds4-backend) when available, everything else to llama.cpp). Override it to force a specific engine.
+`--backend` defaults to `auto` (picks the engine by model identity: a GGUF runs on llama.cpp, a safetensors repo on vLLM or SGLang). Override it to force a specific engine.
 
-`--server <id>` picks a specific **server** — one build/binary of a backend (`llamacpp-vulkan`, `llamacpp-cuda`, `ds4` or a named `ds4-rocm`). It determines which binary spawns and, when `--backend` is unset, which backend runs the model (the server's owning backend). Server ids auto-derive as `<backend>-<compute>` from each build's own device names (or the bare backend id for a device-less engine like ds4/lemonade), overridable with a per-server `name:`; list them from `status` (the `servers` array; `status --json` mirrors it). A `--device <selector>` already implies its owning server, so `--server` is for picking a build with no device pin. The pick persists in `last_params`, so a relaunch reuses it — in the TUI it reopens the launch picker's `server` row on that build.
+`--server <id>` picks a specific **server** — one build/binary of a backend (`llamacpp-vulkan`, `llamacpp-cuda`, `vllm`, or a generic entry's `generic-<name>`). It determines which binary spawns and, when `--backend` is unset, which backend runs the model (the server's owning backend). Server ids auto-derive as `<backend>-<compute>` from each build's own device names (or the bare backend id for a device-less engine like vLLM or Lemonade), overridable with a per-server `name:`; list them from `status` (the `servers` array; `status --json` mirrors it). A `--device <selector>` already implies its owning server, so `--server` is for picking a build with no device pin. The pick persists in `last_params`, so a relaunch reuses it — in the TUI it reopens the launch picker's `server` row on that build.
 
 Every knob any backend declares is a first-class `start` flag — `--n-gpu-layers`, `--threads`, `--device`, `--tensor-split`, `--main-gpu`, `--split-mode`, `--flash-attn`, `--cache-type-k`/`-v`, `--batch-size`, `--load-mode`, and the same for every other backend's own tunables. The flag is spelled the way the engine spells it. Run `start --help` for the full list, grouped by the backend that declares each; `llamastash knobs` lists them with value ranges and choices. Flags, editor rows and preset keys are all generated from one declaration per knob, so no surface can be missing one. Booleans take `--flash-attn` (= on) or `--flash-attn=false`. Anything `start` doesn't recognise as a knob — including `llama-server`'s single-dash shorts like `-ngl` — still works verbatim after `--`. A knob set both inline and after `--` resolves to the `--` value.
 
@@ -565,7 +564,7 @@ llamastash daemon status [--json]   # PID + uptime + connections + managed launc
 
 `daemon start` detaches into the background by default and returns once the socket is bound. Pass `--foreground` (or `-f`) to keep the daemon attached to the terminal — useful when a process supervisor (systemd, runit, container `CMD`) owns the lifecycle and needs to see stdout/stderr directly.
 
-Without `llama-server`, `daemon start` refuses unless another backend is enabled (ds4, Lemonade, vLLM, SGLang, or a `backend.generic` entry). On such a host those backends launch as usual and only llama.cpp launches fail. `--force` starts the daemon either way.
+Without `llama-server`, `daemon start` refuses unless another backend is enabled (Lemonade, vLLM, SGLang, or a `backend.generic` entry). On such a host those backends launch as usual and only llama.cpp launches fail. `--force` starts the daemon either way.
 
 `daemon stop` calls the IPC `shutdown` RPC, then waits (up to 10 s) for the daemon process to actually exit before printing `daemon: stopped` — so `daemon stop && daemon start` never races the dying daemon's lockfile or its managed `lemond` umbrella. If teardown outlives the wait it falls back to `daemon: shutdown requested (still exiting, pid N)`. When `runtime.json` is missing (the IPC channel can't be opened because a stale daemon from an older version is holding the lockfile) pass `--force` (or `-f`) to fall back to a `SIGTERM` on the PID recorded in `daemon.pid`. The CLI auto-detects this state on every command and prints the exact `kill` / `--force` invocation needed.
 
@@ -595,25 +594,24 @@ llamastash start <model> --mtp-draft-n 5  # tokens drafted per step (backend def
 
 `--mtp` is a **launch-only** setting (there is no `config.yaml` key to set it globally), but it persists in `last_params` and in named presets like any other launch choice, so `mtp: off` / `mtp: on` in a preset entry's `knobs:` map pins it — including under `default:`, where it now applies to a plain `start` and a TUI launch that left the row alone. That matters most for pinning MTP **off** on a model where speculation costs more than it saves. `--mtp-draft-n` works whichever backend serves the model, and rides the `mtp-draft-n` knob, so `-- --mtp off` / `-- --mtp-draft-n 5` in the extras tail work too. The TUI launch picker shows the same control as an `mtp` row cycling inherited → auto → on → off, but only for MTP-capable models; it shows your intent, not the resolved answer (`status`'s `active` reports that). Forcing it on a model that has no draft head **warns and skips** rather than failing the launch (emitting the flag blind is a hard server error). If you drive speculative decoding yourself through the `-- <extras>` tail, llamastash defers entirely and adds nothing.
 
-Under the hood, each backend maps this onto its own flags — the serving backend enables speculation with the resolved draft head (and `--mtp-draft-n` when set), emitted **before** the fit step so context reservation stays MTP-aware. **DeepSeek-V4 on the ds4 backend** uses ds4's own `mtp` / `mtp_draft` / `mtp_margin` native knobs, auto-pairing a sidecar found next to the model. ds4 publishes no draft-acceptance figure, so `acceptance` stays null on a ds4 launch even while MTP is active.
-
-ds4 cannot stream weights from disk and speculate at the same time — `ssd_streaming` and an MTP draft head are mutually exclusive in ds4-server. llamastash reconciles them before launching: whichever of the two it enabled on your behalf gives way (an auto-paired sidecar is dropped so a memory-pressured launch can still stream; auto-streaming is skipped so a head you asked for survives), and it refuses the launch up front when you set both explicitly. Watch for the notice in either direction.
+Under the hood, each backend maps this onto its own flags — the serving backend enables speculation with the resolved draft head (and `--mtp-draft-n` when set), emitted **before** the fit step so context reservation stays MTP-aware. A generic server entry has no MTP automation: `--mtp` does nothing there, and you pass the engine's own draft-head flag through a knob. For DeepSeek-V4 on ds4 that's the `mtp-model` knob, set in a preset (see [Running ds4 as a generic server](#running-ds4-as-a-generic-server)).
 
 #### DSpark speculative decoding
 
-DSpark is ds4's second speculative engine for DeepSeek-V4 Flash: a support model that reads the target's hidden states and proposes up to five tokens per step, which the Flash model then verifies. It replaces the one-stage MTP head for that run rather than stacking with it, and it rides the same `mtp` knob — `mtp` points at the support GGUF, `dspark` turns the runtime on.
+DSpark is ds4's second speculative engine for DeepSeek-V4 Flash: a support model that reads the target's hidden states and proposes up to five tokens per step, which the Flash model then verifies. It replaces the one-stage MTP head for that run rather than stacking with it, and it takes the same `--mtp` slot: `mtp-model` points at the support GGUF, and `dspark` turns the runtime on. With the ds4 generic entry from [Running ds4 as a generic server](#running-ds4-as-a-generic-server):
 
 ```yaml
 presets:
-  DeepSeek-V4-Flash-...-0731.gguf:
+  DeepSeek-V4-Flash-*-0731.gguf:
     entries:
-      dspark:
+      ds4-dspark:
+        server: generic-ds4
         knobs:
           dspark: true
-          ssd-streaming: false   # streaming and a draft head are exclusive
+          mtp-model: /path/to/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 ```
 
-Leave `mtp` unset and llamastash auto-pairs the support GGUF sitting beside the model (it declares its own `deepseek4-dspark` architecture, so it is matched by header, not by filename). With `dspark` on and no support file resolvable, the DSpark knobs are dropped with a notice instead of handing ds4-server a `--dspark` it will reject after the full weight load.
+`ds4-server` refuses `--dspark` without an `--mtp` file, and only after the full weight load, so always set both.
 
 **Measure before you trust it.** DSpark is experimental, and on current ds4 builds it is often a net decode *loss* even at high acceptance. The per-accepted-token replay ds4 runs to preserve greedy identity can cancel the whole speculative saving (upstream ds4 issues [#695](https://github.com/antirez/ds4/issues/695), [#731](https://github.com/antirez/ds4/issues/731), [#733](https://github.com/antirez/ds4/issues/733) report this on Metal and M3 Ultra at 70-83% acceptance; measured here on ROCm/gfx1151 at 80% acceptance, 13.7 t/s falls to 7.0 t/s). ds4 also emits no acceptance figure through its API, so llamastash cannot surface one. Check it yourself with `DS4_DSPARK_STATS=1` on the ds4 binary (counters flush on clean exit) or `DS4_DSPARK_PROBE=1` for per-cycle stage status.
 
@@ -631,83 +629,9 @@ llamastash pull owner/repo:model.gguf --no-companions # base file only
 llamastash pull owner/repo:model.gguf --all-companions # every projector precision / head
 ```
 
-## ds4 backend
-
-> **⚠️ Experimental.** ds4 support is new and lightly road-tested (validated on a single Strix Halo / ROCm host). Its behaviour, config keys, and defaults may change between releases. llama.cpp is the stable default and runs DeepSeek-V4 too on a current build (**b9840+**), so ds4 is never required — if anything here misbehaves, force llama.cpp with `--backend llamacpp` or `backend.ds4.enabled: false`.
-
-[ds4](https://github.com/antirez/ds4) (antirez's DwarfStar) is a third backend: a direct, process-per-model engine that runs the `ds4-server` binary for the DeepSeek-V4 Flash/PRO GGUFs at [huggingface.co/antirez/deepseek-v4-gguf](https://huggingface.co/antirez/deepseek-v4-gguf). It is the purpose-built engine for those files (disk KV cache, SSD streaming); a current llama.cpp (**b9840+**) also runs DeepSeek-V4, so ds4 is preferred, never required.
-
-> **Minimum llama.cpp version for these GGUFs.** DeepSeek-V4 support landed in llama.cpp **b9840** ([ggml-org/llama.cpp#24162](https://github.com/ggml-org/llama.cpp/pull/24162), merged 2026-06-29). On **b9840 or newer** — a release binary or a source build from that merge onward — llama.cpp loads antirez's Flash/PRO GGUFs; on anything older it fails immediately with `error loading model: unknown model architecture: 'deepseek4'`. This matters because ds4's "falls back to llama.cpp, never a refusal" (below) only degrades gracefully when your llama.cpp is new enough — an older `llama-server` turns that fallback into a hard load error. Point `backend.llamacpp.servers` at a b9840+ build if you rely on the fallback. (Note: on the llama.cpp backend, Flash Attention is currently auto-disabled for the deepseek4 graph; it loads and runs without it.)
-
-**You supply the binary.** LlamaStash does not install ds4-server — build it from the repo (`git clone https://github.com/antirez/ds4 && cd ds4 && make`) and either put `ds4-server` on `PATH` or point `backend.ds4.servers` at it. ds4 is **default-on the moment the binary resolves**; it stays completely dormant when it doesn't (no discovery, no new JSON fields on other rows).
-
-Enable / configure:
-
-```yaml
-backend:
-  ds4:
-    # binary: /opt/ds4/ds4-server   # explicit path; else `ds4-server` on PATH
-    # enabled:                       # tri-state:
-    #   (unset)  auto — on when the binary is found (the default)
-    #   true     force on
-    #   false    force off even when the binary is present
-```
-
-`--ds4` on `daemon start` and `LLAMASTASH_DS4=1` also force ds4 on (OR-merged with the config, and carried through the detached daemon re-exec).
-
-### Which GGUFs run on ds4
-
-Routing is automatic and keys on a header-level compatibility predicate — arch `deepseek4` **plus** ds4's quant contract (routed-expert tensors `ffn_*_exps` in `IQ2_XXS` / `Q2_K` / `Q4_K`, every other tensor in `F32` / `F16` / `Q8_0` / `I32`). Both published Flash/PRO variants pass; a generic third-party `deepseek4` K-quant does not and stays an ordinary llama.cpp model.
-
-- A **compatible** GGUF launches on ds4 when ds4 is available and the mode is chat/completions.
-- Otherwise it **falls back to llama.cpp** — never a refusal, on a **b9840+** llama.cpp (see the version note above); an older `llama-server` fails the load with `unknown model architecture: 'deepseek4'`.
-- `start <model> --backend ds4` forces ds4 (it surfaces its own error if the file is a mismatch); `--backend llamacpp` forces llama.cpp on a compatible file. `--backend` accepts `auto` (default) | `ds4` | `llamacpp` | `lemonade`.
-- `--mode embedding` / `--mode rerank` on a compatible model routes to llama.cpp — ds4 serves chat/completions only.
-- The split PRO half-files (`…-Layers00-30.gguf` / `…-Layers-31-output.gguf`) are refused before spawn with "ds4 distributed mode unsupported"; use a single-file DeepSeek-V4 GGUF. Single-file PRO quants (e.g. the `…-Pro-IQ2XXS-…-Instruct` variants) are fine.
-
-### ds4 knobs
-
-ds4 declares its own tunables, each named for the flag `ds4-server` itself takes. Every one is a `start --<flag>`, a row in the TUI launch picker, and a preset key — set it wherever suits and the same run reproduces from any of the three.
-
-| Knob             | ds4-server flag      | What it does |
-| ---------------- | -------------------- | ------------ |
-| `power`          | `--power`            | GPU duty-cycle target, 1–100 (ds4 default 100) |
-| `tokens`         | `--tokens`           | Default max output tokens when a client omits a limit |
-| `threads`        | `--threads`          | CPU helper-thread count for host-side work |
-| `kv_disk_dir`    | `--kv-disk-dir`      | Directory for ds4's persistent disk KV cache (see privacy note below) |
-| `kv_disk_space_mb` | `--kv-disk-space-mb` | Disk KV cache budget in MB (ds4 default 4096 when enabled) |
-| `ssd_streaming`  | `--ssd-streaming`    | Stream weights from disk (below-RAM-floor mode; skips the admission gate). Mutually exclusive with `mtp` |
-| `ssd_streaming_cache_experts` | `--ssd-streaming-cache-experts` | SSD streaming: resident routed-expert cap — exact count `N` or routed memory budget `NGB` (ds4 auto: 80% of the working set) |
-| `ssd_streaming_preload_experts` | `--ssd-streaming-preload-experts` | SSD streaming: upfront popularity preload count (DeepSeek auto-seeds when unset) |
-| `ssd_streaming_cold` | `--ssd-streaming-cold` | SSD streaming: skip the default popularity-based expert-cache preload |
-| `warm_weights`   | `--warm-weights`     | Touch mapped tensor pages at startup to reduce first-use stalls |
-| `quality`        | `--quality`          | Prefer exact kernels where faster approximate paths exist |
-| `mtp`            | `--mtp`              | Path to the MTP draft-head sidecar (auto-paired from a sibling when unset; see [MTP speculative decoding](#mtp-speculative-decoding)) |
-| `mtp_draft`      | `--mtp-draft`        | Tokens drafted per step (also set by the neutral `--mtp-draft-n`) |
-| `mtp_margin`     | `--mtp-margin`       | Acceptance margin for the draft verifier |
-| `dspark`         | `--dspark`           | DSpark block speculation off the support GGUF in `mtp` (greedy decoding only; see [DSpark](#dspark-speculative-decoding)) |
-| `dspark_confidence` | `--dspark-confidence` | Prune proposals below this confidence, `0`–`1` (ds4 default `0.7`; `0` forces fixed five-token blocks) |
-| `dspark_strict`  | `--dspark-strict`    | Load the DSpark support model but keep target-only decode — the comparison baseline |
-
-Any other ds4-server flag (`--kv-cache-*`, `--prefill-chunk`, …) rides the free-form extras tail after `--`, e.g. `start <model> -- --prefill-chunk 512`. The loopback/credential denylist still applies, extended for ds4 with `--cors` and `--dist-` — those are stripped/refused.
-
-### Oversized models and below-floor hardware
-
-The DeepSeek-V4 GGUFs are 81–300+ GB; the practical RAM floor is roughly 128 GB on CUDA/ROCm and 96 GB on Metal. On a box below the floor, full residency out-of-memories. LlamaStash handles this for you: when a ds4 launch's resident estimate (~1.25× the weights, covering the expert cache + KV) exceeds free memory, it **auto-enables `ssd_streaming`** before spawn and prints a one-line notice (`ds4 needs ~N GiB resident but only M is free — enabled SSD streaming`). ds4-server then streams weights from disk under a bounded cache instead of OOM-killing mid-load. Set the **`ssd_streaming` native knob** yourself to force streaming on, or `ssd_streaming: false` to force full residency and skip the auto-enable. The knob is also the one launch where the pre-spawn admission gate is skipped (the on-disk size no longer maps to memory demand); this bypass keys on the native knob only — an extras-spelled `--ssd-streaming` still hits the admission gate. DeepSeek-V4's KV cache is modeled from the header (its two-tier compressed cache, ~0.5 GiB at 16k ctx and ~11 GiB at 1M for Flash), so the admission estimate is realistic at long context; the auto-streaming notice above is the memory signal to watch when residency is tight.
-
-Streaming rules out MTP speculation (ds4-server refuses the pair, and only after loading the whole model). When both would apply, llamastash drops whichever it enabled itself and says so; setting `ssd_streaming: true` and an `mtp` head together is refused before the load.
-
-### The ds4 `/v1/models` menu
-
-ds4-server advertises a **static two-entry list** on `/v1/models` — both `deepseek-v4-flash` and `deepseek-v4-pro` — no matter which GGUF is loaded, so a direct `curl` shows two models with one running. It is a fixed menu, not a report of the resident model. `/v1/chat/completions` serves the loaded model and **echoes back the `model` name you send** (no alias rewrite). LlamaStash's proxy publishes your real catalog (by file name) on its own `/v1/models` and forwards your request model verbatim, so through the proxy you request — and get back — the name you used. The right pane marks a ds4-routed model with a ` ds4 ` chip (backend identity only; no model-id remap to disclose).
-
-### kv-disk cache privacy
-
-`--kv-disk-dir` is ds4's own persistent cache, reused across restarts. LlamaStash never subdir-mangles or cleans it — it is entirely ds4-owned state. It durably holds conversation-derived data under ds4's own permissions (umask) at exactly the path you type, without any of LlamaStash's `0600` state-file hygiene. **Point it at a private, user-owned directory.**
-
 ## vLLM backend
 
-**Experimental.** vLLM serves **safetensors HuggingFace repos** — the non-GGUF half of your cache. A GGUF still binds llama.cpp (or ds4); vLLM claims repos the GGUF scanner does not. Setup, the ROCm container recipe, and the full knob table are in **[vLLM setup](vllm-setup.md)**.
+**Experimental.** vLLM serves **safetensors HuggingFace repos** — the non-GGUF half of your cache. A GGUF still binds llama.cpp; vLLM claims repos the GGUF scanner does not. Setup, the ROCm container recipe, and the full knob table are in **[vLLM setup](vllm-setup.md)**.
 
 Enable/disable follows the same tri-state as the other detected backends: unset means on-when-found, `backend.vllm.enabled: false` forces off, and `daemon start --vllm` / `LLAMASTASH_VLLM=1` force on over it.
 
@@ -777,7 +701,7 @@ Two shapes:
 
 **Placeholders** in `args` and `env`: `{port}`, `{host}` (always `127.0.0.1`), `{name}` (the id `/v1/models` publishes for the model, repo-qualified when another model shares its name; `id@launch` for a named launch), `{model}`, and `{<knob id>}`. An unknown placeholder is refused at config load. Braces that don't hold a plain identifier (`{"a": 1}`) stay literal.
 
-**Knobs** are strings passed as `<flag> <value>`, in declaration order, after `args` and before `-- <extras>`. A bare string (`- --seed`) is shorthand for `{flag: --seed}`. Fields: `flag`, `id` (default: the flag without dashes), `default`, `ctx: true` (at most one; makes the knob the context window, so `--ctx`, the TUI Context row and `status` ctx use it), `label`, `help`. A knob with no value and no default sends nothing. A knob referenced by a placeholder is substituted there instead of emitted; if it has no value the launch is refused. Knob ids may not reuse a built-in knob id or alias (set `id:`). Knobs appear in the TUI editor (an unset knob shows its `default`), presets, `last_params`, `status --json` and `llamastash knobs`, and are set from the CLI with presets or the TUI; `start <model> -- --flag v` passes `--flag v` straight to the engine as an extra; it does not set the knob.
+**Knobs** are strings passed as `<flag> <value>`, in declaration order, after `args` and before `-- <extras>`. A bare string (`- --seed`) is shorthand for `{flag: --seed}`. Fields: `flag`, `id` (default: the flag without dashes), `default`, `ctx: true` (at most one; makes the knob the context window, so `--ctx`, the TUI Context row and `status` ctx use it), `switch: true` (an on/off knob that sends the bare flag when on and nothing when off; its `default` is `true` or `false`), `label`, `help`. A knob with no value and no default sends nothing. A knob referenced by a placeholder is substituted there instead of emitted; if it has no value the launch is refused. Knob ids may not reuse a built-in knob id or alias (set `id:`). Knobs appear in the TUI editor (an unset knob shows its `default`), presets, `last_params`, `status --json` and `llamastash knobs`, and are set from the CLI with presets or the TUI; `start <model> -- --flag v` passes `--flag v` straight to the engine as an extra; it does not set the knob.
 
 ```bash
 llamastash list                                            # entries and matching GGUFs
@@ -940,6 +864,80 @@ exec /path/to/ciru/scripts/ciru/run-server.sh "$@"
 
 - `exec` hands the PID to llama-server, so llamastash's one SIGTERM reaches the engine directly.
 - CIRU answers under its own alias (`Qwen3.8-Flash-CIRU-STRIX-IU4`) and does not check the request's `model` field. Loads in about 115 s.
+
+### Running ds4 as a generic server
+
+[ds4](https://github.com/antirez/ds4) (antirez's DwarfStar) runs the DeepSeek-V4 Flash/PRO GGUFs from [huggingface.co/antirez/deepseek-v4-gguf](https://huggingface.co/antirez/deepseek-v4-gguf) through its `ds4-server` binary. It was a dedicated backend up to 0.4.0. It's now a generic server entry, which gives the same argv, readiness and speed (tested on 2026-09-28 with ds4 `0aaea5a` and the Flash IQ2_XXS `0731` GGUF: 13.2 t/s either way). You build `ds4-server` yourself (`git clone https://github.com/antirez/ds4 && cd ds4 && make`).
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: ds4                                   # server id: generic-ds4
+        model: "DeepSeek-V4-*"
+        binary: /path/to/ds4/ds4-server
+        args: [-m, "{model}", --host, "{host}", --port, "{port}"]
+        ready: /v1/models            # ds4-server binds its port only after the load
+        knobs:
+          - {flag: --ctx, id: ds4-ctx, ctx: true}
+          - --power
+          - --tokens
+          - {flag: --threads, id: ds4-threads}
+          - --kv-disk-dir
+          - --kv-disk-space-mb
+          - {flag: --ssd-streaming, switch: true}
+          - --ssd-streaming-cache-experts
+          - --ssd-streaming-preload-experts
+          - {flag: --ssd-streaming-cold, switch: true}
+          - {flag: --warm-weights, switch: true}
+          - {flag: --quality, switch: true}
+          - {flag: --mtp, id: mtp-model}
+          - {flag: --mtp-draft, id: ds4-mtp-draft}
+          - --mtp-margin
+          - {flag: --dspark, switch: true}
+          - --dspark-confidence
+          - {flag: --dspark-strict, switch: true}
+
+presets:
+  DeepSeek-V4-Flash-*-0731.gguf:
+    default: ds4-mtp
+    entries:
+      ds4:
+        server: generic-ds4
+      ds4-mtp:
+        server: generic-ds4
+        knobs:
+          mtp-model: /path/to/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
+      ds4-dspark:
+        server: generic-ds4
+        knobs:
+          dspark: true
+          mtp-model: /path/to/DeepSeek-V4-Flash-DSpark-support-0731.gguf
+```
+
+```bash
+llamastash start DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731 --ctx 32768
+llamastash start DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731 --preset ds4-dspark
+```
+
+The knob ids match the old backend's, so presets keep working. The exceptions are `ds4-ctx`, `ds4-threads` and `ds4-mtp-draft`, because `ctx`, `threads` and `mtp-draft-n` are built-in llama.cpp ids. `--ctx` still sets the context window. Any other `ds4-server` flag goes in the extras tail after `--`.
+
+**Migrating from the ds4 backend.** A config that still has `backend.ds4:` is rejected at load, and the error points here.
+
+1. Delete the `backend.ds4:` block, and drop `--ds4` / `LLAMASTASH_DS4` from your scripts.
+2. Add the `generic` entry above, with `binary` set to your `ds4-server`.
+3. Add `server: generic-ds4` to your ds4 presets. llama.cpp is now the default server for these GGUFs, so a preset or `--server generic-ds4` picks ds4.
+4. Set `mtp-model` in a preset to pair a draft head. The old backend found the MTP or DSpark file next to the model on its own; a generic entry doesn't.
+5. Run `llamastash daemon restart`.
+
+What the dedicated backend did that the generic entry doesn't:
+
+- **No automatic routing or fallback.** A DeepSeek-V4 GGUF defaults to llama.cpp. llama.cpp runs these files from **b9840** on ([ggml-org/llama.cpp#24162](https://github.com/ggml-org/llama.cpp/pull/24162)); an older `llama-server` fails with `unknown model architecture: 'deepseek4'`.
+- **No automatic SSD streaming.** Set `ssd-streaming: true` yourself on a box below the memory floor (about 128 GB on CUDA/ROCm, 96 GB on Metal). The admission check still sizes the launch from the GGUF, so a streaming launch that doesn't fit needs `start --force`.
+- **No MTP and streaming reconciliation.** `ds4-server` refuses `--ssd-streaming` together with `--mtp` after the full model load, so don't set both.
+- **No split-half guard.** The PRO `*-Layers00-30.gguf` / `*-Layers-31-output.gguf` halves are for ds4's distributed mode; launch a single-file GGUF instead.
+
+Two `ds4-server` behaviors to know about. Its `/v1/models` always lists both `deepseek-v4-flash` and `deepseek-v4-pro`, whatever is loaded; chat requests echo back the `model` you send, so no `rewrite_model` is needed. And `--kv-disk-dir` is ds4's own persistent cache: it holds conversation data under ds4's permissions at exactly the path you give, so point it at a private directory. See [DSpark speculative decoding](#dspark-speculative-decoding) for the DSpark caveats.
 
 ## Proxy (OpenAI-compatible listener)
 
@@ -1318,7 +1316,7 @@ Non-interactive contract: when stdout isn't a terminal and `--recommended` is no
 
 ### `llamastash doctor`
 
-Read-only diagnostic (its one write is the memory-drift baseline refresh). Re-runs hardware detection, diffs against `_init_snapshot.json`, and emits findings with stable ids agents can branch on: `binary_missing`, `binary_digest_drift` (skipped on brew installs — routine `brew upgrade` legitimately rotates the digest), `hardware_drift`, `memory_drift`, `gtt_hint`, `snapshot_stale`, `config_mode_drift`, `remote_snapshot_unreachable`, plus two configured-server advisories — `server_binary_missing` (Warning: a `backend.<id>.servers[].binary` path no longer resolves) and `servers_configured` (Info: a summary of the resolvable servers and their device counts; silent when no `servers:` are configured) — and two info-tier ds4 advisories that both honor the `LLAMASTASH_DS4` force: `ds4_unavailable` (the binary is absent but a compatible model is present — those still run on llama.cpp; the `fix_hint` carries the clone/`make` recipe, the `backend.ds4.servers` key, and a pointer to [ds4 backend](#ds4-backend); this is the only finding that scans discovery) and `ds4_disabled` (the binary is installed but `backend.ds4.enabled: false` and no force — `fix_hint` says re-enable, no scan). All of these ids are additive, so `schema_version` stays `2`; readers refuse only versions above their max. When the local benchmark snapshot looks stale, `doctor` probes the latest remote (the same one the recommender prefers) before judging `snapshot_stale`, so it only fires when no fresher snapshot is actually reachable; `LLAMASTASH_OFFLINE` skips that probe.
+Read-only diagnostic (its one write is the memory-drift baseline refresh). Re-runs hardware detection, diffs against `_init_snapshot.json`, and emits findings with stable ids agents can branch on: `binary_missing`, `binary_digest_drift` (skipped on brew installs — routine `brew upgrade` legitimately rotates the digest), `hardware_drift`, `memory_drift`, `gtt_hint`, `snapshot_stale`, `config_mode_drift`, `remote_snapshot_unreachable`, plus two configured-server advisories — `server_binary_missing` (Warning: a `backend.<id>.servers[].binary` path no longer resolves) and `servers_configured` (Info: a summary of the resolvable servers and their device counts; silent when no `servers:` are configured). All of these ids are additive, so `schema_version` stays `2`; readers refuse only versions above their max. When the local benchmark snapshot looks stale, `doctor` probes the latest remote (the same one the recommender prefers) before judging `snapshot_stale`, so it only fires when no fresher snapshot is actually reachable; `LLAMASTASH_OFFLINE` skips that probe.
 
 ```
 llamastash doctor [--json]
@@ -1492,7 +1490,7 @@ When enabled, left-click moves focus and the wheel replays the `↑`/`↓` actio
 
 Three-stage modal: **Search → File picker → Confirm**. Search runs live against the public `/api/models` endpoint (300 ms debounce); paste an `owner/repo[:filename]` slug + Enter to bypass search. Each search row carries a `fmt` column and two size columns — `params` (model parameter count, e.g. `35B`) and `size` (approximate download size, the representative GGUF file HF parsed, e.g. `5.3G`); the exact per-quant size lands in the File picker.
 
-`fmt` is the repo's weight format: `GGUF` for llama.cpp / ds4, `SFTN` for a safetensors repo (vLLM, SGLang), `-` when the repo publishes both or neither. Both formats are searched — the browser used to be GGUF-only, which left safetensors repos unfindable and so unpullable. The `init` wizard still searches GGUF only, since it is bootstrapping a first model for the default backend.
+`fmt` is the repo's weight format: `GGUF` for llama.cpp, `SFTN` for a safetensors repo (vLLM, SGLang), `-` when the repo publishes both or neither. Both formats are searched — the browser used to be GGUF-only, which left safetensors repos unfindable and so unpullable. The `init` wizard still searches GGUF only, since it is bootstrapping a first model for the default backend.
 
 Drilling into a GGUF repo lists its quants to pick from. A safetensors repo has nothing to pick — one model spread over `*.safetensors` plus `config.json` and the tokenizer files, all of which an engine needs — so the picker offers a single whole-repo row and the pull takes the full set.
 

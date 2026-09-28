@@ -730,7 +730,7 @@ pub async fn run(args: DoctorArgs, _cli: &Cli, config: &Config) -> CliResult {
   }
 
   // Backend-contributed advisories (D-doctor): each backend adds its own
-  // findings via the `doctor_findings` hook (ds4's "compatible model present but
+  // findings via the `doctor_findings` hook ("compatible model present but
   // engine unavailable", say). Collected generically over the registry so this
   // path names no backend; every id stays additive (schema stays 2).
   for backend in crate::backend::Backends::all() {

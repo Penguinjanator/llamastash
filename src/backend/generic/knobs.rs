@@ -22,12 +22,21 @@ pub fn def_for(spec: &KnobSpec) -> KnobDef {
   let id = leak(spec.knob_id());
   let flag = leak(spec.flag.trim().to_string());
   let label = leak(spec.label.clone().unwrap_or_else(|| id.to_string()));
-  let help = leak(match (&spec.help, &spec.default) {
-    (Some(h), _) => h.clone(),
-    (None, Some(d)) => format!("passed as {flag}; default {d}"),
-    (None, None) => format!("passed as {flag}; unset sends nothing"),
+  let help = leak(match (&spec.help, &spec.default, spec.switch) {
+    (Some(h), _, _) => h.clone(),
+    (None, Some(d), true) => format!("sends {flag} when on; default {d}"),
+    (None, None, true) => format!("sends {flag} when on"),
+    (None, Some(d), false) => format!("passed as {flag}; default {d}"),
+    (None, None, false) => format!("passed as {flag}; unset sends nothing"),
   });
-  let (kind, concept, group, ring) = if spec.ctx {
+  let emit = if spec.switch {
+    Emit::BareFlagWhenTrue
+  } else {
+    Emit::FlagValue
+  };
+  let (kind, concept, group, ring) = if spec.switch {
+    (KnobKind::Bool, None, Group::Advanced, Ring::None)
+  } else if spec.ctx {
     (
       KnobKind::U32 { max: None },
       Some(Concept::ContextLength),
@@ -47,7 +56,7 @@ pub fn def_for(spec: &KnobSpec) -> KnobDef {
     label,
     help,
     aliases: &[],
-    emit: Emit::FlagValue,
+    emit,
     ring,
     volatile: false,
     fallback: LayerLabel::ServerDefault,

@@ -1,7 +1,8 @@
 //! argv and env for one generic launch.
 //!
 //! argv = `args` (placeholders filled) + each set knob not referenced by a
-//! placeholder, as `<flag> <value>` in declaration order + launch extras. The
+//! placeholder, as `<flag> <value>` (a `switch` knob: the bare flag when
+//! `true`) in declaration order + launch extras. The
 //! entry's own `args` skip the extras denylist: they carry `{port}` and
 //! `{host}` by design.
 
@@ -22,9 +23,12 @@ pub struct Composed {
   pub env: Vec<(String, OsString)>,
 }
 
-/// Each declared knob's value for this launch: the resolved set's, else the
-/// entry's `default`, else none.
-fn knob_values(entry: &GenericServer, knobs: &KnobSet) -> Vec<(String, String, Option<String>)> {
+/// Each declared knob's id, flag, value (the resolved set's, else the entry's
+/// `default`, else none) and whether it is a `switch`.
+fn knob_values(
+  entry: &GenericServer,
+  knobs: &KnobSet,
+) -> Vec<(String, String, Option<String>, bool)> {
   entry
     .knobs
     .iter()
@@ -37,7 +41,7 @@ fn knob_values(entry: &GenericServer, knobs: &KnobSet) -> Vec<(String, String, O
         .and_then(|(_, v)| v.set_value())
         .map(|s| s.to_arg())
         .or(spec.default.clone());
-      (id, spec.flag.trim().to_string(), value)
+      (id, spec.flag.trim().to_string(), value, spec.switch)
     })
     .collect()
 }
@@ -53,7 +57,7 @@ pub fn compose(
 ) -> Result<Composed, String> {
   let values = knob_values(entry, knobs);
   let referenced: BTreeSet<String> = entry.placeholders().into_iter().collect();
-  for (id, _, value) in &values {
+  for (id, _, value, _) in &values {
     if referenced.contains(id) && value.is_none() {
       return Err(format!(
         "backend.generic entry `{}`: knob `{id}` is referenced by a placeholder but has no value; \
@@ -71,8 +75,8 @@ pub fn compose(
       "model" => Some(model.to_string_lossy().into_owned()),
       _ => values
         .iter()
-        .find(|(id, _, _)| id == key)
-        .and_then(|(_, _, v)| v.clone()),
+        .find(|(id, _, _, _)| id == key)
+        .and_then(|(_, _, v, _)| v.clone()),
     }
   };
 
@@ -81,13 +85,17 @@ pub fn compose(
     .iter()
     .map(|a| OsString::from(substitute(a, &lookup)))
     .collect();
-  for (id, flag, value) in &values {
+  for (id, flag, value, switch) in &values {
     if referenced.contains(id) {
       continue;
     }
-    if let Some(v) = value {
-      argv.push(flag.into());
-      argv.push(v.into());
+    match (value, switch) {
+      (Some(v), true) if v.trim() == "true" => argv.push(flag.into()),
+      (Some(_), true) | (None, _) => {}
+      (Some(v), false) => {
+        argv.push(flag.into());
+        argv.push(v.into());
+      }
     }
   }
   argv.extend(crate::launch::params::strip_forbidden_extras(
@@ -203,6 +211,47 @@ servers:
     )
     .unwrap();
     assert!(strs(&out.argv).contains(&"argv-gufo@coder".to_string()));
+  }
+
+  #[test]
+  fn a_switch_sends_its_bare_flag_only_when_on() {
+    let c: GenericConfig = yaml_serde::from_str(
+      r#"
+servers:
+  - name: argv-switch
+    binary: /opt/s
+    args: []
+    knobs:
+      - {flag: --stream, switch: true}
+      - {flag: --warm, switch: true, default: "true"}
+      - {flag: --cold, switch: true, default: "false"}
+"#,
+    )
+    .unwrap();
+    let run = |knobs: &KnobSet| {
+      let out = compose(
+        &c.servers[0],
+        knobs,
+        &[],
+        1,
+        "n",
+        std::path::Path::new(NO_MODEL),
+      )
+      .unwrap();
+      strs(&out.argv)
+    };
+    assert_eq!(run(&KnobSet::new()), ["--warm"]);
+
+    let mut knobs = KnobSet::new();
+    knobs.set_scalar(
+      crate::launch::knobs::KnobId("stream"),
+      crate::launch::knobs::Scalar::Bool(true),
+    );
+    knobs.set_scalar(
+      crate::launch::knobs::KnobId("warm"),
+      crate::launch::knobs::Scalar::Bool(false),
+    );
+    assert_eq!(run(&knobs), ["--stream"]);
   }
 
   #[test]

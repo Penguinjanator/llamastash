@@ -619,7 +619,7 @@ pub fn served_model_name(model_path: &Path) -> String {
 /// Every name vLLM should answer to, primary first.
 ///
 /// vLLM is the first backend behind our proxy that *validates* the request's
-/// `model` field — llama.cpp ignores it, ds4 echoes it back. The proxy forwards
+/// `model` field — llama.cpp ignores it. The proxy forwards
 /// the client's bytes unchanged by design, so a name our own resolver accepted
 /// (it matches case-insensitive substrings) would reach vLLM verbatim and 404
 /// **after** paying a full cold start. `--served-model-name` takes a list, so

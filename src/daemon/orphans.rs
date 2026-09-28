@@ -366,17 +366,6 @@ pub(crate) async fn models_endpoint_serves_id(
     .is_some_and(|ids| ids.iter().any(|id| id == expected))
 }
 
-/// Compare two model paths for adoption, tolerant of canonicalisation: try a
-/// canonical compare first (resolves symlinks / `..`), fall back to a direct
-/// path compare when either can't be canonicalised (file already gone). Shared
-/// by a backend's `adoption_matches` argv `-m` cross-check.
-pub(crate) fn paths_equal(a: &Path, b: &Path) -> bool {
-  match (a.canonicalize(), b.canonicalize()) {
-    (Ok(ca), Ok(cb)) => ca == cb,
-    _ => a == b,
-  }
-}
-
 /// GET `/v1/models` via `reqwest` — the same client the right-pane
 /// chat tab uses, so the orphan probe doesn't carry its own HTTP/1.1
 /// framing. Capped at 32 KiB so a misbehaving peer can't balloon our
@@ -564,57 +553,6 @@ mod tests {
       }
     });
     (task, port)
-  }
-
-  #[test]
-  fn paths_equal_matches_same_file_and_rejects_different() {
-    // The ds4 adoption argv `-m` cross-check: two spellings of the same file
-    // match; a different basename does not (per-file PID-reuse discrimination).
-    let dir = crate::test_support::unique_temp_dir("orphans-paths", "eq");
-    let a = dir.join("m.gguf");
-    std::fs::write(&a, b"x").unwrap();
-    assert!(paths_equal(&a, &a));
-    // A `./`-prefixed spelling canonicalizes to the same file.
-    let dotted = dir.join(".").join("m.gguf");
-    assert!(paths_equal(&dotted, &a), "canonicalization collapses ./");
-    // A different file in the same dir must not match.
-    let b = dir.join("other.gguf");
-    std::fs::write(&b, b"y").unwrap();
-    assert!(!paths_equal(&a, &b));
-    // A non-existent path falls back to a direct compare (unequal).
-    assert!(!paths_equal(&dir.join("gone.gguf"), &a));
-    std::fs::remove_dir_all(&dir).ok();
-  }
-
-  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-  async fn ds4_tagged_snapshot_dispatches_to_alias_branch() {
-    // A snapshot tagged `resolved_backend: "ds4"` takes the ds4 adoption path
-    // (F8: dispatch keys on the recorded tag, not the process basename). The
-    // test process's argv carries no `-m <recorded path>`, so the ds4 branch's
-    // argv cross-check fails and the row is (correctly) stale — proving the
-    // ds4 branch ran, not the llama.cpp path/basename rule (which would have
-    // adopted on the alias-shaped body alone).
-    let live = std::process::id() as i32;
-    let body = serde_json::json!({
-      "object": "list",
-      "data": [{"id": "deepseek-v4-flash", "object": "model"}],
-    })
-    .to_string();
-    let (_resp, port) = spawn_one_shot(200, body).await;
-    let mut snap = fake_snapshot(live, port, "/m/deepseek-v4-flash.gguf", 1);
-    snap.resolved_backend = "ds4".to_string();
-    let report = sweep(SweepInputs {
-      recorded_running: &[snap],
-      external_markers: vec!["llamastash-sweep-marker-that-matches-nothing-9f3a"],
-      probe_timeout: Duration::from_secs(1),
-    })
-    .await;
-    assert!(
-      report.adopted.is_empty() && report.stale.len() == 1,
-      "ds4 branch must reject when argv `-m` doesn't match (adopted={}, stale={})",
-      report.adopted.len(),
-      report.stale.len()
-    );
   }
 
   #[test]

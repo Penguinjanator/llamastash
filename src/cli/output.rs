@@ -87,7 +87,7 @@ pub fn list_human(
   }
   // Show the BACKEND column when any model surfaces a backend beyond the
   // default `llamacpp` — either a non-default primary or more than one supported
-  // backend (a ds4-compatible file lists `ds4|llamacpp`). Matches the TUI's
+  // backend (such a file lists `vllm|llamacpp`). Matches the TUI's
   // `multi_backend` gate.
   let show_backend = rows.iter().any(|r| {
     r.supported_backends.len() > 1
@@ -214,7 +214,7 @@ fn addressable_name(row: &CatalogRow, run: Option<&RunningRow>) -> String {
 }
 
 /// Backend badge for a catalog row: every backend that can serve it,
-/// priority-ordered (`ds4|llamacpp`), else the daemon's single tag, else
+/// priority-ordered (`vllm|llamacpp`), else the daemon's single tag, else
 /// `placeholder`. Shared by the `list` BACKEND column and `show`'s header
 /// row so the two surfaces can never name different backends for one model.
 /// The table formatter clips the cell if it overflows.
@@ -1103,14 +1103,14 @@ mod tests {
       "single-backend host hides the column: {single:?}"
     );
     // A non-`llamacpp` prediction flips it on.
-    let mut ds4 = row("deepseek", "deepseek4", "Q2_K", 4096);
-    ds4.backend = Some("ds4".to_string());
-    let multi = list_human(&[llama, ds4], &HashMap::new(), false);
+    let mut other = row("qwen", "qwen3", "Q4_K", 4096);
+    other.backend = Some("vllm".to_string());
+    let multi = list_human(&[llama, other], &HashMap::new(), false);
     assert!(
       multi.contains("BACKEND"),
       "multi-backend host shows the column"
     );
-    assert!(multi.contains("ds4"), "the ds4 value renders: {multi:?}");
+    assert!(multi.contains("vllm"), "the vllm value renders: {multi:?}");
   }
 
   #[test]
@@ -1229,12 +1229,12 @@ mod tests {
   #[test]
   fn backend_badge_is_the_one_rule_both_surfaces_render() {
     // `list`'s BACKEND column and `show`'s header row share this helper, so a
-    // ds4-compatible file can never read `ds4|llamacpp` on one surface and
+    // file two backends serve can never read `vllm|llamacpp` on one surface and
     // `llamacpp` on the other.
     let mut multi = row("ds", "deepseek4", "IQ2_XXS", 8192);
-    multi.supported_backends = vec!["ds4".into(), "llamacpp".into()];
+    multi.supported_backends = vec!["vllm".into(), "llamacpp".into()];
     multi.backend = Some("llamacpp".into());
-    assert_eq!(backend_badge(&multi, "?"), "ds4|llamacpp");
+    assert_eq!(backend_badge(&multi, "?"), "vllm|llamacpp");
 
     // Untagged by the daemon → the caller's placeholder, not a guess from
     // the row's `source`.

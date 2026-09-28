@@ -1828,8 +1828,8 @@ fn apply_launch_submit(app: &mut App, writer: Option<&mpsc::Sender<WriterCmd>>) 
     extras,
     mode,
     prefer_port: picker.prefer_port,
-    // Scoping value, not a user override: a ds4 scope sends `Auto` so the
-    // daemon routes (and the split-half guard fires). See `launch_backend`.
+    // Scoping value, not a user override: a scope sends `Auto` so the daemon
+    // routes. See `launch_backend`.
     backend: picker.launch_backend(),
     selection,
     // Chosen server build (or `None` for the priority default). The daemon

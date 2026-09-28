@@ -204,7 +204,7 @@ pub fn resolve_static_id(key: &str) -> Option<KnobId> {
 /// must parse before the serving backend is known — but wrong for a backend
 /// writing its own knob, because a name one backend declares as an *alias*
 /// (llama.cpp's `-c`/`ctx` for `ctx-size`) can shadow another's *canonical*
-/// id (ds4's `ctx`). Writing through the blind lookup then stores the value
+/// id (a backend that declares `ctx` itself). Writing through the blind lookup then stores the value
 /// under an id the emitting backend never reads.
 ///
 /// Order: this backend's canonical ids, then its aliases, then its concepts,
@@ -632,7 +632,7 @@ mod tests {
   fn a_custom_emit_knob_does_not_collide() {
     use crate::launch::knobs::def::Emit;
     // `Emit::Custom` never reaches argv, so its derived flag is a phantom —
-    // this is the real ds4 `mtp` / `mtp-model` shape.
+    // a knob pair like `mtp` / `mtp-model` has this shape.
     let defs = [
       flag_def("mtp", None, Emit::Custom),
       flag_def("mtp-model", Some("--mtp"), Emit::FlagValue),
@@ -732,30 +732,12 @@ mod shared_ids {
       shared,
       vec![
         "ctx-size",
-        "mtp",
-        "mtp-draft-n",
         // The two safetensors engines spell these the same way and `validate`
         // holds their kinds identical.
         "quantization",
-        "threads",
         "trust-remote-code",
       ],
       "shared knob ids changed; confirm the kinds still agree before pinning the new set"
-    );
-  }
-
-  /// A shared id may still emit a different flag per backend — `mtp-draft-n`
-  /// is `--spec-draft-n-max` on one and `--mtp-draft` on another. The id is
-  /// the contract; the spelling is the backend's business.
-  #[test]
-  fn a_shared_id_can_emit_different_flags() {
-    let flags: std::collections::BTreeSet<String> = iter()
-      .filter(|(_, d)| d.id == "mtp-draft-n")
-      .map(|(_, d)| d.emit_flag())
-      .collect();
-    assert!(
-      flags.len() > 1,
-      "expected divergent flags for one shared id, got {flags:?}"
     );
   }
 }

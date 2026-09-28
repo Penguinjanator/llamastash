@@ -595,8 +595,8 @@ mod tests {
     // arch pairs with either. Deleting one must leave the head for the other.
     use crate::gguf::test_fixtures::FixtureBuilder;
     let dir = tempdir("shared-head");
-    let a = dir.join("ds4-flash-Q2_K.gguf");
-    let b = dir.join("ds4-pro-Q2_K.gguf");
+    let a = dir.join("deepseek-v4-flash-Q2_K.gguf");
+    let b = dir.join("deepseek-v4-pro-Q2_K.gguf");
     let head = dir.join("mtp-deepseek-v4.gguf");
     fs::write(&a, b"weights").unwrap();
     fs::write(&b, b"weights").unwrap();

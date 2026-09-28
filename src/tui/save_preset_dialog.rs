@@ -42,8 +42,6 @@ pub struct SavePresetDialog {
   pub model_name: String,
   /// Captured launch knobs (ctx/reasoning folded in; Auto preserved).
   pub knobs: crate::launch::knobs::KnobSet,
-  /// Captured native (per-backend) knobs — the six ds4 tunables when the
-  /// captured launch is ds4-backed, so the preset stores them too. Empty for
   /// The knobs the dialog will write into the preset entry.
   /// Captured extras argv tail.
   pub extras: Vec<String>,

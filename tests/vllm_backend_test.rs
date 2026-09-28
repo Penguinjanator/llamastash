@@ -15,7 +15,7 @@ const ALLOWED: &[&str] = &[
   "src/backend/mod.rs",
   "src/config/mod.rs",
   // The daemon force-flag is user-facing CLI surface, so it names the backend
-  // by design — the same sanctioned exception `--lemonade` / `--ds4` carry.
+  // by design — the same sanctioned exception `--lemonade` / `--sglang` carry.
   // `daemon/mod.rs` used to be here too, for re-appending that flag across the
   // detached re-exec; it derives the flags from the force map now and names
   // nothing.
@@ -485,8 +485,8 @@ fn force_flag_is_re_appended_on_the_detached_re_exec() {
   // Forced: the flag is rebuilt from the map, so both re-exec sites get it
   // from one place instead of a copy-pasted block each.
   opts.backend_force.insert(id.to_string(), true);
-  opts.backend_force.insert("ds4".to_string(), true);
+  opts.backend_force.insert("sglang".to_string(), true);
   let flags = backend_force_flags(&opts);
   assert!(flags.contains(&format!("--{id}")), "got {flags:?}");
-  assert!(flags.contains(&"--ds4".to_string()), "got {flags:?}");
+  assert!(flags.contains(&"--sglang".to_string()), "got {flags:?}");
 }

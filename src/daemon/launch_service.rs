@@ -807,8 +807,8 @@ pub(crate) async fn compose_and_spawn(
     .map(|e| (e.params.clone(), e.resolved_backend.clone()));
   // D-contamination: the implicit LastUsed layer + extras inheritance apply
   // only when the stored launch resolved to the *same* backend, so llama.cpp
-  // extras (`--rope-freq-base …`) saved before ds4 existed can't poison a ds4
-  // spawn (and vice versa). Explicit config (presets, inline extras) is
+  // extras (`--rope-freq-base …`) can't poison a vLLM spawn of the same
+  // model (and vice versa). Explicit config (presets, inline extras) is
   // untouched. A legacy row with no tag reads as `llamacpp`.
   let last_params_backend_ok = last_params_entry
     .as_ref()
@@ -841,8 +841,8 @@ pub(crate) async fn compose_and_spawn(
   // Native knobs (not layered by the typed-knob resolver): explicit inline
   // values win verbatim; else a no-selection relaunch inherits the last-used
   // native knobs — but only through the backend-matched `last_params` gate
-  // above (D-contamination), so a ds4 relaunch re-applies its `--power` /
-  // `--kv-disk-*` while a cross-backend run inherits nothing. Empty for
+  // above (D-contamination), so a vLLM relaunch re-applies its own knobs
+  // while a cross-backend run inherits nothing. Empty for
   // llama.cpp / Lemonade.
   // Seed the resolved backend's config-derived launch knobs into
   // `backend_knobs`, fresh each launch (config projection, not user intent) —
@@ -1053,9 +1053,8 @@ pub(crate) async fn compose_and_spawn(
   // `inference_backend` was resolved up front (before the last_params gate).
   // The orchestrator owns the branch on plan shape below.
 
-  // Backend-specific extras denylist, checked once the backend is known: ds4
-  // adds `--cors` / `--dist-` on top of the base loopback/auth heads already
-  // refused above. Release the port before returning so a retry can reuse it.
+  // Backend-specific extras denylist, checked once the backend is known, on
+  // top of the base loopback/auth heads already refused above. Release the port before returning so a retry can reuse it.
   let extra_heads = crate::backend::Backend::forbidden_extra_heads(&inference_backend);
   if !extra_heads.is_empty() {
     let backend_banned =
@@ -1102,7 +1101,7 @@ pub(crate) async fn compose_and_spawn(
   };
   // Dropped-knob surfacing (R6): typed knobs the user set that the resolved
   // backend can't honor are silently dropped from argv — tell the user which.
-  // ds4 honors only `Ctx`, so a `--flash-attn` on a ds4-routed model warns.
+  // A `--flash-attn` on a vLLM-routed model warns, for example.
   //
   // Against the **user** layer, not the resolved set. The resolved set carries
   // the resolver's own answers (a model-default `reasoning`, an arch default),
@@ -1722,7 +1721,7 @@ fn spawn_last_params_recorder(
           // the result on the model, so reuse it instead of fetching
           // twice; only fall back to a fetch when the gate didn't run
           // (pinned ctx / no trained-window metadata). The fetch is the
-          // resolved backend's — a backend with no actuals endpoint (ds4)
+          // resolved backend's — a backend with no actuals endpoint
           // returns empty, so the row stays "unavailable" without a wasted
           // probe. Best-effort — an empty result leaves the row unavailable.
           if let Some(port) = params.port {
@@ -2095,7 +2094,7 @@ mod tests {
     // A process launch stamps its `L#` + resolved backend on the running
     // snapshot, so `backend_for_launch` hands the stop to the launch's *real*
     // backend rather than defaulting — the guard for a process-per-model backend
-    // that overrides `stop`. (llama.cpp and ds4 share the default stop today, so
+    // that overrides `stop`. (llama.cpp and vLLM share the default stop today, so
     // this is latent-correctness, not observable yet.)
     let ctx = MethodContext::new(ShutdownToken::new());
     let push = |id_path: &'static str, lid: &'static str, backend: &'static str, port: u16| {
@@ -2112,7 +2111,7 @@ mod tests {
     ctx
       .state
       .mutate(|s| {
-        s.running.push(push("/m/ds4.gguf", "L1", "ds4", 41100));
+        s.running.push(push("/m/vllm-model", "L1", "vllm", 41100));
         s.running
           .push(push("/m/llama.gguf", "L2", "llamacpp", 41101));
       })
@@ -2122,8 +2121,8 @@ mod tests {
       backend_for_launch(&ctx, &LaunchId("L1".to_string()))
         .await
         .id(),
-      "ds4",
-      "a ds4-tagged process launch resolves to ds4, not the default backend"
+      "vllm",
+      "a vllm-tagged process launch resolves to vllm, not the default backend"
     );
     assert_eq!(
       backend_for_launch(&ctx, &LaunchId("L2".to_string()))

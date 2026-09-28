@@ -109,12 +109,12 @@ pub struct DaemonOptions {
   /// Aggregate backend config, grouped under `backend:` in `config.yaml`:
   /// llama.cpp launch knobs (`jinja` / `strict_fit` / `fit_ctx_floor`, plus the
   /// per-backend `servers:` arrays, distinct from the resolved default
-  /// [`Self::binary`] above), the `[lemonade]` block, and the `[ds4]` block.
+  /// [`Self::binary`] above) and each optional engine's block.
   /// Each backend reads its own sub-config through its hooks (the server catalog
   /// is built from `configured_servers`).
   pub backend: BackendConfig,
   /// Per-backend force-enable flags keyed by backend id (`--lemonade` /
-  /// `LLAMASTASH_LEMONADE`, `--ds4` / `LLAMASTASH_DS4`). Kept separate from the
+  /// `LLAMASTASH_LEMONADE`, `--vllm` / `LLAMASTASH_VLLM`). Kept separate from the
   /// config so the detached re-exec can re-append the flags (env/flag don't
   /// survive detach; config does). An absent key means "not forced".
   pub backend_force: std::collections::BTreeMap<String, bool>,
@@ -403,7 +403,7 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
   let proxy_status_cell = proxy::server::new_status_cell();
   // Aggregate backend config + per-backend force-enable map, both already
   // post-env-override (`build_options` applied `LLAMASTASH_FIT_CTX_FLOOR` /
-  // `STRICT_FIT` and folded the `--lemonade` / `--ds4` forces). Each backend
+  // `STRICT_FIT` and folded the `--lemonade` / `--vllm` / `--sglang` forces). Each backend
   // reads its own sub-config through its hooks; the daemon names no backend.
   let mut ctx = MethodContext::with_catalog(token.clone(), catalog)
     .with_supervisors(supervisors)

@@ -295,8 +295,8 @@ fn render_human(row: &CatalogRow, shards: &[ShardSize], total_bytes: u64, env: &
   }
   header.push(("parent", row.parent.clone()));
   header.push(("source", row.source.clone()));
-  // Same badge the `list` BACKEND column renders, so a ds4-compatible file
-  // reads `ds4|llamacpp` on both surfaces instead of a source-derived guess.
+  // Same badge the `list` BACKEND column renders, so a file two backends can
+  // serve reads `vllm|llamacpp` on both surfaces instead of a source-derived guess.
   header.push((
     "backend",
     crate::cli::output::backend_badge(row, DASH_PLACEHOLDER),
@@ -877,7 +877,7 @@ mod tests {
     // byte-identically, so capability fields (multimodal / mtp /
     // supported_backends / split_siblings) can never lag `list --json` again.
     let mut row = fake_row("/m/x.gguf");
-    row.supported_backends = vec!["ds4".into(), "llamacpp".into()];
+    row.supported_backends = vec!["vllm".into(), "llamacpp".into()];
     row.multimodal = Some(Multimodal {
       vision: true,
       audio: false,
@@ -911,7 +911,7 @@ mod tests {
     );
     assert_eq!(
       envelope.get("supported_backends"),
-      Some(&json!(["ds4", "llamacpp"]))
+      Some(&json!(["vllm", "llamacpp"]))
     );
     // Show-only sections layer on top.
     for key in ["size", "arch_defaults", "last_params", "running"] {

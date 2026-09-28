@@ -45,8 +45,8 @@ scripts/bench/dspark_ab.sh <work-dir> <out.md>
 
 pre-0731 / 0731 / 0731+DSpark, launched via llamastash presets. Do **not** set
 `LLAMASTASH_BENCH_DISABLE_DEFAULTS` here: it collapses knob resolution to User
-layers only and strips the preset `backend_knobs` that carry `--mtp` /
-`--dspark`.
+layers only and strips the preset knobs that carry `--mtp` / `--dspark`.
+ds4 runs as a `backend.generic` entry the script writes into its own config.
 
 ## `ds4_dspark_charged.sh` — same three-way, direct `ds4` CLI, power-gated
 

@@ -836,8 +836,8 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::Terminal;
     let mut app = App::new(AppOptions::default());
-    let mut picker = LaunchPickerState::for_model("DeepSeek-V4-Flash");
-    picker.model_backend = crate::launch::params::BackendChoice::Explicit("ds4".into());
+    let mut picker = LaunchPickerState::for_model("Qwen3-8B");
+    picker.model_backend = crate::launch::params::BackendChoice::Explicit("vllm".into());
     app.launch_picker = Some(picker);
     let palette = app.palette();
     let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
@@ -853,12 +853,12 @@ mod tests {
       })
       .collect();
     let row_of = |needle: &str| rows.iter().position(|r| r.contains(needle));
-    // ds4's own tunables are ordinary rows now: they sit under the same group
-    // headers llama.cpp's do, keyed by the flag ds4 itself takes, with the
+    // vLLM's own tunables are ordinary rows: they sit under the same group
+    // headers llama.cpp's do, keyed by the flag vLLM itself takes, with the
     // free-text extras row last of all.
     let header = row_of(crate::launch::knobs::Group::Memory.title())
-      .expect("the shared group header ds4's memory knobs declare");
-    let ssd = row_of("ssd-streaming").expect("a ds4 knob row");
+      .expect("the shared group header vLLM's memory knobs declare");
+    let ssd = row_of("kv-cache-memory-bytes").expect("a vLLM knob row");
     let extras = row_of("extras").expect("extras row");
     assert!(header < ssd, "group header precedes its knobs");
     assert!(ssd < extras, "extras comes last");

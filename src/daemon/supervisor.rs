@@ -599,7 +599,7 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
     .unwrap_or_else(crate::backend::default_backend);
   spawn_supervised("probe", async move {
     let outcome = match &expect_model_ids {
-      // ds4: 200 on `/v1/models` plus a body advertising a ds4 alias.
+      // 200 on the readiness path plus a body advertising an expected id.
       Some(ids) => {
         probe::poll_until_ready_model_id(
           probe_model.inner.port,

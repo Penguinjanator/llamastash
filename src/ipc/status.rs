@@ -136,8 +136,8 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
       "ready_at": ready_at,
       "state": state_obj,
       "params": params_json,
-      // Backend this launch actually resolved to (`llamacpp` / `ds4` /
-      // `lemonade`) — the TUI keys its ds4 badge / knob panel on this, not on
+      // Backend this launch actually resolved to (`llamacpp` / `vllm` /
+      // `lemonade`) — the TUI keys its backend badge / knob panel on this, not on
       // the routing prediction.
       "backend": resolved_backend,
       "latest_rss_bytes": latest_rss_bytes,

@@ -307,7 +307,7 @@ async fn start_model_replies_promptly_and_records_preload_outcome() {
   let elapsed = started.elapsed();
   let body = resp.result.expect("start_model result");
   // A delegated launch returns the *model's* own `L#` handle (drawn from the
-  // same registry counter as any llama.cpp / ds4 launch), not the umbrella id.
+  // same registry counter as any llama.cpp / vLLM launch), not the umbrella id.
   let slow_launch_id = body["launch_id"].as_str().expect("launch_id string");
   assert!(
     slow_launch_id.starts_with('L') && slow_launch_id != umbrella_launch_id().as_str(),

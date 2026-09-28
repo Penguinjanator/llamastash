@@ -381,7 +381,7 @@ impl Backend for LlamaCppBackend {
   }
 
   fn launch_priority(&self) -> i32 {
-    // The stable default engine; ds4 outranks it for a compatible DeepSeek-V4.
+    // The stable default engine.
     10
   }
 

@@ -9,7 +9,7 @@ AMD Ryzen AI / XDNA hardware, plus ROCm, ONNX, and others.
 > Expect rough edges; behaviour, config keys, and the discovery/routing
 > surface may change without notice. llama.cpp remains the stable default.
 
-It is **default-on when the `lemond` binary resolves** (mirroring ds4): if
+It is **default-on when the `lemond` binary resolves** (mirroring vLLM): if
 `lemond` is on your `PATH`, or `backend.lemonade.servers` points at it, LlamaStash
 auto-enables the backend unless you set `backend.lemonade.enabled: false`. When no
 `lemond` is found it stays completely dormant — no discovery, no umbrella.
@@ -54,7 +54,7 @@ over a config `enabled: false`, or opt out entirely with:
   ```yaml
   backend:
     lemonade:
-      # Tri-state, like ds4: leave unset for the default (auto: on whenever
+      # Tri-state, like vLLM: leave unset for the default (auto: on whenever
       # `lemond` resolves), `true` to force on, `false` to force off even when
       # the binary is present.
       # enabled: true

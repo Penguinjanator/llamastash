@@ -399,8 +399,10 @@ proxy:
 # ─── Backend engines ──────────────────────────────────────────────
 #
 # All backend configuration lives under `backend:`. llama.cpp is the
-# always-on default engine (no enable toggle); Lemonade and ds4 are
-# optional engines, each default-on when its own binary resolves.
+# always-on default engine (no enable toggle); Lemonade, vLLM and SGLang
+# are optional engines, each default-on when its own binary resolves.
+# `generic` runs any other OpenAI-compatible server you declare (ds4,
+# gufo, Halogen, …).
 #
 # Unknown keys under `backend` / each engine block are rejected loudly
 # (no silently-tolerated typos).
@@ -465,7 +467,7 @@ backend:
   # XDNA, plus ROCm / ONNX / others — via the Lemonade (`lemond`) managed
   # umbrella.
   #
-  # Default-on when the `lemond` binary resolves (like ds4): if `lemond`
+  # Default-on when the `lemond` binary resolves (like vLLM): if `lemond`
   # is on PATH (or `binary` below points at it) the daemon runs Lemonade
   # discovery + umbrella unless `enabled: false`. Zero footprint when the
   # binary is absent. llamastash never installs `lemond` — you set it up
@@ -494,42 +496,6 @@ backend:
     #
     # Sources — CLI: (none) · Env: (none). Config-only.
     port: 13305
-
-  # ── ds4 (DwarfStar) — DeepSeek V4 backend [EXPERIMENTAL] ──
-  #
-  # EXPERIMENTAL: new and lightly road-tested; keys and defaults below may
-  # change between releases. llama.cpp stays the stable default and runs
-  # DeepSeek-V4 too, so ds4 is never required (set `enabled: false` or use
-  # `--backend llamacpp` to opt out).
-  #
-  # A third backend that runs antirez's `ds4-server` for the DeepSeek-V4
-  # Flash/PRO GGUFs. A ds4-compatible GGUF auto-routes to ds4 when the
-  # binary resolves; anything else (and any incompatible quant) stays on
-  # llama.cpp — ds4 is preferred, never required. You supply the binary:
-  # build ds4-server from https://github.com/antirez/ds4 and either put it
-  # on PATH or point `binary` at it. Zero footprint when it's absent.
-  # See docs/usage.md#ds4-backend.
-  ds4:
-    # Force the backend on or off. Tri-state — leave unset (commented,
-    # the shown default) for auto: on whenever `ds4-server` resolves;
-    # `true` to force on; `false` to force off even when present.
-    #
-    # Sources — CLI: daemon start --ds4 (force on) ·
-    #           Env: LLAMASTASH_DS4=1 (force on).
-    # (The flag and env only force on; `false` here still wins as an
-    # explicit off.)
-    enabled: true
-
-    # The `ds4-server` binary (single-entry `servers` list). Leave empty
-    # to fall back to a `ds4-server` found on `$PATH`. ds4-server has no
-    # `--list-devices` probe, so its compute type (Metal / CUDA / ROCm —
-    # ds4 has no Vulkan build) can't be auto-detected: the server id is the
-    # bare `ds4`. Set `name:` to label it — `name: rocm` → id `ds4-rocm`.
-    #
-    # Sources — CLI: (none) · Env: (none). Config-only.
-    servers:
-      - binary: /opt/ds4/ds4-server
-        name: rocm
 
   # vLLM — serves safetensors HuggingFace repos (the non-GGUF half of your
   # cache), so it sits alongside llama.cpp rather than competing for the
@@ -661,6 +627,21 @@ backend:
           - --seed                         # no default: sent only when set
         ready: /ready                      # HTTP path that returns 200 when loaded
         stop_grace_secs: 60                # SIGTERM→SIGKILL floor for every stop
+      # ds4 (DwarfStar, https://github.com/antirez/ds4) for the DeepSeek-V4
+      # GGUFs. See docs/usage.md#running-ds4-as-a-generic-server.
+      - name: ds4
+        model: "DeepSeek-V4-*"
+        binary: /opt/ds4/ds4-server
+        args: [-m, "{model}", --host, "{host}", --port, "{port}"]
+        ready: /v1/models                  # ds4-server binds only after loading
+        knobs:
+          - {flag: --ctx, id: ds4-ctx, ctx: true}
+          - --power
+          - --kv-disk-dir
+          # `switch: true` sends the bare flag when on, nothing when off.
+          - {flag: --ssd-streaming, switch: true}
+          - {flag: --mtp, id: mtp-model}   # a draft head path; set it in a preset
+          - {flag: --dspark, switch: true}
       # Without `model`, the entry is its own row, published as `name`. For
       # engines whose weights are not a catalog GGUF.
       - name: flash-next-halogen

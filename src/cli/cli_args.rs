@@ -366,13 +366,6 @@ pub enum DaemonAction {
     /// set it up manually (see `docs/lemonade-setup.md`).
     #[arg(long)]
     lemonade: bool,
-    /// Force-enable the ds4 (DwarfStar) direct backend for DeepSeek V4 GGUFs,
-    /// overriding `ds4.enabled: false`. ds4 is otherwise **on by default**
-    /// whenever `ds4-server` is found (on `PATH` or via `ds4.binary`). OR-ed
-    /// with `LLAMASTASH_DS4=1`. llamastash never installs `ds4-server`; build
-    /// it and point `ds4.binary` at it (see `docs/usage.md`).
-    #[arg(long)]
-    ds4: bool,
     /// Force-enable the vLLM backend for safetensors HF repos, overriding
     /// `backend.vllm.enabled: false`. vLLM is otherwise **on by default**
     /// whenever a `vllm` launcher is found (on `PATH` or via
@@ -1985,7 +1978,6 @@ mod tests {
         proxy_host,
         insecure_no_auth,
         lemonade,
-        ds4,
         vllm,
         sglang,
         force,
@@ -1998,7 +1990,6 @@ mod tests {
         assert!(proxy_host.is_none());
         assert!(!insecure_no_auth);
         assert!(!lemonade);
-        assert!(!ds4);
         assert!(!vllm);
         assert!(!sglang);
         assert!(!force);

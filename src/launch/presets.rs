@@ -412,7 +412,7 @@ mod tests {
   #[test]
   fn a_preset_context_window_survives_whichever_key_it_lands_under() {
     for (backend_id, yaml) in [
-      ("ds4", "knobs:\n  ctx: 8192\nbackend: ds4\n"),
+      ("vllm", "knobs:\n  ctx: 8192\nbackend: vllm\n"),
       ("llamacpp", "knobs:\n  ctx: 8192\nbackend: llamacpp\n"),
     ] {
       let body: crate::config::PresetBody = yaml_serde::from_str(yaml).expect("parse");

@@ -65,7 +65,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &Palette, f
   frame.render_widget(outer, area);
 
   // Inner stack: blank pad, name (bold), path (muted, wraps to as
-  // many lines as needed up to 3), ds4 badge (only for ds4 rows, else
+  // many lines as needed up to 3), backend badge (only for non-default rows, else
   // zero-height), a blank gap, stats (`:port  state  RAM  CPU`),
   // separator, tab content. Wrapping the path means narrow panes still
   // surface the full filesystem location instead of a left-truncated
@@ -608,7 +608,7 @@ fn render_header_badge(frame: &mut Frame<'_>, area: Rect, badge: &BackendBadge, 
     .add_modifier(Modifier::BOLD);
   // Each backend id is its own accent-filled chip, separated by a plain
   // (no-background) space so two backends read as two distinct badges
-  // (` ds4 ` ` llamacpp `) rather than one merged strip.
+  // (` vllm ` ` llamacpp `) rather than one merged strip.
   let mut spans: Vec<Span<'static>> = Vec::with_capacity(badge.ids.len() * 2);
   for id in &badge.ids {
     if !spans.is_empty() {
@@ -644,7 +644,7 @@ fn focused_is_lemonade_registry(app: &App) -> bool {
 /// Backend-agnostic so a future backend adds a chip without touching the layout.
 struct BackendBadge {
   /// One or more backend ids, priority-ordered. Each renders as its own
-  /// accent-filled chip (` ds4 `, ` llamacpp `) with a plain gap between, so a
+  /// accent-filled chip (` vllm `, ` llamacpp `) with a plain gap between, so a
   /// multi-backend model reads as separate badges. Owned so it names any
   /// backend generically.
   ids: Vec<String>,
@@ -659,7 +659,7 @@ struct BackendBadge {
 /// even for a compatible file force-run on the default). A **selected** row
 /// shows every backend that can serve the model — its `supported_backends`
 /// (priority order, so llama.cpp is **not hidden** when a second engine also
-/// serves the model, e.g. a deepseek4's ` ds4  llamacpp `), falling back to the
+/// serves the model, e.g. ` vllm  llamacpp `), falling back to the
 /// `list_models` routing prediction, then the discovery-source backend.
 ///
 /// Every model with a resolved backend carries a chip, including plain
@@ -805,7 +805,7 @@ fn render_header_stats(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &P
         ),
       ];
       // ctx — the resolved `--fit` window (llama.cpp) or the pinned value; omit
-      // when neither is known (ds4/lemonade launched without an explicit ctx).
+      // when neither is known (a backend launched without an explicit ctx).
       let known_ctx = m.resolved_ctx.or_else(|| {
         m.knobs
           .u32(crate::launch::knobs::resolve_id("ctx-size").expect("ctx knob"))
@@ -922,14 +922,14 @@ mod tests {
   }
 
   #[test]
-  fn ds4_badge_renders_in_header_gap_for_ds4_model() {
+  fn backend_badge_renders_in_header_gap_for_a_non_default_model() {
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
     use ratatui::Terminal;
     // The badge sits in the header row under the path, resolved via
     // `focused_backend_badge` and painted by `render_header_badge`. A running
     // row keys on the launch's actual backend (a single id). The model name
-    // itself never contains "ds4".
+    // itself never contains "vllm".
     let render_badge = |app: &App| -> String {
       let palette = app.palette();
       let Some(badge) = focused_backend_badge(app) else {
@@ -951,31 +951,30 @@ mod tests {
     app.managed = vec![ready_managed("qwen", None, None)];
     app.list_cursor = 2;
     // A *running* focused row keys on the launch's actual backend, not the
-    // routing prediction: tag it ds4 → the chip renders.
-    app.managed[0].backend = Some("ds4".into());
+    // routing prediction: tag it vllm → the chip renders.
+    app.managed[0].backend = Some("vllm".into());
     let row = render_badge(&app);
-    assert!(row.contains("ds4"), "ds4 chip missing");
-    // Chip only — no "serves as" alias disclosure (ds4-server echoes the request
-    // model, not a fixed alias).
+    assert!(row.contains("vllm"), "vllm chip missing");
+    // Chip only — no "serves as" alias disclosure.
     assert!(
       !row.contains("serves as"),
-      "ds4 row must not disclose an alias"
+      "vllm row must not disclose an alias"
     );
     // The prediction alone must NOT badge a running row launched on llama.cpp.
     app.managed[0].backend = Some("llamacpp".into());
     app
       .backend_by_path
-      .insert(PathBuf::from("/m/qwen.gguf"), "ds4".into());
+      .insert(PathBuf::from("/m/qwen.gguf"), "vllm".into());
     let llama_row = render_badge(&app);
     assert!(
-      !llama_row.contains("ds4"),
-      "running llama.cpp row must not badge ds4 from the prediction"
+      !llama_row.contains("vllm"),
+      "running llama.cpp row must not badge vllm from the prediction"
     );
   }
 
   #[test]
   fn lemonade_badge_renders_chip() {
-    // Running row keys on the launch's real backend (mirrors the ds4 setup).
+    // Running row keys on the launch's real backend (mirrors the vLLM setup).
     let mut app = App::new(AppOptions::default());
     app.models = vec![fake_model()];
     app.managed = vec![ready_managed("npu-model", None, None)];
@@ -1002,11 +1001,11 @@ mod tests {
 
   #[test]
   fn selected_row_badges_all_supported_backends_including_llamacpp() {
-    // A selected (not-running) deepseek4 that both ds4 and llama.cpp can serve
+    // A selected (not-running) model that both vLLM and llama.cpp can serve
     // shows both, in priority order — and llama.cpp is no longer suppressed.
     let mut app = App::new(AppOptions::default());
     let mut m = fake_model();
-    m.supported_backends = vec!["ds4".into(), "llamacpp".into()];
+    m.supported_backends = vec!["vllm".into(), "llamacpp".into()];
     app.models = vec![m];
     app.list_cursor = app
       .rendered_rows()
@@ -1014,9 +1013,9 @@ mod tests {
       .position(|r| r.path() == Some(std::path::Path::new("/m/qwen.gguf")))
       .expect("model row present");
     let badge = focused_backend_badge(&app).expect("selected multi-backend → badge");
-    // llama.cpp is not hidden when a second engine (ds4) also serves the model —
-    // and each id is a separate chip (` ds4 ` ` llamacpp `), not one merged strip.
-    assert_eq!(badge.ids, vec!["ds4".to_string(), "llamacpp".to_string()]);
+    // llama.cpp is not hidden when a second engine (vllm) also serves the model —
+    // and each id is a separate chip (` vllm ` ` llamacpp `), not one merged strip.
+    assert_eq!(badge.ids, vec!["vllm".to_string(), "llamacpp".to_string()]);
 
     // A llama.cpp-only model now carries its own chip too — the badge is no
     // longer suppressed for the default backend.
@@ -1034,7 +1033,7 @@ mod tests {
     // plain (non-accent) space between them — not one merged accent strip.
     let mut app = App::new(AppOptions::default());
     let mut m = fake_model();
-    m.supported_backends = vec!["ds4".into(), "llamacpp".into()];
+    m.supported_backends = vec!["vllm".into(), "llamacpp".into()];
     app.models = vec![m];
     app.list_cursor = app
       .rendered_rows()

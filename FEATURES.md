@@ -72,9 +72,9 @@ A single binary plays TUI, CLI, and background daemon. The first client (TUI or 
 
 Run as many models as your hardware can hold. Each launch gets its own port, auto-allocated from a configurable inclusive range (default `41100..=41300`, override via [`daemon.port_range`](docs/usage.md#schema)). Every running model follows a `Launching → Loading → Ready → Stopping → Stopped` state machine with `/health` probing — you see when a model is actually serving versus still loading weights.
 
-### DeepSeek-V4 via the ds4 backend (experimental)
+### DeepSeek-V4 via ds4 as a generic server (experimental)
 
-For antirez's DeepSeek-V4 Flash/PRO GGUFs, llamastash runs [`ds4-server`](https://github.com/antirez/ds4) (the purpose-built engine) instead of llama.cpp. It's **default-on when the `ds4-server` binary resolves** (`ds4.binary` or `PATH`); force it with `[ds4]` config, `--ds4`, or `LLAMASTASH_DS4=1`. A compatible GGUF auto-routes to ds4 for chat/completions and **falls back to llama.cpp otherwise — never a refusal** (a current llama.cpp, **b9840+**, runs `deepseek4` too; older builds fail the load with `unknown model architecture: 'deepseek4'`). `--backend ds4` / `--backend llamacpp` override either way; embedding/rerank always route to llama.cpp. Six ds4-native launch knobs (`power`, `tokens`, `threads`, `kv_disk_dir`, `kv_disk_space_mb`, `ssd_streaming`) surface in the TUI and as `start` flags, and when a model won't fit RAM the launcher auto-enables SSD streaming so it loads from disk instead of OOM-killing mid-load. The TUI badges ds4-routed rows and `doctor` flags a compatible-but-unavailable model. See [`docs/usage.md` § ds4 backend](docs/usage.md#ds4-backend).
+antirez's [`ds4-server`](https://github.com/antirez/ds4) runs the DeepSeek-V4 Flash/PRO GGUFs as a `backend.generic` entry. Its flags (`--ctx`, `--power`, `--kv-disk-dir`, `--ssd-streaming`, `--mtp`, `--dspark`, and the rest) are declared as knobs, so they show in the TUI launch editor and presets, and a preset pins the `generic-ds4` server and the MTP or DSpark head file. llama.cpp (**b9840+**) runs these GGUFs too and is the default server. See [`docs/usage.md` § Running ds4 as a generic server](docs/usage.md#running-ds4-as-a-generic-server).
 
 ### GPU-aware built-in arch defaults
 

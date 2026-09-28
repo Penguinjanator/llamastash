@@ -78,7 +78,7 @@ fn row_for(entry: &ModelEntry) -> DiscoveredModel {
     // Lemonade serves registry models by name, not local GGUFs — there's no
     // companion projector to detect, so no multimodal signal.
     multimodal: None,
-    // Registry-served, not a local GGUF — never ds4-routable, and it runs on
+    // Registry-served, not a local GGUF — never auto-routed elsewhere, and it runs on
     // Lemonade and nowhere else, so scope the launch picker's server row to
     // Lemonade's own server(s) instead of the whole host catalog.
     supported_backends: vec![crate::backend::lemonade::LEMONADE_BACKEND_ID.to_string()],

@@ -15,7 +15,7 @@
 //!     mode: embedding                     flash-attn: true
 //!     mtp: off                            mode: embedding
 //!     backend_knobs:                      mtp: false
-//!       ssd_streaming: "false"            ssd-streaming: false
+//!       enforce_eager: "false"            enforce-eager: false
 //!     extras: [--rope-freq-base]        extras: [--rope-freq-base]
 //! ```
 //!
@@ -423,12 +423,12 @@ mod tests {
   fn backend_knobs_and_siblings_fold_into_the_same_map() {
     let p = write(
       "fold",
-      "presets:\n  m.gguf:\n    entries:\n      e:\n        mode: embedding\n        mtp: off\n        backend_knobs:\n          ssd_streaming: \"false\"\n",
+      "presets:\n  m.gguf:\n    entries:\n      e:\n        mode: embedding\n        mtp: off\n        backend_knobs:\n          enforce_eager: \"false\"\n",
     );
     migrate(&p).unwrap().expect("should migrate");
     let out = read(&p);
     assert!(!out.contains("backend_knobs"), "sub-map is gone:\n{out}");
-    assert!(out.contains("ssd-streaming: false"), "folded up:\n{out}");
+    assert!(out.contains("enforce-eager: false"), "folded up:\n{out}");
     assert!(out.contains("mode: embedding"), "mode is a knob:\n{out}");
     assert!(out.contains("mtp: false"), "mtp is a knob:\n{out}");
   }
@@ -492,7 +492,7 @@ mod tests {
   fn comments_between_entries_survive() {
     let p = write(
       "interleaved",
-      "presets:\n         # first model, tuned for long context\n  a.gguf:\n    entries:\n      e:\n        ctx: 1\n         # second model: streaming pinned off on purpose\n  b.gguf:\n    entries:\n      e:\n        backend_knobs:\n          ssd_streaming: \"false\"\n         # third model, measured 6.15 -> 18.5 t/s\n  c.gguf:\n    entries:\n      e:\n        mtp: on\n",
+      "presets:\n         # first model, tuned for long context\n  a.gguf:\n    entries:\n      e:\n        ctx: 1\n         # second model: streaming pinned off on purpose\n  b.gguf:\n    entries:\n      e:\n        backend_knobs:\n          enforce_eager: \"false\"\n         # third model, measured 6.15 -> 18.5 t/s\n  c.gguf:\n    entries:\n      e:\n        mtp: on\n",
     );
     let before = read(&p);
     migrate(&p).unwrap().expect("should migrate");
@@ -503,7 +503,7 @@ mod tests {
         "lost comment {comment:?}:\n{after}"
       );
     }
-    assert!(after.contains("ssd-streaming: false"), "{after}");
+    assert!(after.contains("enforce-eager: false"), "{after}");
     assert!(after.contains("mtp: true"), "{after}");
   }
 

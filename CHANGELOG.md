@@ -9,6 +9,11 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 - Generic backend: run any OpenAI-compatible server declared in `config.yaml` (gufo, Halogen via Docker, CIRU tested), as its own row or as a server option on matching GGUFs, with per-entry knobs and a stop-grace floor.
 
 - Generic backend: `rewrite_model: true` makes the proxy send the launch's own name as `body.model`, for servers like gufo that refuse any other name.
+- Generic backend: `switch: true` knobs send a bare flag when on and nothing when off.
+
+### Removed
+
+- **Breaking: the ds4 backend.** Run `ds4-server` as a `backend.generic` entry instead; it gives the same argv, readiness and speed. A config with a `backend.ds4:` block is rejected with a pointer to the migration steps, and `--ds4` / `LLAMASTASH_DS4` are gone. See [Running ds4 as a generic server](docs/usage.md#running-ds4-as-a-generic-server).
 
 ### Changed
 
@@ -27,7 +32,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 - The TUI launch editor shows a generic entry's knob `default:` on unset rows instead of `inherited`.
 - A failing command run with `--json` prints `{"error": {"code", "message"}}` on stdout instead of the human error line.
 - A request for a model running more than once goes to an unnamed launch before a named one, then to the newest. It used to pick by launch-id string order, so `L10` lost to `L9`.
-- A host without `llama-server` can start the daemon and launch ds4, Lemonade, vLLM, SGLang and generic models; before, every launch failed with "daemon launch environment not configured".
+- A host without `llama-server` can start the daemon and launch Lemonade, vLLM, SGLang and generic models; before, every launch failed with "daemon launch environment not configured".
 - A crashed Lemonade umbrella is respawned on the next start instead of failing every Lemonade launch until the daemon restarts. `docs/lemonade-setup.md` now shows the `servers:` key; its old `binary:` example was rejected by the config loader.
 
 ## [0.4.0] — 2026-09-16
