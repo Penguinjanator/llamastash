@@ -679,6 +679,7 @@ backend:
         memory_gib: 80                     # admission demand; unset = no gating
         stop_grace_secs: 90
         ready_timeout_secs: 600
+        # rewrite_model: true              # proxy sets body.model to {name}
 
 # ─── Keybindings ──────────────────────────────────────────────────
 #

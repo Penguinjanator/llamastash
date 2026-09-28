@@ -111,16 +111,17 @@ pub(crate) async fn forward_to_upstream(
   // guard's `Drop` decrements the inflight counter — covers happy-
   // path body completion, abandoned client connections, and upstream
   // errors uniformly because the response body owns the guard.
-  let inflight_guard = match acquire_inflight_guard(state, port, served_model_key).await {
-    Some(g) => g,
-    None => {
-      return Ok(error_envelope(
-        StatusCode::BAD_GATEWAY,
-        "upstream_unreachable",
-        "model exited before forwarding could begin",
-      ));
-    }
-  };
+  let (inflight_guard, request_model) =
+    match acquire_inflight_guard(state, port, served_model_key).await {
+      Some(g) => g,
+      None => {
+        return Ok(error_envelope(
+          StatusCode::BAD_GATEWAY,
+          "upstream_unreachable",
+          "model exited before forwarding could begin",
+        ));
+      }
+    };
   // Compose upstream URL: path + query from the original request,
   // host always 127.0.0.1 (loopback only — see plan §Scope Boundaries).
   let path_and_query = inbound_uri
@@ -188,7 +189,10 @@ pub(crate) async fn forward_to_upstream(
   let request = client
     .request(upstream_method, &upstream_url)
     .headers(outbound_headers)
-    .body(body_bytes);
+    .body(match request_model {
+      Some(model) => with_model(body_bytes, &model),
+      None => body_bytes,
+    });
 
   let upstream = match request.send().await {
     Ok(r) => r,
@@ -224,7 +228,7 @@ async fn acquire_inflight_guard(
   state: &Arc<ProxyState>,
   port: u16,
   expected_id: &crate::gguf::identity::ModelId,
-) -> Option<crate::daemon::supervisor::InflightGuard> {
+) -> Option<(crate::daemon::supervisor::InflightGuard, Option<String>)> {
   let snap = state.ctx.supervisors.snapshot().await;
   for (_lid, model) in snap {
     if model.port() != port {
@@ -239,9 +243,27 @@ async fn acquire_inflight_guard(
     ) {
       continue;
     }
-    return Some(model.inflight_guard());
+    let request_model = model
+      .params()
+      .launch_config
+      .get(crate::backend::REQUEST_MODEL_KEY)
+      .cloned();
+    return Some((model.inflight_guard(), request_model));
   }
   None
+}
+
+/// `body` with its top-level `model` set to `model`. A body that is not a JSON
+/// object carrying `model` is returned unchanged.
+fn with_model(body: Bytes, model: &str) -> Bytes {
+  let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_slice(&body) else {
+    return body;
+  };
+  if !obj.contains_key("model") {
+    return body;
+  }
+  obj.insert("model".into(), model.into());
+  serde_json::to_vec(&obj).map_or(body, Bytes::from)
 }
 
 /// Translate `reqwest::Response` into `hyper::Response`, preserving
@@ -433,6 +455,25 @@ pub(crate) fn deconstruct(
 mod tests {
   use super::*;
   use http_body_util::BodyExt;
+
+  #[test]
+  fn with_model_replaces_only_a_top_level_model() {
+    let out = with_model(
+      Bytes::from(r#"{"model":"q@other","messages":[{"model":"keep"}],"stream":true}"#),
+      "q",
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["model"], "q");
+    assert_eq!(v["messages"][0]["model"], "keep");
+    assert_eq!(v["stream"], true);
+
+    for untouched in [r#"{"messages":[]}"#, "not json", "[1]", ""] {
+      assert_eq!(
+        with_model(Bytes::from(untouched), "q"),
+        untouched.as_bytes()
+      );
+    }
+  }
 
   #[test]
   fn sanitize_header_value_replaces_non_visible_ascii() {

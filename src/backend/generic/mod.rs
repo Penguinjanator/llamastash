@@ -521,6 +521,12 @@ impl Backend for GenericBackend {
       Some(n) => crate::launch::resolve::join_named_reference(&model_id, n),
       None => model_id,
     };
+    if entry.server.rewrite_model {
+      exec.params.launch_config.insert(
+        crate::backend::REQUEST_MODEL_KEY.to_string(),
+        published.clone(),
+      );
+    }
     exec
       .params
       .launch_config

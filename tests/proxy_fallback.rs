@@ -910,6 +910,103 @@ async fn case_variant_of_a_live_name_reuses_that_launch() {
   std::fs::remove_dir_all(&dir).ok();
 }
 
+// ---- A named request reuses the model's only launch when it is unnamed ----
+
+/// `qwen3@other` with no launch named `other` would load a second copy with
+/// the same settings, so it goes to the lone unnamed launch. `qwen3@coder`
+/// names a preset, so it still auto-starts under that preset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn named_request_reuses_the_lone_unnamed_launch_unless_it_names_a_preset() {
+  let dir = unique_temp("named-reuse-unnamed");
+  let log_dir = dir.join("logs");
+  std::fs::create_dir_all(&log_dir).unwrap();
+  let model_path = write_gguf(&dir, "qwen3.gguf", "qwen3");
+
+  let mut knobs = llamastash::launch::knobs::KnobSet::new();
+  knobs.set_by_name("ctx-size", "8192");
+  let mut entries = BTreeMap::new();
+  entries.insert(
+    "coder".to_string(),
+    PresetBody {
+      knobs,
+      ..PresetBody::default()
+    },
+  );
+  let mut presets = BTreeMap::new();
+  presets.insert(
+    model_path.display().to_string(),
+    ConfigPresetBlock {
+      default: None,
+      entries,
+    },
+  );
+
+  let registry = SupervisorRegistry::new();
+  let (state, ctx) = build_state_with_fallback(
+    vec![discovered(&model_path, Some("qwen3"), Some("qwen3"))],
+    registry,
+    &log_dir,
+    allocate_port_range(),
+    true,
+    presets,
+  )
+  .await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
+
+  let launches = || async {
+    ctx
+      .state
+      .snapshot()
+      .await
+      .running
+      .iter()
+      .map(|r| (r.port, r.name.clone()))
+      .collect::<Vec<_>>()
+  };
+
+  let (status, _, _) = http_post(
+    addr,
+    "/v1/chat/completions",
+    r#"{"model":"qwen3","messages":[]}"#,
+  )
+  .await;
+  assert_eq!(status, 200);
+  let unnamed = launches().await;
+  assert_eq!(unnamed.len(), 1);
+
+  let (status, _, _) = http_post(
+    addr,
+    "/v1/chat/completions",
+    r#"{"model":"qwen3@other","messages":[]}"#,
+  )
+  .await;
+  assert_eq!(status, 200);
+  assert_eq!(
+    launches().await,
+    unnamed,
+    "a name that is no preset must reuse the lone unnamed launch"
+  );
+
+  let (status, _, _) = http_post(
+    addr,
+    "/v1/chat/completions",
+    r#"{"model":"qwen3@coder","messages":[]}"#,
+  )
+  .await;
+  assert_eq!(status, 200);
+  let after = launches().await;
+  assert_eq!(
+    after.len(),
+    2,
+    "a preset name must auto-start; got {after:?}"
+  );
+  assert!(after.iter().any(|(_, n)| n.as_deref() == Some("coder")));
+
+  stop_all(&ctx, &[]).await;
+  shutdown_listener(shutdown, listener_handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
 // ---- /v1/models lists named row while live, drops it after stop ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -64,6 +64,11 @@ pub use server::{
 /// this instead of the literal, so they name no specific backend.
 pub const DEFAULT_BACKEND_ID: &str = "llamacpp";
 
+/// `LaunchParams::launch_config` key a backend sets when its server accepts only
+/// one `model` value in a request body. The proxy writes that value into every
+/// body it forwards to the launch.
+pub const REQUEST_MODEL_KEY: &str = "request_model";
+
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

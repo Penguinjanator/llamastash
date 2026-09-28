@@ -46,6 +46,10 @@ pub struct GenericServer {
   pub stop_grace_secs: Option<u64>,
   #[serde(default)]
   pub ready_timeout_secs: Option<u64>,
+  /// Replace `body.model` with the launch's `{name}` value when forwarding, for
+  /// a server that refuses any other model name.
+  #[serde(default)]
+  pub rewrite_model: bool,
 }
 
 // `memory_gib` is the only float, and validation refuses a NaN, so equality
@@ -508,6 +512,7 @@ servers:
       memory_gib: None,
       stop_grace_secs: None,
       ready_timeout_secs: None,
+      rewrite_model: false,
     };
     let split = Path::new("/hf/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf");
     let other = Path::new("/hf/gemma-4-Q4_K_M.gguf");

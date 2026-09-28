@@ -298,6 +298,15 @@ impl EffectivePresets {
       _ => None,
     }
   }
+  /// The preset a `<model>@<name>` address names. Compared with `name_matches`
+  /// because the address half is case-insensitive: `@Coder` and `@coder` are
+  /// one launch, so they must not resolve different presets.
+  pub fn named(&self, name: &str) -> Option<&NamedPreset> {
+    self
+      .presets
+      .iter()
+      .find(|p| crate::launch::resolve::name_matches(Some(&p.name), name))
+  }
 }
 
 /// Resolve a model's effective preset set from the config store: the union

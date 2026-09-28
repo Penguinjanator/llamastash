@@ -317,11 +317,12 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
   } else {
     None
   };
+  let same_model: Vec<_> = sup_snap
+    .into_iter()
+    .filter(|(_, model)| same_path(&model.id().path, &resolved.path))
+    .collect();
   let mut ready = Vec::new();
-  for (launch_id, model) in sup_snap.into_iter() {
-    if !same_path(&model.id().path, &resolved.path) {
-      continue;
-    }
+  for (launch_id, model) in same_model.iter().cloned() {
     // When a name is present, only a launch with that name is a match.
     if let (Some(n), Some(st)) = (&name, &state_snap) {
       if !st
@@ -341,8 +342,31 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
   }
   let running = state_snap.as_ref().map_or(&[][..], |s| &s.running[..]);
   let keys: Vec<(LaunchId, u16)> = ready.iter().map(|(id, m)| (id.clone(), m.port())).collect();
-  if let Some(i) = pick_ready_launch(&keys, running) {
-    let model = &ready[i].1;
+  let mut target = pick_ready_launch(&keys, running).map(|i| ready[i].1.clone());
+
+  // A `<model>@<name>` with no launch of that name goes to the model's only
+  // launch when that one is unnamed and Ready, instead of loading a second copy
+  // with the same settings. A name that is one of the model's presets still
+  // auto-starts, because it asks for different settings.
+  if target.is_none() {
+    if let (Some(n), Some(st), [(launch_id, model)]) = (&name, &state_snap, &same_model[..]) {
+      if !is_named(&st.running, launch_id, model.port())
+        && matches!(model.state().await, ManagedState::Ready)
+        && crate::daemon::launch_service::model_presets(
+          &state.ctx,
+          std::path::Path::new(&resolved.path),
+          resolved.arch.as_deref(),
+        )
+        .await
+        .named(n)
+        .is_none()
+      {
+        target = Some(model.clone());
+      }
+    }
+  }
+
+  if let Some(model) = target {
     return RouteDecision::ReadyAt {
       port: model.port(),
       served_model_id: served_name_for_row(&resolved),
@@ -372,20 +396,25 @@ fn pick_ready_launch(
   ready: &[(LaunchId, u16)],
   running: &[crate::daemon::state_store::RunningSnapshot],
 ) -> Option<usize> {
-  let named = |id: &LaunchId, port: u16| {
-    running.iter().any(|r| {
-      r.name.is_some()
-        && match &r.launch_id {
-          Some(mine) => mine == id,
-          None => r.port == port,
-        }
-    })
-  };
   ready
     .iter()
     .enumerate()
-    .max_by_key(|(_, (id, port))| (!named(id, *port), id.counter().unwrap_or(0)))
+    .max_by_key(|(_, (id, port))| (!is_named(running, id, *port), id.counter().unwrap_or(0)))
     .map(|(i, _)| i)
+}
+
+fn is_named(
+  running: &[crate::daemon::state_store::RunningSnapshot],
+  id: &LaunchId,
+  port: u16,
+) -> bool {
+  running.iter().any(|r| {
+    r.name.is_some()
+      && match &r.launch_id {
+        Some(mine) => mine == id,
+        None => r.port == port,
+      }
+  })
 }
 
 /// Routing decision for a managed-multiplexer-backed model. A managed

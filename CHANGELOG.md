@@ -8,6 +8,13 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 - Generic backend: run any OpenAI-compatible server declared in `config.yaml` (gufo, Halogen via Docker, CIRU tested), as its own row or as a server option on matching GGUFs, with per-entry knobs and a stop-grace floor.
 
+- Generic backend: `rewrite_model: true` makes the proxy send the launch's own name as `body.model`, for servers like gufo that refuse any other name.
+
+### Changed
+
+- A launch started from a named preset without `--name` takes the preset's name, so `start --preset coder` answers at `<model>@coder` like a proxy auto-start of that preset.
+- A `<model>@<name>` request with no launch of that name goes to the model's only launch when it is unnamed and `<name>` is not a preset, instead of loading a second copy.
+
 ### Fixed
 
 - **Launches inside an LXC container on an AMD APU are checked against the GTT pool instead of the container RAM limit** when every layer is offloaded, and the TUI VRAM gauge shows the full GTT pool there. CPU-side launches keep the RAM check, since the container limit applies to them. Thanks [@Ramon-Balaguer](https://github.com/Ramon-Balaguer) ([#83](https://github.com/llamastash/llamastash/pull/83)).

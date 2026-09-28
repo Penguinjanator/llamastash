@@ -334,6 +334,24 @@ fn name_holder<'a>(
     .find(|r| crate::launch::resolve::name_matches(r.name.as_deref(), name))
 }
 
+/// `model_path`'s effective preset set, read from the same store and catalog
+/// the IPC preset handlers use.
+pub(crate) async fn model_presets(
+  ctx: &MethodContext,
+  model_path: &Path,
+  arch: Option<&str>,
+) -> crate::launch::presets::EffectivePresets {
+  let store = ctx.presets.snapshot().await;
+  let rows = crate::ipc::methods::catalog_rows(ctx).await;
+  crate::launch::presets::effective_presets(
+    &crate::util::paths::model_file_label(model_path),
+    &model_path.display().to_string(),
+    arch,
+    &store,
+    &rows,
+  )
+}
+
 /// The refusal for `--name` on a managed-multiplexer model, or `None` when the
 /// name is fine.
 ///
@@ -383,6 +401,18 @@ pub(crate) async fn compose_and_spawn(
   // publishes an address that parses back to a different pair or to none.
   // Normalizing here also means everything downstream — the uniqueness gate,
   // the stamp, the snapshot — sees the same trimmed value the clients send.
+  // The mirror of a proxy auto-start of `<model>@<name>`, which takes its preset
+  // from the name: a manual launch from a named preset takes its name from the
+  // preset, so both reach the same `<model>@<preset>` address.
+  let name_from_preset = parsed.name.is_none()
+    && origin == crate::daemon::supervisor::LaunchOrigin::Manual
+    && parsed
+      .preset
+      .as_deref()
+      .is_some_and(crate::launch::resolve::is_launch_name);
+  if name_from_preset {
+    parsed.name = parsed.preset.clone();
+  }
   if let Some(name) = parsed.name.as_deref() {
     parsed.name = Some(
       crate::launch::resolve::validate_launch_name(name)
@@ -480,7 +510,10 @@ pub(crate) async fn compose_and_spawn(
   )?;
 
   if let Some(err) = multiplexer_refuses_name(&identity, parsed.name.as_deref()) {
-    return Err(err);
+    if !name_from_preset {
+      return Err(err);
+    }
+    parsed.name = None;
   }
 
   // Pre-spawn refusal (D-guard): on an auto-routed launch, ask every backend
@@ -502,17 +535,7 @@ pub(crate) async fn compose_and_spawn(
   // via the same `effective_presets` the IPC handlers use.
   let is_default_sel = matches!(parsed.selection, LaunchSelection::Default);
   let effective_default = if is_default_sel {
-    let store = ctx.presets.snapshot().await;
-    let rows = crate::ipc::methods::catalog_rows(ctx).await;
-    let key = crate::util::paths::model_file_label(&parsed.model_path);
-    let path_str = parsed.model_path.display().to_string();
-    Some(crate::launch::presets::effective_presets(
-      &key,
-      &path_str,
-      arch.as_deref(),
-      &store,
-      &rows,
-    ))
+    Some(model_presets(ctx, &parsed.model_path, arch.as_deref()).await)
   } else {
     None
   };
@@ -522,17 +545,11 @@ pub(crate) async fn compose_and_spawn(
   // has, since it sends nothing but `body.model`. Scoped to auto-start on
   // purpose: on `start --name` and in the TUI, `--preset` is already how a
   // preset gets chosen, and a launch name there stays independent of one.
-  // Compared with `name_matches`, because the address half is
-  // case-insensitive — `@Coder` and `@coder` are one launch, so they must not
-  // resolve different presets.
   let addressed_preset = match origin {
-    crate::daemon::supervisor::LaunchOrigin::AutoStart => parsed.name.as_deref().and_then(|n| {
-      effective_default.as_ref().and_then(|e| {
-        e.presets
-          .iter()
-          .find(|p| crate::launch::resolve::name_matches(Some(&p.name), n))
-      })
-    }),
+    crate::daemon::supervisor::LaunchOrigin::AutoStart => parsed
+      .name
+      .as_deref()
+      .and_then(|n| effective_default.as_ref().and_then(|e| e.named(n))),
     crate::daemon::supervisor::LaunchOrigin::Manual => None,
   };
   // The preset this launch takes its `PresetDefault` layer from: the one the
@@ -2839,6 +2856,33 @@ mod tests {
         err.message
       ),
       Ok(_) => panic!("expected the duplicate-name refusal, got a successful launch"),
+    }
+  }
+
+  /// A preset launch without `--name` goes through the same gate as a named one.
+  #[tokio::test]
+  async fn a_preset_launch_without_a_name_is_named_after_the_preset() {
+    let ctx = MethodContext::new(ShutdownToken::new()).with_state(PersistedState::new(
+      DaemonState {
+        running: vec![named_running("/m/a.gguf", Some("coder"))],
+        ..Default::default()
+      },
+      None,
+    ));
+    let parsed = StartParams {
+      model_path: PathBuf::from("/m/a.gguf"),
+      preset: Some("coder".to_string()),
+      ..Default::default()
+    };
+    match compose_and_spawn(&ctx, parsed, LaunchOrigin::Manual).await {
+      Err(err) => assert!(
+        err
+          .message
+          .contains("name `coder` is already running as L1"),
+        "got: {}",
+        err.message
+      ),
+      Ok(_) => panic!("expected the duplicate-name refusal"),
     }
   }
 
