@@ -9,13 +9,19 @@ fn main() -> Result<()> {
     .block_on(run())
 }
 
-/// glibc's default of 8 arenas per core kept ~140 MiB that the startup scan's
-/// parallel header parses had freed; 2 brings an idle daemon from ~215 to
-/// ~75 MiB. Set in-process rather than through `MALLOC_ARENA_MAX` so spawned
-/// model servers keep glibc's default, and before the runtime starts so no
-/// worker thread has taken an arena yet.
+/// glibc's default of 8 arenas per core keeps memory the startup scan's
+/// parallel header parses freed. Set in-process rather than through
+/// `MALLOC_ARENA_MAX` so spawned model servers keep glibc's default, and before
+/// the runtime starts so no worker thread has taken an arena yet. A limit the
+/// user set is left alone: glibc has already applied it, and `mallopt` would
+/// overwrite it.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn limit_malloc_arenas() {
+  let user_set = std::env::var_os("MALLOC_ARENA_MAX").is_some()
+    || std::env::var("GLIBC_TUNABLES").is_ok_and(|t| t.contains("glibc.malloc.arena_max"));
+  if user_set {
+    return;
+  }
   // SAFETY: `mallopt` only sets an allocator parameter; no pointers involved.
   unsafe {
     libc::mallopt(libc::M_ARENA_MAX, 2);
