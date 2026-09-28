@@ -181,6 +181,15 @@ pub fn parse_cli() -> Result<Cli, clap::Error> {
   Ok(cli)
 }
 
+/// Whether `--json` appears in argv before a `--`. For a parse failure, where
+/// no matches exist to read the flag from.
+pub fn argv_wants_json() -> bool {
+  std::env::args_os()
+    .skip(1)
+    .take_while(|a| a != "--")
+    .any(|a| a == "--json")
+}
+
 /// Whether any subcommand level set its `--json` flag. Read from the matches
 /// rather than the typed args so a new command with `--json` needs no edit.
 fn wants_json(m: &clap::ArgMatches) -> bool {

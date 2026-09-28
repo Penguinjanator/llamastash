@@ -15,13 +15,18 @@ async fn main() -> Result<()> {
   let cli = match cli::cli_args::parse_cli() {
     Ok(cli) => cli,
     Err(err) => {
-      let _ = err.print();
-      let code = if err.use_stderr() {
-        cli::exit_codes::USAGE
+      if !err.use_stderr() {
+        let _ = err.print();
+        std::process::exit(0);
+      }
+      if cli::cli_args::argv_wants_json() {
+        let text = err.render().to_string();
+        let message = text.trim().strip_prefix("error: ").unwrap_or(text.trim());
+        cli::output::print_json_error(cli::exit_codes::USAGE, message);
       } else {
-        0
-      };
-      std::process::exit(code);
+        let _ = err.print();
+      }
+      std::process::exit(cli::exit_codes::USAGE);
     }
   };
 
