@@ -1435,17 +1435,16 @@ async fn daemon_restart_from_nothing_starts_a_daemon() {
   let guard = DetachedDaemon::new(state.clone());
   let proxy = free_port().to_string();
   let models_arg = models.to_str().unwrap();
+  let server = fake_binary();
+  let server_arg = server.to_str().expect("utf-8 fixture path");
 
   let (code, _, err) = run_cli(
     &state,
-    &[
-      "daemon",
+    &daemon_argv(
       "restart",
-      "--proxy-port",
-      &proxy,
-      "--model-path",
-      models_arg,
-    ],
+      server_arg,
+      &["--proxy-port", &proxy, "--model-path", models_arg],
+    ),
   );
   assert_eq!(code, exit_codes::SUCCESS, "stderr: {err}");
 
@@ -1469,15 +1468,17 @@ async fn daemon_restart_replaces_the_running_daemon() {
   let guard = DetachedDaemon::new(state.clone());
   let proxy = free_port().to_string();
   let models_arg = models.to_str().unwrap();
+  let server = fake_binary();
+  let server_arg = server.to_str().expect("utf-8 fixture path");
   let args = ["--proxy-port", &proxy, "--model-path", models_arg];
 
-  let (code, _, err) = run_cli(&state, &daemon_argv("start", &args));
+  let (code, _, err) = run_cli(&state, &daemon_argv("start", server_arg, &args));
   assert_eq!(code, exit_codes::SUCCESS, "stderr: {err}");
   let first = wait_for_daemon_pid(&state, None)
     .await
     .expect("pid after start");
 
-  let (code, _, err) = run_cli(&state, &daemon_argv("restart", &args));
+  let (code, _, err) = run_cli(&state, &daemon_argv("restart", server_arg, &args));
   assert_eq!(code, exit_codes::SUCCESS, "stderr: {err}");
   let second = wait_for_daemon_pid(&state, Some(first))
     .await
@@ -1490,9 +1491,11 @@ async fn daemon_restart_replaces_the_running_daemon() {
   std::fs::remove_dir_all(&models).ok();
 }
 
-/// `daemon <verb> <flags...>` as an argv slice.
-fn daemon_argv<'a>(verb: &'static str, flags: &[&'a str]) -> Vec<&'a str> {
-  let mut argv = vec!["daemon", verb];
+/// `daemon <verb> <flags...>` as an argv slice, with the llama.cpp binary
+/// pinned to the `fake_llama_server` fixture. Without it the start precheck
+/// needs a real llama.cpp install on `$PATH`, which CI runners do not have.
+fn daemon_argv<'a>(verb: &'static str, server: &'a str, flags: &[&'a str]) -> Vec<&'a str> {
+  let mut argv = vec!["--llama-server", server, "daemon", verb];
   argv.extend_from_slice(flags);
   argv
 }
