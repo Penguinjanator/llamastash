@@ -333,8 +333,9 @@ proxy:
 
   # Idle-TTL eviction for proxy-auto-started supervisors. After
   # `idle_ttl_secs` of no inbound request *and* no in-flight stream,
-  # the daemon's eviction sweeper calls `model.stop(5s grace)` so a
-  # long-running daemon doesn't pin VRAM on models nobody is using.
+  # the daemon's eviction sweeper stops the launch like `stop_model`
+  # (5s grace) so a long-running daemon doesn't pin VRAM on models
+  # nobody is using.
   # `0` disables eviction entirely; supervisors stay resident until
   # an explicit `stop_model`. Only auto-start supervisors are
   # evictable — explicit `llamastash start` / TUI launches are
