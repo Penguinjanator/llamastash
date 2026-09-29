@@ -54,6 +54,16 @@ pub struct GenericServer {
   /// (the default) means all, so the engine answers or refuses each request.
   #[serde(default)]
   pub modes: Vec<crate::launch::mode::LaunchMode>,
+  /// Display-only row info for an entry without `model`, shown verbatim in
+  /// the Arch / Params / Quant / Ctx columns. A `model` row reads its GGUF.
+  #[serde(default)]
+  pub arch: Option<String>,
+  #[serde(default)]
+  pub params: Option<String>,
+  #[serde(default)]
+  pub quant: Option<String>,
+  #[serde(default)]
+  pub ctx: Option<u64>,
 }
 
 // `memory_gib` is the only float, and validation refuses a NaN, so equality
@@ -144,6 +154,19 @@ impl GenericServer {
     crate::launch::presets::preset_key_matches(&want, &file_label, path_str)
       || (!crate::util::glob::is_pattern(&want)
         && want.eq_ignore_ascii_case(&crate::util::paths::model_display_name(path)))
+  }
+
+  /// The row's Ctx column: the declared `ctx`, else the `ctx: true` knob's
+  /// default.
+  pub fn row_ctx(&self) -> Option<u64> {
+    self.ctx.or_else(|| {
+      self
+        .knobs
+        .iter()
+        .map(KnobDecl::spec)
+        .find(|k| k.ctx)
+        .and_then(|k| k.default?.trim().parse().ok())
+    })
   }
 
   /// Every `{…}` placeholder in `args` and `env` values, in order of appearance.
@@ -285,6 +308,31 @@ impl GenericConfig {
               .into(),
           ));
         }
+      }
+      let info = [
+        ("arch", s.arch.as_deref()),
+        ("params", s.params.as_deref()),
+        ("quant", s.quant.as_deref()),
+      ];
+      for (field, value) in info {
+        match value {
+          Some(_) if s.model.is_some() => {
+            return Err(entry(format!(
+              "`{field}` applies only without `model`; a catalog model reads its GGUF"
+            )));
+          }
+          Some(v) if v.trim().is_empty() => return Err(entry(format!("`{field}` is empty"))),
+          _ => {}
+        }
+      }
+      match s.ctx {
+        Some(_) if s.model.is_some() => {
+          return Err(entry(
+            "`ctx` applies only without `model`; a catalog model reads its GGUF".into(),
+          ));
+        }
+        Some(0) => return Err(entry("`ctx` must be > 0".into())),
+        _ => {}
       }
       let placeholders = s.placeholders();
       match s.model.as_deref() {
@@ -506,6 +554,22 @@ servers:
         "{name: e, binary: /b, ready: /h, model: x, args: [\"{model}\"], memory_gib: 4}",
         "only without `model`",
       ),
+      (
+        "{name: e, binary: /b, ready: /h, model: x, args: [\"{model}\"], quant: Q4_K_M}",
+        "`quant` applies only without `model`",
+      ),
+      (
+        "{name: e, binary: /b, ready: /h, model: x, args: [\"{model}\"], ctx: 4096}",
+        "`ctx` applies only without `model`",
+      ),
+      (
+        "{name: e, binary: /b, ready: /h, arch: ''}",
+        "`arch` is empty",
+      ),
+      (
+        "{name: e, binary: /b, ready: /h, ctx: 0}",
+        "`ctx` must be > 0",
+      ),
     ] {
       let msg = refusal(&format!("servers:\n  - {entry}\n"));
       assert!(msg.contains(want), "{entry}: {msg}");
@@ -543,6 +607,10 @@ servers:
       ready_timeout_secs: None,
       rewrite_model: false,
       modes: vec![],
+      arch: None,
+      params: None,
+      quant: None,
+      ctx: None,
     };
     let split = Path::new("/hf/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf");
     let other = Path::new("/hf/gemma-4-Q4_K_M.gguf");

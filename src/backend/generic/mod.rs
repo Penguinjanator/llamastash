@@ -118,12 +118,12 @@ impl GenericBackend {
       parent: PathBuf::from(GENERIC_PATH_SCHEME),
       source: ModelSource::Config,
       metadata: Some(ModelMetadata {
-        arch: None,
+        arch: server.arch.clone(),
         total_parameters: None,
-        parameter_label: None,
+        parameter_label: server.params.clone(),
         quant: Quant::Unknown(0),
-        quant_label: None,
-        native_ctx: None,
+        quant_label: server.quant.clone(),
+        native_ctx: server.row_ctx(),
         chat_template: None,
         tokenizer_kind: None,
         reasoning_hint: false,
@@ -590,6 +590,32 @@ mod tests {
       row.metadata.unwrap().mode_hint,
       crate::gguf::metadata::ModeHint::Embedding
     );
+  }
+
+  /// Declared row info fills the list columns verbatim; Ctx falls back to the
+  /// `ctx: true` knob default.
+  #[test]
+  fn declared_row_info_fills_the_catalog_row() {
+    install(
+      "servers:\n  \
+       - {name: info-full, binary: /b, ready: /h, arch: qwen3next, params: 80B, quant: Q4_K_M, ctx: 262144, knobs: [{flag: --if-ctx, id: if-ctx, ctx: true, default: \"65536\"}]}\n  \
+       - {name: info-knob, binary: /b, ready: /h, knobs: [{flag: --ik-ctx, id: ik-ctx, ctx: true, default: \"131072\"}]}\n  \
+       - {name: info-none, binary: /b, ready: /h}\n",
+    );
+    let md = |name: &str| {
+      GenericBackend::catalog_row(&entry_named(name).unwrap().server)
+        .metadata
+        .unwrap()
+    };
+    let full = md("info-full");
+    assert_eq!(full.arch.as_deref(), Some("qwen3next"));
+    assert_eq!(full.parameter_label.as_deref(), Some("80B"));
+    assert_eq!(full.quant_display(), "Q4_K_M");
+    assert_eq!(full.native_ctx, Some(262144), "declared ctx wins");
+    assert_eq!(md("info-knob").native_ctx, Some(131072));
+    let none = md("info-none");
+    assert_eq!(none.arch, None);
+    assert_eq!(none.native_ctx, None);
   }
 
   /// `integrations` declares this as a favorite's context when no default

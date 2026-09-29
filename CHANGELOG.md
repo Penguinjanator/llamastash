@@ -7,6 +7,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 ### Added
 
 - `llamastash daemon restart` — stops the running daemon, waits for it to exit, then starts a new one with the same flags. Takes the `daemon start` flag set. Use it after a hand-edited `config.yaml`.
+- A generic entry without `model` can declare `arch`, `params`, `quant` and `ctx` for its row's list columns; Ctx falls back to the `ctx: true` knob default.
 - `/v1/models` rows carry a `mode` (`chat`, `embedding`, `rerank`), and a generic entry can declare `modes: [chat]` so the proxy refuses embeddings and rerank requests for it before starting it.
 - Generic backend: run any OpenAI-compatible server declared in `config.yaml` (gufo, Halogen via Docker, CIRU tested), as its own row or as a server option on matching GGUFs, with per-entry knobs and a stop-grace floor.
 

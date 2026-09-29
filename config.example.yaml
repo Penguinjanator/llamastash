@@ -663,6 +663,13 @@ backend:
         ready_timeout_secs: 600
         # rewrite_model: true              # proxy sets body.model to {name}
         # modes: [chat]                    # refuse /v1/embeddings and /v1/rerank
+        # Row info for the Arch / Params / Quant / Ctx columns, shown as
+        # written. Only without `model`. Ctx defaults to the `ctx: true`
+        # knob's default; Size comes from memory_gib, Mode from modes.
+        # arch: qwen3next
+        # params: 80B
+        # quant: Q4_K_M
+        # ctx: 262144
 
 # ─── Keybindings ──────────────────────────────────────────────────
 #
