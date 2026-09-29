@@ -469,10 +469,10 @@ mod tests {
     };
     let (_handle, mut rx) =
       start(vec![WatchRoot::recursive(root.clone())], opts).expect("start watcher");
-    // `root` was built before the watcher started, and on macOS and Windows the
-    // creation still arrives afterwards as one `Changed` over the whole tree.
-    // Drain until the channel goes quiet, otherwise the read window below picks
-    // up that event and the reads look like what triggered it.
+    // macOS reports the tree created before `start()` about 64 ms after the
+    // watcher comes up, as one `Changed` over all three paths. Drain until the
+    // channel goes quiet so that event cannot land in the read window below and
+    // make the reads look like what triggered it.
     while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
       // Startup creation events, discarded until the channel goes quiet.
     }
@@ -480,8 +480,21 @@ mod tests {
       let _ = fs::read_dir(root.join("sub")).unwrap().count();
       let _ = fs::read(root.join("sub/model.gguf")).unwrap();
     }
-    let got = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
-    assert!(got.is_err(), "reads must not fire an event, got {got:?}");
+    // A read burst on Windows surfaces one `Changed` naming the directory that
+    // was enumerated, one debounce window after the reads. The scan reads
+    // directories, so silence is not on offer there. What has to hold, and what
+    // keeps a rescan from feeding itself, is that no read reports a model: a
+    // directory-level event carries no `.gguf` path, and the rescan it triggers
+    // is the same work the periodic tick already does.
+    let mut read_events: Vec<WatchEvent> = Vec::new();
+    while let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+      read_events.push(e);
+    }
+    let read_models: Vec<_> = read_events.iter().flat_map(changed_gguf_paths).collect();
+    assert!(
+      read_models.is_empty(),
+      "reads must not report a model change, got {read_events:?}"
+    );
 
     fs::write(root.join("sub/model.gguf"), b"GGUF\x03\x00").unwrap();
     let after_write = tokio::time::timeout(Duration::from_secs(2), rx.recv())
