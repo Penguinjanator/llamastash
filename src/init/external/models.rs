@@ -2,7 +2,7 @@
 //!
 //! Two sources, in preference order: the model `init`'s download step just
 //! fetched (when it ran), then every favorite in the daemon's catalog. A
-//! favorite with a default preset registers as `<id>@<preset>`. The ids come
+//! favorite with presets registers as `<id>@<preset>`, one per preset. The ids come
 //! from [`crate::launch::resolve::published_ids`], the same rule
 //! `/v1/models` publishes under, so what a tool sends back as `body.model`
 //! is a name the proxy already answers to — for a GGUF file, a safetensors
@@ -62,7 +62,8 @@ pub async fn resolve(
   let note = match &catalog {
     Some(catalog) => {
       let mut favs = catalog.favorites(&config.presets);
-      favs.sort_by(|a, b| a.id.cmp(&b.id));
+      // By model only: a model's presets keep their default-first order.
+      favs.sort_by(|a, b| a.id.split('@').next().cmp(&b.id.split('@').next()));
       let count = favs.len();
       for f in favs {
         if seen.insert(f.id.clone()) {
@@ -101,21 +102,29 @@ impl Catalog {
       .iter()
       .zip(&self.ids)
       .filter(|(r, _)| self.favorited.contains(&r.path))
-      .map(|(r, id)| self.patch_model(r, id, presets))
+      .flat_map(|(r, id)| self.patch_models(r, id, presets))
       .collect()
   }
 
-  /// A row registered the way it launches. With a default preset it is
-  /// `<id>@<preset>` so the tool always gets that preset, and it declares the
-  /// preset's context. Otherwise, and for a preset that sets no context, the
-  /// context is the server entry's configured default, then the trained window.
-  fn patch_model(
+  /// A row registered the way it launches. A model with presets registers one
+  /// `<id>@<preset>` per preset, the default first so a single-slot tool picks
+  /// it, each declaring that preset's context. A model without presets
+  /// registers its plain id. Where no preset sets a context, it is the server
+  /// entry's configured default, then the trained window.
+  fn patch_models(
     &self,
     row: &CatalogRow,
     id: &str,
     presets: &BTreeMap<String, ConfigPresetBlock>,
-  ) -> PatchModel {
-    let mut m = PatchModel::from_catalog_row(row, id.to_string());
+  ) -> Vec<PatchModel> {
+    let base = PatchModel::from_catalog_row(row, id.to_string());
+    let path = Path::new(&row.path);
+    let context = |preset_ctx: Option<u32>, server: Option<&str>| {
+      preset_ctx
+        .or_else(|| crate::backend::config_default_ctx(path, server))
+        .map(u64::from)
+        .or(base.context_window)
+    };
     let eff = crate::launch::presets::effective_presets(
       &row.name(),
       &row.path,
@@ -123,18 +132,23 @@ impl Catalog {
       presets,
       &self.rows,
     );
-    let (server, preset_ctx) = match eff.default_preset() {
-      Some(p) => {
+    if eff.presets.is_empty() {
+      let mut m = base.clone();
+      m.context_window = context(None, None);
+      return vec![m];
+    }
+    let default = eff.default_preset().map(|p| p.name.as_str());
+    let mut named: Vec<_> = eff.presets.iter().collect();
+    named.sort_by_key(|p| Some(p.name.as_str()) != default);
+    named
+      .into_iter()
+      .map(|p| {
+        let mut m = base.clone();
         m.id = format!("{id}@{}", p.name);
-        (p.params.server.clone(), p.params.ctx)
-      }
-      None => (None, None),
-    };
-    m.context_window = preset_ctx
-      .or_else(|| crate::backend::config_default_ctx(Path::new(&row.path), server.as_deref()))
-      .map(u64::from)
-      .or(m.context_window);
-    m
+        m.context_window = context(p.params.ctx, p.params.server.as_deref());
+        m
+      })
+      .collect()
   }
 
   /// The id this catalog publishes `path` under, or `None` for a path it has
@@ -328,28 +342,28 @@ mod tests {
     }
   }
 
-  /// Favorites register the way a plain request launches them: under the
-  /// default preset's address with its context, else the trained window.
-  /// Writing the trained window for a model whose preset launches it smaller
-  /// made the tool overflow it. The server-entry default is covered where
-  /// [`crate::backend::config_default_ctx`] is implemented.
+  /// A favorite with presets registers one `<id>@<preset>` per preset, the
+  /// default first, each with the context that preset launches at. One without
+  /// presets registers its plain id. Writing the trained window for a model
+  /// whose preset launches it smaller made the tool overflow it. The
+  /// server-entry default is covered where [`crate::backend::config_default_ctx`]
+  /// is implemented.
   #[test]
-  fn favorites_take_the_default_preset_s_address_and_context() {
+  fn favorites_register_every_preset_with_its_context() {
     let presets: BTreeMap<String, ConfigPresetBlock> = yaml_serde::from_str(
-      "Integ-Model-*:\n  default: coder\n  entries:\n    coder: {knobs: {ctx: 131072}}\n    long: {knobs: {ctx: 262144}}\n\
-       Integ-Auto-*:\n  default: auto\n  entries:\n    coder: {knobs: {ctx: 4096}}\n\
-       Integ-Open-*:\n  entries:\n    coder: {knobs: {ctx: 4096}}\n",
+      "Integ-Model-*:\n  default: long\n  entries:\n    coder: {knobs: {ctx: 131072}}\n    long: {knobs: {ctx: 262144}}\n    plain: {extras: [--x]}\n\
+       Integ-Auto-*:\n  default: auto\n  entries:\n    coder: {knobs: {ctx: 4096}}\n",
     )
     .expect("preset yaml");
     let paths = [
       "/m/Integ-Model-Q4.gguf",
       "/m/Integ-Auto-Q4.gguf",
-      "/m/Integ-Open-Q4.gguf",
       "/m/Integ-Bare-Q4.gguf",
+      "/m/Integ-None-Q4.gguf",
     ];
     let mut cat = catalog(&paths.iter().map(|p| (*p, "local")).collect::<Vec<_>>());
     for r in &mut cat.rows {
-      r.native_ctx = (!r.path.contains("Bare")).then_some(1_000_000);
+      r.native_ctx = (!r.path.contains("None")).then_some(1_000_000);
     }
     cat.favorited = paths.iter().map(|p| p.to_string()).collect();
     let got: Vec<(String, u64)> = cat
@@ -361,10 +375,12 @@ mod tests {
     assert_eq!(
       got,
       vec![
+        want("Integ-Model-Q4@long", 262144),
         want("Integ-Model-Q4@coder", 131072),
-        want("Integ-Auto-Q4", 1_000_000),
-        want("Integ-Open-Q4", 1_000_000),
-        want("Integ-Bare-Q4", 32768),
+        want("Integ-Model-Q4@plain", 1_000_000),
+        want("Integ-Auto-Q4@coder", 4096),
+        want("Integ-Bare-Q4", 1_000_000),
+        want("Integ-None-Q4", 32768),
       ]
     );
   }
