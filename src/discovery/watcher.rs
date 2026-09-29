@@ -469,11 +469,24 @@ mod tests {
     };
     let (_handle, mut rx) =
       start(vec![WatchRoot::recursive(root.clone())], opts).expect("start watcher");
+    // macOS reports the tree created before `start()` shortly after the watcher
+    // comes up, as one `Changed` over all three paths.
+    drain_until_quiet(&mut rx, GAP).await;
+
+    // The first touch of the tree is warm-up, not measurement. On Windows the
+    // first `read_dir` after the watch starts surfaces one `Changed` naming the
+    // directory read, one debounce window later. Every later read round was
+    // silent across 6 of 6 Windows transcripts, so it is a first-touch effect
+    // and not something the reads do each time.
+    read_tree(&root);
+    drain_until_quiet(&mut rx, GAP).await;
+
+    // Steady state: the same reads again, nothing may fire. This is what keeps
+    // the scan from feeding the watcher and the watcher from feeding the scan.
     for _ in 0..5 {
-      let _ = fs::read_dir(root.join("sub")).unwrap().count();
-      let _ = fs::read(root.join("sub/model.gguf")).unwrap();
+      read_tree(&root);
     }
-    let got = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+    let got = tokio::time::timeout(GAP, rx.recv()).await;
     assert!(got.is_err(), "reads must not fire an event, got {got:?}");
 
     fs::write(root.join("sub/model.gguf"), b"GGUF\x03\x00").unwrap();
@@ -483,6 +496,20 @@ mod tests {
       .expect("channel open");
     assert!(matches!(after_write, WatchEvent::Changed { .. }));
     fs::remove_dir_all(&root).ok();
+  }
+
+  /// Window used to decide that no more events are coming.
+  const GAP: Duration = Duration::from_millis(500);
+
+  /// Read what the scan would read under `root`.
+  fn read_tree(root: &std::path::Path) {
+    let _ = fs::read_dir(root.join("sub")).unwrap().count();
+    let _ = fs::read(root.join("sub/model.gguf")).unwrap();
+  }
+
+  /// Take events until `rx` has been silent for `gap`.
+  async fn drain_until_quiet(rx: &mut tokio::sync::mpsc::Receiver<WatchEvent>, gap: Duration) {
+    while let Ok(Some(_)) = tokio::time::timeout(gap, rx.recv()).await {}
   }
 
   #[test]
