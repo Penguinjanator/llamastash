@@ -321,25 +321,20 @@ fn pick_launch_binary(
 
 /// The live launch of `model_path` that already answers to `name`, if any.
 ///
-/// Rows whose supervisor has errored are skipped. An errored launch keeps its
-/// `state.json` row until it is stopped, but it is not an addressable target (the
-/// proxy skips it and `stop` reports it as a failed stop), so letting it hold the
-/// name would lock the user out of ever relaunching under the name they chose,
-/// with no way to free it except by launch id.
+/// Rows in `dead` (supervisor errored or exited) are skipped. Such a launch keeps
+/// its `state.json` row until it is stopped, but it is not an addressable target,
+/// so letting it hold the name would lock the user out of relaunching under the
+/// name they chose, with no way to free it except by launch id.
 fn name_holder<'a>(
   running: impl IntoIterator<Item = &'a RunningSnapshot>,
   model_path: &Path,
   name: &str,
-  errored: &std::collections::BTreeSet<String>,
+  dead: &std::collections::BTreeSet<String>,
 ) -> Option<&'a RunningSnapshot> {
   running
     .into_iter()
     .filter(|r| r.params.model_path == model_path)
-    .filter(|r| {
-      !r.launch_id
-        .as_ref()
-        .is_some_and(|id| errored.contains(&id.0))
-    })
+    .filter(|r| !r.launch_id.as_ref().is_some_and(|id| dead.contains(&id.0)))
     .find(|r| crate::launch::resolve::name_matches(r.name.as_deref(), name))
 }
 
@@ -441,8 +436,8 @@ pub(crate) async fn compose_and_spawn(
   // refusal names the launch holding it, so the user knows what to stop without
   // running `status` first.
   //
-  // Two details make this more than a snapshot scan. A launch that already
-  // errored keeps its row until it is stopped but is not an addressable target,
+  // Two details make this more than a snapshot scan. A launch that errored or
+  // exited keeps its row until it is stopped but is not an addressable target,
   // so it must not lock the name forever. And the row is not pushed until
   // `spawn_supervised`, long after this check, so the claim is taken here and
   // held by the guard for the rest of the spawn: without it two concurrent
@@ -450,13 +445,16 @@ pub(crate) async fn compose_and_spawn(
   // serialized the only symptom would be two launches sharing one address.
   let _name_claim = match parsed.name.as_deref() {
     Some(name) => {
-      let mut errored: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+      let mut dead: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
       for (launch_id, model) in ctx.supervisors.snapshot().await {
-        if matches!(model.state().await, ManagedState::Error { .. }) {
-          errored.insert(launch_id.0);
+        if matches!(
+          model.state().await,
+          ManagedState::Error { .. } | ManagedState::Stopped
+        ) {
+          dead.insert(launch_id.0);
         }
       }
-      let holder = name_holder(&state_snap.running, &parsed.model_path, name, &errored);
+      let holder = name_holder(&state_snap.running, &parsed.model_path, name, &dead);
       if let Some(holder) = holder {
         let held_as = holder
           .launch_id
