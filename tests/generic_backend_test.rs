@@ -668,4 +668,66 @@ servers:
     assert!(r["params"]["server"].is_null(), "{r}");
     shutdown(client, daemon).await;
   }
+
+  /// A remembered server that is gone from config must not leave its backend
+  /// behind. The launch dropped the missing server but kept the remembered
+  /// backend, so a plain `start` ran that backend with no server to pick,
+  /// instead of the model's default.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_removed_remembered_server_falls_back_to_the_default_backend() {
+    let models = unique_temp("gone-models");
+    std::fs::write(
+      models.join("d-served.gguf"),
+      llamastash::gguf::test_fixtures::build_minimal_gguf("llama"),
+    )
+    .unwrap();
+    let state = unique_temp("gone");
+    let opts_at = |state: &PathBuf| {
+      let mut o = opts(state.clone(), None);
+      o.discovery.scan_roots = vec![llamastash::discovery::scanner::ScanRoot {
+        path: models.clone(),
+        source: llamastash::discovery::ModelSource::UserPath,
+      }];
+      o
+    };
+    let served = models.join("d-served.gguf").display().to_string();
+
+    let (mut client, daemon) = boot(opts_at(&state)).await;
+    wait_server(&mut client, "generic-gen-gguf").await;
+    let id = start(
+      &mut client,
+      json!({"model_path": served, "server": "generic-gen-gguf"}),
+    )
+    .await;
+    wait_state(&mut client, &id, "ready").await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+      let lp = client.call("last_params_list", None).await.unwrap();
+      if lp.to_string().contains("generic-gen-gguf") {
+        break;
+      }
+      assert!(Instant::now() < deadline, "server never persisted: {lp}");
+      tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    stop_timed(&mut client, &id, 5).await;
+    shutdown(client, daemon).await;
+
+    // The entry is removed from config between runs. Entries are installed
+    // process-wide, so rename the remembered id instead of dropping the entry.
+    let file = state.join("state.json");
+    let text = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(
+      &file,
+      text.replace("generic-gen-gguf", "generic-gen-removed"),
+    )
+    .unwrap();
+
+    let (mut client, daemon) = boot(opts_at(&state)).await;
+    wait_server(&mut client, "generic-gen-gguf").await;
+    let id = start(&mut client, json!({"model_path": served})).await;
+    let r = wait_state(&mut client, &id, "ready").await;
+    assert_eq!(r["backend"], "llamacpp", "{r}");
+    assert!(r["params"]["server"].is_null(), "{r}");
+    shutdown(client, daemon).await;
+  }
 }

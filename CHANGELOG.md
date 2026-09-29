@@ -24,6 +24,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 ### Fixed
 
 - `daemon stop` and `daemon restart` get past a `runtime.json` left behind by a crash. It used to fail every stop with a shutdown error until the file was deleted by hand.
+- A plain `start` of a model whose remembered generic server was removed from `config.yaml` runs on the model's default backend instead of failing with `pick one with --server`.
 - `integrations` registers a favorite with a default preset as `<model>@<preset>`, and writes the context the model launches with (preset, then server entry default, then trained) instead of always the trained context.
 - A proxy auto-start of `<model>@<name>` after an idle stop no longer fails with `name ... is already running`; the idle stop left the launch's row behind.
 - `start --device none` runs the model on CPU only; the selector used to be dropped as stale and the model offloaded to the GPU.

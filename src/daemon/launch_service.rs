@@ -729,7 +729,7 @@ pub(crate) async fn compose_and_spawn(
   launch_params.backend = parsed
     .backend
     .clone()
-    .or(identity_default.backend)
+    .or(identity_default.backend.clone())
     .unwrap_or_default();
 
   // Chosen server (a build/binary of a backend). Resolve it from the catalog
@@ -738,7 +738,7 @@ pub(crate) async fn compose_and_spawn(
   // pick subsumes backend selection. An unknown id was already rejected before
   // the port reservation; the only `None` that reaches here is the empty-catalog
   // startup race, which falls back to the default binary.
-  launch_params.server = parsed.server.clone().or(identity_default.server);
+  launch_params.server = parsed.server.clone().or(identity_default.server.clone());
   let picked_server: Option<crate::backend::Server> = match &launch_params.server {
     Some(server_id) => {
       let servers = env.servers.loaded().await;
@@ -761,6 +761,12 @@ pub(crate) async fn compose_and_spawn(
         // the default rather than failing a launch the user did not pin.
         log::warn!("server {server_id:?} not in catalog; using the default binary");
         launch_params.server = None;
+        // The remembered backend came with that server. Kept alone it runs
+        // the backend with no server to pick, which a config-declared one
+        // cannot do, so the model's default decides instead.
+        if parsed.backend.is_none() && identity_default.backend_from_last {
+          launch_params.backend = crate::launch::params::BackendChoice::Auto;
+        }
         None
       } else {
         found
@@ -1596,6 +1602,8 @@ fn knobs_for_persist(
 struct InheritedIdentity {
   backend: Option<crate::launch::params::BackendChoice>,
   server: Option<String>,
+  /// `backend` came from `last_params`, not the preset.
+  backend_from_last: bool,
 }
 
 /// The backend / server a no-selection launch should reuse.
@@ -1632,9 +1640,13 @@ fn inherited_launch_identity(
       .filter(|v| f(v))
       .or(from_last.as_ref().filter(|v| f(v)))
   };
+  let has_backend =
+    |v: &(crate::launch::params::BackendChoice, Option<String>)| v.0.explicit_id().is_some();
   InheritedIdentity {
-    backend: pick(|(b, _)| b.explicit_id().is_some()).map(|(b, _)| b.clone()),
+    backend: pick(has_backend).map(|(b, _)| b.clone()),
     server: pick(|(_, s)| s.is_some()).and_then(|(_, s)| s.clone()),
+    backend_from_last: !from_preset.as_ref().is_some_and(has_backend)
+      && from_last.as_ref().is_some_and(has_backend),
   }
 }
 
