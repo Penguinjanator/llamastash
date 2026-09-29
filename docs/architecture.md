@@ -351,6 +351,8 @@ stateDiagram-v2
     Stopped --> [*]
 ```
 
+A Ready process that exits without a stop request (a crash, the kernel OOM killer) goes to `Error`, with its exit code or signal and its last log lines as the cause. The row stays in `status` and the TUI until the user stops it; the proxy skips it, and a new request auto-starts a replacement.
+
 Each launch is owned by a `ManagedModel`. The supervisor health-probes `/health` every 500 ms during `Loading`; transitions to `Ready` on first 200 OK. After Ready, a longer 30 s liveness re-check runs in the background.
 
 Per-launch logs are tee'd to a 10 MB × 5-file rotating log on disk and a 4K-line in-memory ring buffer so the TUI's Logs tab and the `logs_tail` IPC method don't need to re-open files.

@@ -723,19 +723,20 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
             ManagedState::Error { .. } | ManagedState::Stopped => {
               // Already classified; preserve the more-specific cause.
             }
-            ManagedState::Ready | ManagedState::Stopping => {
+            ManagedState::Stopping => {
               *state = ManagedState::Stopped;
             }
+            // Nobody asked it to stop (a crash, the OOM killer): an error with
+            // the reason, kept until the user stops it, not a clean `stopped`.
+            ManagedState::Ready => {
+              *state = ManagedState::Error {
+                cause: exit_cause("process exited unexpectedly", status, &tail),
+              };
+            }
             ManagedState::Launching | ManagedState::Loading => {
-              let mut cause = format!(
-                "process exited before becoming ready (status: {:?})",
-                status.code()
-              );
-              if !tail.is_empty() {
-                cause.push_str("; last stderr lines:\n");
-                cause.push_str(&tail.join("\n"));
-              }
-              *state = ManagedState::Error { cause };
+              *state = ManagedState::Error {
+                cause: exit_cause("process exited before becoming ready", status, &tail),
+              };
             }
           }
           drop(state);
@@ -1076,6 +1077,25 @@ pub(crate) mod test_support {
       }),
     }
   }
+}
+
+/// `what` plus how the child ended (exit code, or the signal that killed it)
+/// and its last log lines.
+fn exit_cause(what: &str, status: std::process::ExitStatus, tail: &[String]) -> String {
+  #[cfg(unix)]
+  let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+  #[cfg(not(unix))]
+  let signal: Option<i32> = None;
+  let mut cause = match (status.code(), signal) {
+    (Some(code), _) => format!("{what} (exit code {code})"),
+    (None, Some(sig)) => format!("{what} (killed by signal {sig})"),
+    (None, None) => what.to_string(),
+  };
+  if !tail.is_empty() {
+    cause.push_str("; last stderr lines:\n");
+    cause.push_str(&tail.join("\n"));
+  }
+  cause
 }
 
 #[cfg(test)]

@@ -227,6 +227,14 @@ llamastash status --json | jq -r '.daemon.server_path'
 
 Or run the file on ds4 instead, through a [generic server entry](usage.md#running-ds4-as-a-generic-server). (On a b9840+ llama.cpp, Flash Attention is currently auto-disabled for the deepseek4 graph — the model still loads and runs.)
 
+## A model shows `error: process exited unexpectedly`
+
+**Symptom:** a model that was `ready` now shows `error` in `status` or the TUI, with `process exited unexpectedly (killed by signal 9)` or `(exit code N)` and the last lines of its log.
+
+**Cause:** the model process died without being asked to stop. `killed by signal 9` is SIGKILL, which is what the kernel's OOM killer sends; check `journalctl -k | grep -i oom`. An exit code is the engine's own failure; the log lines show why.
+
+**Fix:** the row stays until you stop it: `llamastash stop <model>` (or the stop key in the TUI, `Ctrl+s` by default). A new request to the proxy starts a fresh copy either way.
+
 ## `launch refused: needs N GiB but only M is free`
 
 **Symptom:** `start` exits before spawning anything, naming the projected demand and the effective free memory.
