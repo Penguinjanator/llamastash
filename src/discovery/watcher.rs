@@ -469,6 +469,13 @@ mod tests {
     };
     let (_handle, mut rx) =
       start(vec![WatchRoot::recursive(root.clone())], opts).expect("start watcher");
+    // `root` was built before the watcher started, and on macOS and Windows the
+    // creation still arrives afterwards as one `Changed` over the whole tree.
+    // Drain until the channel goes quiet, otherwise the read window below picks
+    // up that event and the reads look like what triggered it.
+    while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+      // Startup creation events, discarded until the channel goes quiet.
+    }
     for _ in 0..5 {
       let _ = fs::read_dir(root.join("sub")).unwrap().count();
       let _ = fs::read(root.join("sub/model.gguf")).unwrap();
