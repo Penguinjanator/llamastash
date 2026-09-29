@@ -301,10 +301,13 @@ pub enum DaemonAction {
   /// Restart the daemon: stop the running one, then start a new one with the
   /// same flags.
   ///
-  /// Stops gracefully — the IPC `shutdown` SIGTERMs every managed launch and
-  /// the command waits for the old process to exit before re-spawning. With
-  /// nothing running it is plain `start`. Running models go down with the old
-  /// daemon and are not brought back; launch them again afterwards.
+  /// Stops gracefully — the daemon SIGTERMs every managed launch and this
+  /// command waits for the old process to release its lockfile before
+  /// re-spawning. With nothing running it is plain `start`. If the old daemon
+  /// is still exiting when that wait ends, restart fails instead of starting on
+  /// top of it; run `daemon stop --force` and retry. Running models go down
+  /// with the old daemon and are not brought back; launch them again
+  /// afterwards.
   Restart(DaemonStartArgs),
   /// Stop the running daemon. Every managed launch is stopped with it
   /// (SIGTERM, then SIGKILL after the grace window) — only a daemon
