@@ -932,7 +932,11 @@ async fn last_params_list_handler(ctx: &MethodContext) -> Result<Value, ErrorObj
     .map(|entry| {
       json!({
         "id": &entry.id,
-        "model_path": entry.id.as_gguf().map(|g| &g.path),
+        // A backend identity has no file; the launch path names its row.
+        "model_path": entry
+          .id
+          .as_gguf()
+          .map_or(&entry.params.model_path, |g| &g.path),
         "params": entry.params.to_wire(),
       })
     })
@@ -956,6 +960,31 @@ mod tests {
 
   fn ctx() -> MethodContext {
     MethodContext::new(ShutdownToken::new())
+  }
+
+  /// A config-declared row keys its `last_params` by a backend identity, which
+  /// has no GGUF path. `model_path` was null for it, so the TUI dropped the
+  /// entry from its Recent section and from the launch picker's seed.
+  #[tokio::test]
+  async fn last_params_list_names_a_backend_identity_by_its_launch_path() {
+    use crate::backend::identity::{BackendModelId, ModelIdentity};
+    use crate::launch::mode::LaunchMode;
+    use crate::launch::params::LaunchParams;
+    let mut state = crate::daemon::state_store::DaemonState::default();
+    state.upsert_last_params(
+      ModelIdentity::Backend(BackendModelId {
+        backend: "enginex".to_string(),
+        name: "row".to_string(),
+      }),
+      LaunchParams::new(std::path::PathBuf::from("enginex://row"), LaunchMode::Chat),
+      "enginex".to_string(),
+    );
+    let ctx = ctx().with_state(crate::daemon::context::PersistedState::new(state, None));
+    let body = last_params_list_handler(&ctx).await.unwrap();
+    assert_eq!(
+      body["last_params"][0]["model_path"], "enginex://row",
+      "{body}"
+    );
   }
 
   #[tokio::test]
