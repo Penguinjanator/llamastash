@@ -227,16 +227,16 @@ jobs:
         run: cargo test --features test-fixtures,uat --workspace --no-fail-fast
         env:
           CARGO_INCREMENTAL: "0"
-          LLVM_PROFILE_FILE: "target/debug/coverage/llamastash-%p-%m.profraw"
+          # %8m merges each binary's processes into at most 8 files; %p wrote one
+          # file per spawned process (~4k), which made zip + grcov take ~10 min.
+          LLVM_PROFILE_FILE: "target/debug/coverage/llamastash-%8m.profraw"
           RUST_BACKTRACE: 1
           RUSTFLAGS: "-Cinstrument-coverage -Cpanic=abort -Zpanic_abort_tests"
           RUSTDOCFLAGS: "-C instrument-coverage -Cpanic=abort -Zpanic_abort_tests -Z unstable-options --persist-doctests target/debug/"
           TMPDIR: /tmp
-      - name: bundle raw coverage profiles
-        run: zip ./target/debug/coverage/files.zip ./target/debug/coverage/llamastash-*.profraw
       - name: grcov
         run: |
-          grcov ./target/debug/coverage/files.zip \
+          grcov ./target/debug/coverage/ \
             -s . \
             --binary-path ./target/debug/ \
             -o ./target/debug/coverage/lcov.info \
