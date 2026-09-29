@@ -2042,7 +2042,7 @@ pub fn spawn_writer(
   tokio::spawn(async move {
     while let Some(cmd) = rx.recv().await {
       if matches!(cmd, WriterCmd::RestartDaemon) {
-        handle_restart_daemon(&socket, daemon_opts.clone()).await;
+        handle_restart_daemon(&socket, daemon_opts.clone(), feedback.clone()).await;
         continue;
       }
       let mut client = match Client::connect(&socket).await {
@@ -2107,8 +2107,8 @@ pub fn spawn_writer(
 /// ([`crate::daemon::restart::shutdown_and_wait`] — the same one
 /// `llamastash daemon restart` runs), then `start_detached` a fresh daemon
 /// with the same options the parent dispatcher resolved. Best-effort
-/// throughout — every failure logs and the TUI keeps running so the user can
-/// retry from the keymap.
+/// throughout — every failure logs and raises an error toast, and the TUI
+/// keeps running so the user can retry from the keymap.
 ///
 /// Why wait on the lockfile and not just the socket: the daemon's cleanup
 /// sequence is (1) accept-loop exit, (2) up to 2s connection drain, (3)
@@ -2120,8 +2120,24 @@ pub fn spawn_writer(
 async fn handle_restart_daemon(
   socket: &std::path::Path,
   daemon_opts: Option<crate::daemon::DaemonOptions>,
+  feedback: Option<mpsc::Sender<Event>>,
 ) {
   use crate::daemon::restart::StopOutcome;
+
+  // The confirm dialog leaves "daemon restarting…" on screen, so a restart
+  // that gives up has to say so in the TUI rather than only in the log.
+  async fn bail(feedback: &Option<mpsc::Sender<Event>>, message: impl Into<String>) {
+    let message = message.into();
+    log::warn!("restart: {message}");
+    if let Some(fb) = feedback {
+      let _ = fb
+        .send(Event::Refresh(RefreshTick::WriterError {
+          method: "restart_daemon",
+          message,
+        }))
+        .await;
+    }
+  }
 
   // The state dir to wait on: the resolved options carry it, and `socket` is
   // the attach dir the TUI itself opened with.
@@ -2132,11 +2148,22 @@ async fn handle_restart_daemon(
   match crate::daemon::restart::shutdown_and_wait(&state_dir).await {
     Ok(StopOutcome::Stopped) | Ok(StopOutcome::NoChannel) => {}
     Ok(StopOutcome::StillExiting { pid }) => {
-      log::warn!("restart: pid {pid} still exiting; did not spawn a replacement");
+      bail(
+        &feedback,
+        format!(
+          "daemon (pid {pid}) was still exiting when the wait ended; no new daemon was started. \
+           Run `daemon stop --force` and restart again."
+        ),
+      )
+      .await;
       return;
     }
     Err(e) => {
-      log::warn!("restart: shutdown request failed: {e}");
+      bail(
+        &feedback,
+        format!("could not ask the daemon to shut down: {e}"),
+      )
+      .await;
       return;
     }
   }
@@ -2145,17 +2172,21 @@ async fn handle_restart_daemon(
     None => match crate::daemon::DaemonOptions::from_defaults() {
       Ok(o) => o,
       Err(e) => {
-        log::warn!("restart: default DaemonOptions: {e}");
+        bail(&feedback, format!("no daemon options to restart with: {e}")).await;
         return;
       }
     },
   };
   match crate::daemon::start_detached(opts) {
     Ok(crate::daemon::StartOutcome::AlreadyRunning(_)) => {
-      log::warn!("restart: daemon is still running; restart did not spawn a new process");
+      bail(
+        &feedback,
+        "a daemon is still running, so no new one was started",
+      )
+      .await;
     }
     Ok(_) => log::info!("restart: daemon re-spawned"),
-    Err(e) => log::warn!("restart: start_detached failed: {e}"),
+    Err(e) => bail(&feedback, format!("re-spawn failed: {e}")).await,
   }
 }
 
