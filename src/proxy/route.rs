@@ -539,6 +539,8 @@ pub(crate) async fn would_route_backend(
   });
   Some(crate::backend::resolve_backend_for_launch(
     &identity,
+    &m.path,
+    None,
     crate::launch::params::BackendChoice::Auto,
     &m.supported_backends,
     launch_mode,

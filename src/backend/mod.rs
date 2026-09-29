@@ -502,12 +502,12 @@ pub trait Backend {
     false
   }
 
-  /// Whether this backend serves `mode`. Default `true` — serves chat /
-  /// embedding / rerank alike. A backend that serves only some modes overrides
-  /// this; an `Auto` launch in an unserved mode falls back to the identity
-  /// default (so e.g. embeddings route to the generic backend), a routing
-  /// input, not an error.
-  fn serves_mode(&self, _mode: LaunchMode) -> bool {
+  /// Whether a launch of `path` on `server` serves `mode`. Default `true` —
+  /// serves chat / embedding / rerank alike. A backend that serves only some
+  /// modes overrides this; an `Auto` launch in an unserved mode falls back to
+  /// the identity default, a routing input, not an error. The proxy refuses an
+  /// embeddings or rerank request bound for a launch that does not serve it.
+  fn serves_mode(&self, _path: &Path, _server: Option<&str>, _mode: LaunchMode) -> bool {
     true
   }
 
@@ -1169,8 +1169,8 @@ impl Backend for Backends {
     for_each_backend!(self, b => b.project_hf_repos(candidates))
   }
 
-  fn serves_mode(&self, mode: LaunchMode) -> bool {
-    for_each_backend!(self, b => b.serves_mode(mode))
+  fn serves_mode(&self, path: &Path, server: Option<&str>, mode: LaunchMode) -> bool {
+    for_each_backend!(self, b => b.serves_mode(path, server, mode))
   }
 
   fn refuses(&self, arch: Option<&str>, path: &Path) -> Option<String> {
@@ -1819,6 +1819,8 @@ pub fn adopted_process_name(backend_id: &str) -> &'static str {
 /// routing backend needs only its trait overrides.
 pub fn resolve_backend_for_launch(
   identity: &ModelIdentity,
+  path: &Path,
+  server: Option<&str>,
   choice: BackendChoice,
   supported_backends: &[String],
   mode: LaunchMode,
@@ -1831,7 +1833,7 @@ pub fn resolve_backend_for_launch(
       // when its preferred engine is absent, or on an embedding/rerank launch).
       for id in supported_backends {
         if let Some(b) = Backends::all().into_iter().find(|b| b.id() == id.as_str()) {
-          if b.available(ctx) && b.serves_mode(mode) {
+          if b.available(ctx) && b.serves_mode(path, server, mode) {
             return b;
           }
         }

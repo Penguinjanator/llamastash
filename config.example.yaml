@@ -662,6 +662,7 @@ backend:
         stop_grace_secs: 90
         ready_timeout_secs: 600
         # rewrite_model: true              # proxy sets body.model to {name}
+        # modes: [chat]                    # refuse /v1/embeddings and /v1/rerank
 
 # ─── Keybindings ──────────────────────────────────────────────────
 #

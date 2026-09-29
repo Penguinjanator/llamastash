@@ -50,6 +50,10 @@ pub struct GenericServer {
   /// a server that refuses any other model name.
   #[serde(default)]
   pub rewrite_model: bool,
+  /// The endpoints the server answers: `chat`, `embedding`, `rerank`. Empty
+  /// (the default) means all, so the engine answers or refuses each request.
+  #[serde(default)]
+  pub modes: Vec<crate::launch::mode::LaunchMode>,
 }
 
 // `memory_gib` is the only float, and validation refuses a NaN, so equality
@@ -538,6 +542,7 @@ servers:
       stop_grace_secs: None,
       ready_timeout_secs: None,
       rewrite_model: false,
+      modes: vec![],
     };
     let split = Path::new("/hf/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf");
     let other = Path::new("/hf/gemma-4-Q4_K_M.gguf");

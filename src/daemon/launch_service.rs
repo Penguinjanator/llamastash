@@ -799,6 +799,8 @@ pub(crate) async fn compose_and_spawn(
   // names no backend.
   let inference_backend = crate::backend::resolve_backend_for_launch(
     &identity,
+    &parsed.model_path,
+    launch_params.server.as_deref(),
     launch_params.backend.clone(),
     &supported_backends,
     mode,

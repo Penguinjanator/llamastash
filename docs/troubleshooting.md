@@ -263,11 +263,11 @@ Weights the engine streams from the mapping rather than holding resident are alr
 
 **This is ds4-server behavior, not a LlamaStash bug.** ds4-server advertises a fixed two-entry menu on `/v1/models` regardless of which GGUF is resident. `/v1/chat/completions` serves the loaded model and echoes back the `model` name you sent. Through the LlamaStash proxy you never see the menu: the proxy publishes your own catalog on its `/v1/models` and forwards your request model, which ds4 echoes back.
 
-## ds4 embeddings / rerank request fails
+## Generic server fails an embeddings or rerank request
 
-**Symptom:** a `POST /v1/embeddings` or `/v1/rerank` request for a model running on ds4 fails with an error from `ds4-server`.
+**Symptom:** a `POST /v1/embeddings` or `/v1/rerank` request for a model on a generic entry (ds4-server, Halogen, gufo) fails with the engine's own error, often after starting it.
 
-**Cause:** ds4-server has no embeddings or rerank endpoints. Launch the model on llama.cpp for those modes (the default server), and keep ds4 for chat/completions.
+**Fix:** most of these servers answer chat only. Add `modes: [chat]` to the entry in `config.yaml`; the proxy then refuses those requests with `400 unsupported_endpoint` without starting the model. Send embeddings to a model that serves them, such as a GGUF embedder on llama.cpp.
 
 ## `--mtp on` didn't enable MTP (or a launch failed with "context type MTP requested")
 

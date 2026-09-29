@@ -108,6 +108,11 @@ servers:
     knobs:
       - --gguf-knob
     ready: /health
+  - name: gen-chat
+    binary: {bin}
+    args: [--port, "{{port}}"]
+    ready: /health
+    modes: [chat]
   - name: gen-slow
     binary: {bin}
     args: [--port, "{{port}}", --health-delay-ms, "60000"]
@@ -479,6 +484,62 @@ servers:
         .iter()
         .any(|m| m["id"]["path"] == "generic://gen-a" && state_of(m) == "ready"),
       "auto-started the entry: {status}"
+    );
+    shutdown(client, daemon).await;
+  }
+
+  /// An entry that declares `modes: [chat]` is listed as chat on `/v1/models`,
+  /// and an embeddings request for it is refused before any launch instead of
+  /// failing inside the engine.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_chat_only_entry_refuses_embeddings_and_lists_its_mode() {
+    let proxy_port = std::net::TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .port();
+    let (mut client, daemon) = boot(opts(unique_temp("modes"), Some(proxy_port))).await;
+    let http = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{proxy_port}");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let row = loop {
+      let models: Value = http
+        .get(format!("{base}/v1/models"))
+        .send()
+        .await
+        .expect("models")
+        .json()
+        .await
+        .unwrap();
+      if let Some(r) = models["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "gen-chat")
+      {
+        break r.clone();
+      }
+      assert!(Instant::now() < deadline, "entry never listed: {models}");
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(row["mode"], "chat", "{row}");
+
+    let resp = http
+      .post(format!("{base}/v1/embeddings"))
+      .json(&json!({"model": "gen-chat", "input": "hi"}))
+      .timeout(Duration::from_secs(30))
+      .send()
+      .await
+      .expect("proxy request");
+    assert_eq!(resp.status().as_u16(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "unsupported_endpoint", "{body}");
+
+    let status = client.call("status", None).await.unwrap();
+    assert!(
+      !status["models"].to_string().contains("generic://gen-chat"),
+      "refused before launch: {status}"
     );
     shutdown(client, daemon).await;
   }

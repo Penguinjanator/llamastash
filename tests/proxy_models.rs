@@ -204,10 +204,11 @@ async fn three_models_return_in_alphabetical_order() {
   let ids: Vec<&str> = data.iter().map(|r| r["id"].as_str().unwrap()).collect();
   assert_eq!(ids, vec!["gemma:2b", "llama", "qwen3"]);
 
-  // Each row carries the documented four fields and only those.
+  // Each row carries the four OpenAI fields plus `mode`, and only those.
   for row in data {
     let obj = row.as_object().expect("row object");
-    assert_eq!(obj.len(), 4, "row has 4 fields: {row}");
+    assert_eq!(obj.len(), 5, "row has 5 fields: {row}");
+    assert_eq!(obj.get("mode"), Some(&serde_json::json!("chat")));
     assert_eq!(obj.get("object"), Some(&serde_json::json!("model")));
     assert_eq!(obj.get("owned_by"), Some(&serde_json::json!("llamastash")));
     assert!(obj.get("created").is_some(), "created field present");
@@ -409,10 +410,11 @@ async fn schema_parity_with_documented_openai_shape() {
   assert_eq!(row["object"].as_str(), Some("model"));
   assert!(row["created"].is_u64(), "created is number");
   assert!(row["owned_by"].is_string(), "owned_by is string");
-  // Reject any drift: exactly four documented fields.
+  assert!(row["mode"].is_string(), "mode is string");
+  // Reject any drift: the four OpenAI fields plus `mode`.
   assert_eq!(
     row.as_object().unwrap().keys().collect::<Vec<_>>().len(),
-    4,
+    5,
     "no extra fields snuck in: {row}"
   );
   shutdown_listener(shutdown, listener_handle).await;

@@ -112,6 +112,7 @@ impl GenericBackend {
   fn catalog_row(server: &GenericServer) -> crate::discovery::DiscoveredModel {
     use crate::discovery::{DiscoveredModel, ModelSource};
     use crate::gguf::metadata::{ModeHint, ModelMetadata, Quant};
+    use crate::launch::mode::LaunchMode;
     DiscoveredModel {
       path: PathBuf::from(format!("{GENERIC_PATH_SCHEME}{}", server.name)),
       parent: PathBuf::from(GENERIC_PATH_SCHEME),
@@ -126,7 +127,11 @@ impl GenericBackend {
         chat_template: None,
         tokenizer_kind: None,
         reasoning_hint: false,
-        mode_hint: ModeHint::Chat,
+        mode_hint: match server.modes.first() {
+          Some(LaunchMode::Embedding) => ModeHint::Embedding,
+          Some(LaunchMode::Rerank) => ModeHint::Rerank,
+          _ => ModeHint::Chat,
+        },
         // The declared figure is the launch's whole resident demand: it feeds
         // the size column, the probe budget and the admission gate alike.
         weights_bytes: server.memory_gib.map(gib_to_bytes),
@@ -272,6 +277,16 @@ impl Backend for GenericBackend {
 
   fn knob_scope(&self, path: &Path, server: Option<&str>) -> Option<&'static str> {
     entry_for_launch(path, server).map(|e| e.scope)
+  }
+
+  fn serves_mode(
+    &self,
+    path: &Path,
+    server: Option<&str>,
+    mode: crate::launch::mode::LaunchMode,
+  ) -> bool {
+    entry_for_launch(path, server)
+      .is_none_or(|e| e.server.modes.is_empty() || e.server.modes.contains(&mode))
   }
 
   fn config_default_knobs(&self, path: &Path, server: Option<&str>) -> KnobSet {
@@ -547,6 +562,34 @@ mod tests {
       ..Default::default()
     };
     GenericBackend::new().install_config(&config).unwrap();
+  }
+
+  /// `modes` limits what an entry serves; without it every mode passes and the
+  /// engine answers or refuses. The row's mode is the first one declared.
+  #[test]
+  fn modes_limit_what_an_entry_serves() {
+    use crate::backend::Backend;
+    use crate::launch::mode::LaunchMode;
+    install(
+      "servers:\n  \
+       - {name: md-chat, binary: /b, ready: /h, modes: [chat]}\n  \
+       - {name: md-embed, binary: /b, ready: /h, modes: [embedding]}\n  \
+       - {name: md-any, binary: /b, ready: /h}\n",
+    );
+    let serves = |name: &str, mode| {
+      GenericBackend::new().serves_mode(Path::new(&format!("generic://{name}")), None, mode)
+    };
+    assert!(serves("md-chat", LaunchMode::Chat));
+    assert!(!serves("md-chat", LaunchMode::Embedding));
+    assert!(!serves("md-chat", LaunchMode::Rerank));
+    assert!(serves("md-embed", LaunchMode::Embedding));
+    assert!(serves("md-any", LaunchMode::Rerank));
+    let embed = entry_named("md-embed").unwrap();
+    let row = GenericBackend::catalog_row(&embed.server);
+    assert_eq!(
+      row.metadata.unwrap().mode_hint,
+      crate::gguf::metadata::ModeHint::Embedding
+    );
   }
 
   /// `integrations` declares this as a favorite's context when no default

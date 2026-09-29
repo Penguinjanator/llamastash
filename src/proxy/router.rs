@@ -195,20 +195,38 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
   if let Some(mode) = req_mode {
     let target = match &decision {
       RouteDecision::ReadyAt {
-        served_model_key, ..
-      } => route::running_model_backend(&state, served_model_key).await,
+        served_model_key,
+        port,
+        ..
+      } => {
+        let server = state
+          .ctx
+          .state
+          .snapshot()
+          .await
+          .running
+          .iter()
+          .find(|r| r.port == *port)
+          .and_then(|r| r.params.server.clone());
+        route::running_model_backend(&state, served_model_key)
+          .await
+          .map(|b| (b, served_model_key.path.clone(), server))
+      }
       RouteDecision::NotRunning { resolved_row, .. } => {
-        route::would_route_backend(&state, resolved_row).await
+        route::would_route_backend(&state, resolved_row)
+          .await
+          .map(|b| (b, std::path::PathBuf::from(&resolved_row.path), None))
       }
       _ => None,
     };
-    if let Some(b) = target {
-      if !b.serves_mode(mode) {
+    if let Some((b, path, server)) = target {
+      if !b.serves_mode(&path, server.as_deref(), mode) {
         // Name the actual backend for the user (dynamic, so the code names none).
         let msg = format!(
-          "the {} backend serves chat/completions only, not embeddings or rerank; \
-           launch an embedding-capable model for this endpoint",
-          b.id()
+          "this model on the {} backend does not serve {req_path}; \
+           send it to a model that serves {}",
+          b.id(),
+          mode.label()
         );
         return error_response(StatusCode::BAD_REQUEST, "unsupported_endpoint", &msg);
       }
@@ -364,12 +382,15 @@ async fn list_models(state: Arc<ProxyState>) -> ProxyResponse {
   let ids = published_ids(&snap);
   let mut rows: Vec<ModelObject> = snap
     .iter()
-    .map(|m| ModelObject::new(published_id(&ids, m)))
+    .map(|m| {
+      ModelObject::new(published_id(&ids, m))
+        .with_mode(m.metadata.as_ref().and_then(|md| md.mode_hint.as_label()))
+    })
     .collect();
   let state_snap = state.ctx.state.snapshot().await;
-  for (named_id, _) in named_launch_ids(&state_snap.running, &ids) {
+  for (named_id, r) in named_launch_ids(&state_snap.running, &ids) {
     if !rows.iter().any(|row| row.id == named_id) {
-      rows.push(ModelObject::new(named_id));
+      rows.push(ModelObject::new(named_id).with_mode(Some(r.params.mode.label())));
     }
   }
   // ASCII-lexicographic sort: stable, deterministic across runs, and
