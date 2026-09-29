@@ -1491,6 +1491,117 @@ async fn daemon_restart_replaces_the_running_daemon() {
   std::fs::remove_dir_all(&models).ok();
 }
 
+/// A restart applies the flags of the invocation that asked for it: the new
+/// daemon serves on the `--proxy-port` just passed, not the one the old daemon
+/// came up with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_restart_applies_the_new_proxy_port() {
+  let state = unique_temp("rtp-state");
+  let models = unique_temp("rtp-models");
+  let guard = DetachedDaemon::new(state.clone());
+  let models_arg = models.to_str().unwrap();
+  let server = fake_binary();
+  let server_arg = server.to_str().expect("utf-8 fixture path");
+  let first_port = free_port();
+  let first_port_arg = first_port.to_string();
+
+  let (code, _, err) = run_cli(
+    &state,
+    &daemon_argv(
+      "start",
+      server_arg,
+      &["--proxy-port", &first_port_arg, "--model-path", models_arg],
+    ),
+  );
+  assert_eq!(code, exit_codes::SUCCESS, "stderr: {err}");
+  let first = wait_for_daemon_pid(&state, None)
+    .await
+    .expect("pid after start");
+  let first_listen = wait_for_proxy_port(&state).await;
+  assert_eq!(first_listen, first_port, "start did not take --proxy-port");
+
+  let wanted = first_port + 1;
+  let wanted_arg = wanted.to_string();
+  let (code, _, err) = run_cli(
+    &state,
+    &daemon_argv(
+      "restart",
+      server_arg,
+      &["--proxy-port", &wanted_arg, "--model-path", models_arg],
+    ),
+  );
+  assert_eq!(code, exit_codes::SUCCESS, "stderr: {err}");
+  let second = wait_for_daemon_pid(&state, Some(first))
+    .await
+    .expect("a different pid after restart");
+  // Read back the port the daemon actually bound rather than trusting the one
+  // it was asked for, so a squatter in the gap cannot turn this into a flake
+  // while the flag itself is fine.
+  let bound = wait_for_proxy_port(&state).await;
+
+  assert_ne!(second, first);
+  assert!(
+    bound > first_listen,
+    "restarted proxy stayed on the old port {first_listen}"
+  );
+  assert_proxy_listening(bound);
+
+  drop(guard);
+  std::fs::remove_dir_all(&state).ok();
+  std::fs::remove_dir_all(&models).ok();
+}
+
+/// A daemon that died without cleaning up must not wedge a restart. The
+/// handshake outlives a hard kill pointing at a dead control plane, so the stop
+/// has to read "no process holds the lock" as "nothing to stop".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_restart_recovers_from_a_stale_handshake() {
+  use llamastash::util::process_control::{platform_default, SignalTarget};
+
+  let state = unique_temp("rts-state");
+  let models = unique_temp("rts-models");
+  let guard = DetachedDaemon::new(state.clone());
+  let models_arg = models.to_str().unwrap();
+  let server = fake_binary();
+  let server_arg = server.to_str().expect("utf-8 fixture path");
+  let proxy = free_port().to_string();
+  let args = ["--proxy-port", &proxy, "--model-path", models_arg];
+
+  let (code, _, err) = run_cli(&state, &daemon_argv("start", server_arg, &args));
+  assert_eq!(code, exit_codes::SUCCESS, "stderr: {err}");
+  let first = wait_for_daemon_pid(&state, None)
+    .await
+    .expect("pid after start");
+
+  // Hard kill skips the daemon's teardown, so `runtime.json` survives it.
+  let pc = platform_default();
+  pc.signal_kill(SignalTarget::SinglePid(first as u32));
+  let deadline = Instant::now() + Duration::from_secs(10);
+  while pc.is_alive(first as u32) {
+    assert!(
+      Instant::now() < deadline,
+      "killed daemon {first} would not die"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+  }
+  assert!(
+    llamastash::daemon::runtime_file::path(&state).exists(),
+    "a hard kill has to leave the handshake behind or this test proves nothing"
+  );
+
+  let (code, _, err) = run_cli(&state, &daemon_argv("restart", server_arg, &args));
+  assert_eq!(code, exit_codes::SUCCESS, "stderr: {err}");
+  let second = wait_for_daemon_pid(&state, Some(first))
+    .await
+    .expect("a different pid after restart");
+  assert_ne!(second, first);
+  assert_proxy_listening(proxy.parse().unwrap());
+
+  drop(guard);
+  std::fs::remove_dir_all(&state).ok();
+  std::fs::remove_dir_all(&models).ok();
+}
+
 /// `daemon <verb> <flags...>` as an argv slice, with the llama.cpp binary
 /// pinned to the `fake_llama_server` fixture. Without it the start precheck
 /// needs a real llama.cpp install on `$PATH`, which CI runners do not have.
@@ -1539,6 +1650,34 @@ fn assert_proxy_listening(port: u16) {
       "proxy never came back up on port {port}"
     );
     std::thread::sleep(Duration::from_millis(100));
+  }
+}
+
+/// The port the running daemon reports for its bound proxy listener
+/// (`status.proxy.listen`).
+fn reported_proxy_port(state: &Path) -> Option<u16> {
+  let (_, json, _) = run_cli(state, &["status", "--json"]);
+  json
+    .pointer("/proxy/listen")?
+    .as_str()?
+    .rsplit(':')
+    .next()?
+    .parse()
+    .ok()
+}
+
+/// Poll until the daemon reports a proxy listener, then return its port.
+async fn wait_for_proxy_port(state: &Path) -> u16 {
+  let deadline = Instant::now() + Duration::from_secs(20);
+  loop {
+    if let Some(port) = reported_proxy_port(state) {
+      return port;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "daemon never reported a proxy listener"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
   }
 }
 
