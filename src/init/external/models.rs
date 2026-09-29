@@ -1,21 +1,24 @@
 //! Which models the patched tool configs register.
 //!
 //! Two sources, in preference order: the model `init`'s download step just
-//! fetched (when it ran), then every favorite in the daemon's catalog. The
-//! ids come from [`crate::launch::resolve::published_ids`], the same rule
+//! fetched (when it ran), then every favorite in the daemon's catalog. A
+//! favorite with a default preset registers as `<id>@<preset>`. The ids come
+//! from [`crate::launch::resolve::published_ids`], the same rule
 //! `/v1/models` publishes under, so what a tool sends back as `body.model`
 //! is a name the proxy already answers to — for a GGUF file, a safetensors
 //! repo, an Ollama blob, or a Lemonade registry entry alike, and for two
 //! same-named GGUFs cached in different roots.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
 
 use serde_json::Value;
 
 use crate::cli::cli_args::Cli;
-use crate::config::Config;
+use crate::config::{Config, ConfigPresetBlock};
 use crate::init::external::PatchModel;
 use crate::init::wizard::ModelSummary;
+use crate::launch::resolve::CatalogRow;
 
 /// Resolved model list plus anything the user should hear about how it was
 /// built. `note` is a human-readable line the wizard prints on non-`--json`
@@ -58,7 +61,7 @@ pub async fn resolve(
 
   let note = match &catalog {
     Some(catalog) => {
-      let mut favs = catalog.favorites();
+      let mut favs = catalog.favorites(&config.presets);
       favs.sort_by(|a, b| a.id.cmp(&b.id));
       let count = favs.len();
       for f in favs {
@@ -81,7 +84,7 @@ pub async fn resolve(
 /// row publishes under. Held together because the publishing rule is
 /// catalog-wide: no row's id can be decided on its own.
 struct Catalog {
-  rows: Vec<crate::launch::resolve::CatalogRow>,
+  rows: Vec<CatalogRow>,
   ids: Vec<String>,
   favorited: HashSet<String>,
 }
@@ -92,14 +95,46 @@ impl Catalog {
   /// The catalog filter is the same one `favorites list` applies: a favorite
   /// whose file was deleted or moved out of a watched directory is dropped
   /// rather than written into a tool config as an unservable name.
-  fn favorites(&self) -> Vec<PatchModel> {
+  fn favorites(&self, presets: &BTreeMap<String, ConfigPresetBlock>) -> Vec<PatchModel> {
     self
       .rows
       .iter()
       .zip(&self.ids)
       .filter(|(r, _)| self.favorited.contains(&r.path))
-      .map(|(r, id)| PatchModel::from_catalog_row(r, id.clone()))
+      .map(|(r, id)| self.patch_model(r, id, presets))
       .collect()
+  }
+
+  /// A row registered the way it launches. With a default preset it is
+  /// `<id>@<preset>` so the tool always gets that preset, and it declares the
+  /// preset's context. Otherwise, and for a preset that sets no context, the
+  /// context is the server entry's configured default, then the trained window.
+  fn patch_model(
+    &self,
+    row: &CatalogRow,
+    id: &str,
+    presets: &BTreeMap<String, ConfigPresetBlock>,
+  ) -> PatchModel {
+    let mut m = PatchModel::from_catalog_row(row, id.to_string());
+    let eff = crate::launch::presets::effective_presets(
+      &row.name(),
+      &row.path,
+      row.arch.as_deref(),
+      presets,
+      &self.rows,
+    );
+    let (server, preset_ctx) = match eff.default_preset() {
+      Some(p) => {
+        m.id = format!("{id}@{}", p.name);
+        (p.params.server.clone(), p.params.ctx)
+      }
+      None => (None, None),
+    };
+    m.context_window = preset_ctx
+      .or_else(|| crate::backend::config_default_ctx(Path::new(&row.path), server.as_deref()))
+      .map(u64::from)
+      .or(m.context_window);
+    m
   }
 
   /// The id this catalog publishes `path` under, or `None` for a path it has
@@ -291,6 +326,47 @@ mod tests {
       ids,
       favorited: HashSet::new(),
     }
+  }
+
+  /// Favorites register the way a plain request launches them: under the
+  /// default preset's address with its context, else the trained window.
+  /// Writing the trained window for a model whose preset launches it smaller
+  /// made the tool overflow it. The server-entry default is covered where
+  /// [`crate::backend::config_default_ctx`] is implemented.
+  #[test]
+  fn favorites_take_the_default_preset_s_address_and_context() {
+    let presets: BTreeMap<String, ConfigPresetBlock> = yaml_serde::from_str(
+      "Integ-Model-*:\n  default: coder\n  entries:\n    coder: {knobs: {ctx: 131072}}\n    long: {knobs: {ctx: 262144}}\n\
+       Integ-Auto-*:\n  default: auto\n  entries:\n    coder: {knobs: {ctx: 4096}}\n\
+       Integ-Open-*:\n  entries:\n    coder: {knobs: {ctx: 4096}}\n",
+    )
+    .expect("preset yaml");
+    let paths = [
+      "/m/Integ-Model-Q4.gguf",
+      "/m/Integ-Auto-Q4.gguf",
+      "/m/Integ-Open-Q4.gguf",
+      "/m/Integ-Bare-Q4.gguf",
+    ];
+    let mut cat = catalog(&paths.iter().map(|p| (*p, "local")).collect::<Vec<_>>());
+    for r in &mut cat.rows {
+      r.native_ctx = (!r.path.contains("Bare")).then_some(1_000_000);
+    }
+    cat.favorited = paths.iter().map(|p| p.to_string()).collect();
+    let got: Vec<(String, u64)> = cat
+      .favorites(&presets)
+      .into_iter()
+      .map(|m| (m.id.clone(), m.declared_context()))
+      .collect();
+    let want = |id: &str, ctx: u64| (id.to_string(), ctx);
+    assert_eq!(
+      got,
+      vec![
+        want("Integ-Model-Q4@coder", 131072),
+        want("Integ-Auto-Q4", 1_000_000),
+        want("Integ-Open-Q4", 1_000_000),
+        want("Integ-Bare-Q4", 32768),
+      ]
+    );
   }
 
   #[test]

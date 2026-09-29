@@ -338,7 +338,7 @@ places.
 - [x] Frequent model path scanning: the file watcher passed on open events from the scan's own reads, so each rescan triggered the next. Open and read-only close events are now dropped.
 - [x] **gufo 404s on a `model` other than its `--served-model-name`.** An `@<preset>` auto-start already names the launch, so that id works. A plain id sent to a named launch, or `@<other>` sent to the unnamed one, got 404 (verified live on gufo 2026-09-28). Fixed by the generic entry flag `rewrite_model: true`, which makes the proxy send the launch's `{name}`.
 - [x] vLLM's data-parallel short aliases (`-dpn`, `-dpr`, `-dpl`, `-dpa`, `-dpp`, `-dpb`, `-dph`, `-dpe`, `-dpm`, vLLM 0.30.0) are refused like their long forms; documented in `docs/vllm-setup.md`.
-- [ ] integrations command writes the wrong contextWindow values??
+- [x] **`integrations` wrote the trained context as `contextWindow`**, e.g. 262144 for Qwen3.8 models whose default preset launches at 131072, and 32768 for a generic row with no header. A favorite with a default preset now registers as `<id>@<preset>` with that preset's context; otherwise the server entry's configured default, then the trained context.
 - [x] Removed the ds4 backend; ds4 runs as a generic server entry with `switch` knobs for its on/off flags (`docs/usage.md` § Running ds4 as a generic server). Same argv, readiness and decode speed as the old backend, tested live on 2026-09-28.
 - [x] A CLI/TUI launch from a named preset without a name takes the preset's name (`compose_and_spawn`), so it answers at `<model>@<preset>` like a proxy auto-start.
 - [x] A `<model>@<name>` request with no launch of that name goes to the model's only launch when it is unnamed, Ready, and `<name>` is not a preset (`route::decide`).

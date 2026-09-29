@@ -1408,6 +1408,25 @@ pub fn runtime_knob_scope(path: &Path, server: Option<&str>) -> Option<&'static 
   }
 }
 
+/// The context window config sets for a launch of `path` on `server` when no
+/// preset or flag sets one, e.g. a server entry's `ctx: true` knob `default:`.
+/// Picks the backend the way [`runtime_knob_scope`] does.
+pub fn config_default_ctx(path: &Path, server: Option<&str>) -> Option<u32> {
+  let backends = Backends::all();
+  let backend = match server {
+    Some(_) => backends
+      .iter()
+      .find(|b| b.knob_scope(path, server).is_some()),
+    None => backends
+      .iter()
+      .find(|b| b.synthetic_identity(path).is_some()),
+  }?;
+  let scope = backend.knob_scope(path, server)?;
+  backend
+    .config_default_knobs(path, server)
+    .u32_by_concept(scope, crate::launch::knobs::def::Concept::ContextLength)
+}
+
 /// Whether config itself declares models to list, so a daemon with
 /// scanning off still has a catalog.
 pub fn config_declares_models(config: &BackendConfig) -> bool {

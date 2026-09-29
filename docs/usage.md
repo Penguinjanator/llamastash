@@ -1365,6 +1365,15 @@ Examples: `llamastash integrations pi`, `llamastash integrations opencode,zed`, 
 
 **Which models get registered.** The run reads your favorites from the daemon and registers each one, named exactly as `/v1/models` publishes it — a GGUF by its file stem (`Qwen3-Coder-30B-Q4_K_M`), a safetensors repo by its repo id (`Qwen/Qwen3-0.6B`), an Ollama model by `<name>:<tag>`, and a GGUF whose file name is shared by another model under its repo-qualified form ([Model ids on the proxy](#model-ids-on-the-proxy)). So whatever a tool sends back as `body.model` is a name the proxy already answers to. During a full `llamastash init` the model the download step just fetched is registered first, then the favorites. No favorites and nothing downloaded means a provider block with no models: the run says so on stderr, and `llamastash favorites add <model>` then a re-run fills it in.
 
+**Default presets and context size.** A favorite with a default preset registers as `<id>@<preset>` (`Qwen3-Coder-30B-Q4_K_M@coder`), so the tool always launches that preset. Tools that take a context size (pi.dev's `contextWindow`, Zed's `max_tokens`) get the size the model launches with, in this order:
+
+1. the default preset's context,
+2. the server entry's configured default (a generic entry's `ctx: true` knob `default:`),
+3. the model's trained context,
+4. 32768.
+
+A preset that sets no context falls through to step 2 for the server it picks. A context left to `--fit` (`auto`) is not known ahead of time, so the trained context is used.
+
 Per-tool shape: tools whose schema holds a model list (OpenCode, Continue.dev, Zed, pi.dev) register all of them; tools with a single model slot (Aider's `model:`, Claude Code's `ANTHROPIC_MODEL`) take the first non-embedding model. Embedders are routed by kind — Continue.dev gets `roles: [embed]`; Zed and pi.dev leave them out, since both drive chat only and pi has no embeddings API at all.
 
 **pi.dev patches two files.** `~/.pi/agent/models.json` gets the provider block, and `~/.pi/agent/settings.json` gets `llamastash/**` appended to `enabledModels` — pi's model switcher is bounded by that list, so without the pattern the models are configured but out of scope until you widen it by hand. The pattern is only appended when `enabledModels` is already set: pi reads an absent or empty list as "no scoping", and writing ours there would hide every other provider. Any config that is a symlink (a dotfiles repo, typically) is written *through* the link, not over it.

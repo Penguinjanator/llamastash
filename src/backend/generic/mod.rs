@@ -549,6 +549,26 @@ mod tests {
     GenericBackend::new().install_config(&config).unwrap();
   }
 
+  /// `integrations` declares this as a favorite's context when no default
+  /// preset sets one: the entry's own row, and a GGUF on a picked entry. A
+  /// GGUF with no pick runs on the default backend, so the entry's default
+  /// does not apply to it.
+  #[test]
+  fn config_default_ctx_reads_the_entry_s_ctx_knob_default() {
+    install(
+      "servers:\n  \
+       - {name: cdc-row, binary: /b, ready: /h, knobs: [{flag: --cr-ctx, id: cr-ctx, ctx: true, default: \"65536\"}]}\n  \
+       - {name: cdc-srv, model: \"Cdc-*\", binary: /b, args: [\"{model}\"], ready: /h, knobs: [{flag: --cs-ctx, id: cs-ctx, ctx: true, default: \"98304\"}]}\n  \
+       - {name: cdc-none, binary: /b, ready: /h, knobs: [--cn-seed]}\n",
+    );
+    let ctx = crate::backend::config_default_ctx;
+    assert_eq!(ctx(Path::new("generic://cdc-row"), None), Some(65536));
+    assert_eq!(ctx(Path::new("generic://cdc-none"), None), None);
+    let gguf = Path::new("/m/Cdc-Q4.gguf");
+    assert_eq!(ctx(gguf, Some(&server_id("cdc-srv"))), Some(98304));
+    assert_eq!(ctx(gguf, None), None);
+  }
+
   #[test]
   fn the_tui_editor_shows_an_unset_knob_s_entry_default() {
     use crate::tui::launch_picker::{LaunchPickerState, INHERITED_LABEL};

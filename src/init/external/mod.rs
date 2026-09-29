@@ -84,11 +84,10 @@ pub struct PatchModel {
   /// proxy answers to.
   pub id: String,
   pub is_embed: bool,
-  /// The model's trained context window, when the catalog knows it.
-  /// Clients size their own history against this — declare 32k for a 262k
-  /// model and the tool compacts the conversation long before it needs to.
-  /// The launched context is resolved per launch (and `--fit` may size it
-  /// down), so the trained window is the honest figure at patch time.
+  /// The context window the model launches with, when known: the default
+  /// preset's, else the server entry's configured default, else the trained
+  /// window. Clients size their own history against this, so too high makes
+  /// them overflow the server and too low makes them compact early.
   pub context_window: Option<u64>,
 }
 
