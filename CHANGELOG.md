@@ -6,6 +6,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ### Added
 
+- `llamastash daemon restart` — stops the running daemon, waits for it to exit, then starts a new one with the same flags. Takes the `daemon start` flag set. Use it after a hand-edited `config.yaml`.
 - Generic backend: run any OpenAI-compatible server declared in `config.yaml` (gufo, Halogen via Docker, CIRU tested), as its own row or as a server option on matching GGUFs, with per-entry knobs and a stop-grace floor.
 
 - Generic backend: `rewrite_model: true` makes the proxy send the launch's own name as `body.model`, for servers like gufo that refuse any other name.
@@ -22,6 +23,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ### Fixed
 
+- `daemon stop` and `daemon restart` get past a `runtime.json` left behind by a crash. It used to fail every stop with a shutdown error until the file was deleted by hand.
 - `start --device none` runs the model on CPU only; the selector used to be dropped as stale and the model offloaded to the GPU.
 - vLLM's data-parallel short aliases (`-dpm`, `-dpa` and the rest) are refused in the extras tail like their long forms.
 - An idle daemon no longer rescans the model folders about three times a second; its own folder reads were triggering the file watcher. Idle CPU drops from about a third of a core to 0%, and memory from about 1 GiB to 208-261 MiB on 17 models.

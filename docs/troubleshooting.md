@@ -31,7 +31,7 @@ Both shapes of the binary work. llama.cpp's own installer (`llama.app`) ships a 
 
 **Symptom:** `llamastash list` exits `65` (`DaemonUnreachable`) even though `daemon.pid` is present and locked. The recorded daemon is dead but the handshake file (`runtime.json`) didn't get cleaned up.
 
-**Fix:** `daemon stop --force` falls back to a PID-targeted graceful-then-kill that also clears the handshake. If that's unreachable too, remove the handshake + lockfile manually:
+**Fix:** `daemon stop --force` falls back to a PID-targeted graceful-then-kill that also clears the handshake. The reverse state — `runtime.json` present, nothing holding the lock — is cleared on its own: `daemon stop` and `daemon restart` find no lock holder, delete the handshake, and report `daemon: not running`. If neither is reachable, remove the handshake + lockfile manually:
 
 ```bash
 state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/llamastash"

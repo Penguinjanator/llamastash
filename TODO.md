@@ -334,7 +334,6 @@ places.
 
 ## R11 (v0.5.0 checklist)
 
-- [ ] add a restart command for daemon
 - [x] LlamaStash memory use grew to more than 1 GB: the rescan loop below re-parsed full GGUF headers (tokenizer tables, 32 MiB read buffers, split shards on every cache hit) about 3 times a second. Idle RSS on 17 models is now 64-133 MiB (release build, 3 runs) with the process capped at 2 glibc malloc arenas (`mallopt` in `main`, not the env var, so model servers keep the default); 208-261 MiB without the cap.
 - [x] Frequent model path scanning: the file watcher passed on open events from the scan's own reads, so each rescan triggered the next. Open and read-only close events are now dropped.
 - [x] **gufo 404s on a `model` other than its `--served-model-name`.** An `@<preset>` auto-start already names the launch, so that id works. A plain id sent to a named launch, or `@<other>` sent to the unnamed one, got 404 (verified live on gufo 2026-09-28). Fixed by the generic entry flag `rewrite_model: true`, which makes the proxy send the launch's `{name}`.
@@ -357,11 +356,13 @@ places.
 - [x] **Duplicate launches have a documented pick.** A plain model reference goes to a Ready unnamed launch before a named one, then the newest by numeric `L#` (`route::pick_ready_launch`); documented in `docs/usage.md` and `docs/architecture.md` § Named launches.
 - [x] **A failing `--json` command prints a JSON error.** `report` prints `{"error": {"code", "message"}}` on stdout when any subcommand level set `--json` (read from clap's matches, so new commands need no edit); `show`'s own copy is gone.
 - [x] `strip_forbidden_extras` drops each forbidden flag's values by its real value count (per-backend tables from the vLLM 0.30.0, SGLang 0.5.20 and ds4 parsers), not the leading-dash guess. llama.cpp and ds4 now use it too; ds4's strip used to leave the value behind.
+- [x] **A `daemon restart` command.** `llamastash daemon restart` takes the `daemon start` flag set and stops the running daemon first. `DaemonStartArgs` feeds both subcommands, and `stop_daemon()` returns a `StopOutcome` so `restart` refuses to spawn over a daemon that has not released its lockfile yet.
 
 ## General Roadmap
 
 ### High priority
 
+- [ ] **`--llama-server` is never adopted on a Lemonade-enabled host.** `reconcile_binary_with_running_daemon` ([`src/cli/client.rs`](src/cli/client.rs)) reads a non-empty `status.models` as "managed launches are active", and the supervised Lemonade umbrella is one of those rows (`launch_id: lemonade-umbrella`), so wherever `lemond` resolves the flag is dropped with "Stop them and re-run to apply" — there is no launch for the user to stop. Verified 2026-09-28 on this box: umbrella row present → refused; `backend.lemonade.enabled: false` → restarted (pid 2818574 → 2820119, `daemon.server_path` took the new binary). Ask the umbrella's backend whether its supervised process is busy, or count only model rows.
 - [ ] **An orphaned launch is not routable after a daemon crash.** It survives as a read-only `external` row (named, stoppable) but is not on `/v1/models` and [`route::decide`](src/proxy/route.rs) cannot pick it, so the next request for that model starts a second copy beside it while the orphan holds its RAM. Deliberate for now — see the D1 correction in [`docs/plans/2026-09-03-002-feat-named-launches-plan.md`](docs/plans/2026-09-03-002-feat-named-launches-plan.md); re-adopting as a managed launch means a `ManagedModel` with no pipes to capture and no health monitor. Revisit only with a plan.
 - [ ] bench vllm vs llamacpp vs sglang for qwen 3.8 27b and flash next: parked due to vLLM/SGlang strix halo support/optimization. See https://github.com/sgl-project/sglang/issues/30599
 - [ ] **Measure `load-mode`, then keep or drop it from the presets.** (Was `no-mmap`; llama.cpp folded that flag into `--load-mode` on 2026-09-09 and the presets migrated to `load-mode: none`. The measurement below is unchanged — substitute `load-mode: none` for `no-mmap: true` and `--load-mode none` for `-- --no-mmap`.)

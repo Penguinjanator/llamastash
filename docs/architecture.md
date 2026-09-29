@@ -390,6 +390,50 @@ dies with it and nothing external respawns it, so an agent pointed at the
 proxy URL sees a dead port until something re-attaches. Proxy traffic
 counts as activity precisely so that doesn't happen mid-session.
 
+## Daemon stop and restart
+
+Every client-side path that has to know the daemon is gone waits on one
+function, `daemon::restart::shutdown_and_wait`: call the `shutdown` RPC, then
+poll the lockfile until the old process is gone. Four callers — `daemon stop`,
+`daemon restart`, the TUI's `Ctrl+R`, and the `--llama-server` reconcile in
+`cli::client::connect_or_spawn`, which re-spawns the running daemon on a
+different `llama-server`. Waiting on the lockfile is the whole point. The RPC
+only *requests* teardown — the daemon still has to drain connections, stop
+every managed launch, and drop its `flock` — so a caller that returns on the
+answer races the replacement launch into "already running". The reconcile's
+deleted helper polled `Client::connect` instead, and that only reads
+`runtime.json` — it never probes the port — so it returned as soon as the
+handshake file disappeared, which is before the lock is dropped
+(`run_foreground` stops the managed launches, removes the handshake, then lets
+the lock guard go), and otherwise just slept its fixed 3 s. The window here is
+the longest child stop grace the daemon reported plus 5 s, floored at 10 s. It
+reports `Stopped`, `NoChannel` (nothing reachable over IPC — the caller then
+decides between "genuinely down" and a stale PID that needs signalling), or
+`StillExiting { pid }`. `daemon restart` refuses to spawn on that last one;
+plain `stop` calls it success, and the reconcile logs and re-spawns anyway — a
+failed background reconcile should not fail the command that triggered it. A
+handshake that points at a process no longer holding the lock is cleared on the
+way out, so a crash does not wedge the next start.
+
+The TUI's `Ctrl+K` is the one client-side shutdown outside that function: it
+fires a bare `shutdown` RPC and returns immediately, because nothing is re-spawned
+behind it and the TUI must not block on the teardown.
+
+`daemon restart` resolves the new daemon's options (`prepare_start`) before it
+stops anything, so a flag or a `config.yaml` that cannot produce a daemon
+fails while the old one is still up. It then waits on the state dir those
+options resolved to rather than the ambient one, so a restart driven with
+`--state-dir` acts on that daemon. `shutdown_and_wait` also drops its IPC
+client before it polls: the control plane drains down to zero active
+connections, and a client left attached makes that drain run its full 2 s.
+
+The restart's start half is the CLI's `daemon start` path unchanged — same
+flag set (`DaemonStartArgs`), same config migration, LAN proxy-key
+provisioning, and backend precheck. The TUI's restart skips that half: it
+re-spawns the `DaemonOptions` its own dispatch resolved when the TUI opened,
+passed through as the child's argv. The daemon that comes up re-reads
+`config.yaml` either way.
+
 ## Model identity
 
 `(canonical absolute path, BLAKE3 of GGUF header bytes)`. The header is small (up to ~1 MB); hashing it gives an identity that survives renames but doesn't fingerprint the whole weight file.
