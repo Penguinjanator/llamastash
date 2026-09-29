@@ -54,8 +54,9 @@ pub struct GenericServer {
   /// (the default) means all, so the engine answers or refuses each request.
   #[serde(default)]
   pub modes: Vec<crate::launch::mode::LaunchMode>,
-  /// Display-only row info for an entry without `model`, shown verbatim in
-  /// the Arch / Params / Quant / Ctx columns. A `model` row reads its GGUF.
+  /// Row info for an entry without `model`, for the Arch / Params / Quant /
+  /// Ctx columns. The catalog carries it like GGUF metadata, so `arch` also
+  /// ranks proxy fallback candidates. A `model` row reads its GGUF.
   #[serde(default)]
   pub arch: Option<String>,
   #[serde(default)]
@@ -163,9 +164,11 @@ impl GenericServer {
       self
         .knobs
         .iter()
-        .map(KnobDecl::spec)
-        .find(|k| k.ctx)
-        .and_then(|k| k.default?.trim().parse().ok())
+        .find_map(|d| match d {
+          KnobDecl::Full(k) if k.ctx => Some(k),
+          _ => None,
+        })
+        .and_then(|k| k.default.as_deref()?.trim().parse().ok())
     })
   }
 
@@ -309,30 +312,22 @@ impl GenericConfig {
           ));
         }
       }
+      let is_blank = |v: &Option<String>| v.as_deref().is_some_and(|v| v.trim().is_empty());
       let info = [
-        ("arch", s.arch.as_deref()),
-        ("params", s.params.as_deref()),
-        ("quant", s.quant.as_deref()),
+        ("arch", s.arch.is_some(), is_blank(&s.arch)),
+        ("params", s.params.is_some(), is_blank(&s.params)),
+        ("quant", s.quant.is_some(), is_blank(&s.quant)),
+        ("ctx", s.ctx.is_some(), s.ctx == Some(0)),
       ];
-      for (field, value) in info {
-        match value {
-          Some(_) if s.model.is_some() => {
-            return Err(entry(format!(
-              "`{field}` applies only without `model`; a catalog model reads its GGUF"
-            )));
-          }
-          Some(v) if v.trim().is_empty() => return Err(entry(format!("`{field}` is empty"))),
-          _ => {}
+      for (field, set, blank) in info {
+        if set && s.model.is_some() {
+          return Err(entry(format!(
+            "`{field}` applies only without `model`; a catalog model reads its GGUF"
+          )));
         }
-      }
-      match s.ctx {
-        Some(_) if s.model.is_some() => {
-          return Err(entry(
-            "`ctx` applies only without `model`; a catalog model reads its GGUF".into(),
-          ));
+        if blank {
+          return Err(entry(format!("`{field}` is empty or 0")));
         }
-        Some(0) => return Err(entry("`ctx` must be > 0".into())),
-        _ => {}
       }
       let placeholders = s.placeholders();
       match s.model.as_deref() {
@@ -568,7 +563,7 @@ servers:
       ),
       (
         "{name: e, binary: /b, ready: /h, ctx: 0}",
-        "`ctx` must be > 0",
+        "`ctx` is empty or 0",
       ),
     ] {
       let msg = refusal(&format!("servers:\n  - {entry}\n"));

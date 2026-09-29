@@ -136,11 +136,9 @@ async fn build_view(args: &ShowArgs, cli: &Cli, config: &Config) -> Result<ShowV
   // resolver. Yaml arch_defaults sit on the same layer and win
   // per-field; surface both so the user sees where each field comes
   // from.
-  let arch_key = row.arch.as_deref().unwrap_or("");
-  let builtin_arch_defaults = defaults_table::lookup(arch_key, backend);
-  let yaml_arch_defaults = row
-    .arch
-    .as_deref()
+  let launch_arch = launch_arch(&row);
+  let builtin_arch_defaults = defaults_table::lookup(launch_arch.unwrap_or(""), backend);
+  let yaml_arch_defaults = launch_arch
     .and_then(|a| config.arch_defaults.get(a))
     .cloned();
 
@@ -208,6 +206,15 @@ async fn build_view(args: &ShowArgs, cli: &Cli, config: &Config) -> Result<ShowV
 ///
 /// The tier-1 error is what surfaces on a total miss: it names the whole
 /// reference the user typed rather than some half of it.
+/// The arch the launch resolver keys arch defaults on. A config-declared
+/// row's arch is display text: its launch reads no GGUF header.
+fn launch_arch(row: &CatalogRow) -> Option<&str> {
+  match crate::discovery::ModelSource::from_label(&row.source) {
+    Some(crate::discovery::ModelSource::Config) => None,
+    _ => row.arch.as_deref(),
+  }
+}
+
 fn resolve_show_target(
   catalog: &[CatalogRow],
   running: &[crate::cli::resolve::RunningRow],
@@ -608,6 +615,15 @@ mod tests {
       multimodal: None,
       mtp: None,
     }
+  }
+
+  #[test]
+  fn a_config_row_s_declared_arch_keys_no_arch_defaults() {
+    let mut row = fake_row("/m/a.gguf");
+    row.arch = Some("qwen3next".into());
+    assert_eq!(launch_arch(&row), Some("qwen3next"));
+    row.source = "config".into();
+    assert_eq!(launch_arch(&row), None);
   }
 
   #[test]
