@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::daemon::existing_daemon_pid;
+use crate::daemon::{existing_daemon_pid, runtime_file};
 use crate::ipc::{Client, ClientError};
 
 /// Floor on the exit wait, so a daemon with no managed children still gets its
@@ -46,7 +46,8 @@ pub enum StopOutcome {
 ///
 /// A shutdown RPC failure on a *live* daemon is an error — no wait fixes it. A
 /// handshake that points at a process which is not there is not: it reports
-/// [`StopOutcome::NoChannel`].
+/// [`StopOutcome::NoChannel`] and clears the handshake, so the caller's next
+/// start is not aimed at a dead URL.
 pub async fn shutdown_and_wait(state_dir: &Path) -> Result<StopOutcome> {
   let mut client = match Client::connect(state_dir).await {
     Ok(client) => client,
@@ -54,10 +55,20 @@ pub async fn shutdown_and_wait(state_dir: &Path) -> Result<StopOutcome> {
     Err(_other) if existing_daemon_pid(state_dir).is_none() => return Ok(StopOutcome::NoChannel),
     Err(other) => return Err(other).context("daemon shutdown request"),
   };
-  let resp = client
-    .call("shutdown", None)
-    .await
-    .context("daemon shutdown request")?;
+  let resp = match client.call("shutdown", None).await {
+    Ok(resp) => resp,
+    // `runtime.json` outlives its daemon on a crash, and `Client::connect` only
+    // reads the file — it never probes the URL. So a call that cannot land on a
+    // state dir nobody holds the lock on means there is nothing to stop, not a
+    // stop that failed. Clearing the handshake here is what keeps `daemon
+    // restart` working after a crash instead of failing until the file is
+    // deleted by hand.
+    Err(_stale) if existing_daemon_pid(state_dir).is_none() => {
+      runtime_file::remove(state_dir);
+      return Ok(StopOutcome::NoChannel);
+    }
+    Err(other) => return Err(other).context("daemon shutdown request"),
+  };
   // Close the pooled keep-alive before waiting for the exit. The control plane
   // drains by polling its active-connection count down to zero, so a client
   // still holding a connection open here makes the daemon sit out the whole
@@ -94,6 +105,32 @@ mod tests {
       .await
       .expect("no-daemon stop is not an error");
     assert_eq!(outcome, StopOutcome::NoChannel);
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  /// A handshake left by a crashed daemon points at a control plane that is
+  /// gone. With nobody holding the lock that is "nothing to stop", not a failed
+  /// stop, and the dead handshake gets cleared so the caller's next start is
+  /// not aimed at it.
+  #[tokio::test]
+  async fn shutdown_and_wait_clears_a_handshake_with_no_lock_holder() {
+    use crate::daemon::runtime_file;
+
+    let dir = unique_temp_dir("stale");
+    let stale: runtime_file::RuntimeInfo = serde_json::from_str(
+      r#"{"ipc_url":"http://127.0.0.1:1","ipc_token":"dead-token","started_at_unix":1,"daemon_pid":1}"#,
+    )
+    .expect("handshake fixture");
+    runtime_file::save(&dir, &stale).expect("save handshake");
+
+    let outcome = shutdown_and_wait(&dir)
+      .await
+      .expect("a stale handshake is not an error");
+    assert_eq!(outcome, StopOutcome::NoChannel);
+    assert!(
+      !runtime_file::path(&dir).exists(),
+      "the dead handshake should be gone"
+    );
     std::fs::remove_dir_all(&dir).ok();
   }
 }

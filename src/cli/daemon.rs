@@ -440,6 +440,10 @@ async fn stop_daemon(attach_dir: &std::path::Path, force: bool) -> Result<StopOu
   }
   match existing_daemon_pid(attach_dir) {
     None => {
+      // Nothing holds the lock, so any `runtime.json` still sitting here is a
+      // handshake whose URL is dead. Dropping it keeps the next command from
+      // aiming at a process that is gone.
+      runtime_file::remove(attach_dir);
       println!("{}", crate::cli::colors::dim("daemon: not running"));
       Ok(StopOutcome::NoChannel)
     }
