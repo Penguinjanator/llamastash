@@ -4,6 +4,7 @@
 
 pub mod aider;
 pub mod claude_code;
+pub mod codex;
 pub mod continue_dev;
 pub mod env_sh;
 pub mod opencode;
@@ -26,6 +27,7 @@ pub fn registered() -> Vec<Box<dyn ToolPatcher>> {
     Box::new(continue_dev::ContinueDev),
     Box::new(zed::Zed),
     Box::new(pi_dev::PiDev),
+    Box::new(codex::Codex),
     Box::new(env_sh::EnvSh),
     Box::new(claude_code::ClaudeCode),
   ]

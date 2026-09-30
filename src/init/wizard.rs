@@ -30,7 +30,7 @@ use crate::init::detection::{
 };
 use crate::init::fetch::{build_with_offline_check, FetchClient, FetchClientConfig};
 use crate::init::install::{
-  default_install_method, gh_releases, BinaryInstall, InstallChoice, InstallError,
+  default_install_method, gh_releases, BinaryInstall, GhBuild, InstallChoice, InstallError,
 };
 use crate::init::prompts::{self, ModelChoice};
 use crate::init::recommender::{recommend, OnDiskModel, RecommendOptions, Recommendation};
@@ -664,12 +664,16 @@ async fn run_install_step(
     }
   }
   let default = default_install_method(hardware);
+  let driver_major = gh_releases::nvidia_driver_major();
+  let cuda_label = gh_releases::cuda_asset_suffix(hardware, driver_major)
+    .and_then(|s| gh_releases::cuda_label(&s));
   log::debug!(
-    "init: install step (default={:?}, detected_binary={:?})",
+    "init: install step (default={:?}, detected_binary={:?}, nvidia_driver={:?})",
     default,
-    binary.resolved_path
+    binary.resolved_path,
+    driver_major
   );
-  let choice = prompts::pick_install_method(args, default, binary).await?;
+  let choice = prompts::pick_install_method(args, default, binary, cuda_label.as_deref()).await?;
   log::debug!("init: install method chosen: {choice:?}");
   match choice {
     InstallChoice::Brew => {
@@ -691,44 +695,43 @@ async fn run_install_step(
         }
       }
     }
-    InstallChoice::GhReleases => {
+    InstallChoice::GhReleases(build) => {
       let install_root = crate::util::paths::state_dir()
         .ok_or_else(|| CliExit::new(INIT_ABORTED, "no state dir"))?
         .join("llama-cpp");
-      let sp_query = prompts::StepProgress::start_if(
+      let (install, cuda) = install_gh_release(
+        fetch,
+        hardware,
+        build,
+        driver_major,
+        &install_root,
         emit_progress,
-        "Querying GitHub Releases for the latest llama.cpp asset",
-      );
-      let pick = match gh_releases::fetch_latest_asset(fetch, hardware).await {
-        Ok(p) => {
-          sp_query.success(format!(
-            "Selected GitHub Releases asset `{}` ({})",
-            p.asset_name, p.tag
-          ));
-          p
-        }
-        Err(e) => {
-          sp_query.fail(format!("GitHub Releases query failed: {e}"));
-          return Err(install_err_to_exit(e));
-        }
-      };
-      let sp_install = prompts::StepProgress::start_if(
-        emit_progress,
-        format!("Downloading + verifying + extracting `{}`", pick.asset_name),
-      );
-      match gh_releases::install_picked(fetch, &pick, &install_root).await {
-        Ok(install) => {
-          sp_install.success(format!(
-            "Installed llama-server at {}",
-            install.path.display()
-          ));
-          Ok(install)
-        }
-        Err(e) => {
-          sp_install.fail(format!("GitHub Releases install failed: {e}"));
-          Err(install_err_to_exit(e))
-        }
+      )
+      .await?;
+      if !cuda || cuda_device_loaded(&install.path) {
+        return Ok(install);
       }
+      // The CUDA backend is a plugin llama.cpp skips when it cannot
+      // load, so a broken CUDA install still runs, on the CPU. Fall
+      // back to the Vulkan build instead of keeping it.
+      let msg = format!(
+        "{} lists no CUDA device; installing the Vulkan build instead",
+        install.path.display()
+      );
+      log::warn!("init server: {msg}");
+      if emit_progress {
+        eprintln!("{}", colors::warning(&msg));
+      }
+      install_gh_release(
+        fetch,
+        hardware,
+        GhBuild::Vulkan,
+        driver_major,
+        &install_root,
+        emit_progress,
+      )
+      .await
+      .map(|(vulkan, _)| vulkan)
     }
     InstallChoice::CustomPath(p) => {
       if emit_progress {
@@ -752,6 +755,65 @@ async fn run_install_step(
       }
     }
   }
+}
+
+/// Query, download, verify and extract one GitHub Releases build.
+/// Returns the install and whether it is a CUDA build.
+async fn install_gh_release(
+  fetch: &FetchClient,
+  hardware: &HardwareSnapshot,
+  build: GhBuild,
+  driver_major: Option<u32>,
+  install_root: &std::path::Path,
+  emit_progress: bool,
+) -> Result<(BinaryInstall, bool), CliExit> {
+  let sp_query = prompts::StepProgress::start_if(
+    emit_progress,
+    "Querying GitHub Releases for the latest llama.cpp asset",
+  );
+  let pick = match gh_releases::fetch_latest_asset(fetch, hardware, build, driver_major).await {
+    Ok(p) => {
+      sp_query.success(format!(
+        "Selected GitHub Releases asset `{}` ({})",
+        p.asset_name, p.tag
+      ));
+      p
+    }
+    Err(e) => {
+      sp_query.fail(format!("GitHub Releases query failed: {e}"));
+      return Err(install_err_to_exit(e));
+    }
+  };
+  let what = match &pick.runtime_libs {
+    Some(libs) => format!("`{}` + `{}`", pick.asset_name, libs.asset_name),
+    None => format!("`{}`", pick.asset_name),
+  };
+  let sp_install = prompts::StepProgress::start_if(
+    emit_progress,
+    format!("Downloading + verifying + extracting {what}"),
+  );
+  match gh_releases::install_picked(fetch, &pick, install_root).await {
+    Ok(install) => {
+      sp_install.success(format!(
+        "Installed llama-server at {}",
+        install.path.display()
+      ));
+      Ok((install, pick.is_cuda()))
+    }
+    Err(e) => {
+      sp_install.fail(format!("GitHub Releases install failed: {e}"));
+      Err(install_err_to_exit(e))
+    }
+  }
+}
+
+/// Whether `binary --list-devices` shows a CUDA device.
+fn cuda_device_loaded(binary: &std::path::Path) -> bool {
+  use crate::backend::Backend;
+  crate::backend::default_backend()
+    .probe_devices(binary)
+    .iter()
+    .any(|d| d.gpu_backend.eq_ignore_ascii_case("cuda"))
 }
 
 fn install_err_to_exit(e: InstallError) -> CliExit {

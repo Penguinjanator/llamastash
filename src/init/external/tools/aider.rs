@@ -8,6 +8,15 @@
 //! Per Aider's docs, only OpenAI/Anthropic keys are allowed in the
 //! YAML — that's fine for our purposes (we use the openai-api-key
 //! key with the stub `llamastash` value).
+//!
+//! **Effort: nothing written.** Checked against Aider `main` `5dc9490bb`
+//! (release 0.86.0): the in-chat `/reasoning-effort <level>` command is
+//! not gated (`aider/commands.py`) and sends `reasoning_effort` as-is.
+//! Only the `--reasoning-effort` flag checks the model's
+//! `accepts_settings`, which would need a `.aider.model.settings.yml`
+//! entry; such an entry replaces Aider's name-based defaults for that
+//! model id (`configure_model_settings` in `aider/models.py`), so it is
+//! not written.
 
 use std::path::PathBuf;
 

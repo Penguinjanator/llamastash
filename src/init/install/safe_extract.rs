@@ -265,6 +265,85 @@ pub fn safe_extract_tar_gz(
   })
 }
 
+/// Extract a runtime-library bundle (the Linux `cudart-` tarball) flat
+/// into `dest_dir`, the directory holding the installed binary.
+///
+/// Stricter than [`safe_extract_tar_gz`]: only directories and regular
+/// files named `lib*.so*` are accepted, each written under its own file
+/// name directly in `dest_dir`, since the binaries resolve them through
+/// an `$ORIGIN` rpath. Same size and entry caps. Each file lands through
+/// a temp file and a rename, so an interrupted run leaves no partial
+/// library behind; an existing file of the same name is replaced.
+pub fn safe_extract_libs_tar_gz(archive_bytes: &[u8], dest_dir: &Path) -> Result<(), InstallError> {
+  let mut tar = tar::Archive::new(GzDecoder::new(archive_bytes));
+  let mut total_uncompressed: u64 = 0;
+  let mut written = 0usize;
+  for (i, entry) in tar
+    .entries()
+    .map_err(|e| InstallError::Io(format!("tar read: {e}")))?
+    .enumerate()
+  {
+    if i >= MAX_ENTRIES {
+      return Err(InstallError::UnsafeArchive {
+        path: String::new(),
+        reason: format!("entry count exceeded the {MAX_ENTRIES} cap"),
+      });
+    }
+    let mut entry = entry.map_err(|e| InstallError::Io(format!("tar entry: {e}")))?;
+    let entry_path =
+      entry
+        .path()
+        .map(|p| p.to_path_buf())
+        .map_err(|e| InstallError::UnsafeArchive {
+          path: String::new(),
+          reason: format!("bad path: {e}"),
+        })?;
+    let entry_path_str = entry_path.display().to_string();
+    let refuse = |reason: &str| InstallError::UnsafeArchive {
+      path: entry_path_str.clone(),
+      reason: reason.into(),
+    };
+    let safe_rel = safe_relative_path(&entry_path).map_err(|r| refuse(&r))?;
+    match entry.header().entry_type() {
+      EntryType::Directory => continue,
+      EntryType::Regular => {}
+      other => return Err(refuse(&format!("unsupported entry type {other:?}"))),
+    }
+    let name = safe_rel
+      .file_name()
+      .and_then(|n| n.to_str())
+      .ok_or_else(|| refuse("entry has no file name"))?;
+    if !(name.starts_with("lib") && name.contains(".so")) {
+      return Err(refuse("not a shared library"));
+    }
+    let entry_size = entry.header().size().unwrap_or(0);
+    if entry_size > MAX_PER_ENTRY_UNCOMPRESSED_BYTES {
+      return Err(refuse("entry exceeds the per-entry size cap"));
+    }
+    total_uncompressed = total_uncompressed.saturating_add(entry_size);
+    if total_uncompressed > MAX_TOTAL_UNCOMPRESSED_BYTES {
+      return Err(refuse("total uncompressed size exceeded the cap"));
+    }
+    let mut tmp = tempfile::Builder::new()
+      .prefix(&format!(".{name}.tmp."))
+      .tempfile_in(dest_dir)
+      .map_err(|e| InstallError::Io(e.to_string()))?;
+    let mut limited = entry.by_ref().take(MAX_PER_ENTRY_UNCOMPRESSED_BYTES);
+    std::io::copy(&mut limited, tmp.as_file_mut()).map_err(|e| InstallError::Io(e.to_string()))?;
+    tmp
+      .persist(dest_dir.join(name))
+      .map_err(|e| InstallError::Io(format!("persist {name}: {e}")))?;
+    written += 1;
+  }
+  if written == 0 {
+    return Err(InstallError::UnsafeArchive {
+      path: String::new(),
+      reason: "runtime bundle held no shared libraries".into(),
+    });
+  }
+  Ok(())
+}
+
 /// Dispatch on `archive_name`'s extension to either the tar.gz or
 /// (Windows-only) zip extraction codepath. The picked filename's
 /// trailing extension drives the choice — `.zip` routes through the
@@ -615,6 +694,52 @@ mod tests {
       let mode = std::fs::metadata(&out.path).unwrap().permissions().mode() & 0o777;
       assert_eq!(mode, 0o700, "llama-server must be chmod 0700");
     }
+    std::fs::remove_dir_all(&dest).ok();
+  }
+
+  #[test]
+  fn runtime_libs_land_flat_beside_the_binary() {
+    // Upstream's layout: one wrapping dir holding the three libraries.
+    let top = "cudart-llama-b11302-bin-ubuntu-cuda-13.4-x64";
+    let archive = build_archive(|tar| {
+      for lib in ["libcudart.so.13", "libcublas.so.13", "libcublasLt.so.13"] {
+        write_file_entry(tar, &format!("{top}/{lib}"), lib.as_bytes());
+      }
+    });
+    let dest = temp_dir("libs-flat");
+    std::fs::write(dest.join("llama-server"), b"bin").unwrap();
+    safe_extract_libs_tar_gz(&archive, &dest).expect("extract");
+    assert_eq!(
+      std::fs::read(dest.join("libcudart.so.13")).unwrap(),
+      b"libcudart.so.13"
+    );
+    assert!(dest.join("libcublasLt.so.13").is_file());
+    assert!(!dest.join(top).exists(), "no wrapping dir");
+    std::fs::remove_dir_all(&dest).ok();
+  }
+
+  #[test]
+  fn runtime_bundle_refuses_anything_but_shared_libraries() {
+    let dest = temp_dir("libs-refuse");
+    let exe = build_archive(|tar| write_file_entry(tar, "top/llama-server", b"swap"));
+    assert!(matches!(
+      safe_extract_libs_tar_gz(&exe, &dest),
+      Err(InstallError::UnsafeArchive { .. })
+    ));
+    assert!(!dest.join("llama-server").exists());
+    let link = build_archive(|tar| {
+      let mut header = Header::new_gnu();
+      header.set_size(0);
+      header.set_entry_type(EntryType::Symlink);
+      header.set_link_name("/usr/lib/libc.so.6").unwrap();
+      header.set_cksum();
+      tar
+        .append_data(&mut header, "top/libcudart.so.13", &[][..])
+        .unwrap();
+    });
+    assert!(safe_extract_libs_tar_gz(&link, &dest).is_err());
+    let empty = build_archive(|_| {});
+    assert!(safe_extract_libs_tar_gz(&empty, &dest).is_err());
     std::fs::remove_dir_all(&dest).ok();
   }
 

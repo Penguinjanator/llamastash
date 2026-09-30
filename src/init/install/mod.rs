@@ -28,9 +28,20 @@ use crate::init::snapshot::InstallMethod;
 /// What the user picked from the install-method prompt.
 #[derive(Debug, Clone)]
 pub enum InstallChoice {
-  GhReleases,
+  GhReleases(GhBuild),
   Brew,
   CustomPath(PathBuf),
+}
+
+/// Which GitHub Releases build to fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GhBuild {
+  /// The best build for the host: CUDA on Linux + NVIDIA when the driver
+  /// can run one, else what [`gh_releases::pick_asset_suffix`] routes to.
+  #[default]
+  Best,
+  /// Vulkan even where a CUDA build would fit.
+  Vulkan,
 }
 
 /// Outcome of a successful install. `digest` is the binary's
@@ -82,13 +93,7 @@ pub fn default_install_method(hw: &HardwareSnapshot) -> InstallChoice {
   match (&hw.gpu, hw.os, hw.cpu_arch) {
     (GpuInfo::AppleMetal { .. }, OsFamily::MacOs, CpuArch::Arm64) => InstallChoice::Brew,
     (_, OsFamily::MacOs, _) => InstallChoice::Brew,
-    // Linux + Nvidia → GH Releases Vulkan (no CUDA prebuilt exists).
-    (GpuInfo::Nvidia { .. }, OsFamily::Linux, _)
-    | (GpuInfo::Amd { .. }, OsFamily::Linux, _)
-    | (GpuInfo::Unknown { .. }, OsFamily::Linux, _) => InstallChoice::GhReleases,
-    // Linux CPU-only: brew if linuxbrew is on PATH, else GH Releases CPU.
-    (GpuInfo::CpuOnly, OsFamily::Linux, _) => InstallChoice::GhReleases,
-    _ => InstallChoice::GhReleases,
+    _ => InstallChoice::GhReleases(GhBuild::Best),
   }
 }
 
@@ -138,17 +143,15 @@ mod tests {
   }
 
   #[test]
-  fn linux_nvidia_routes_to_gh_releases() {
-    // No ubuntu-cuda asset; routing lands on the Vulkan prebuilt with
-    // a downgrade banner.
+  fn linux_nvidia_routes_to_the_best_gh_releases_build() {
     let choice = default_install_method(&hw(nvidia_device(), OsFamily::Linux, CpuArch::X86_64));
-    assert!(matches!(choice, InstallChoice::GhReleases));
+    assert!(matches!(choice, InstallChoice::GhReleases(GhBuild::Best)));
   }
 
   #[test]
   fn linux_cpu_only_routes_to_gh_releases_cpu_asset() {
     let choice = default_install_method(&hw(GpuInfo::CpuOnly, OsFamily::Linux, CpuArch::X86_64));
-    assert!(matches!(choice, InstallChoice::GhReleases));
+    assert!(matches!(choice, InstallChoice::GhReleases(GhBuild::Best)));
   }
 
   #[test]

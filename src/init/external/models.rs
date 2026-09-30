@@ -117,7 +117,10 @@ impl Catalog {
     id: &str,
     presets: &BTreeMap<String, ConfigPresetBlock>,
   ) -> Vec<PatchModel> {
-    let base = PatchModel::from_catalog_row(row, id.to_string());
+    let mut base = PatchModel::from_catalog_row(row, id.to_string());
+    if row.has_reasoning_hint {
+      base.effort = crate::init::external::effort::from_gguf(Path::new(&row.path));
+    }
     let path = Path::new(&row.path);
     let context = |preset_ctx: Option<u32>, server: Option<&str>| {
       preset_ctx
@@ -177,7 +180,11 @@ fn from_download(summary: &ModelSummary, catalog: Option<&Catalog>) -> Option<Pa
       .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
   });
   match gguf {
-    Some(path) => Some(PatchModel::from_id(downloaded_id(path, catalog))),
+    Some(path) => {
+      let mut m = PatchModel::from_id(downloaded_id(path, catalog));
+      m.effort = crate::init::external::effort::from_gguf(path);
+      Some(m)
+    }
     // No GGUF but files landed: a safetensors repo, pulled whole.
     None => (!summary.files.is_empty()).then(|| PatchModel::from_id(summary.repo.clone())),
   }

@@ -15,14 +15,54 @@
 //! (which carries the real bearer key when the proxy enforces auth), so
 //! the opencode integration needs `env.sh` sourced — or
 //! `LLAMASTASH_API_KEY` otherwise exported — to authenticate.
+//!
+//! Per model, verified against opencode `dev` `e9f8a210b` (release
+//! 1.18.33):
+//! - `limit`: a config model without one gets `context: 0`
+//!   (`provider/provider.ts`), and `context: 0` turns compaction off
+//!   (`session/overflow.ts`), so a long session overflows the server. The
+//!   config schema requires `output` beside `context`.
+//! - `reasoning` + `variants`: `ProviderTransform.variants()` builds no
+//!   effort variants for an id containing `qwen` (and several other
+//!   families), so they are written explicitly, one per level the chat
+//!   template accepts. `@ai-sdk/openai-compatible` sends `reasoningEffort`
+//!   as `reasoning_effort`.
 
 use std::path::PathBuf;
 
 use serde_json::json;
 
-use crate::init::external::{Format, PatchContext, ToolPatcher};
+use crate::init::external::{Format, PatchContext, PatchModel, ToolPatcher};
 
 pub struct OpenCode;
+
+/// opencode's own output cap (`OUTPUT_TOKEN_MAX` in
+/// `provider/transform.ts`), what it uses when `output` is `0`.
+const OUTPUT_TOKEN_MAX: u64 = 32_000;
+
+fn model_entry(m: &PatchModel) -> serde_json::Value {
+  let context = m.declared_context();
+  // opencode compacts at `context - output`; half the window keeps a
+  // small-context model usable.
+  let output = OUTPUT_TOKEN_MAX.min(context / 2);
+  let mut entry = json!({
+    "name": m.id,
+    "limit": { "context": context, "output": output },
+  });
+  if let Some(effort) = &m.effort {
+    let mut variants: serde_json::Map<String, serde_json::Value> = effort
+      .levels
+      .iter()
+      .map(|l| (l.clone(), json!({ "reasoningEffort": l })))
+      .collect();
+    if effort.can_disable {
+      variants.insert("none".into(), json!({ "reasoningEffort": "none" }));
+    }
+    entry["reasoning"] = json!(true);
+    entry["variants"] = serde_json::Value::Object(variants);
+  }
+  entry
+}
 
 impl ToolPatcher for OpenCode {
   fn id(&self) -> &'static str {
@@ -59,7 +99,7 @@ impl ToolPatcher for OpenCode {
     let models: serde_json::Map<String, serde_json::Value> = ctx
       .models
       .iter()
-      .map(|m| (m.id.clone(), json!({ "name": m.id })))
+      .map(|m| (m.id.clone(), model_entry(m)))
       .collect();
     json!({
       "$schema": "https://opencode.ai/config.json",
@@ -95,6 +135,48 @@ mod tests {
     // A safetensors repo id carries a slash — it is still just a key.
     assert_eq!(models["qwen3-coder-30b"]["name"], "qwen3-coder-30b");
     assert_eq!(models["Qwen/Qwen3-0.6B"]["name"], "Qwen/Qwen3-0.6B");
+  }
+
+  #[test]
+  fn every_model_declares_its_context_and_output_limit() {
+    let mut ctx = PatchContext::fixture(&["big", "small"]);
+    ctx.models[0].context_window = Some(262_144);
+    ctx.models[1].context_window = Some(8192);
+    let v = OpenCode.build_additions(&ctx);
+    let models = &v["provider"]["llamastash"]["models"];
+    assert_eq!(
+      models["big"]["limit"],
+      json!({"context": 262_144, "output": 32_000})
+    );
+    assert_eq!(
+      models["small"]["limit"],
+      json!({"context": 8192, "output": 4096})
+    );
+  }
+
+  #[test]
+  fn a_model_with_effort_levels_gets_reasoning_and_variants() {
+    let mut ctx = PatchContext::fixture(&["Qwen3.8-27B-UD-Q6_K", "plain"]);
+    ctx.models[0].effort = Some(crate::init::external::effort::EffortLevels {
+      levels: vec!["low".into(), "medium".into(), "xhigh".into()],
+      default: Some("xhigh".into()),
+      can_disable: true,
+    });
+    let v = OpenCode.build_additions(&ctx);
+    let models = &v["provider"]["llamastash"]["models"];
+    let qwen = &models["Qwen3.8-27B-UD-Q6_K"];
+    assert_eq!(qwen["reasoning"], true);
+    assert_eq!(
+      qwen["variants"],
+      json!({
+        "low": {"reasoningEffort": "low"},
+        "medium": {"reasoningEffort": "medium"},
+        "xhigh": {"reasoningEffort": "xhigh"},
+        "none": {"reasoningEffort": "none"},
+      })
+    );
+    assert!(models["plain"].get("reasoning").is_none());
+    assert!(models["plain"].get("variants").is_none());
   }
 
   #[test]
@@ -200,7 +282,7 @@ mod tests {
     let path = dir.join("opencode.json");
     std::fs::write(
       &path,
-      r#"{"provider":{"llamastash":{"npm":"@ai-sdk/openai-compatible","name":"LlamaStash","options":{"baseURL":"http://127.0.0.1:99999/v1","apiKey":"{env:LLAMASTASH_API_KEY}"},"models":{"qwen3-coder-30b":{"name":"qwen3-coder-30b"}}}}}"#,
+      r#"{"provider":{"llamastash":{"npm":"@ai-sdk/openai-compatible","name":"LlamaStash","options":{"baseURL":"http://127.0.0.1:99999/v1","apiKey":"{env:LLAMASTASH_API_KEY}"},"models":{"qwen3-coder-30b":{"name":"qwen3-coder-30b","limit":{"context":32768,"output":16384}}}}}}"#,
     )
     .unwrap();
     let out = dry_run(&OpenCode, &ctx(), Some(path)).expect("dry_run");

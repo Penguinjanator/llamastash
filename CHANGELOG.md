@@ -4,9 +4,19 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ## [Unreleased]
 
+### Added
+
+- `init` installs llama.cpp's CUDA build on Linux + NVIDIA (CUDA 13 on driver 580+, CUDA 12 on 525+), with its CUDA runtime libraries, and falls back to Vulkan when the build lists no CUDA device. `--install gh-releases:vulkan` keeps Vulkan.
+- `init` integrations wire reasoning effort for models whose chat template lists levels (Qwen3.8: `low`, `medium`, `xhigh`, plus `none`): pi gets `reasoning` + `thinkingLevelMap`, OpenCode gets `variants`, Zed gets a `reasoning_effort` default.
+- `init` integrations: Codex CLI entry, written as a `~/.codex/llamastash.config.toml` profile (`codex --profile llamastash`) on the Responses API.
+
 ### Changed
 
 - Faster daemon boot and `stop`: looking up one process no longer scans every process on the host, and the boot sweep no longer reads every thread.
+
+### Fixed
+
+- OpenCode integration now declares each model's context and output `limit`; without it OpenCode read the context as `0` and never compacted.
 
 ## [0.5.0] — 2026-09-30
 

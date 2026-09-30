@@ -169,7 +169,7 @@ The wizard's recommender without the install / download / config-write steps. Up
 
 ### `llamastash integrations` — point your AI tools at the proxy
 
-Patches the config of each tool you pick — OpenCode, Aider, Continue.dev, Zed, pi.dev — with the proxy URL and every model you have favorited, and writes the sourceable `env.sh` / `claude-code.sh` snippets. `llamastash integrations pi` for one tool, bare for an interactive multiselect. Merges preserve your own keys, API keys are written as env references rather than literals, and each model is named the way `/v1/models` publishes it, so a GGUF file and a safetensors repo both resolve. Same step `init` runs, without the wizard. See [`docs/usage.md` § `llamastash integrations`](docs/usage.md#llamastash-integrations-tools).
+Patches the config of each tool you pick — OpenCode, Aider, Continue.dev, Zed, pi.dev, Codex CLI — with the proxy URL and every model you have favorited, and writes the sourceable `env.sh` / `claude-code.sh` snippets. For reasoning models whose chat template lists effort levels (Qwen3.8: `low`, `medium`, `xhigh`), pi, OpenCode and Zed get their effort pickers wired to those levels. Codex gets its own `codex --profile llamastash` file, so your `config.toml` is untouched. `llamastash integrations pi` for one tool, bare for an interactive multiselect. Merges preserve your own keys, API keys are written as env references rather than literals, and each model is named the way `/v1/models` publishes it, so a GGUF file and a safetensors repo both resolve. Same step `init` runs, without the wizard. See [`docs/usage.md` § `llamastash integrations`](docs/usage.md#llamastash-integrations-tools).
 
 ### Reproducible pulls via `--revision <SHA>`
 

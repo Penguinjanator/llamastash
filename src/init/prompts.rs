@@ -25,7 +25,7 @@ use crate::init::benchmark::ModelEntry;
 use crate::init::detection::{BinaryPresence, CpuArch, HardwareSnapshot, OsFamily};
 use crate::init::fetch::FetchClient;
 use crate::init::hf_api::{self, format_param_count, HfSearchResult, HfSortKey};
-use crate::init::install::InstallChoice;
+use crate::init::install::{GhBuild, InstallChoice};
 use crate::init::recommender::{Recommendation, RecommendationKind};
 use crate::init::wizard::InitSummary;
 
@@ -480,10 +480,14 @@ pub fn arch_short(arch: CpuArch) -> &'static str {
 /// Resolve the install-method choice. Returns immediately if the
 /// override flag is set, the wizard is in recommended mode, or
 /// stdout is not a terminal. Otherwise prompts via cliclack.
+///
+/// `cuda` labels the CUDA build this host can run (`CUDA 13`); when set,
+/// GitHub Releases is offered as two items, CUDA and Vulkan.
 pub async fn pick_install_method(
   args: &InitArgs,
   default: InstallChoice,
   existing: &BinaryPresence,
+  cuda: Option<&str>,
 ) -> Result<InstallChoice, CliExit> {
   if let Some(override_value) = &args.install {
     return install_override_to_choice(override_value.clone(), existing);
@@ -496,7 +500,7 @@ pub async fn pick_install_method(
     // non-TTY warning before the first picker runs.
     return Ok(default);
   }
-  let (initial_idx, items) = build_install_items(&default, existing, brew_offer_available());
+  let (initial_idx, items) = build_install_items(&default, existing, brew_offer_available(), cuda);
   let items_for_thread = items.clone();
   let chosen_idx = tokio::task::spawn_blocking(move || {
     let mut select = cliclack::select::<usize>("Install method").initial_value(initial_idx);
@@ -973,7 +977,8 @@ fn install_override_to_choice(
 ) -> Result<InstallChoice, CliExit> {
   match override_value {
     InstallOverride::Brew => Ok(InstallChoice::Brew),
-    InstallOverride::GhReleases => Ok(InstallChoice::GhReleases),
+    InstallOverride::GhReleases => Ok(InstallChoice::GhReleases(GhBuild::Best)),
+    InstallOverride::GhReleasesVulkan => Ok(InstallChoice::GhReleases(GhBuild::Vulkan)),
     InstallOverride::Custom(path) => Ok(InstallChoice::CustomPath(path)),
     InstallOverride::Existing => match existing.resolved_path.clone() {
       Some(path) => Ok(InstallChoice::CustomPath(path)),
@@ -1013,12 +1018,27 @@ fn build_install_items(
   default: &InstallChoice,
   existing: &BinaryPresence,
   brew_available: bool,
+  cuda: Option<&str>,
 ) -> (usize, Vec<(InstallPick, String, String)>) {
-  let mut items: Vec<(InstallPick, String, String)> = vec![(
-    InstallPick::Resolved(InstallChoice::GhReleases),
-    "GitHub Releases".into(),
-    "verified asset for this host".into(),
-  )];
+  let mut items: Vec<(InstallPick, String, String)> = match cuda {
+    Some(label) => vec![
+      (
+        InstallPick::Resolved(InstallChoice::GhReleases(GhBuild::Best)),
+        format!("GitHub Releases · {label}"),
+        "native NVIDIA build plus its CUDA runtime (~560-730 MB download)".into(),
+      ),
+      (
+        InstallPick::Resolved(InstallChoice::GhReleases(GhBuild::Vulkan)),
+        "GitHub Releases · Vulkan".into(),
+        "portable GPU build, smaller download, usually slower on NVIDIA".into(),
+      ),
+    ],
+    None => vec![(
+      InstallPick::Resolved(InstallChoice::GhReleases(GhBuild::Best)),
+      "GitHub Releases".into(),
+      "verified asset for this host".into(),
+    )],
+  };
   if brew_available {
     items.push((
       InstallPick::Resolved(InstallChoice::Brew),
@@ -1054,7 +1074,7 @@ fn build_install_items(
 fn install_choice_matches_default(candidate: &InstallChoice, default: &InstallChoice) -> bool {
   match (candidate, default) {
     (InstallChoice::Brew, InstallChoice::Brew) => true,
-    (InstallChoice::GhReleases, InstallChoice::GhReleases) => true,
+    (InstallChoice::GhReleases(a), InstallChoice::GhReleases(b)) => a == b,
     (InstallChoice::CustomPath(a), InstallChoice::CustomPath(b)) => a == b,
     _ => false,
   }
@@ -1324,7 +1344,30 @@ mod tests {
   #[test]
   fn install_override_gh_releases_short_circuits() {
     let result = install_override_to_choice(InstallOverride::GhReleases, &no_existing_binary());
-    assert!(matches!(result, Ok(InstallChoice::GhReleases)));
+    assert!(matches!(
+      result,
+      Ok(InstallChoice::GhReleases(GhBuild::Best))
+    ));
+    let vulkan =
+      install_override_to_choice(InstallOverride::GhReleasesVulkan, &no_existing_binary());
+    assert!(matches!(
+      vulkan,
+      Ok(InstallChoice::GhReleases(GhBuild::Vulkan))
+    ));
+  }
+
+  #[test]
+  fn build_install_items_splits_gh_releases_when_cuda_fits() {
+    let default = InstallChoice::GhReleases(GhBuild::Best);
+    let (initial, items) =
+      build_install_items(&default, &no_existing_binary(), false, Some("CUDA 13"));
+    assert_eq!(items[0].1, "GitHub Releases · CUDA 13");
+    assert_eq!(items[1].1, "GitHub Releases · Vulkan");
+    assert_eq!(initial, 0, "CUDA is the default");
+    assert!(matches!(
+      items[1].0,
+      InstallPick::Resolved(InstallChoice::GhReleases(GhBuild::Vulkan))
+    ));
   }
 
   #[test]
@@ -1492,9 +1535,14 @@ mod tests {
     let mut args = empty_args();
     args.recommended = true;
     args.install = Some(InstallOverride::Brew);
-    let result = pick_install_method(&args, InstallChoice::GhReleases, &no_existing_binary())
-      .await
-      .expect("override should not fail");
+    let result = pick_install_method(
+      &args,
+      InstallChoice::GhReleases(GhBuild::Best),
+      &no_existing_binary(),
+      None,
+    )
+    .await
+    .expect("override should not fail");
     assert!(
       matches!(result, InstallChoice::Brew),
       "got {result:?}, expected Brew"
@@ -1505,7 +1553,7 @@ mod tests {
   async fn pick_install_method_recommended_short_circuits_to_default() {
     let mut args = empty_args();
     args.recommended = true;
-    let result = pick_install_method(&args, InstallChoice::Brew, &no_existing_binary())
+    let result = pick_install_method(&args, InstallChoice::Brew, &no_existing_binary(), None)
       .await
       .expect("recommended should not fail");
     assert!(
@@ -1516,7 +1564,12 @@ mod tests {
 
   #[test]
   fn build_install_items_always_includes_custom_path_sentinel() {
-    let (_, items) = build_install_items(&InstallChoice::GhReleases, &no_existing_binary(), true);
+    let (_, items) = build_install_items(
+      &InstallChoice::GhReleases(GhBuild::Best),
+      &no_existing_binary(),
+      true,
+      None,
+    );
     let last = items.last().expect("items must not be empty");
     assert!(
       matches!(last.0, InstallPick::PromptCustomPath),
@@ -1529,9 +1582,10 @@ mod tests {
   #[test]
   fn build_install_items_with_existing_binary_still_appends_custom_path_sentinel() {
     let (_, items) = build_install_items(
-      &InstallChoice::GhReleases,
+      &InstallChoice::GhReleases(GhBuild::Best),
       &existing_binary("/opt/llama-server"),
       true,
+      None,
     );
     let last = items.last().expect("items must not be empty");
     assert!(
@@ -1553,7 +1607,12 @@ mod tests {
 
   #[test]
   fn build_install_items_includes_homebrew_when_brew_available() {
-    let (_, items) = build_install_items(&InstallChoice::GhReleases, &no_existing_binary(), true);
+    let (_, items) = build_install_items(
+      &InstallChoice::GhReleases(GhBuild::Best),
+      &no_existing_binary(),
+      true,
+      None,
+    );
     assert!(
       has_brew_item(&items),
       "Homebrew must be offered when brew is available"
@@ -1562,7 +1621,12 @@ mod tests {
 
   #[test]
   fn build_install_items_omits_homebrew_when_brew_unavailable() {
-    let (_, items) = build_install_items(&InstallChoice::GhReleases, &no_existing_binary(), false);
+    let (_, items) = build_install_items(
+      &InstallChoice::GhReleases(GhBuild::Best),
+      &no_existing_binary(),
+      false,
+      None,
+    );
     assert!(
       !has_brew_item(&items),
       "Homebrew must not be offered when brew is unavailable (e.g. Windows, or brew not on PATH)"
@@ -1570,7 +1634,7 @@ mod tests {
     // GH Releases + the Custom path… sentinel still stand.
     assert!(items
       .iter()
-      .any(|(p, _, _)| matches!(p, InstallPick::Resolved(InstallChoice::GhReleases))));
+      .any(|(p, _, _)| matches!(p, InstallPick::Resolved(InstallChoice::GhReleases(_)))));
     assert!(matches!(
       items.last().expect("items must not be empty").0,
       InstallPick::PromptCustomPath
@@ -1595,11 +1659,16 @@ mod tests {
     // libtest captures at the print layer, not fd 1).
     std::env::set_var("LLAMASTASH_ASSUME_NON_TTY", "1");
     let args = empty_args();
-    let result = pick_install_method(&args, InstallChoice::GhReleases, &no_existing_binary())
-      .await
-      .expect("non-TTY fallback should not fail");
+    let result = pick_install_method(
+      &args,
+      InstallChoice::GhReleases(GhBuild::Best),
+      &no_existing_binary(),
+      None,
+    )
+    .await
+    .expect("non-TTY fallback should not fail");
     assert!(
-      matches!(result, InstallChoice::GhReleases),
+      matches!(result, InstallChoice::GhReleases(GhBuild::Best)),
       "got {result:?}, expected GhReleases default"
     );
   }

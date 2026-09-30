@@ -1,17 +1,16 @@
 //! `ggml-org/llama.cpp` GitHub Releases install path.
 //!
-//! Two facts anchor this module:
-//! 1. SHA-256 lives in the API JSON `digest` field (`sha256:<hex>`).
-//!    No discrete sidecar files; no body-text parsing.
-//! 2. Linux + Nvidia has **no** CUDA prebuilt — Vulkan is the
-//!    routing default with an actionable downgrade banner.
+//! SHA-256 lives in the API JSON `digest` field (`sha256:<hex>`). No
+//! discrete sidecar files; no body-text parsing.
 //!
 //! Variant table:
 //!
 //! | Host | Asset name suffix |
 //! |---|---|
 //! | linux x86_64 cpu | `ubuntu-x64.tar.gz` |
-//! | linux x86_64 vulkan / nvidia | `ubuntu-vulkan-x64.tar.gz` |
+//! | linux nvidia, driver >= 580 | `ubuntu-cuda-13.*-<arch>.tar.gz` + `cudart-` bundle |
+//! | linux x86_64 nvidia, driver >= 525 | `ubuntu-cuda-12.*-x64.tar.gz` + `cudart-` bundle |
+//! | linux x86_64 vulkan / older nvidia | `ubuntu-vulkan-x64.tar.gz` |
 //! | linux x86_64 amd | `ubuntu-rocm-<ver>-x64.tar.gz` |
 //! | linux arm64 cpu | `ubuntu-arm64.tar.gz` |
 //! | linux arm64 vulkan | `ubuntu-vulkan-arm64.tar.gz` |
@@ -29,8 +28,8 @@ use crate::gpu::GpuInfo;
 use crate::init::detection::{CpuArch, HardwareSnapshot, OsFamily};
 use crate::init::fetch::{FetchClient, FetchError};
 
-use super::safe_extract::safe_extract;
-use super::{sha256_file, BinaryInstall, InstallError};
+use super::safe_extract::{safe_extract, safe_extract_libs_tar_gz};
+use super::{sha256_file, BinaryInstall, GhBuild, InstallError};
 use crate::init::snapshot::InstallMethod;
 
 /// Endpoint the wizard hits to discover the latest asset list. Pinned
@@ -44,9 +43,9 @@ const RELEASES_URL: &str = "https://api.github.com/repos/ggml-org/llama.cpp/rele
 /// mirror.
 const RELEASES_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
-/// Per-asset body cap (1 GB). Largest GH Releases asset for the
-/// platforms v2 supports is the Vulkan tarball (~30 MB on Linux);
-/// the cap keeps a hostile mirror from streaming an unbounded body.
+/// Per-asset body cap (1 GB). The largest asset fetched is the Linux
+/// CUDA 12.8 runtime bundle (566 MB at `b11302`); the cap keeps a
+/// hostile mirror from streaming an unbounded body.
 const ASSET_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
@@ -107,9 +106,9 @@ pub fn pick_asset_suffix(hw: &HardwareSnapshot) -> Option<String> {
     // this arm the common case on any Windows box whose driver ships
     // `vulkaninfo.exe`, not just true multi-card rigs. Pick the build
     // that covers the strongest device present: CUDA when any NVIDIA card
-    // is in the set (Windows only — Linux has no CUDA prebuilt), else
-    // Vulkan, which runs on every GPU llama.cpp
-    // targets. (macOS `Multi` already resolves via the `OsFamily::MacOs`
+    // is in the set, else Vulkan, which runs on every GPU llama.cpp
+    // targets. (Linux CUDA is chosen by [`cuda_asset_suffix`], which
+    // also needs the driver version.) (macOS `Multi` already resolves via the `OsFamily::MacOs`
     // catch-all above; `OsFamily::Other` via the top arm.)
     (GpuInfo::Multi { devices }, OsFamily::Windows) => {
       if devices.iter().any(|d| d.backend == "nvidia") {
@@ -121,6 +120,90 @@ pub fn pick_asset_suffix(hw: &HardwareSnapshot) -> Option<String> {
     (GpuInfo::Multi { .. }, OsFamily::Linux) => Some(format!("ubuntu-vulkan-{arch_suffix}.tar.gz")),
     _ => None,
   }
+}
+
+/// The Linux CUDA build this host's NVIDIA driver can run, or `None`
+/// when there is no NVIDIA card on Linux or the driver is too old or
+/// unknown.
+///
+/// CUDA 13.x needs driver 580 or newer; 12.x runs on 525 or newer
+/// (NVIDIA's CUDA toolkit release notes, minor version compatibility
+/// table). Upstream ships 12.x for x64 only. The minor is a glob so a
+/// toolkit bump upstream (13.4 → 13.5) still matches.
+pub fn cuda_asset_suffix(hw: &HardwareSnapshot, driver_major: Option<u32>) -> Option<String> {
+  if hw.os != OsFamily::Linux || !has_nvidia(&hw.gpu) {
+    return None;
+  }
+  let driver = driver_major?;
+  match (hw.cpu_arch, driver) {
+    (CpuArch::X86_64, 580..) => Some("ubuntu-cuda-13.*-x64.tar.gz".into()),
+    (CpuArch::X86_64, 525..) => Some("ubuntu-cuda-12.*-x64.tar.gz".into()),
+    (CpuArch::Arm64, 580..) => Some("ubuntu-cuda-13.*-arm64.tar.gz".into()),
+    _ => None,
+  }
+}
+
+fn has_nvidia(gpu: &GpuInfo) -> bool {
+  match gpu {
+    GpuInfo::Nvidia { .. } => true,
+    GpuInfo::Multi { devices } => devices.iter().any(|d| d.backend == "nvidia"),
+    _ => false,
+  }
+}
+
+/// Short label for a CUDA suffix, for the install picker (`CUDA 13`).
+pub fn cuda_label(suffix: &str) -> Option<String> {
+  let rest = suffix.strip_prefix("ubuntu-cuda-")?;
+  let major = rest.split('.').next()?;
+  Some(format!("CUDA {major}"))
+}
+
+/// The suffix to fetch for `build`: the CUDA build when asked for the
+/// best build and the driver can run one, else [`pick_asset_suffix`].
+pub fn select_asset_suffix(
+  hw: &HardwareSnapshot,
+  build: GhBuild,
+  driver_major: Option<u32>,
+) -> Option<String> {
+  let cuda = match build {
+    GhBuild::Best => cuda_asset_suffix(hw, driver_major),
+    GhBuild::Vulkan => None,
+  };
+  cuda.or_else(|| pick_asset_suffix(hw))
+}
+
+/// Major version of the loaded NVIDIA kernel driver. Reads
+/// `/proc/driver/nvidia/version`, then asks `nvidia-smi`. `None` when
+/// neither answers.
+pub fn nvidia_driver_major() -> Option<u32> {
+  if let Some(v) = std::fs::read_to_string("/proc/driver/nvidia/version")
+    .ok()
+    .and_then(|s| parse_driver_major(&s))
+  {
+    return Some(v);
+  }
+  let mut cmd = std::process::Command::new("nvidia-smi");
+  cmd.args(["--query-gpu=driver_version", "--format=csv,noheader"]);
+  let out =
+    crate::util::process::run_with_drain_and_timeout(cmd, std::time::Duration::from_secs(5))
+      .ok()?;
+  parse_driver_major(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// First `<major>.<minor>[.<patch>]` token in `text`, as its major.
+/// Covers both `/proc/driver/nvidia/version` (`NVRM version: NVIDIA
+/// UNIX Open Kernel Module for x86_64  580.82.07  Release Build ...`)
+/// and `nvidia-smi` output (`580.82.07`).
+fn parse_driver_major(text: &str) -> Option<u32> {
+  text.split_whitespace().find_map(|tok| {
+    let mut parts = tok.split('.');
+    let major = parts.next()?;
+    let minor = parts.next()?;
+    let numeric = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    (numeric(major) && numeric(minor) && parts.all(numeric))
+      .then(|| major.parse().ok())
+      .flatten()
+  })
 }
 
 /// Determine whether `asset_name` matches `suffix`. `suffix` may
@@ -150,6 +233,49 @@ pub struct AssetPick {
   pub asset_name: String,
   pub url: String,
   pub sha256: String,
+  /// Shared libraries the build needs beside it: the `cudart-` bundle
+  /// (`libcudart`, `libcublas`, `libcublasLt`) for a Linux CUDA build.
+  /// The binaries load them through an `$ORIGIN` rpath, so no CUDA
+  /// toolkit is needed on the host.
+  pub runtime_libs: Option<Download>,
+}
+
+/// A verified download: name, URL, expected SHA-256.
+#[derive(Debug, Clone)]
+pub struct Download {
+  pub asset_name: String,
+  pub url: String,
+  pub sha256: String,
+}
+
+impl AssetPick {
+  /// A CUDA build, which needs its device list checked after install:
+  /// the CUDA backend is a plugin that llama.cpp skips when it cannot
+  /// load, so the binary still runs and `--version` still passes.
+  pub fn is_cuda(&self) -> bool {
+    self.asset_name.contains("-cuda-")
+  }
+}
+
+/// The name upstream gives a Linux build's runtime bundle:
+/// `cudart-` + the build's own asset name.
+fn runtime_libs_name(asset_name: &str) -> Option<String> {
+  (asset_name.contains("-bin-ubuntu-cuda-")).then(|| format!("cudart-{asset_name}"))
+}
+
+fn sha256_of(asset: &AssetRow) -> Result<String, InstallError> {
+  let digest = asset.digest.as_deref().ok_or_else(|| {
+    InstallError::Integrity(format!(
+      "asset `{}` has no digest field on the GH API response",
+      asset.name
+    ))
+  })?;
+  Ok(
+    digest
+      .strip_prefix("sha256:")
+      .ok_or_else(|| InstallError::Integrity(format!("digest `{digest}` is not sha256:<hex>")))?
+      .to_string(),
+  )
 }
 
 /// Fetch the most recent releases and pick the newest one that has an
@@ -169,11 +295,14 @@ const RATE_LIMIT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_se
 pub async fn fetch_latest_asset(
   fetch: &FetchClient,
   hw: &HardwareSnapshot,
+  build: GhBuild,
+  driver_major: Option<u32>,
 ) -> Result<AssetPick, InstallError> {
-  let suffix = pick_asset_suffix(hw).ok_or(InstallError::NoMatchingAsset {
-    os: hw.os,
-    arch: hw.cpu_arch,
-  })?;
+  let suffix =
+    select_asset_suffix(hw, build, driver_major).ok_or(InstallError::NoMatchingAsset {
+      os: hw.os,
+      arch: hw.cpu_arch,
+    })?;
   // GH Releases API allows 60 unauthenticated requests/hour.
   // On the first 429/403 we sleep briefly and try again; a second
   // rate-limit response is surfaced as-is so the wizard can offer
@@ -198,44 +327,57 @@ pub async fn fetch_latest_asset(
   if releases.is_empty() {
     return Err(InstallError::Fetch("empty releases list".into()));
   }
-  let (tag, matched) =
+  let (tag, matched, runtime) =
     pick_release_with_asset(releases, &suffix).ok_or(InstallError::NoMatchingAsset {
       os: hw.os,
       arch: hw.cpu_arch,
     })?;
-  let digest = matched.digest.ok_or_else(|| {
-    InstallError::Integrity(format!(
-      "asset `{}` has no digest field on the GH API response",
-      matched.name
-    ))
-  })?;
-  let sha256 = digest
-    .strip_prefix("sha256:")
-    .ok_or_else(|| InstallError::Integrity(format!("digest `{digest}` is not sha256:<hex>")))?
-    .to_string();
+  let runtime_libs = match runtime {
+    Some(r) => Some(Download {
+      sha256: sha256_of(&r)?,
+      asset_name: r.name,
+      url: r.browser_download_url,
+    }),
+    None => None,
+  };
   Ok(AssetPick {
     tag,
+    sha256: sha256_of(&matched)?,
     asset_name: matched.name,
     url: matched.browser_download_url,
-    sha256,
+    runtime_libs,
   })
 }
 
 /// Walk the release list from newest to oldest and return the first
-/// `(tag, asset)` where some asset matches `suffix`. Skipping a newer
+/// `(tag, asset, runtime_libs)` where some asset matches `suffix`, plus
+/// its runtime bundle when the build needs one. Skipping a newer
 /// release covers the upstream-incomplete-release case (e.g. llama.cpp
-/// `b9352` dropped the Linux/Windows asset matrix on publish); a clean
-/// rejection of every surveyed release is left for the caller to map
-/// to `NoMatchingAsset` so the user sees a single canonical error.
-fn pick_release_with_asset(releases: Vec<ReleaseRow>, suffix: &str) -> Option<(String, AssetRow)> {
+/// `b9352` dropped the Linux/Windows asset matrix on publish), and a
+/// CUDA build whose `cudart-` bundle is missing is skipped the same
+/// way. A clean rejection of every surveyed release is left for the
+/// caller to map to `NoMatchingAsset` so the user sees a single
+/// canonical error.
+fn pick_release_with_asset(
+  releases: Vec<ReleaseRow>,
+  suffix: &str,
+) -> Option<(String, AssetRow, Option<AssetRow>)> {
   let mut skipped: Vec<String> = Vec::new();
   for release in releases {
-    let matched = release
-      .assets
-      .iter()
-      .find(|a| asset_matches(&a.name, suffix))
-      .cloned();
-    if let Some(asset) = matched {
+    let matched = release.assets.iter().find_map(|a| {
+      if !asset_matches(&a.name, suffix) {
+        return None;
+      }
+      match runtime_libs_name(&a.name) {
+        Some(want) => release
+          .assets
+          .iter()
+          .find(|r| r.name == want)
+          .map(|r| (a.clone(), Some(r.clone()))),
+        None => Some((a.clone(), None)),
+      }
+    });
+    if let Some((asset, runtime)) = matched {
       if !skipped.is_empty() {
         log::info!(
           "init server: skipping {} newer llama.cpp release(s) without `{}` asset ({}); using {}",
@@ -245,7 +387,7 @@ fn pick_release_with_asset(releases: Vec<ReleaseRow>, suffix: &str) -> Option<(S
           release.tag_name,
         );
       }
-      return Some((release.tag_name, asset));
+      return Some((release.tag_name, asset, runtime));
     }
     skipped.push(release.tag_name);
   }
@@ -272,13 +414,63 @@ pub async fn install_picked(
       actual,
     });
   }
-  let extracted = safe_extract(&pick.asset_name, &bytes, install_root, &pick.tag)?;
+  let extracted = safe_extract(
+    &pick.asset_name,
+    &bytes,
+    install_root,
+    &install_dir_name(pick),
+  )?;
+  drop(bytes);
+  if let Some(libs) = &pick.runtime_libs {
+    let dir = extracted
+      .path
+      .parent()
+      .ok_or_else(|| InstallError::Io("installed binary has no parent dir".into()))?;
+    // A re-run over a finished install already has the libraries.
+    if !has_cuda_runtime(dir) {
+      let lib_bytes = fetch
+        .get_bytes(&libs.url, ASSET_MAX_BYTES)
+        .await
+        .map_err(translate_fetch)?;
+      let lib_sha = sha256_bytes(&lib_bytes);
+      if lib_sha != libs.sha256 {
+        return Err(InstallError::ChecksumMismatch {
+          expected: libs.sha256.clone(),
+          actual: lib_sha,
+        });
+      }
+      safe_extract_libs_tar_gz(&lib_bytes, dir)?;
+    }
+  }
   let digest = sha256_file(&extracted.path)?;
   Ok(BinaryInstall {
     method: InstallMethod::GhReleases,
     path: extracted.path,
     digest,
     version: Some(pick.tag.clone()),
+  })
+}
+
+/// Directory under the install root for this build. A CUDA build gets
+/// its own (`b11302-cuda-13.4-x64`) so a fallback to the Vulkan build of
+/// the same tag does not find the CUDA one already in `b11302/`.
+fn install_dir_name(pick: &AssetPick) -> String {
+  let variant = pick
+    .is_cuda()
+    .then(|| pick.asset_name.split_once("-bin-ubuntu-"))
+    .flatten()
+    .and_then(|(_, rest)| rest.strip_suffix(".tar.gz"));
+  match variant {
+    Some(v) => format!("{}-{v}", pick.tag),
+    None => pick.tag.clone(),
+  }
+}
+
+fn has_cuda_runtime(dir: &Path) -> bool {
+  std::fs::read_dir(dir).is_ok_and(|entries| {
+    entries
+      .flatten()
+      .any(|e| e.file_name().to_string_lossy().starts_with("libcudart.so"))
   })
 }
 
@@ -344,9 +536,119 @@ mod tests {
   }
 
   #[test]
-  fn linux_nvidia_x64_picks_vulkan_suffix() {
-    let s = pick_asset_suffix(&hw(nvidia(), OsFamily::Linux, CpuArch::X86_64)).unwrap();
-    assert_eq!(s, "ubuntu-vulkan-x64.tar.gz");
+  fn linux_nvidia_picks_cuda_by_driver_and_vulkan_otherwise() {
+    let x64 = hw(nvidia(), OsFamily::Linux, CpuArch::X86_64);
+    let arm = hw(nvidia(), OsFamily::Linux, CpuArch::Arm64);
+    let best = |h: &HardwareSnapshot, d| select_asset_suffix(h, GhBuild::Best, d).unwrap();
+    assert_eq!(best(&x64, Some(580)), "ubuntu-cuda-13.*-x64.tar.gz");
+    assert_eq!(best(&x64, Some(570)), "ubuntu-cuda-12.*-x64.tar.gz");
+    assert_eq!(best(&x64, Some(525)), "ubuntu-cuda-12.*-x64.tar.gz");
+    assert_eq!(best(&x64, Some(520)), "ubuntu-vulkan-x64.tar.gz");
+    assert_eq!(best(&x64, None), "ubuntu-vulkan-x64.tar.gz");
+    // Upstream ships no CUDA 12 build for arm64.
+    assert_eq!(best(&arm, Some(590)), "ubuntu-cuda-13.*-arm64.tar.gz");
+    assert_eq!(best(&arm, Some(570)), "ubuntu-vulkan-arm64.tar.gz");
+    assert_eq!(
+      select_asset_suffix(&x64, GhBuild::Vulkan, Some(580)).unwrap(),
+      "ubuntu-vulkan-x64.tar.gz"
+    );
+  }
+
+  #[test]
+  fn cuda_is_only_offered_for_nvidia_on_linux() {
+    assert!(cuda_asset_suffix(&hw(amd(), OsFamily::Linux, CpuArch::X86_64), Some(580)).is_none());
+    assert!(
+      cuda_asset_suffix(&hw(nvidia(), OsFamily::Windows, CpuArch::X86_64), Some(580)).is_none()
+    );
+    let multi = GpuInfo::Multi {
+      devices: vec![dev("nvidia"), dev("unknown")],
+    };
+    assert_eq!(
+      cuda_asset_suffix(&hw(multi, OsFamily::Linux, CpuArch::X86_64), Some(580)).as_deref(),
+      Some("ubuntu-cuda-13.*-x64.tar.gz")
+    );
+  }
+
+  #[test]
+  fn cuda_label_names_the_major() {
+    assert_eq!(
+      cuda_label("ubuntu-cuda-13.*-x64.tar.gz").as_deref(),
+      Some("CUDA 13")
+    );
+    assert!(cuda_label("ubuntu-vulkan-x64.tar.gz").is_none());
+  }
+
+  #[test]
+  fn driver_major_parses_proc_and_nvidia_smi_output() {
+    assert_eq!(
+      parse_driver_major(
+        "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  580.82.07  Release Build  (dvs-builder@U16)  Fri Aug 22 2025\nGCC version:  gcc version 14.2.1 20250207 (GCC)\n"
+      ),
+      Some(580)
+    );
+    assert_eq!(
+      parse_driver_major(
+        "NVRM version: NVIDIA UNIX x86_64 Kernel Module  550.54.14  Thu Feb 22 01:44:30 UTC 2024"
+      ),
+      Some(550)
+    );
+    assert_eq!(parse_driver_major("575.57.08\n"), Some(575));
+    assert_eq!(parse_driver_major("NVIDIA-SMI has failed"), None);
+  }
+
+  #[test]
+  fn a_cuda_build_takes_its_runtime_bundle_and_is_skipped_without_one() {
+    let releases = vec![
+      // Newest release is missing the runtime bundle: fall back.
+      release("b11303", &["llama-b11303-bin-ubuntu-cuda-13.4-x64.tar.gz"]),
+      release(
+        "b11302",
+        &[
+          "cudart-llama-b11302-bin-ubuntu-cuda-13.4-x64.tar.gz",
+          "llama-b11302-bin-ubuntu-cuda-12.8-x64.tar.gz",
+          "llama-b11302-bin-ubuntu-cuda-13.4-x64.tar.gz",
+          "cudart-llama-b11302-bin-ubuntu-cuda-12.8-x64.tar.gz",
+        ],
+      ),
+    ];
+    let (tag, asset, runtime) =
+      pick_release_with_asset(releases, "ubuntu-cuda-13.*-x64.tar.gz").unwrap();
+    assert_eq!(tag, "b11302");
+    assert_eq!(asset.name, "llama-b11302-bin-ubuntu-cuda-13.4-x64.tar.gz");
+    assert_eq!(
+      runtime.expect("runtime bundle").name,
+      "cudart-llama-b11302-bin-ubuntu-cuda-13.4-x64.tar.gz"
+    );
+  }
+
+  #[test]
+  fn a_cuda_build_installs_apart_from_the_same_tags_vulkan_build() {
+    let pick = |name: &str| AssetPick {
+      tag: "b11302".into(),
+      asset_name: name.into(),
+      url: String::new(),
+      sha256: String::new(),
+      runtime_libs: None,
+    };
+    assert_eq!(
+      install_dir_name(&pick("llama-b11302-bin-ubuntu-cuda-13.4-x64.tar.gz")),
+      "b11302-cuda-13.4-x64"
+    );
+    assert_eq!(
+      install_dir_name(&pick("llama-b11302-bin-ubuntu-vulkan-x64.tar.gz")),
+      "b11302"
+    );
+    assert_eq!(
+      install_dir_name(&pick("llama-b11302-bin-win-cuda-12.4-x64.zip")),
+      "b11302"
+    );
+  }
+
+  #[test]
+  fn non_cuda_builds_take_no_runtime_bundle() {
+    let releases = vec![release("b1", &["llama-b1-bin-ubuntu-vulkan-x64.tar.gz"])];
+    let (_, _, runtime) = pick_release_with_asset(releases, "ubuntu-vulkan-x64.tar.gz").unwrap();
+    assert!(runtime.is_none());
   }
 
   #[test]
@@ -475,8 +777,8 @@ mod tests {
 
   #[test]
   fn linux_multi_gpu_picks_vulkan() {
-    // No CUDA prebuilt on Linux, so even an NVIDIA-bearing
-    // multi-GPU set routes to the universal Vulkan tarball.
+    // The base route. CUDA for an NVIDIA-bearing set on Linux is layered
+    // on by `select_asset_suffix`, which also needs the driver version.
     let gpu = GpuInfo::Multi {
       devices: vec![dev("nvidia"), dev("unknown")],
     };
@@ -511,7 +813,7 @@ mod tests {
       release("b9352", &["llama-b9352-bin-ubuntu-x64.tar.gz"]),
       release("b9351", &["llama-b9351-bin-ubuntu-x64.tar.gz"]),
     ];
-    let (tag, asset) = pick_release_with_asset(releases, "ubuntu-x64.tar.gz").unwrap();
+    let (tag, asset, _) = pick_release_with_asset(releases, "ubuntu-x64.tar.gz").unwrap();
     assert_eq!(tag, "b9352");
     assert_eq!(asset.name, "llama-b9352-bin-ubuntu-x64.tar.gz");
   }
@@ -537,7 +839,7 @@ mod tests {
         ],
       ),
     ];
-    let (tag, asset) = pick_release_with_asset(releases, "ubuntu-x64.tar.gz").unwrap();
+    let (tag, asset, _) = pick_release_with_asset(releases, "ubuntu-x64.tar.gz").unwrap();
     assert_eq!(tag, "b9351");
     assert_eq!(asset.name, "llama-b9351-bin-ubuntu-x64.tar.gz");
   }
@@ -557,7 +859,7 @@ mod tests {
       release("b9352", &["llama-b9352-bin-macos-arm64.tar.gz"]),
       release("b9219", &["llama-b9219-bin-ubuntu-rocm-7.2-x64.tar.gz"]),
     ];
-    let (tag, asset) = pick_release_with_asset(releases, "ubuntu-rocm-*-x64.tar.gz").unwrap();
+    let (tag, asset, _) = pick_release_with_asset(releases, "ubuntu-rocm-*-x64.tar.gz").unwrap();
     assert_eq!(tag, "b9219");
     assert_eq!(asset.name, "llama-b9219-bin-ubuntu-rocm-7.2-x64.tar.gz");
   }

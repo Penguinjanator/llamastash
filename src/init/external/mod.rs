@@ -16,6 +16,7 @@
 //! diff / redact / atomic-write plumbing all lives here so a new
 //! tool is ~30 lines.
 
+pub mod effort;
 pub mod merge;
 pub mod models;
 pub mod tools;
@@ -89,6 +90,10 @@ pub struct PatchModel {
   /// window. Clients size their own history against this, so too high makes
   /// them overflow the server and too low makes them compact early.
   pub context_window: Option<u64>,
+  /// Reasoning-effort levels the chat template accepts, for a reasoning
+  /// model whose template lists them. Patchers write effort controls
+  /// only when this is set.
+  pub effort: Option<effort::EffortLevels>,
 }
 
 impl PatchModel {
@@ -102,6 +107,7 @@ impl PatchModel {
       id,
       is_embed,
       context_window: None,
+      effort: None,
     }
   }
 
@@ -128,6 +134,7 @@ impl PatchModel {
       id,
       is_embed,
       context_window: row.native_ctx,
+      effort: None,
     }
   }
 }

@@ -810,7 +810,8 @@ pub struct InitArgs {
   )]
   pub skip: Vec<InitStep>,
   /// Pre-answer the install-method prompt. Accepted values:
-  /// `brew`, `gh-releases`, `existing`, `custom:<PATH>` (relative
+  /// `brew`, `gh-releases`, `gh-releases:vulkan`, `existing`,
+  /// `custom:<PATH>` (relative
   /// paths are accepted at parse time; runtime integrity checks
   /// decide if they are usable). When supplied for a step that
   /// `--skip` excludes, the wizard emits a stderr warning and
@@ -849,7 +850,8 @@ pub struct InitArgs {
   pub no_tui: bool,
 
   /// Pre-answer the integrations picker. Comma-separated tool ids:
-  /// `opencode`, `aider`, `continue`, `zed`, `pi`, `env-sh`. Use
+  /// `opencode`, `aider`, `continue`, `zed`, `pi`, `codex`, `env-sh`,
+  /// `claude-code`. Use
   /// `none` to skip the step entirely (equivalent to
   /// `--skip integrations`). Without this flag and without
   /// `--recommended` / `--json`, the interactive multiselect runs;
@@ -896,8 +898,8 @@ pub enum InitStepCommand {
 #[derive(Args, Debug, Default)]
 pub struct InitServerArgs {
   /// Pre-answer the install-method prompt. Same grammar as
-  /// `init --install` (`brew`, `gh-releases`, `existing`,
-  /// `custom:<PATH>`).
+  /// `init --install` (`brew`, `gh-releases`, `gh-releases:vulkan`,
+  /// `existing`, `custom:<PATH>`).
   #[arg(long, value_name = "CHOICE", value_parser = parse_install_override)]
   pub install: Option<InstallOverride>,
 }
@@ -930,7 +932,8 @@ pub struct InitConfigArgs {
 #[derive(Args, Debug, Default)]
 pub struct InitIntegrationsArgs {
   /// Comma-separated tool ids to patch (`opencode`, `aider`,
-  /// `continue`, `zed`, `pi`, `env-sh`). `none` skips the step.
+  /// `continue`, `zed`, `pi`, `codex`, `env-sh`, `claude-code`). `none`
+  /// skips the step.
   #[arg(long, value_name = "TOOLS", value_delimiter = ',', action = ArgAction::Append)]
   pub integrations: Vec<String>,
 }
@@ -1013,6 +1016,8 @@ pub fn parse_revision(raw: &str) -> Result<String, String> {
 pub enum InstallOverride {
   Brew,
   GhReleases,
+  /// The Vulkan build where `gh-releases` would pick CUDA.
+  GhReleasesVulkan,
   Existing,
   Custom(PathBuf),
 }
@@ -1047,6 +1052,7 @@ pub fn parse_install_override(raw: &str) -> Result<InstallOverride, String> {
   match raw {
     "brew" => Ok(InstallOverride::Brew),
     "gh-releases" => Ok(InstallOverride::GhReleases),
+    "gh-releases:vulkan" => Ok(InstallOverride::GhReleasesVulkan),
     "existing" => Ok(InstallOverride::Existing),
     other => {
       if let Some(path) = other.strip_prefix("custom:") {
@@ -1056,7 +1062,7 @@ pub fn parse_install_override(raw: &str) -> Result<InstallOverride, String> {
         Ok(InstallOverride::Custom(PathBuf::from(path)))
       } else {
         Err(format!(
-          "invalid value `{raw}` — possible values: brew, gh-releases, existing, custom:<PATH>"
+          "invalid value `{raw}` — possible values: brew, gh-releases, gh-releases:vulkan, existing, custom:<PATH>"
         ))
       }
     }
@@ -1196,7 +1202,7 @@ pub struct ApiKeyArgs {
 #[derive(Args, Debug)]
 pub struct IntegrationsArgs {
   /// Tools to patch (`opencode`, `aider`, `continue`, `zed`, `pi`,
-  /// `env-sh`, `claude-code`), space- or comma-separated. Omit to pick
+  /// `codex`, `env-sh`, `claude-code`), space- or comma-separated. Omit to pick
   /// from an interactive list; `none` runs the step and patches nothing.
   #[arg(value_name = "TOOLS", value_delimiter = ',')]
   pub tools: Vec<String>,
@@ -1762,6 +1768,7 @@ mod tests {
     for (raw, expected) in [
       ("brew", InstallOverride::Brew),
       ("gh-releases", InstallOverride::GhReleases),
+      ("gh-releases:vulkan", InstallOverride::GhReleasesVulkan),
       ("existing", InstallOverride::Existing),
     ] {
       let cli = parse(&["init", "--install", raw]);

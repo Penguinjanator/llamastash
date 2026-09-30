@@ -1312,9 +1312,23 @@ Examples: `llamastash init server --install gh-releases`, `llamastash init model
 | `--offline`              | Refuse outbound network. Useful for `--only config` / `--only server` reruns where the model and snapshot are already cached. `LLAMASTASH_OFFLINE=1` is equivalent.     |
 | `--only <STEPS>`         | Comma-separated list of `server,models,config,integrations` (other names rejected). Only the listed steps run. Or run one step as a subcommand: `init server`.            |
 | `--skip <STEPS>`         | Inverse of `--only`. Mutually exclusive with it (clap refuses both).                                                                                                    |
-| `--install <CHOICE>`     | Pre-answer the install-method prompt. Values: `brew`, `gh-releases`, `existing`, `custom:<PATH>`. Override beats `--recommended`.                                       |
+| `--install <CHOICE>`     | Pre-answer the install-method prompt. Values: `brew`, `gh-releases`, `gh-releases:vulkan`, `existing`, `custom:<PATH>`. Override beats `--recommended`. See [Linux + NVIDIA](#linux--nvidia-cuda-or-vulkan) for `gh-releases:vulkan`. |
 | `--model <CHOICE>`       | Pre-answer the model-pick prompt. Values: `recommended`, `none`, `<owner>/<repo>[:<filename>.gguf]`.                                                                    |
 | `--config-step <CHOICE>` | Pre-answer the config-write confirm. Values: `write`, `skip`. (Named `--config-step` rather than `--config` because the top-level `--config <PATH>` is already global.) |
+
+#### Linux + NVIDIA: CUDA or Vulkan
+
+On Linux with an NVIDIA card, the GitHub Releases install picks llama.cpp's CUDA build when the driver can run it, and the Vulkan build otherwise. The CUDA build ships with a `cudart-` bundle (`libcudart`, `libcublas`, `libcublasLt`) that `init` downloads and places next to `llama-server`, so no CUDA toolkit is needed.
+
+| Driver (from `/proc/driver/nvidia/version`, else `nvidia-smi`) | x86_64 | arm64 |
+| --- | --- | --- |
+| 580 or newer | CUDA 13 | CUDA 13 |
+| 525 to 579 | CUDA 12 | Vulkan |
+| older, or unknown | Vulkan | Vulkan |
+
+The download is larger: about 560 to 730 MB for build plus runtime, against about 30 MB for Vulkan. The interactive picker offers both builds (`GitHub Releases · CUDA 13` and `GitHub Releases · Vulkan`); `--install gh-releases:vulkan` picks Vulkan without a prompt. A CUDA build installs to its own directory (`llama-cpp/<tag>-cuda-<ver>-<arch>/`).
+
+After the install, `init` runs `llama-server --list-devices`. llama.cpp loads its CUDA backend as a plugin and skips it when it cannot load, so a broken CUDA install still starts and passes `--version`, on the CPU. When the list shows no CUDA device, `init` says so and installs the Vulkan build instead.
 
 The three per-step flags are **advisory, not authoritative**: supplying `--install brew` for a step that `--skip server` already excludes emits one stderr warning and proceeds. Conflicting axes don't abort.
 
@@ -1359,7 +1373,7 @@ llamastash integrations [TOOLS] [--integrations <TOOLS>] [--json]
 
 | Flag / arg              | Effect                                                                                                                                             |
 | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `[TOOLS]`               | Tool ids to patch, space- or comma-separated: `opencode`, `aider`, `continue`, `zed`, `pi`, `env-sh`, `claude-code`. Omit for the interactive multiselect; `none` runs the step and patches nothing. |
+| `[TOOLS]`               | Tool ids to patch, space- or comma-separated: `opencode`, `aider`, `continue`, `zed`, `pi`, `codex`, `env-sh`, `claude-code`. Omit for the interactive multiselect; `none` runs the step and patches nothing. |
 | `--integrations <TOOLS>` | Same list in flag form, for parity with `init --integrations`.                                                                                     |
 | `--json`                | Same `{"steps_ran": ["detect","integrations"], "integrations": {"applied": [...], "failed": [...]}}` shape as `init --only integrations --json`.    |
 
@@ -1376,7 +1390,20 @@ Examples: `llamastash integrations pi`, `llamastash integrations opencode,zed`, 
 
 A context left to `--fit` (`auto`) is not known ahead of time, so the trained context is used. Launches named with `--name` alone have no config record and are not registered; add those by hand.
 
-Per-tool shape: tools whose schema holds a model list (OpenCode, Continue.dev, Zed, pi.dev) register all of them; tools with a single model slot (Aider's `model:`, Claude Code's `ANTHROPIC_MODEL`) take the first non-embedding model. Embedders are routed by kind — Continue.dev gets `roles: [embed]`; Zed and pi.dev leave them out, since both drive chat only and pi has no embeddings API at all.
+Per-tool shape: tools whose schema holds a model list (OpenCode, Continue.dev, Zed, pi.dev) register all of them; tools with a single model slot (Aider's `model:`, Codex's `model`, Claude Code's `ANTHROPIC_MODEL`) take the first non-embedding model. OpenCode also gets each model's `limit` (`context` as above, `output` 32000 or half the context, whichever is smaller); without it OpenCode reads the context as `0` and never compacts. Embedders are routed by kind — Continue.dev gets `roles: [embed]`; Zed and pi.dev leave them out, since both drive chat only and pi has no embeddings API at all.
+
+**Reasoning effort.** For a reasoning model whose chat template lists the effort levels it accepts, the patchers wire each tool's effort control to those levels. The list comes from the template, not the model family: Qwen3.8's template accepts `low`, `medium` and `xhigh` (its default), and raises an error on any other value. `none` turns thinking off where the template reads `enable_thinking`, since llama.cpp maps `reasoning_effort: "none"` to that. Models without such a list (including safetensors repos, whose template is not read yet) get no effort fields.
+
+| Tool | What is written | How to change the level |
+| --- | --- | --- |
+| pi.dev | `reasoning: true` and a `thinkingLevelMap`; levels the template rejects map to `null`, which hides them | `/thinking <level>` |
+| OpenCode | `reasoning: true` and one `variants` entry per level (plus `none`) | the variant picker |
+| Zed | `reasoning_effort` set to the template's default | the effort picker; Zed's list is fixed to minimal ... max, so for Qwen3.8 `minimal` and `max` get an HTTP 500 whose message ends `Unexpected reasoning effort minimal. Supported types are xhigh (default), medium, and low.` |
+| Codex | a comment listing the levels; no default, so the template's default applies | `model_reasoning_effort = "<level>"` in the profile, or `-c model_reasoning_effort=<level>` |
+| Aider | nothing | `/reasoning-effort <level>` in the chat already works; the `--reasoning-effort` flag would need a model-settings entry that replaces Aider's own defaults for that model |
+| Continue.dev | nothing | Continue sends an effort only for OpenAI `o*` / `gpt-5+` models |
+
+**Codex writes a profile, not `config.toml`.** `codex` writes `$CODEX_HOME/llamastash.config.toml` (`~/.codex/` by default), which Codex loads as a layer over `config.toml` when started with `codex --profile llamastash`. Plain `codex` keeps your own settings. The profile points a `llamastash` provider at the proxy with `wire_api = "responses"` (Codex speaks only the Responses API; llama-server serves `/v1/responses` natively and the proxy forwards it), sets `model` and `model_context_window` for the first chat model, and gets the key by running `llamastash api-key`. The file is rewritten on each run.
 
 **pi.dev patches two files.** `~/.pi/agent/models.json` gets the provider block, and `~/.pi/agent/settings.json` gets `llamastash/**` appended to `enabledModels` — pi's model switcher is bounded by that list, so without the pattern the models are configured but out of scope until you widen it by hand. The pattern is only appended when `enabledModels` is already set: pi reads an absent or empty list as "no scoping", and writing ours there would hide every other provider. Any config that is a symlink (a dotfiles repo, typically) is written *through* the link, not over it.
 
@@ -1385,6 +1412,7 @@ Per-tool shape: tools whose schema holds a model list (OpenCode, Continue.dev, Z
 | Tool | Form | Secret at rest? |
 | --- | --- | --- |
 | pi.dev | `!llamastash api-key` (pi runs it, reads stdout) | No — resolved per pi process |
+| Codex | `auth.command = "llamastash"`, `args = ["api-key"]` (Codex runs it) | No |
 | OpenCode | `{env:LLAMASTASH_API_KEY}` | No — needs the var exported |
 | Zed | nothing written (Zed reads `LLAMASTASH_API_KEY` from env by its own convention) | No |
 | Aider, Continue.dev | literal, file mode `0600` | Yes |
