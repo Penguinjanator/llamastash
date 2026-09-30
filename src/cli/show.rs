@@ -193,6 +193,17 @@ async fn build_view(args: &ShowArgs, cli: &Cli, config: &Config) -> Result<ShowV
   })
 }
 
+/// The arch the launch resolver keys arch defaults on. A config-declared
+/// row's arch is display text: its launch reads no GGUF header. Backend rows
+/// read none either, but no backend sets an arch on them, so Config is the
+/// only source that needs the check today.
+fn launch_arch(row: &CatalogRow) -> Option<&str> {
+  match crate::discovery::ModelSource::from_label(&row.source) {
+    Some(crate::discovery::ModelSource::Config) => None,
+    _ => row.arch.as_deref(),
+  }
+}
+
 /// Resolve `show`'s target to a catalog row, plus the launch name to scope the
 /// running block to when the reference named one.
 ///
@@ -206,15 +217,6 @@ async fn build_view(args: &ShowArgs, cli: &Cli, config: &Config) -> Result<ShowV
 ///
 /// The tier-1 error is what surfaces on a total miss: it names the whole
 /// reference the user typed rather than some half of it.
-/// The arch the launch resolver keys arch defaults on. A config-declared
-/// row's arch is display text: its launch reads no GGUF header.
-fn launch_arch(row: &CatalogRow) -> Option<&str> {
-  match crate::discovery::ModelSource::from_label(&row.source) {
-    Some(crate::discovery::ModelSource::Config) => None,
-    _ => row.arch.as_deref(),
-  }
-}
-
 fn resolve_show_target(
   catalog: &[CatalogRow],
   running: &[crate::cli::resolve::RunningRow],

@@ -326,7 +326,12 @@ impl GenericConfig {
           )));
         }
         if blank {
-          return Err(entry(format!("`{field}` is empty or 0")));
+          let rule = if field == "ctx" {
+            "must be > 0"
+          } else {
+            "is empty"
+          };
+          return Err(entry(format!("`{field}` {rule}")));
         }
       }
       let placeholders = s.placeholders();
@@ -557,17 +562,30 @@ servers:
         "{name: e, binary: /b, ready: /h, model: x, args: [\"{model}\"], ctx: 4096}",
         "`ctx` applies only without `model`",
       ),
+    ] {
+      let msg = refusal(&format!("servers:\n  - {entry}\n"));
+      assert!(msg.contains(want), "{entry}: {msg}");
+    }
+    for (entry, want) in [
       (
         "{name: e, binary: /b, ready: /h, arch: ''}",
         "`arch` is empty",
       ),
       (
+        "{name: e, binary: /b, ready: /h, params: '  '}",
+        "`params` is empty",
+      ),
+      (
+        "{name: e, binary: /b, ready: /h, quant: ''}",
+        "`quant` is empty",
+      ),
+      (
         "{name: e, binary: /b, ready: /h, ctx: 0}",
-        "`ctx` is empty or 0",
+        "`ctx` must be > 0",
       ),
     ] {
       let msg = refusal(&format!("servers:\n  - {entry}\n"));
-      assert!(msg.contains(want), "{entry}: {msg}");
+      assert!(msg.ends_with(want), "{entry}: {msg}");
     }
     let dup = refusal(
       "servers:\n  - {name: e, binary: /b, ready: /h}\n  - {name: e, binary: /c, ready: /h}\n",

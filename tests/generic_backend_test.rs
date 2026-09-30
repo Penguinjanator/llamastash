@@ -284,6 +284,13 @@ servers:
     assert_eq!(listed["source"], "config", "{listed}");
     assert_eq!(listed["backend"], "generic", "{listed}");
 
+    // First, before any `last_params` exist: the recorder stores a launch's
+    // params once it sees Ready, so a plain launch after the named one below
+    // would race it and could inherit ctx 32768.
+    let id2 = start(&mut client, json!({"model_path": "generic://gen-a"})).await;
+    let r2 = wait_state(&mut client, &id2, "ready").await;
+    assert_eq!(r2["params"]["ctx"], 4096, "entry default fills in: {r2}");
+
     // Named launch, `--ctx`, an entry knob, and raw extras.
     let id = start(
       &mut client,
@@ -326,11 +333,7 @@ servers:
       "{env:?}"
     );
 
-    // A second launch of the same entry gets its own port.
-    let id2 = start(&mut client, json!({"model_path": "generic://gen-a"})).await;
-    let r2 = wait_state(&mut client, &id2, "ready").await;
-    assert_ne!(r["port"], r2["port"]);
-    assert_eq!(r2["params"]["ctx"], 4096, "entry default fills in: {r2}");
+    assert_ne!(r["port"], r2["port"], "each launch gets its own port");
 
     shutdown(client, daemon).await;
   }
