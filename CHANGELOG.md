@@ -4,47 +4,77 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-30
+
+This release adds the **generic backend**: any OpenAI-compatible server you declare in `config.yaml` becomes a LlamaStash-managed model. LlamaStash reserves the port, waits on the readiness path, routes the proxy and stops the process. Everything engine-specific, its flags, its env and its weights, lives in the entry or in a wrapper script you write. That reaches engines a dedicated backend would never cover: in a 2026-09-26 Qwen3.8 Flash-Next benchmark on a 128 GB Strix Halo, Halogen and gufo ran a 3-turn pass at 1k tokens out in 114 s and 124 s against 224 s for llama.cpp, and prefilled a 32k prompt at about 1,040 t/s against 314 t/s. Neither could be launched before this. ds4 for DeepSeek-V4 now runs the same way, having lost its dedicated backend.
+
 ### Added
 
-- `llamastash daemon restart` — stops the running daemon, waits for it to exit, then starts a new one with the same flags. Takes the `daemon start` flag set. Use it after a hand-edited `config.yaml`.
-- A generic entry without `model` can declare `arch`, `params`, `quant` and `ctx` for its row's list columns; Ctx falls back to the `ctx: true` knob default.
-- `/v1/models` rows carry a `mode` (`chat`, `embedding`, `rerank`), and a generic entry can declare `modes: [chat]` so the proxy refuses embeddings and rerank requests for it before starting it.
-- Generic backend: run any OpenAI-compatible server declared in `config.yaml` (gufo, Halogen via Docker, CIRU tested), as its own row or as a server option on matching GGUFs, with per-entry knobs and a stop-grace floor.
+- **Generic backend.** A `backend.generic.servers` entry launches as its own catalog row, or as a server option on the GGUFs its `model:` glob matches. Per-entry string and on/off (`switch`) knobs, env with placeholders, its own readiness path and stop-grace floor, an optional `rewrite_model` that sends the launch's own name as `body.model` for engines that check it, and its own `arch` / `params` / `quant` / `ctx` for the list columns when there is no GGUF to read them from. Config-only on purpose, since `binary` runs as you. ([#87](https://github.com/llamastash/llamastash/pull/87))
 
-- Generic backend: `rewrite_model: true` makes the proxy send the launch's own name as `body.model`, for servers like gufo that refuse any other name.
-- Generic backend: `switch: true` knobs send a bare flag when on and nothing when off.
+  ```yaml
+  # config.yaml: Halogen 0.14.0 in Docker, its own row, knobs fed to the container as env
+  backend:
+    generic:
+      servers:
+        - name: flash-next-halogen
+          binary: ~/bin/halogen-serve.sh
+          args: ["{port}"]
+          knobs:
+            - {flag: --ctx-window, id: halogen-ctx, ctx: true, default: "131072"}
+            - {flag: --halogen-reasoning-effort, id: halogen-effort, default: xhigh}
+          env:
+            HALOGEN_CTX: "{halogen-ctx}"
+            HALOGEN_KV_POOL_POSITIONS: "{halogen-ctx}"
+            HALOGEN_REASONING_EFFORT: "{halogen-effort}"
+          ready: /v1/models
+          stop_grace_secs: 90
+  ```
 
-### Removed
+  ```bash
+  llamastash start flash-next-halogen --ctx 65536
+  llamastash start flash-next-halogen --preset halogen-medium   # shorter thinking, faster turns
+  ```
 
-- **Breaking: the ds4 backend.** Run `ds4-server` as a `backend.generic` entry instead; it gives the same argv, readiness and speed. A config with a `backend.ds4:` block is rejected with a pointer to the migration steps, and `--ds4` / `LLAMASTASH_DS4` are gone. See [Running ds4 as a generic server](docs/usage.md#running-ds4-as-a-generic-server).
+- `llamastash daemon restart` stops the running daemon, waits for it to release its lockfile, then starts a new one with the same flags. Takes the `daemon start` flag set. Use it after a hand-edited `config.yaml`. ([#89](https://github.com/llamastash/llamastash/pull/89))
+- `/v1/models` rows carry a `mode` (`chat`, `embedding`, `rerank`), and a generic entry can declare `modes: [chat]` so the proxy refuses embedding and rerank requests for it before starting it.
 
 ### Changed
 
 - A launch started from a named preset without `--name` takes the preset's name, so `start --preset coder` answers at `<model>@coder` like a proxy auto-start of that preset.
 - A `<model>@<name>` request with no launch of that name goes to the model's only launch when it is unnamed and `<name>` is not a preset, instead of loading a second copy, also while that launch is still loading.
+- `integrations` registers each preset of a favorite as `<model>@<preset>`, default first, at the context that preset actually launches with instead of the trained context.
+
+### Removed
+
+- **Breaking: the ds4 backend.** Run `ds4-server` as a `backend.generic` entry instead; it gives the same argv, readiness and speed. A config with a `backend.ds4:` block is rejected with a pointer to the migration steps, and `--ds4` / `LLAMASTASH_DS4` are gone. See [Running ds4 as a generic server](docs/usage.md#running-ds4-as-a-generic-server).
 
 ### Fixed
 
-- `daemon stop` and `daemon restart` get past a `runtime.json` left behind by a crash. It used to fail every stop with a shutdown error until the file was deleted by hand.
-- A plain `start` of a model whose remembered generic server was removed from `config.yaml` runs on the model's default backend instead of failing with `pick one with --server`.
-- A config-declared generic row (Halogen and similar) shows in the TUI's Recent section and seeds the launch picker from its last run; `last_params_list` sent it with no `model_path`.
+- An idle daemon no longer rescans the model folders about three times a second, and caps its own glibc malloc arenas at 2. Idle CPU drops from about a third of a core to 0%, and idle memory from about 1 GiB to 64-133 MiB on 17 models. Model servers it starts keep glibc's default, and a `MALLOC_ARENA_MAX` you set is left alone.
+- **Launches inside an LXC container on an AMD APU are checked against the GTT pool instead of the container RAM limit** when every layer is offloaded, and the TUI VRAM gauge shows the full GTT pool there. CPU-side launches keep the RAM check, since the container limit applies to them. Thanks [@Ramon-Balaguer](https://github.com/Ramon-Balaguer) ([#83](https://github.com/llamastash/llamastash/pull/83)).
 - A model whose process dies on its own (a crash, the OOM killer) shows as `error` with its exit code or signal and last log lines, and stays listed until you stop it, instead of a silent `stopped` row with a dead pid.
-- `integrations` registers each preset of a favorite as `<model>@<preset>`, default first, and writes the context each one launches with (preset, then server entry default, then trained) instead of always the trained context.
-- A proxy auto-start of `<model>@<name>` after an idle stop no longer fails with `name ... is already running`; the idle stop left the launch's row behind.
+- The TUI launch picker applies a preset's `server:` and `backend:` pins instead of the last-used server and the row's default backend, and `--backend <id>` beats a remembered or preset server from another backend.
+- A launch right after `daemon start` waits for the server list, so a preset's `server:` pin or a typed `--server` is no longer dropped for the default binary.
+- An idle-evicted launch releases its name, so the next `<model>@<name>` request starts a replacement instead of being refused with `name ... is already running`.
+- A launch whose server binds only after loading no longer fails with `bind() failed`; the readiness probe sometimes connected to its own port.
+- A host without `llama-server` can start the daemon and launch Lemonade, vLLM, SGLang and generic models; before, every launch failed with "daemon launch environment not configured".
+- A plain `start` of a model whose remembered generic server was removed from `config.yaml` runs on the model's default backend instead of failing with `pick one with --server`.
+- A config-declared generic row shows in the TUI's Recent section and seeds the launch picker from its last run.
+- `daemon stop` and `daemon restart` get past a `runtime.json` left behind by a crash. It used to fail every stop with a shutdown error until the file was deleted by hand.
 - `start --device none` runs the model on CPU only; the selector used to be dropped as stale and the model offloaded to the GPU.
 - vLLM's data-parallel short aliases (`-dpm`, `-dpa` and the rest) are refused in the extras tail like their long forms.
-- An idle daemon no longer rescans the model folders about three times a second; its own folder reads were triggering the file watcher. Idle CPU drops from about a third of a core to 0%, and memory from about 1 GiB to 208-261 MiB on 17 models.
-- On Linux, the LlamaStash process limits glibc to 2 malloc arenas, which cuts idle memory from 208-261 MiB to 64-133 MiB on 17 models. Model servers it starts keep glibc's default, and a `MALLOC_ARENA_MAX` you set is left alone.
-- A launch right after `daemon start` waits for the server list, so a preset's `server:` pin or a typed `--server` is no longer dropped for the default binary.
-- **Launches inside an LXC container on an AMD APU are checked against the GTT pool instead of the container RAM limit** when every layer is offloaded, and the TUI VRAM gauge shows the full GTT pool there. CPU-side launches keep the RAM check, since the container limit applies to them. Thanks [@Ramon-Balaguer](https://github.com/Ramon-Balaguer) ([#83](https://github.com/llamastash/llamastash/pull/83)).
-- A launch whose server binds only after loading (gufo, ds4) could fail with `bind() failed`: the readiness probe sometimes connected to its own port. A picked server now also decides the backend, so a TUI launch on a non-default server no longer gets the default engine's argv.
-- `start --backend <id>` no longer runs on a remembered or preset server that belongs to another backend.
-- The TUI launch picker applies a preset's `server:` and `backend:` pins; it showed and launched the last-used server and the row's default backend instead.
-- The TUI launch editor shows a generic entry's knob `default:` on unset rows instead of `inherited`.
 - A failing command run with `--json` prints `{"error": {"code", "message"}}` on stdout instead of the human error line.
 - A request for a model running more than once goes to an unnamed launch before a named one, then to the newest. It used to pick by launch-id string order, so `L10` lost to `L9`.
-- A host without `llama-server` can start the daemon and launch Lemonade, vLLM, SGLang and generic models; before, every launch failed with "daemon launch environment not configured".
-- A crashed Lemonade umbrella is respawned on the next start instead of failing every Lemonade launch until the daemon restarts. `docs/lemonade-setup.md` now shows the `servers:` key; its old `binary:` example was rejected by the config loader.
+- A crashed Lemonade umbrella is respawned on the next start instead of failing every Lemonade launch until the daemon restarts.
+- The TUI launch editor shows a generic entry's `default:` on an unset knob row instead of `inherited`.
+
+### Contributors
+
+Thanks to everyone who shipped code in this release:
+
+- [@Ramon-Balaguer](https://github.com/Ramon-Balaguer): AMD LXC memory budgeting ([#83](https://github.com/llamastash/llamastash/pull/83))
+- [@deepu105](https://github.com/deepu105): everything else
 
 ## [0.4.0] — 2026-09-16
 

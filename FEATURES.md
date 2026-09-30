@@ -72,7 +72,7 @@ A single binary plays TUI, CLI, and background daemon. The first client (TUI or 
 
 Run as many models as your hardware can hold. Each launch gets its own port, auto-allocated from a configurable inclusive range (default `41100..=41300`, override via [`daemon.port_range`](docs/usage.md#schema)). Every running model follows a `Launching → Loading → Ready → Stopping → Stopped` state machine with `/health` probing — you see when a model is actually serving versus still loading weights.
 
-### DeepSeek-V4 via ds4 as a generic server (experimental)
+### DeepSeek-V4 via ds4 as a generic server
 
 antirez's [`ds4-server`](https://github.com/antirez/ds4) runs the DeepSeek-V4 Flash/PRO GGUFs as a `backend.generic` entry. Its flags (`--ctx`, `--power`, `--kv-disk-dir`, `--ssd-streaming`, `--mtp`, `--dspark`, and the rest) are declared as knobs, so they show in the TUI launch editor and presets, and a preset pins the `generic-ds4` server and the MTP or DSpark head file. llama.cpp (**b9840+**) runs these GGUFs too and is the default server. See [`docs/usage.md` § Running ds4 as a generic server](docs/usage.md#running-ds4-as-a-generic-server).
 
