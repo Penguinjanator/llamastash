@@ -541,11 +541,12 @@ mod tests {
     assert!(read(&report.backup).contains("keep memory pinned"));
   }
 
-  /// `preflight` refuses a group- or world-writable parent directory. It
-  /// guards the *write*, so a config with nothing to migrate — which makes no
-  /// write — must not fail on it. Calling it up front turned every daemon
-  /// start on an already-migrated config in such a directory into a logged
-  /// failure the user could do nothing about.
+  /// `preflight` refuses a parent directory another user could write into
+  /// (world-writable, or group-writable on a group that isn't your
+  /// user-private one). It guards the *write*, so a config with nothing to
+  /// migrate — which makes no write — must not fail on it. Calling it up
+  /// front turned every daemon start on an already-migrated config in such
+  /// a directory into a logged failure the user could do nothing about.
   #[cfg(unix)]
   #[test]
   fn nothing_to_migrate_does_not_trip_the_write_path_guard() {

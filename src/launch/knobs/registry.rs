@@ -113,9 +113,7 @@ pub fn scoped_all() -> Vec<(&'static str, &'static [KnobDef])> {
 /// The knobs one backend declares, by backend id, or one runtime table by its
 /// scope. Empty for an unknown id.
 pub fn for_backend(backend_id: &str) -> &'static [KnobDef] {
-  Backends::all()
-    .iter()
-    .find(|b| b.id() == backend_id)
+  Backends::from_id(backend_id)
     .map(|b| b.knobs())
     .or_else(|| scoped(backend_id))
     .unwrap_or(&[])

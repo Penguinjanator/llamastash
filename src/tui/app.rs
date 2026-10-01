@@ -1639,9 +1639,7 @@ impl App {
     let default_binary = self.daemon_info.server_path.as_deref().map(Path::new);
     let mut out = Vec::new();
     for backend_id in &backends {
-      let owner = crate::backend::Backends::all()
-        .into_iter()
-        .find(|b| crate::backend::Backend::id(b) == backend_id);
+      let owner = crate::backend::Backends::from_id(backend_id);
       let of_backend = || {
         self.servers.iter().filter(|s| {
           &s.backend_id == backend_id

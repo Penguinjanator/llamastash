@@ -580,19 +580,17 @@ fn check_config_mode_drift() -> Option<Finding> {
       ));
     }
     if let Some(parent) = path.parent() {
-      if let Ok(pmeta) = std::fs::metadata(parent) {
-        let pmode = pmeta.permissions().mode() & 0o777;
-        if pmode & 0o022 != 0 {
-          return Some(Finding::new(
-            FindingId::ConfigModeDrift,
-            Severity::Warning,
-            format!(
-              "parent dir `{}` is group/world-writable (mode {pmode:#o}) — \
-               `chmod 700` recommended",
-              parent.display()
-            ),
-          ));
-        }
+      let our_uid = unsafe { libc::geteuid() };
+      if let Some(surface) = crate::util::file_security::dir_swap_surface(parent, our_uid) {
+        return Some(Finding::new(
+          FindingId::ConfigModeDrift,
+          Severity::Warning,
+          format!(
+            "parent dir `{}` {} — `chmod 700` recommended",
+            parent.display(),
+            surface.describe(our_uid)
+          ),
+        ));
       }
     }
   }

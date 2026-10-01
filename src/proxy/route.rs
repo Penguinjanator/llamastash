@@ -442,7 +442,7 @@ async fn decide_umbrella_route(
   use crate::backend::{Backend, Backends};
   let backend_id =
     crate::discovery::ModelSource::from_label(&resolved.source).map(|s| s.backend_id());
-  let backend = backend_id.and_then(|id| Backends::all().into_iter().find(|b| b.id() == id));
+  let backend = backend_id.and_then(Backends::from_id);
   let umbrella_id = backend.as_ref().and_then(|b| b.umbrella_launch_id());
   let umbrella = match umbrella_id {
     Some(id) => state.ctx.supervisors.get(&id).await,
@@ -508,9 +508,7 @@ pub(crate) async fn running_model_backend(
     .iter()
     .find(|m| m.path == id.path)
     .and_then(|m| m.default_backend().map(str::to_string))?;
-  Backends::all()
-    .into_iter()
-    .find(|b| b.id() == rb && b.available(&state.ctx))
+  Backends::from_id(&rb).filter(|b| b.available(&state.ctx))
 }
 
 /// The backend an `Auto` launch of `row` would land on — resolved through the
