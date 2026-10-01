@@ -115,7 +115,7 @@ pub(crate) async fn forward_to_upstream(
   // guard's `Drop` decrements the inflight counter — covers happy-
   // path body completion, abandoned client connections, and upstream
   // errors uniformly because the response body owns the guard.
-  let (inflight_guard, request_model, resolved_backend) =
+  let (inflight_guard, request_model, backend) =
     match acquire_inflight_guard(state, port, served_model_key).await {
       Some(g) => g,
       None => {
@@ -195,9 +195,10 @@ pub(crate) async fn forward_to_upstream(
   // serving backend needs the engine to understand (see
   // [`crate::backend::Backend::rewrite_request_body`]).
   let body = outbound_body(
+    &state.ctx,
     body_bytes,
     inbound_uri.path(),
-    &resolved_backend,
+    &backend,
     request_model.as_deref(),
   );
   let request = client
@@ -242,7 +243,7 @@ async fn acquire_inflight_guard(
 ) -> Option<(
   crate::daemon::supervisor::InflightGuard,
   Option<String>,
-  String,
+  crate::backend::Backends,
 )> {
   let snap = state.ctx.supervisors.snapshot().await;
   for (_lid, model) in snap {
@@ -266,29 +267,31 @@ async fn acquire_inflight_guard(
     return Some((
       model.inflight_guard(),
       request_model,
-      model.resolved_backend().to_string(),
+      model.backend().clone(),
     ));
   }
   None
 }
 
 /// The request body as sent upstream: `body` with the launch's request-model
-/// name, then the serving backend's own rewrite for `endpoint`. An unknown
-/// backend id forwards like a backend that rewrites nothing.
+/// name, then the serving backend's own rewrite for `endpoint`.
 fn outbound_body(
+  ctx: &crate::daemon::context::MethodContext,
   body: Bytes,
   endpoint: &str,
-  backend_id: &str,
+  backend: &crate::backend::Backends,
   request_model: Option<&str>,
 ) -> Bytes {
-  use crate::backend::{Backend as _, Backends};
+  use crate::backend::Backend as _;
+  // Two surgical edits, each copying every untouched entry as the client's own
+  // bytes. In practice only one of them ever parses the body: the request-model
+  // pin is set only by a config-declared server, and that backend rewrites
+  // nothing.
   let body = match request_model {
     Some(model) => with_model(body, model),
     None => body,
   };
-  let rewritten =
-    Backends::from_id(backend_id).and_then(|backend| backend.rewrite_request_body(endpoint, &body));
-  match rewritten {
+  match backend.rewrite_request_body(ctx, endpoint, &body) {
     Some(rewritten) => Bytes::from(rewritten),
     None => body,
   }
@@ -538,66 +541,49 @@ mod tests {
 
   #[test]
   fn outbound_body_forwards_client_bytes_when_there_is_nothing_to_rewrite() {
-    // No effort field and no request-model pin: the endpoint hook has nothing
-    // to map, so the client's exact bytes reach the engine.
+    // No effort field and no request-model pin, so every registered backend
+    // forwards the client's exact bytes. What a backend does rewrite is that
+    // backend's own test, in its own module.
+    use crate::backend::{Backend as _, Backends};
+    let ctx = test_ctx();
     for body in [
       r#"{"model":"q","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
       r#"{"thinking":{"type":"adaptive"},"stream": true ,"output_config":{"format":{}}}"#,
     ] {
-      assert_eq!(
-        outbound_body(
-          Bytes::from(body),
-          "/v1/messages",
-          crate::backend::DEFAULT_BACKEND_ID,
-          None,
-        ),
-        body.as_bytes(),
-        "{body}"
-      );
+      for backend in Backends::all() {
+        assert_eq!(
+          outbound_body(&ctx, Bytes::from(body), "/v1/messages", &backend, None),
+          body.as_bytes(),
+          "{} on {body}",
+          backend.id(),
+        );
+      }
     }
   }
 
   #[test]
-  fn outbound_body_maps_effort_only_for_the_backend_that_needs_it() {
+  fn outbound_body_pins_the_launch_request_model() {
+    // The request-model pin is what a config-declared server that checks
+    // `body.model` launches with, so the client's own name never reaches it.
+    let ctx = test_ctx();
     assert_eq!(
       outbound_body(
-        Bytes::from(r#"{"model":"other","output_config":{"effort":"xhigh"}}"#),
-        "/v1/messages",
-        crate::backend::DEFAULT_BACKEND_ID,
-        Some("q"),
+        &ctx,
+        Bytes::from(r#"{"model":"client-name","stream":true}"#),
+        "/v1/chat/completions",
+        &test_backend(crate::backend::DEFAULT_BACKEND_ID),
+        Some("launch-name"),
       ),
-      r#"{"model":"q","output_config":{"effort":"xhigh"},"chat_template_kwargs":{"reasoning_effort":"xhigh"}}"#
-        .as_bytes(),
-      "the request-model pin and the effort mapping ride the same rewrite"
+      r#"{"model":"launch-name","stream":true}"#.as_bytes(),
     );
-    for endpoint in ["/v1/chat/completions", "/v1/messages/count_tokens"] {
-      assert_eq!(
-        outbound_body(
-          Bytes::from(r#"{"output_config":{"effort":"xhigh"}}"#),
-          endpoint,
-          crate::backend::DEFAULT_BACKEND_ID,
-          None,
-        ),
-        r#"{"output_config":{"effort":"xhigh"}}"#.as_bytes(),
-        "{endpoint} is not the effort surface"
-      );
-    }
-    let untouched = r#"{"output_config":{"effort":"xhigh"}}"#;
-    // Every registered backend except the one whose engine drops the field
-    // forwards the client's bytes; so does an unknown backend id.
-    use crate::backend::{Backend as _, Backends};
-    let others = Backends::all()
-      .into_iter()
-      .map(|backend| backend.id())
-      .filter(|id| *id != crate::backend::DEFAULT_BACKEND_ID)
-      .chain(std::iter::once("not-a-backend"));
-    for backend_id in others {
-      assert_eq!(
-        outbound_body(Bytes::from(untouched), "/v1/messages", backend_id, None,),
-        untouched.as_bytes(),
-        "{backend_id} rewrites nothing"
-      );
-    }
+  }
+
+  fn test_ctx() -> crate::daemon::context::MethodContext {
+    crate::daemon::context::MethodContext::new(crate::daemon::shutdown::ShutdownToken::new())
+  }
+
+  fn test_backend(id: &str) -> crate::backend::Backends {
+    crate::backend::Backends::from_id(id).expect("registered backend")
   }
 
   #[test]

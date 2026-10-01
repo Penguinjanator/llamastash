@@ -364,7 +364,17 @@ pub trait Backend {
   /// with the backend instead of naming an engine or a client in the generic
   /// proxy. Callers must treat the body as opaque bytes; a rewrite that leaves
   /// bytes untouched is a bug the client sees as a corrupt request.
-  fn rewrite_request_body(&self, _endpoint: &str, _body: &[u8]) -> Option<Vec<u8>> {
+  ///
+  /// Whatever a rewrite does has to be switchable off: it overrides what the
+  /// launch itself configured, and a user who wants the engine's own default
+  /// needs a way back. Read the setting from `ctx` (see
+  /// [`crate::daemon::context::MethodContext::backend`]).
+  fn rewrite_request_body(
+    &self,
+    _ctx: &MethodContext,
+    _endpoint: &str,
+    _body: &[u8],
+  ) -> Option<Vec<u8>> {
     None
   }
 
@@ -1115,8 +1125,13 @@ impl Backend for Backends {
     for_each_backend!(self, b => b.serves_web_ui())
   }
 
-  fn rewrite_request_body(&self, endpoint: &str, body: &[u8]) -> Option<Vec<u8>> {
-    for_each_backend!(self, b => b.rewrite_request_body(endpoint, body))
+  fn rewrite_request_body(
+    &self,
+    ctx: &MethodContext,
+    endpoint: &str,
+    body: &[u8],
+  ) -> Option<Vec<u8>> {
+    for_each_backend!(self, b => b.rewrite_request_body(ctx, endpoint, body))
   }
 
   fn seed_launch_knobs(&self, ctx: &MethodContext, params: &mut LaunchParams) {

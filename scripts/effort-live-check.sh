@@ -10,17 +10,24 @@
 # mapping, upstream now handles the field and the hook can go
 # (upstream ggml-org/llama.cpp#20479).
 #
-# Usage: effort-live-check.sh <proxy-origin> [model] [direct-upstream-origin]
+# Usage: effort-live-check.sh <proxy-origin> <model> [direct-upstream-origin]
 #   e.g. effort-live-check.sh http://127.0.0.1:11535 Qwen3.8-27B-UD-Q6_K http://127.0.0.1:41101
 #
-# The proxy bearer key comes from $LS_PROXY_KEY, else from proxy.api_key in
-# ~/.config/llamastash/config.yaml. A keyless loopback proxy needs neither; the
-# header is sent either way and ignored.
+# The model needs a chat template that defines `reasoning_effort` (the Qwen3.8
+# GGUFs do). A model whose template has no effort branch — Qwen3.5-4B, e.g. —
+# answers every row identically and proves nothing beyond the plumbing.
+#
+# The proxy bearer key comes from $LS_PROXY_KEY. A keyless loopback proxy needs
+# none, and the header is sent either way and ignored.
 set -euo pipefail
-PROXY=${1:-http://127.0.0.1:11535}
-MODEL=${2:-Qwen3.8-27B-UD-Q6_K}
+if [ $# -lt 2 ]; then
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+  exit 2
+fi
+PROXY=$1
+MODEL=$2
 DIRECT=${3:-}
-KEY=${LS_PROXY_KEY:-$(grep -m1 'api_key:' ~/.config/llamastash/config.yaml 2>/dev/null | awk '{print $2}')}
+KEY=${LS_PROXY_KEY:-$(grep -m1 'api_key:' ~/.config/llamastash/config.yaml 2>/dev/null | awk '{print $2}' || true)}
 PROMPT='A farmer has 17 sheep. All but 9 die. He then buys 3 dozen eggs and sells them at a 20% discount off $2.50 each. How many sheep are left and what does he earn? Reason carefully.'
 
 run() { # $1=label  $2=url  $3=extra json fragment (may be empty)

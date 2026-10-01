@@ -10,9 +10,11 @@
 //! xhigh` produced the same completion as sending nothing, while the same value
 //! under `chat_template_kwargs` changed it. So copy it there.
 //!
-//! An effort value the model's own chat template does not define (e.g. `max` on
-//! Qwen3.8) is passed through and the template's error names the values it
-//! accepts — a proxy-side clamp would only hide that.
+//! The value is passed through unclamped. An effort the model's own chat
+//! template does not define is the template's problem, and its error names the
+//! values it accepts — a proxy-side clamp would only hide that, and the set of
+//! valid values is per-template (`xhigh` / `medium` / `low` on Qwen3.8,
+//! something else on gpt-oss).
 //!
 //! `thinking` is left alone: llama.cpp's translator already reads it (only
 //! `type: enabled`, as a token budget), and Claude Code sends
@@ -20,22 +22,31 @@
 //! ignores. Remapping `disabled` would fork the engine's own thinking rules
 //! into the proxy for a case the effort control does not need.
 //!
-//! Drop this when llama.cpp maps the Anthropic effort field itself — upstream
-//! ggml-org/llama.cpp#20479, open since 2026-03-13.
+//! [`crate::backend::llama_cpp::LlamaCppConfig::map_anthropic_effort`] turns
+//! the whole thing off for a user who wants the launch's own effort to stand.
+//! Upstream is meant to absorb this; see TODO.md for the tracking entry.
 
 use crate::util::json_body;
 
-/// Client-facing Anthropic path the proxy routes (path only, no query).
-const MESSAGES_ENDPOINT: &str = "/v1/messages";
+/// Client-facing Anthropic paths the proxy routes (paths only, no query).
+/// `count_tokens` rides the same body, and leaving it unmapped would report a
+/// prompt that differs from the one the inference request builds.
+const MESSAGES_ENDPOINTS: [&str; 2] = ["/v1/messages", "/v1/messages/count_tokens"];
 
 /// `body` with `output_config.effort` also set as
 /// `chat_template_kwargs.reasoning_effort`, or `None` to forward it unchanged.
 /// See [`crate::backend::Backend::rewrite_request_body`].
 pub(super) fn rewrite_request_body(endpoint: &str, body: &[u8]) -> Option<Vec<u8>> {
-  if endpoint != MESSAGES_ENDPOINT {
+  if !MESSAGES_ENDPOINTS.contains(&endpoint) {
     return None;
   }
   let entries = json_body::entries(body)?;
+  // A duplicated key means two owners of one field and no honest way to merge
+  // them, so the request goes through exactly as the client sent it.
+  let duplicated = |key: &str| entries.iter().filter(|(k, _)| k == key).count();
+  if duplicated("chat_template_kwargs") > 1 || duplicated("output_config") > 1 {
+    return None;
+  }
   let kwargs = match entries
     .iter()
     .find(|(key, _)| key == "chat_template_kwargs")
@@ -63,8 +74,9 @@ pub(super) fn rewrite_request_body(endpoint: &str, body: &[u8]) -> Option<Vec<u8
         .find(|(key, _)| key == "effort")
         .map(|(_, value)| value.get().as_bytes().to_vec())
     })?;
-  // Only a JSON string is an effort. A non-string is not ours to interpret,
-  // and the template ignores a non-string kwarg anyway.
+  // Only a JSON string is an effort. Anything else is not ours to interpret,
+  // and templates disagree about what a non-string means (Qwen3.8 raises on
+  // one), so the safest move is to leave the body alone.
   if !effort.starts_with(b"\"") {
     return None;
   }
@@ -102,7 +114,7 @@ mod tests {
   use super::*;
 
   fn rewrite(body: &str) -> Option<Vec<u8>> {
-    rewrite_request_body(MESSAGES_ENDPOINT, body.as_bytes())
+    rewrite_request_body("/v1/messages", body.as_bytes())
   }
 
   #[test]
@@ -139,6 +151,20 @@ mod tests {
   }
 
   #[test]
+  fn duplicated_keys_forward_the_body_untouched() {
+    // Two `chat_template_kwargs` objects: merging into the first would drop
+    // whatever only the second one carries, and an engine that keeps the last
+    // occurrence would then lose the client's own value.
+    for body in [
+      r#"{"chat_template_kwargs":{},"output_config":{"effort":"low"},"chat_template_kwargs":{"reasoning_effort":"medium"}}"#,
+      r#"{"chat_template_kwargs":{"a":1},"output_config":{"effort":"low"},"chat_template_kwargs":{"b":2}}"#,
+      r#"{"output_config":{"effort":"low"},"output_config":{"effort":"high"}}"#,
+    ] {
+      assert_eq!(rewrite(body), None, "{body}");
+    }
+  }
+
+  #[test]
   fn forwards_untouched_when_there_is_nothing_to_map() {
     for body in [
       // No effort field at all — the byte-pure contract Claude Code depends on.
@@ -148,6 +174,7 @@ mod tests {
       // Non-string effort: the template's business, not ours.
       r#"{"output_config":{"effort":5}}"#,
       r#"{"output_config":{"effort":{"level":"high"}}}"#,
+      r#"{"output_config":{"effort":null}}"#,
       // output_config as a non-object.
       r#"{"output_config":"xhigh"}"#,
       // chat_template_kwargs as a non-object: cannot be merged into.
@@ -162,17 +189,28 @@ mod tests {
   }
 
   #[test]
-  fn only_the_messages_endpoint_is_rewritten() {
+  fn only_the_anthropic_endpoints_are_rewritten() {
     let body = r#"{"output_config":{"effort":"low"}}"#;
-    assert_eq!(
-      rewrite_request_body("/v1/messages/count_tokens", body.as_bytes()),
-      None
-    );
-    assert_eq!(
-      rewrite_request_body("/v1/chat/completions", body.as_bytes()),
-      None
-    );
-    assert!(rewrite_request_body(MESSAGES_ENDPOINT, body.as_bytes()).is_some());
+    // count_tokens rides the same body, so it has to be mapped too or its
+    // count disagrees with the request the client then sends.
+    for endpoint in MESSAGES_ENDPOINTS {
+      assert!(
+        rewrite_request_body(endpoint, body.as_bytes()).is_some(),
+        "{endpoint}"
+      );
+    }
+    for endpoint in [
+      "/v1/chat/completions",
+      "/v1/completions",
+      "/v1/messages/other",
+      "/v1/messages/count_tokens/extra",
+    ] {
+      assert_eq!(
+        rewrite_request_body(endpoint, body.as_bytes()),
+        None,
+        "{endpoint}"
+      );
+    }
   }
 
   #[test]

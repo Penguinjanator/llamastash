@@ -465,6 +465,54 @@ async fn anthropic_messages_endpoint_forwards() {
   std::fs::remove_dir_all(&dir).ok();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anthropic_messages_effort_reaches_the_upstream_body() {
+  // What the upstream actually receives, end to end through the proxy: the
+  // launch's backend is resolved from its recorded id, and that backend's
+  // effort mapping is in the bytes the engine sees. A mis-recorded backend id
+  // shows up here rather than passing every unit test.
+  let dir = unique_temp("effort");
+  let catalog_path = "/fixture/qwen-chat.gguf";
+  let registry = SupervisorRegistry::new();
+  let (model, _port, _id) = spawn_fake_supervisor(catalog_path, &dir, LaunchMode::Chat).await;
+  let launch_id = registry.next_id();
+  registry.insert(launch_id, model.clone()).await;
+
+  let state = proxy_state_with(
+    vec![discovered(catalog_path, Some("qwen-chat"), "qwen3")],
+    registry,
+  )
+  .await;
+  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+
+  // Nothing to map, so the upstream sees the client's exact bytes.
+  let plain =
+    r#"{"model":"qwen-chat","max_tokens":16,"thinking":{"type":"adaptive"},"stream":true}"#;
+  let (status, _h, response_body) = http_post(addr, "/v1/messages", plain, &[]).await;
+  assert_eq!(status, 200);
+  let parsed: Value = serde_json::from_slice(&response_body).expect("json body");
+  assert_eq!(
+    parsed["received_body"].as_str().expect("echo"),
+    plain,
+    "an unmapped body arrives byte-identical"
+  );
+
+  // The Anthropic effort field arrives as the kwarg the engine reads, and
+  // nothing else in the body moved.
+  let effort = r#"{"model":"qwen-chat","max_tokens":16,"output_config":{"effort":"xhigh"}}"#;
+  let (status, _h, response_body) = http_post(addr, "/v1/messages", effort, &[]).await;
+  assert_eq!(status, 200);
+  let parsed: Value = serde_json::from_slice(&response_body).expect("json body");
+  assert_eq!(
+    parsed["received_body"].as_str().expect("echo"),
+    r#"{"model":"qwen-chat","max_tokens":16,"output_config":{"effort":"xhigh"},"chat_template_kwargs":{"reasoning_effort":"xhigh"}}"#,
+  );
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, listener_handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
 // --- error paths --------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

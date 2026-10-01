@@ -67,7 +67,11 @@ template error names the valid values), request params in presets (dropped
   in-place `RawValue` rewrite so untouched fields stay byte-identical.
 - Mapping: `output_config.effort` → `chat_template_kwargs.reasoning_effort`.
   A client-set `chat_template_kwargs.reasoning_effort` wins. Leave
-  `output_config` in the body (llama.cpp ignores it).
+  `output_config` in the body (llama.cpp ignores it). Added in review:
+  `count_tokens` maps too (same body, so its count has to match the request
+  that follows), and `backend.llamacpp.map_anthropic_effort: false` turns the
+  whole mapping off, because a per-request kwarg otherwise overrides an effort
+  the launch itself was given.
 - `thinking.type: disabled`: check what llama.cpp does with it today before
   mapping it to `reasoning_effort: "none"`.
 - Effort values the template does not accept (e.g. `max` on Qwen3.8) pass
@@ -81,9 +85,9 @@ template error names the valid values), request params in presets (dropped
   wins" rule; tests on the rewritten bytes.
 - [x] U3. Check `thinking.type: disabled` on current llama.cpp; map it or
   document why not. **Not mapped**, rationale below.
-- [x] U4. File the gufo `/v1/messages` 400 upstream (with the four field names
-  and the Claude Code docs link). **Drafted, not filed** (2026-10-01) — the text
-  is in this file's appendix; filing waits for a go-ahead.
+- [ ] U4. File the gufo `/v1/messages` 400 upstream (with the four field names
+  and the Claude Code docs link). **Drafted 2026-10-01, not filed** — text in
+  the appendix, tracked in `TODO.md`; filing waits for a go-ahead.
 - [x] U5. Docs: `docs/architecture.md` (proxy body rewrites), `docs/usage.md`
   (Claude Code effort), `CHANGELOG.md`.
 
@@ -106,25 +110,35 @@ Done 2026-10-01.
 - `cargo test --features test-fixtures --no-fail-fast` green (47 binaries),
   `cargo clippy --all-targets --features test-fixtures -- -D warnings` clean.
 - Live, isolated daemon (`LLAMASTASH_STATE_DIR` + `--proxy-port 11535`),
-  llama.cpp `f872b5911` (build 11310), Qwen3.8-27B-UD-Q6_K, temp 0, one prompt,
-  `max_tokens` 600. Re-run with
-  [`scripts/effort-live-check.sh`](../../scripts/effort-live-check.sh):
+  llama.cpp `f872b5911` (build 11310), Qwen3.8-27B-UD-Q6_K on the llamacpp
+  backend (`--ctx 16384 --mtp off`), temp 0, one prompt, `max_tokens` 600.
+  Re-run with [`scripts/effort-live-check.sh`](../../scripts/effort-live-check.sh)
+  (`<proxy-origin> <model> [direct-upstream-origin]`). `map_anthropic_effort`
+  left on, which is the default:
 
-| Sent | Output tokens | Thinking chars |
-|---|---|---|
-| nothing | 600 | 1767 |
-| `output_config.effort: low` | 460 | 938 |
-| `output_config.effort: xhigh` | 600 | 1953 |
-| `output_config.effort: max` | template error | — |
-| `output_config.effort: xhigh` + `chat_template_kwargs.reasoning_effort: low` | 460 | 938 |
-| direct `chat_template_kwargs.reasoning_effort: low` | 460 | 938 |
-| direct `chat_template_kwargs.reasoning_effort: xhigh` | 600 | 1953 |
+| Sent | HTTP | Output tokens | Thinking chars |
+|---|---|---|---|
+| nothing | 200 | 600 | 1633 |
+| `output_config.effort: low` | 200 | 521 | 1174 |
+| `output_config.effort: xhigh` | 200 | 600 | 1502 |
+| `output_config.effort: max` | 500 | — | — |
+| `output_config.effort: xhigh` + `chat_template_kwargs.reasoning_effort: low` | 200 | 521 | 1174 |
+| direct `chat_template_kwargs.reasoning_effort: low` | 200 | 521 | 1174 |
+| direct `chat_template_kwargs.reasoning_effort: xhigh` | 200 | 600 | 1502 |
 
   The mapped rows match the direct `chat_template_kwargs` rows exactly, so the
-  rewrite is indistinguishable from sending the kwarg. `max` comes back as the
-  template's own error — `Unexpected reasoning effort max. Supported types are
-  xhigh (default), medium, and low.` — which is the pass-through behavior the
-  scope row asked for.
+  rewrite is indistinguishable from sending the kwarg. `max` comes back as
+  llama.cpp's own 500 carrying the template's exception text
+  (`Unexpected reasoning effort max. Supported types are xhigh (default),
+  medium, and low.`), which is the pass-through behavior the scope row asked
+  for. `/v1/messages/count_tokens` answers 200 with the field present.
+- Same daemon with `map_anthropic_effort: false`: the `low`, `xhigh` and `max`
+  rows all return the no-effort numbers (600 / 1633), so the launch and engine
+  defaults stand, while a client that sends the kwarg directly still gets its
+  own value (521 / 1174).
+- The check needs a model whose template defines `reasoning_effort`. On
+  Qwen3.5-4B (no such branch in its template) every row answers 600 / 1640
+  regardless, which exercises the plumbing and nothing else.
 - What the real client sends, captured from Claude Code 2.1.286 against a
   logging listener on `/v1/messages?beta=true` for an unrecognized model id:
   `thinking: {"type":"adaptive","display":"omitted"}` plus
@@ -142,6 +156,53 @@ Done 2026-10-01.
   remove. **Decided: remove.** No pre-1.0 compat shim, and
   `scripts/effort-live-check.sh` says when the mapping is redundant (the
   `proxy-effort-*` rows move without it).
+
+## Review round (2026-10-01)
+
+Nine findings on the first cut, all addressed.
+
+1. No way to turn the mapping off, and it silently overrode a launch-time
+   effort. Added `backend.llamacpp.map_anthropic_effort` (default `true`), read
+   by the llama.cpp impl from `MethodContext`; the override is now documented.
+2. A rejected effort fails the request instead of being dropped. Not a bug, but
+   undocumented: `max` is rejected by Qwen3.8's template, and a client that
+   always sends an effort now gets an error where it used to get an answer.
+   Written into `usage.md` with the template error text and llama.cpp's own
+   status for it.
+3. `count_tokens` was out of scope yet silently gained the mapping, and U4 was
+   ticked although nothing was filed. `count_tokens` is now in scope, stated in
+   the hook doc and tested; U4 is unticked and both the gufo issue and the
+   upstream watch are in `TODO.md`.
+4. `effort-live-check.sh` died before its own usage check when
+   `~/.config/llamastash/config.yaml` had no `api_key` line (a failing command
+   substitution under `set -e`), and its defaults hardcoded this box's proxy
+   port and model. Args are required now and the key lookup cannot abort it.
+5. No test proved the rewrite reaches upstream, so a mis-recorded
+   `resolved_backend` passed everything. The fake upstream now echoes the
+   request bytes and `tests/proxy_routing.rs` asserts both the mapped and the
+   untouched case.
+6. The `forward.rs` test asserted llama.cpp's byte-level output across three
+   modules. Slimmed to plumbing (byte-identical forward for every backend,
+   request-model pin), with the mapping asserted in `effort.rs` and in the
+   integration test.
+7. Duplicate JSON keys were mishandled: a second `chat_template_kwargs` loses
+   in llama.cpp's parser, and the same shape applied to `output_config`. Both
+   bail when a key repeats, and a non-string `effort` bails instead of failing
+   to compile.
+8. Four doc and PR-body claims were wrong: gufo described as having no effort
+   concept (it 400s on the fields), the template said to ignore a non-string
+   `reasoning_effort` (it raises), `xhigh` attributed to a client default (it
+   is this box's `effortLevel` setting), and the drop-on-rejected-value
+   behaviour left unstated.
+9. Five hand-rolled `Backends::all().find(|b| b.id() == ...)` lookups were left
+   behind (three in `launch_service.rs`, one in `supervisor.rs`, one in
+   `orphans.rs`) and the proxy re-resolved the backend per request.
+   `ManagedModel` now stores the resolved `Backends` next to `resolved_backend`
+   (launch and the readiness probe use it) and the proxy takes it from the model
+   it already found. The double-parse worry did not hold, because
+   `REQUEST_MODEL_KEY` is only ever set by a config-declared server, which
+   rewrites nothing; the two rewrites now sit in one helper with that note.
+
 
 ## Appendix: gufo upstream issue (drafted 2026-10-01, not filed)
 

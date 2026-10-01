@@ -9,7 +9,8 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 - `init` installs llama.cpp's CUDA build with its CUDA runtime on Linux + NVIDIA, and falls back to Vulkan when CUDA does not load (#93).
 - `init` integrations set reasoning effort to the levels the model's chat template accepts in pi, OpenCode, Zed and Codex (#93).
 - `init` integrations: Codex CLI profile, used with `codex --profile llamastash` (#93).
-- Claude Code's `/effort` now reaches a llama.cpp model: the proxy maps the Anthropic `output_config.effort` field onto `chat_template_kwargs.reasoning_effort` when forwarding `/v1/messages`, so switching effort changes thinking length instead of doing nothing. ([#95](https://github.com/llamastash/llamastash/pull/95))
+- Claude Code's `/effort` now reaches a llama.cpp model: the proxy maps the Anthropic `output_config.effort` field onto `chat_template_kwargs.reasoning_effort` when forwarding `/v1/messages`, so switching effort changes thinking length instead of doing nothing. `backend.llamacpp.map_anthropic_effort: false` leaves the effort the launch was given in charge. ([#95](https://github.com/llamastash/llamastash/pull/95))
+
 
 ### Changed
 
