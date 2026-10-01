@@ -180,6 +180,7 @@ async fn build_state(
     .with_sampler(SamplerHandles {
       snapshot: Arc::clone(&metrics),
       gpu: Arc::new(tokio::sync::RwLock::new(llamastash::gpu::GpuInfo::CpuOnly)),
+      interval: Duration::from_secs(1),
     });
   let state = ProxyState::from_context(&ctx, false, true, DEFAULT_BODY_LIMIT_BYTES);
   (state, ctx)

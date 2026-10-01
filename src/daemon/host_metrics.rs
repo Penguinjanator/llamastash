@@ -211,6 +211,8 @@ pub async fn sample_priming(prime_delay: Duration) -> HostMetricsSnapshot {
 pub struct SamplerHandles {
   pub snapshot: Arc<RwLock<HostMetricsSnapshot>>,
   pub gpu: Arc<RwLock<GpuInfo>>,
+  /// Tick cadence, so a reader knows how stale `snapshot` can be.
+  pub interval: Duration,
 }
 
 /// Floor on the sampler tick. `config.daemon.metrics_interval_secs`
@@ -322,7 +324,11 @@ pub fn spawn(
       *gpu_for_task.write().await = info.clone();
     }
   });
-  SamplerHandles { snapshot, gpu }
+  SamplerHandles {
+    snapshot,
+    gpu,
+    interval,
+  }
 }
 
 fn host_refresh_kind() -> RefreshKind {

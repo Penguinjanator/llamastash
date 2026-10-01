@@ -70,6 +70,8 @@ pub struct MethodContext {
   /// `None` value means no sampler was attached (catalog-only tests
   /// stay lightweight by leaving it off).
   pub host_metrics: Option<Arc<RwLock<HostMetricsSnapshot>>>,
+  /// How often `host_metrics` is refreshed.
+  pub host_metrics_interval: std::time::Duration,
   /// Persisted favorites / last_params / running snapshots.
   /// `start_model` and `favorite_*` mutate it and flush to `state.json`
   /// after each change.
@@ -283,6 +285,7 @@ impl MethodContext {
       gpu: Arc::new(GpuInfo::CpuOnly),
       gpu_live: None,
       host_metrics: None,
+      host_metrics_interval: crate::config::DaemonConfig::default().metrics_interval(),
       state: PersistedState::ephemeral(),
       presets: crate::daemon::preset_store::ConfigPresetStore::empty(),
       launch: None,
@@ -331,6 +334,7 @@ impl MethodContext {
   /// GpuInfo) in one call. Production wiring uses this.
   pub fn with_sampler(mut self, handles: SamplerHandles) -> Self {
     self.host_metrics = Some(handles.snapshot);
+    self.host_metrics_interval = handles.interval;
     self.gpu_live = Some(handles.gpu);
     self
   }

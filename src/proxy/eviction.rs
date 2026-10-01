@@ -50,8 +50,8 @@ use crate::proxy::ProxyState;
 const EVICT_STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// How long make-room waits for a stopped launch's memory to show up as
-/// free before re-running admission anyway. The sampler ticks at 1 Hz and
-/// a graceful stop takes up to [`EVICT_STOP_GRACE`].
+/// free before re-running admission anyway, at the default 1 s sampler tick.
+/// A slower tick stretches it: see [`room_wait_window`].
 const MAKE_ROOM_FREE_WAIT: Duration = Duration::from_secs(20);
 
 /// Run the eviction loop until the shutdown token fires. Sleeps for
@@ -558,8 +558,7 @@ async fn resident_estimate(
 }
 
 /// Poll the sampled free memory until it covers `needed` or the window closes, so
-/// the retry is not priced against memory a stopped launch still holds. The
-/// sampler ticks at 1 Hz; a graceful stop takes up to the stop grace. On a
+/// the retry is not priced against memory a stopped launch still holds. On a
 /// timeout this returns anyway and admission decides — this is a wait, not a
 /// second gate.
 ///
@@ -574,7 +573,7 @@ async fn wait_for_room(state: &Arc<ProxyState>, needed: u64) {
   let Some(slot) = state.ctx.host_metrics.as_ref() else {
     return;
   };
-  let deadline = Instant::now() + MAKE_ROOM_FREE_WAIT;
+  let deadline = Instant::now() + room_wait_window(state.ctx.host_metrics_interval);
   while Instant::now() < deadline {
     let free = crate::launch::admission::effective_free_bytes(&slot.read().await.clone())
       .saturating_sub(state.ctx.admission.reserved_bytes());
@@ -585,9 +584,29 @@ async fn wait_for_room(state: &Arc<ProxyState>, needed: u64) {
   }
 }
 
+/// The wait has to outlast two sampler ticks: the tick in flight when the stops
+/// finish may have read memory before they did, and the retry's admission reads
+/// the same sample, so ending the wait before a post-stop tick refuses the launch
+/// after the models were already unloaded.
+fn room_wait_window(sample_interval: Duration) -> Duration {
+  MAKE_ROOM_FREE_WAIT.max(sample_interval.saturating_mul(2))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn room_wait_outlasts_two_sampler_ticks() {
+    assert_eq!(
+      room_wait_window(Duration::from_secs(1)),
+      MAKE_ROOM_FREE_WAIT
+    );
+    assert_eq!(
+      room_wait_window(Duration::from_secs(60)),
+      Duration::from_secs(120)
+    );
+  }
 
   fn ttl() -> Duration {
     Duration::from_secs(60)
