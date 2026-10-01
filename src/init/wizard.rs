@@ -671,15 +671,42 @@ async fn run_install_step(
       .ok()
       .flatten()
   };
-  let cuda_label =
-    gh_releases::cuda_asset_suffix(hardware, nvidia).and_then(|s| gh_releases::cuda_label(&s));
+  let install_root = crate::util::paths::state_dir().map(|d| d.join("llama-cpp"));
+  let cuda_failed = install_root
+    .as_deref()
+    .is_some_and(|root| gh_releases::cuda_failed_before(root, hardware, nvidia));
+  let cuda = gh_releases::best_cuda_suffix(hardware, nvidia)
+    .and_then(|s| gh_releases::cuda_label(&s))
+    .map(|label| prompts::CudaOffer {
+      label,
+      needs_toolkit: hardware.os == crate::init::detection::OsFamily::Windows,
+      failed_before: cuda_failed,
+    });
+  // A CUDA build that listed no device before stays on offer but is not
+  // the default: picking it, or `--install gh-releases`, tries it again.
+  let default = match default {
+    InstallChoice::GhReleases(GhBuild::Best) if cuda_failed => {
+      InstallChoice::GhReleases(GhBuild::Vulkan)
+    }
+    other => other,
+  };
   log::debug!(
     "init: install step (default={:?}, detected_binary={:?}, nvidia={:?})",
     default,
     binary.resolved_path,
     nvidia
   );
-  let choice = prompts::pick_install_method(args, default, binary, cuda_label.as_deref()).await?;
+  let choice = prompts::pick_install_method(args, default, binary, cuda.as_ref()).await?;
+  let prompted =
+    args.install.is_none() && !prompts::is_recommended(args) && prompts::stdout_is_terminal();
+  if cuda_failed && !prompted && args.install.is_none() {
+    let msg = "the CUDA build listed no CUDA device on an earlier run, so the Vulkan build is \
+               used; `--install gh-releases` tries CUDA again";
+    log::warn!("init server: {msg}");
+    if emit_progress {
+      eprintln!("{}", colors::warning(msg));
+    }
+  }
   log::debug!("init: install method chosen: {choice:?}");
   match choice {
     InstallChoice::Brew => {
@@ -702,20 +729,20 @@ async fn run_install_step(
       }
     }
     InstallChoice::GhReleases(build) => {
-      let install_root = crate::util::paths::state_dir()
-        .ok_or_else(|| CliExit::new(INIT_ABORTED, "no state dir"))?
-        .join("llama-cpp");
-      let (install, cuda) =
-        install_gh_release(fetch, hardware, build, nvidia, &install_root, emit_progress).await?;
-      if !cuda {
-        return Ok(install);
-      }
+      let install_root = install_root.ok_or_else(|| CliExit::new(INIT_ABORTED, "no state dir"))?;
       let warn = |msg: &str| {
         log::warn!("init server: {msg}");
         if emit_progress {
           eprintln!("{}", colors::warning(msg));
         }
       };
+      let pick = query_gh_release(fetch, hardware, build, nvidia, emit_progress)
+        .await
+        .map_err(install_err_to_exit)?;
+      let install = install_gh_pick(fetch, &pick, &install_root, emit_progress).await?;
+      if !pick.is_cuda() {
+        return Ok(install);
+      }
       let sp =
         prompts::StepProgress::start_if(emit_progress, "Checking the CUDA build for a CUDA device");
       let installed = install.path.clone();
@@ -728,7 +755,12 @@ async fn run_install_step(
         gh_releases::CudaCheck::Unknown(_) => sp.fail("Could not check the CUDA build"),
       }
       match check {
-        gh_releases::CudaCheck::Loaded => return Ok(install),
+        gh_releases::CudaCheck::Loaded => {
+          if let Err(e) = gh_releases::clear_cuda_failure(&install_root, hardware, nvidia) {
+            log::warn!("init server: could not update the CUDA failure record: {e}");
+          }
+          return Ok(install);
+        }
         // A failed probe says nothing about CUDA; dropping a working
         // install over it would waste the download.
         gh_releases::CudaCheck::Unknown(why) => {
@@ -745,22 +777,20 @@ async fn run_install_step(
       // load, so a broken CUDA install still runs, on the CPU. Fall
       // back to the Vulkan build instead of keeping it.
       warn(&format!(
-        "{} lists no CUDA device; installing the Vulkan build instead",
+        "{} lists no CUDA device; installing the Vulkan build instead. Later runs \
+         default to it; pick CUDA again or pass `--install gh-releases` to retry",
         install.path.display()
       ));
+      if let Err(e) = gh_releases::record_cuda_failure(&install_root, hardware, nvidia) {
+        warn(&format!("could not record the CUDA failure: {e}"));
+      }
       if let Err(e) = gh_releases::remove_install(&install_root, &install.path) {
         warn(&format!("could not remove the CUDA build: {e}"));
       }
-      install_gh_release(
-        fetch,
-        hardware,
-        GhBuild::Vulkan,
-        nvidia,
-        &install_root,
-        emit_progress,
-      )
-      .await
-      .map(|(vulkan, _)| vulkan)
+      let vulkan = query_gh_release(fetch, hardware, GhBuild::Vulkan, nvidia, emit_progress)
+        .await
+        .map_err(install_err_to_exit)?;
+      install_gh_pick(fetch, &vulkan, &install_root, emit_progress).await
     }
     InstallChoice::CustomPath(p) => {
       if emit_progress {
@@ -786,33 +816,40 @@ async fn run_install_step(
   }
 }
 
-/// Query, download, verify and extract one GitHub Releases build.
-/// Returns the install and whether it is a CUDA build.
-async fn install_gh_release(
+/// Find the GitHub Releases asset for `build`.
+async fn query_gh_release(
   fetch: &FetchClient,
   hardware: &HardwareSnapshot,
   build: GhBuild,
   nvidia: Option<gh_releases::NvidiaGpu>,
-  install_root: &std::path::Path,
   emit_progress: bool,
-) -> Result<(BinaryInstall, bool), CliExit> {
+) -> Result<gh_releases::AssetPick, InstallError> {
   let sp_query = prompts::StepProgress::start_if(
     emit_progress,
     "Querying GitHub Releases for the latest llama.cpp asset",
   );
-  let pick = match gh_releases::fetch_latest_asset(fetch, hardware, build, nvidia).await {
+  match gh_releases::fetch_latest_asset(fetch, hardware, build, nvidia).await {
     Ok(p) => {
       sp_query.success(format!(
         "Selected GitHub Releases asset `{}` ({})",
         p.archive.asset_name, p.tag
       ));
-      p
+      Ok(p)
     }
     Err(e) => {
       sp_query.fail(format!("GitHub Releases query failed: {e}"));
-      return Err(install_err_to_exit(e));
+      Err(e)
     }
-  };
+  }
+}
+
+/// Download, verify and extract a picked GitHub Releases build.
+async fn install_gh_pick(
+  fetch: &FetchClient,
+  pick: &gh_releases::AssetPick,
+  install_root: &std::path::Path,
+  emit_progress: bool,
+) -> Result<BinaryInstall, CliExit> {
   let size = crate::init::detection::fmt_bytes(pick.download_bytes());
   let what = match &pick.runtime_libs {
     Some(libs) => format!(
@@ -833,13 +870,13 @@ async fn install_gh_release(
     emit_progress,
     format!("Downloading + verifying + extracting {what}"),
   );
-  match gh_releases::install_picked(fetch, &pick, install_root).await {
+  match gh_releases::install_picked(fetch, pick, install_root).await {
     Ok(install) => {
       sp_install.success(format!(
         "Installed llama-server at {}",
         install.path.display()
       ));
-      Ok((install, pick.is_cuda()))
+      Ok(install)
     }
     Err(e) => {
       sp_install.fail(format!("GitHub Releases install failed: {e}"));

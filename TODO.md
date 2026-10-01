@@ -448,6 +448,8 @@ places.
   - [ ] delegated rows re-adopted across a daemon restart fall back to mirroring the umbrella state until something reloads them (could reconcile against `lemond`'s loaded list at boot).
 - [ ] **Extract the shared single-field modal frame when a third one appears.** [`launch_name_dialog`](src/tui/launch_name_dialog.rs) is a structural clone of [`save_preset_dialog`](src/tui/save_preset_dialog.rs) minus the `Confirm` stage: same centred rect, panel, input line and hint row, differing only in the title and what accept does. Two copies do not pay for a shared frame; three do, so pull it out then instead of cloning a third time.
 - [ ] Benchmark against Ollama, LMStudio and other popular options.
+- [ ] `init` on Windows arm64 + NVIDIA: when the CUDA build lists no CUDA device, the fallback removes it and then finds no Vulkan build (upstream ships no `win-vulkan-arm64.zip` as of `b11320`), so nothing is left installed; `--install gh-releases:vulkan` fails the same way. Look the Vulkan asset up before `remove_install` in `src/init/wizard.rs` and keep the CUDA build when there is none.
+- [ ] Effort alias parsing (`aliases()` in `src/init/external/effort.rs`) scans from `<name> == 'x'` to the next `endif`, so a `set <name> = '<level>'` in a later `elif` / `else` branch would make `x` an alias wrongly. No known template does this; end the scan at `elif` / `else` too.
   - [ ] AMD GPU : Linux
   - [ ] AMD GPU: Windows
   - [ ] AMD APU: Windows

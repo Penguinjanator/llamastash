@@ -477,17 +477,28 @@ pub fn arch_short(arch: CpuArch) -> &'static str {
   }
 }
 
+/// The CUDA build the install picker offers beside the Vulkan one.
+#[derive(Debug, Clone)]
+pub struct CudaOffer {
+  /// `CUDA 13`, or `CUDA` on Windows.
+  pub label: String,
+  /// The Windows CUDA zip ships no CUDA runtime DLLs.
+  pub needs_toolkit: bool,
+  /// It listed no CUDA device on an earlier run.
+  pub failed_before: bool,
+}
+
 /// Resolve the install-method choice. Returns immediately if the
 /// override flag is set, the wizard is in recommended mode, or
 /// stdout is not a terminal. Otherwise prompts via cliclack.
 ///
-/// `cuda` labels the CUDA build this host can run (`CUDA 13`); when set,
-/// GitHub Releases is offered as two items, CUDA and Vulkan.
+/// With a `cuda` offer, GitHub Releases is offered as two items, CUDA
+/// and Vulkan.
 pub async fn pick_install_method(
   args: &InitArgs,
   default: InstallChoice,
   existing: &BinaryPresence,
-  cuda: Option<&str>,
+  cuda: Option<&CudaOffer>,
 ) -> Result<InstallChoice, CliExit> {
   if let Some(override_value) = &args.install {
     return install_override_to_choice(override_value.clone(), existing);
@@ -1018,14 +1029,14 @@ fn build_install_items(
   default: &InstallChoice,
   existing: &BinaryPresence,
   brew_available: bool,
-  cuda: Option<&str>,
+  cuda: Option<&CudaOffer>,
 ) -> (usize, Vec<(InstallPick, String, String)>) {
   let mut items: Vec<(InstallPick, String, String)> = match cuda {
-    Some(label) => vec![
+    Some(offer) => vec![
       (
         InstallPick::Resolved(InstallChoice::GhReleases(GhBuild::Best)),
-        format!("GitHub Releases · {label}"),
-        "native NVIDIA build plus its CUDA runtime (~560-730 MiB download)".into(),
+        format!("GitHub Releases · {}", offer.label),
+        cuda_hint(offer),
       ),
       (
         InstallPick::Resolved(InstallChoice::GhReleases(GhBuild::Vulkan)),
@@ -1066,6 +1077,19 @@ fn build_install_items(
     })
     .unwrap_or(0);
   (initial, items)
+}
+
+fn cuda_hint(offer: &CudaOffer) -> String {
+  let build = if offer.needs_toolkit {
+    "native NVIDIA build, needs the CUDA toolkit installed"
+  } else {
+    "native NVIDIA build plus its CUDA runtime (~560-730 MiB download)"
+  };
+  if offer.failed_before {
+    format!("listed no CUDA device last time; {build}")
+  } else {
+    build.to_string()
+  }
 }
 
 /// `InstallChoice` lacks `PartialEq`. Helper compares by variant +
@@ -1116,7 +1140,7 @@ fn render_recommendation(r: &Recommendation) -> (String, String) {
 /// `cargo test` leaves the binary's fd 1 attached to the user's
 /// terminal. Tests that exercise the non-TTY branches set this env
 /// var so they don't fall through into a blocking cliclack prompt.
-fn stdout_is_terminal() -> bool {
+pub(crate) fn stdout_is_terminal() -> bool {
   if std::env::var_os("LLAMASTASH_ASSUME_NON_TTY").is_some_and(|v| v == "1") {
     return false;
   }
@@ -1359,8 +1383,13 @@ mod tests {
   #[test]
   fn build_install_items_splits_gh_releases_when_cuda_fits() {
     let default = InstallChoice::GhReleases(GhBuild::Best);
+    let mut offer = CudaOffer {
+      label: "CUDA 13".into(),
+      needs_toolkit: false,
+      failed_before: false,
+    };
     let (initial, items) =
-      build_install_items(&default, &no_existing_binary(), false, Some("CUDA 13"));
+      build_install_items(&default, &no_existing_binary(), false, Some(&offer));
     assert_eq!(items[0].1, "GitHub Releases · CUDA 13");
     assert_eq!(items[1].1, "GitHub Releases · Vulkan");
     assert_eq!(initial, 0, "CUDA is the default");
@@ -1368,6 +1397,19 @@ mod tests {
       items[1].0,
       InstallPick::Resolved(InstallChoice::GhReleases(GhBuild::Vulkan))
     ));
+    // After a failed check the wizard defaults to Vulkan, and CUDA stays
+    // on offer with a hint.
+    offer.failed_before = true;
+    let (failed_initial, failed_items) = build_install_items(
+      &InstallChoice::GhReleases(GhBuild::Vulkan),
+      &no_existing_binary(),
+      false,
+      Some(&offer),
+    );
+    assert_eq!(failed_initial, 1, "Vulkan is the default");
+    assert!(failed_items[0]
+      .2
+      .starts_with("listed no CUDA device last time"));
   }
 
   #[test]

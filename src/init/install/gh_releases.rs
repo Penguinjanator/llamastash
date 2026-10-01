@@ -192,11 +192,14 @@ fn wants_cuda(hw: &HardwareSnapshot) -> bool {
   }
 }
 
-/// Short label for a CUDA suffix, for the install picker (`CUDA 13`).
+/// Short label for a CUDA suffix, for the install picker: `CUDA 13` on
+/// Linux, `CUDA` on Windows, whose suffix leaves the version open.
 pub fn cuda_label(suffix: &str) -> Option<String> {
-  let rest = suffix.strip_prefix("ubuntu-cuda-")?;
-  let major = rest.split('.').next()?;
-  Some(format!("CUDA {major}"))
+  if let Some(rest) = suffix.strip_prefix("ubuntu-cuda-") {
+    let major = rest.split('.').next()?;
+    return Some(format!("CUDA {major}"));
+  }
+  suffix.starts_with("win-cuda-").then(|| "CUDA".to_string())
 }
 
 /// The suffix to fetch for `build`: the CUDA build when asked for the
@@ -717,6 +720,76 @@ fn lists_cuda_device(stdout: &str) -> bool {
   })
 }
 
+/// Lists the CUDA builds whose device check failed on this host, one
+/// asset suffix per line, so later runs default to the Vulkan build
+/// instead of downloading the CUDA one again.
+const CUDA_FAILED_FILE: &str = ".cuda-failed";
+
+pub fn cuda_failed_path(install_root: &Path) -> PathBuf {
+  install_root.join(CUDA_FAILED_FILE)
+}
+
+/// The CUDA suffix the best build resolves to on this host, if any.
+pub fn best_cuda_suffix(hw: &HardwareSnapshot, gpu: Option<NvidiaGpu>) -> Option<String> {
+  select_asset_suffix(hw, GhBuild::Best, gpu).filter(|s| s.contains("-cuda-"))
+}
+
+/// Whether the CUDA build the best build resolves to failed its device
+/// check on an earlier run.
+pub fn cuda_failed_before(
+  install_root: &Path,
+  hw: &HardwareSnapshot,
+  gpu: Option<NvidiaGpu>,
+) -> bool {
+  let Some(suffix) = best_cuda_suffix(hw, gpu) else {
+    return false;
+  };
+  std::fs::read_to_string(cuda_failed_path(install_root))
+    .is_ok_and(|s| s.lines().any(|l| l.trim() == suffix))
+}
+
+/// Record that the CUDA build the best build resolves to listed no CUDA
+/// device.
+pub fn record_cuda_failure(
+  install_root: &Path,
+  hw: &HardwareSnapshot,
+  gpu: Option<NvidiaGpu>,
+) -> std::io::Result<()> {
+  let Some(suffix) = best_cuda_suffix(hw, gpu) else {
+    return Ok(());
+  };
+  if cuda_failed_before(install_root, hw, gpu) {
+    return Ok(());
+  }
+  use std::io::Write as _;
+  let mut file = std::fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(cuda_failed_path(install_root))?;
+  writeln!(file, "{suffix}")
+}
+
+/// Forget a recorded failure once the CUDA build lists a device.
+pub fn clear_cuda_failure(
+  install_root: &Path,
+  hw: &HardwareSnapshot,
+  gpu: Option<NvidiaGpu>,
+) -> std::io::Result<()> {
+  let Some(suffix) = best_cuda_suffix(hw, gpu) else {
+    return Ok(());
+  };
+  let path = cuda_failed_path(install_root);
+  let Ok(text) = std::fs::read_to_string(&path) else {
+    return Ok(());
+  };
+  let rest: Vec<&str> = text.lines().filter(|l| l.trim() != suffix).collect();
+  if rest.is_empty() {
+    std::fs::remove_file(&path)
+  } else {
+    std::fs::write(&path, rest.join("\n") + "\n")
+  }
+}
+
 /// Remove the install directory that holds `binary`, the child of
 /// `install_root` it sits under. Used when a CUDA build is replaced by
 /// the Vulkan one, so its ~1 GB does not stay behind.
@@ -863,6 +936,39 @@ mod tests {
   }
 
   #[test]
+  fn a_failed_cuda_build_is_remembered_per_suffix() {
+    let root = crate::util::test_temp::unique_temp_dir("cuda-failed");
+    let x64 = hw(nvidia(), OsFamily::Linux, CpuArch::X86_64);
+    let cuda13 = Some(ampere(580));
+    assert!(!cuda_failed_before(&root, &x64, cuda13));
+    record_cuda_failure(&root, &x64, cuda13).unwrap();
+    record_cuda_failure(&root, &x64, cuda13).unwrap();
+    assert!(cuda_failed_before(&root, &x64, cuda13));
+    assert_eq!(
+      std::fs::read_to_string(cuda_failed_path(&root)).unwrap(),
+      "ubuntu-cuda-13.*-x64.tar.gz\n",
+      "recorded once"
+    );
+    // A driver that moves the pick to another CUDA build tries it.
+    assert!(!cuda_failed_before(&root, &x64, Some(ampere(570))));
+    // Nothing is recorded where the best build is not CUDA.
+    let amd = hw(amd(), OsFamily::Linux, CpuArch::X86_64);
+    record_cuda_failure(&root, &amd, None).unwrap();
+    assert!(!cuda_failed_before(&root, &amd, None));
+    let win = hw(nvidia(), OsFamily::Windows, CpuArch::X86_64);
+    assert!(!cuda_failed_before(&root, &win, None));
+    record_cuda_failure(&root, &win, None).unwrap();
+    assert!(cuda_failed_before(&root, &win, None));
+    // A CUDA build that later lists a device clears its line only.
+    clear_cuda_failure(&root, &win, None).unwrap();
+    assert!(!cuda_failed_before(&root, &win, None));
+    assert!(cuda_failed_before(&root, &x64, cuda13));
+    clear_cuda_failure(&root, &x64, cuda13).unwrap();
+    assert!(!cuda_failed_path(&root).exists());
+    std::fs::remove_dir_all(&root).ok();
+  }
+
+  #[test]
   fn the_vulkan_build_replaces_the_windows_cuda_zip() {
     let win = hw(nvidia(), OsFamily::Windows, CpuArch::X86_64);
     assert_eq!(
@@ -936,6 +1042,7 @@ mod tests {
       cuda_label("ubuntu-cuda-13.*-x64.tar.gz").as_deref(),
       Some("CUDA 13")
     );
+    assert_eq!(cuda_label("win-cuda-*-x64.zip").as_deref(), Some("CUDA"));
     assert!(cuda_label("ubuntu-vulkan-x64.tar.gz").is_none());
   }
 
