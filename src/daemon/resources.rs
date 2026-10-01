@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use serde::Serialize;
-use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
+use sysinfo::{Pid, ProcessRefreshKind, System};
 
 fn thread_count(proc: &sysinfo::Process) -> u32 {
   proc
@@ -41,7 +41,7 @@ pub struct ResourceReading {
 /// process has already exited.
 pub fn sample(pid: u32) -> Option<ResourceReading> {
   let refresh = ProcessRefreshKind::nothing().with_cpu().with_memory();
-  let mut sys = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh));
+  let mut sys = System::new();
   sys.refresh_processes_specifics(
     sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
     true,
@@ -67,7 +67,7 @@ pub fn sample_loop(pid: u32, interval: Duration) -> tokio::sync::mpsc::Receiver<
   let (tx, rx) = tokio::sync::mpsc::channel(8);
   tokio::spawn(async move {
     let refresh = ProcessRefreshKind::nothing().with_cpu().with_memory();
-    let mut sys = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh));
+    let mut sys = System::new();
     // Prime the CPU delta calculation.
     sys.refresh_processes_specifics(
       sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),

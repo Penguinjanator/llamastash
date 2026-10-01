@@ -308,9 +308,9 @@ async fn stop_external_handler(
   // probe polling for a launching model.
   async fn live_and_same(pid: u32, expected_start: u64) -> Option<bool> {
     tokio::task::spawn_blocking(move || {
-      use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
+      use sysinfo::{Pid, ProcessRefreshKind, System};
       let refresh = ProcessRefreshKind::everything();
-      let mut sys = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh));
+      let mut sys = System::new();
       sys.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
         true,

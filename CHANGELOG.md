@@ -4,6 +4,10 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ## [Unreleased]
 
+### Changed
+
+- Single-process lookups (stop grace loop, adopted-row argv, resource sampling) and the boot orphan sweep no longer scan every process and thread on the host first. Cuts the full test suite from ~90 s to ~19 s and speeds up `stop`.
+
 ## [0.5.0] — 2026-09-30
 
 This release adds the **generic backend**: any OpenAI-compatible server you declare in `config.yaml` becomes a LlamaStash-managed model. LlamaStash reserves the port, waits on the readiness path, routes the proxy and stops the process. Everything engine-specific, its flags, its env and its weights, lives in the entry or in a wrapper script you write. That reaches engines a dedicated backend would never cover: in a 2026-09-26 Qwen3.8 Flash-Next benchmark on a 128 GB Strix Halo, Halogen and gufo ran a 3-turn pass at 1k tokens out in 114 s and 124 s against 224 s for llama.cpp, and prefilled a 32k prompt at about 1,040 t/s against 314 t/s. Neither could be launched before this. ds4 for DeepSeek-V4 now runs the same way, having lost its dedicated backend.

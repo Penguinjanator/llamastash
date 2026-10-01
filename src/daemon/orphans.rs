@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Serialize;
-use sysinfo::{ProcessRefreshKind, RefreshKind, System};
+use sysinfo::{ProcessRefreshKind, System};
 
 use crate::backend::Backend;
 use crate::daemon::state_store::RunningSnapshot;
@@ -195,8 +195,11 @@ pub async fn sweep(inputs: SweepInputs<'_>) -> SweepReport {
       ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always)
     }
   };
-  let mut sys = System::new_with_specifics(RefreshKind::nothing().with_processes(process_refresh));
-  sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+  // `refresh_processes` would also walk every thread (`with_tasks`), ~4x the
+  // /proc reads, and `with_processes` on the constructor would scan once more
+  // before this refresh does.
+  let mut sys = System::new();
+  sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::All, true, process_refresh);
 
   let mut adopted: Vec<RunningSnapshot> = Vec::new();
   let mut stale: Vec<RunningSnapshot> = Vec::new();

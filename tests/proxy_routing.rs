@@ -35,7 +35,9 @@ use llamastash::gguf::identity::ModelId;
 use llamastash::gguf::metadata::{ModeHint, ModelMetadata, Quant};
 use llamastash::launch::mode::LaunchMode;
 use llamastash::launch::params::LaunchParams;
-use llamastash::proxy::server::{loopback_addr, new_status_cell, serve, ProxyStatus, StatusCell};
+use llamastash::proxy::server::{
+  loopback_addr, new_status_cell, serve, serve_with_options, ProxyStatus, ServeOptions, StatusCell,
+};
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
 use serde_json::Value;
@@ -932,16 +934,34 @@ async fn partial_request_closes_within_header_read_timeout() {
   // wired into hyper::server::conn::http1::Builder actually fires.
   // A client that opens a TCP socket, writes a partial request
   // line, then idles must have its connection closed by the proxy
-  // within HEADER_READ_TIMEOUT (30s production; 35s budget here so
-  // CI noise doesn't flake). If a future tweak drops the timeout
-  // from the builder chain, this test hangs past the budget.
+  // once the configured timeout elapses. A short timeout keeps the
+  // test fast; if a future tweak drops it from the builder chain,
+  // the read blocks past the budget and this test fails.
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
   use tokio::net::TcpStream;
+
+  const TIMEOUT: Duration = Duration::from_secs(1);
 
   let dir = unique_temp("partial");
   let registry = SupervisorRegistry::new();
   let state = proxy_state_with(Vec::new(), registry).await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let shutdown = ShutdownToken::new();
+  let status: StatusCell = new_status_cell();
+  let listener_handle = {
+    let (state, shutdown, status) = (state, shutdown.clone(), Arc::clone(&status));
+    tokio::spawn(async move {
+      let options = ServeOptions {
+        header_read_timeout: TIMEOUT,
+        ..ServeOptions::default()
+      };
+      serve_with_options(state, loopback_addr(0), shutdown, status, options)
+        .await
+        .expect("proxy serve returns Ok");
+    })
+  };
+  let addr = wait_for_listening(&status, Duration::from_secs(2))
+    .await
+    .expect("listener reaches Listening");
 
   let mut sock = TcpStream::connect(addr).await.expect("connect");
   // Partial request line, no newline, no Host header. Server waits
@@ -949,11 +969,19 @@ async fn partial_request_closes_within_header_read_timeout() {
   sock.write_all(b"GET /he").await.expect("write partial");
   sock.flush().await.ok();
 
+  let started = std::time::Instant::now();
   let mut buf = vec![0u8; 64];
-  let read = tokio::time::timeout(Duration::from_secs(35), sock.read(&mut buf)).await;
+  let read = tokio::time::timeout(TIMEOUT * 5, sock.read(&mut buf)).await;
   let n = read
-    .expect("proxy failed to close partial-request connection within HEADER_READ_TIMEOUT budget")
+    .expect(
+      "proxy failed to close partial-request connection within the header-read timeout budget",
+    )
     .expect("read");
+  assert!(
+    started.elapsed() >= TIMEOUT / 2,
+    "connection closed after {:?}, well before the {TIMEOUT:?} header-read timeout",
+    started.elapsed()
+  );
   // `read` of 0 = clean EOF (peer closed). Hyper closes the socket
   // once the timeout fires; we don't expect any response bytes.
   assert_eq!(n, 0, "expected EOF on timeout; got {n} bytes: {buf:?}");

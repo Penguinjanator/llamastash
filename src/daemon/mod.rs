@@ -698,14 +698,14 @@ struct LiveProcess {
 }
 
 fn lookup_live_process(pid: u32) -> LiveProcess {
-  use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
+  use sysinfo::{Pid, ProcessRefreshKind, System};
   // `everything()` over a blank kind: explicit about wanting all
   // process metadata so `start_time()` is reliably populated across
-  // sysinfo versions and platforms. The cost is one extra /proc read
-  // per call, negligible at boot-sweep scale, and it covers the argv
-  // too so reading the real command line is free.
+  // sysinfo versions and platforms. Start from `System::new()`: building
+  // with `with_processes` first refreshes every process (~100ms on a busy
+  // host) before the single-pid refresh below does the real work.
   let refresh = ProcessRefreshKind::everything();
-  let mut sys = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh));
+  let mut sys = System::new();
   sys.refresh_processes_specifics(
     sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
     true,
