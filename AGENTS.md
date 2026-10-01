@@ -43,12 +43,15 @@ Read the relevant doc before non-trivial work in that area; don't re-derive from
 ```bash
 make build                                                 # release: cargo build --release
 make test                                                  # lint + nextest + doctests with test-fixtures, as CI runs them
-cargo test --features test-fixtures --test <name>          # one integration binary
+cargo nextest run --features test-fixtures                 # full suite without lint
+cargo nextest run --features test-fixtures --test <name>   # one integration binary
 make lint                                                  # fmt --check + clippy -D warnings
 make audit                                                 # maintainer bundle → target/audit; make audit-summary for the headline
 ```
 
 Prefer `make` targets — they carry the standard flags (forgetting `--features test-fixtures` on tests is the classic mistake). See the `Makefile` for the rest, including `make uat-*`.
+
+Run tests with `cargo nextest run`, not `cargo test`. nextest runs tests from all binaries in parallel; `cargo test` runs the binaries one after another. The full suite takes ~20 s under nextest and ~35 s under `cargo test` (measured 2026-10-01). CI uses nextest too. nextest skips doctests; run them with `cargo test --doc --features test-fixtures`.
 
 `--features test-fixtures` gates `fake_llama_server` (`tests/fixtures/`), the `_test_sleep` IPC method, and `src/gguf/test_fixtures`. `--features uat` gates the maintainer-only `llamastash uat` subcommand, never shipped in release binaries. Two-space indent is enforced by `rustfmt.toml`; clippy denies `shadow_unrelated`, so rename rather than reuse a `let` binding in the same scope.
 
@@ -61,7 +64,7 @@ Inline `#[cfg(test)] mod tests` per file is the default; `tests/` for daemon-spa
 Every command's output lands in context. Don't pay twice for the same check.
 
 - **Git hooks run the gates.** pre-commit: `cargo fmt` + `make lint` + `make doc`. pre-push: the same plus `cargo nextest run` and doctests, with `test-fixtures`. Both skip when no Rust file changed. Don't run these by hand before a commit or push; read the hook output only when it fails.
-- **While coding, run the narrowest check:** `cargo check`, one test by name, or one `--test <name>` binary. Batch edits, then check once. No full `make test` after each edit; pre-push runs it.
+- **While coding, run the narrowest check:** `cargo check`, one test by name, or one `--test <name>` binary, through `cargo nextest run`. Batch edits, then check once. No full `make test` after each edit; pre-push runs it.
 - **Reviews start from CI.** `gh pr checks <n>` or `gh run list -c <sha>` for the head commit. Green: don't re-run fmt, clippy, or tests locally; review the diff. Red: `gh run view <id> --log-failed`, reproduce only that job. Pending: `gh pr checks <n> --watch`, don't race it locally.
 - **Filter output.** `2>&1 | tail -n 40` or `rg 'FAILED|panicked|^error'` on cargo runs; `gh ... --json <fields> --jq` instead of full dumps.
 - **Don't re-run a check whose inputs haven't changed** since it last passed.
