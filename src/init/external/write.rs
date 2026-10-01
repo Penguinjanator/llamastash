@@ -120,12 +120,16 @@ pub fn compute_raw_diff(
   ctx: &PatchContext,
   path: &Path,
 ) -> Result<Vec<DiffEntry>, PatchError> {
-  let body = patcher.raw_body(ctx).ok_or_else(|| {
-    PatchError::Serialise(format!(
-      "{}: Format::Raw patcher must implement raw_body()",
-      patcher.id()
-    ))
-  })?;
+  raw_plan(patcher, ctx, path).map(|(_, diff)| diff)
+}
+
+/// The body a [`Format::Raw`] patcher writes, and its diff against the
+/// file on disk. Reads the file once, so both see the same text.
+fn raw_plan(
+  patcher: &dyn ToolPatcher,
+  ctx: &PatchContext,
+  path: &Path,
+) -> Result<(String, Vec<DiffEntry>), PatchError> {
   let current = match std::fs::read_to_string(path) {
     Ok(s) => Some(s),
     Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -137,20 +141,29 @@ pub fn compute_raw_diff(
       })
     }
   };
+  let body = patcher
+    .raw_body_from(ctx, current.as_deref())
+    .ok_or_else(|| {
+      PatchError::Serialise(format!(
+        "{}: Format::Raw patcher must implement raw_body()",
+        patcher.id()
+      ))
+    })?;
   use crate::util::config_patch::DiffKind;
-  match current {
-    Some(ref s) if s == &body => Ok(Vec::new()),
-    Some(_) => Ok(vec![DiffEntry {
+  let diff = match current {
+    Some(ref s) if s == &body => Vec::new(),
+    Some(_) => vec![DiffEntry {
       path: file_label(path),
       kind: DiffKind::Changed,
       value_yaml: body.lines().count().to_string() + " line(s)",
-    }]),
-    None => Ok(vec![DiffEntry {
+    }],
+    None => vec![DiffEntry {
       path: file_label(path),
       kind: DiffKind::Added,
       value_yaml: body.lines().count().to_string() + " line(s)",
-    }]),
-  }
+    }],
+  };
+  Ok((body, diff))
 }
 
 fn file_label(path: &Path) -> String {
@@ -321,13 +334,7 @@ pub fn apply_raw(
   ctx: &PatchContext,
   path: &Path,
 ) -> Result<(Vec<DiffEntry>, u64), PatchError> {
-  let body = patcher.raw_body(ctx).ok_or_else(|| {
-    PatchError::Serialise(format!(
-      "{}: Format::Raw patcher must implement raw_body()",
-      patcher.id()
-    ))
-  })?;
-  let diff_rows = compute_raw_diff(patcher, ctx, path)?;
+  let (body, diff_rows) = raw_plan(patcher, ctx, path)?;
   let written = atomic_write_body(patcher, path, body.as_bytes())?;
   Ok((diff_rows, written))
 }

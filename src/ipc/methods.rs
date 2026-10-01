@@ -76,8 +76,22 @@ pub async fn dispatch_request(ctx: &MethodContext, req: Request) -> Response {
       )
     }
     "shutdown" => {
+      // The longest grace the teardown may take, so `daemon stop` waits for
+      // it instead of giving up while a slow engine is still stopping.
+      let grace = ctx
+        .supervisors
+        .snapshot()
+        .await
+        .iter()
+        .map(|(_, m)| m.min_stop_grace())
+        .max()
+        .unwrap_or_default()
+        .max(SHUTDOWN_STOP_GRACE);
       ctx.shutdown.trigger();
-      Response::ok(id, json!({"shutdown": "scheduled"}))
+      Response::ok(
+        id,
+        json!({"shutdown": "scheduled", "stop_grace_secs": grace.as_secs()}),
+      )
     }
     #[cfg(feature = "test-fixtures")]
     "_test_sleep" => {
@@ -294,9 +308,9 @@ async fn stop_external_handler(
   // probe polling for a launching model.
   async fn live_and_same(pid: u32, expected_start: u64) -> Option<bool> {
     tokio::task::spawn_blocking(move || {
-      use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
+      use sysinfo::{Pid, ProcessRefreshKind, System};
       let refresh = ProcessRefreshKind::everything();
-      let mut sys = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh));
+      let mut sys = System::new();
       sys.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
         true,
@@ -408,6 +422,9 @@ async fn stop_all_handler(
 /// The `join_all` keeps wall-clock equal to the slowest stop rather
 /// than the sum — the original sequential loop blew the default IPC
 /// client timeout for 2+ stuck launches.
+/// The grace daemon shutdown gives each child, before any backend floor.
+pub(crate) const SHUTDOWN_STOP_GRACE: Duration = Duration::from_secs(5);
+
 pub(crate) async fn stop_all_managed(
   ctx: &MethodContext,
   grace: Duration,
@@ -915,7 +932,11 @@ async fn last_params_list_handler(ctx: &MethodContext) -> Result<Value, ErrorObj
     .map(|entry| {
       json!({
         "id": &entry.id,
-        "model_path": entry.id.as_gguf().map(|g| &g.path),
+        // A backend identity has no file; the launch path names its row.
+        "model_path": entry
+          .id
+          .as_gguf()
+          .map_or(&entry.params.model_path, |g| &g.path),
         "params": entry.params.to_wire(),
       })
     })
@@ -939,6 +960,31 @@ mod tests {
 
   fn ctx() -> MethodContext {
     MethodContext::new(ShutdownToken::new())
+  }
+
+  /// A config-declared row keys its `last_params` by a backend identity, which
+  /// has no GGUF path. `model_path` was null for it, so the TUI dropped the
+  /// entry from its Recent section and from the launch picker's seed.
+  #[tokio::test]
+  async fn last_params_list_names_a_backend_identity_by_its_launch_path() {
+    use crate::backend::identity::{BackendModelId, ModelIdentity};
+    use crate::launch::mode::LaunchMode;
+    use crate::launch::params::LaunchParams;
+    let mut state = crate::daemon::state_store::DaemonState::default();
+    state.upsert_last_params(
+      ModelIdentity::Backend(BackendModelId {
+        backend: "enginex".to_string(),
+        name: "row".to_string(),
+      }),
+      LaunchParams::new(std::path::PathBuf::from("enginex://row"), LaunchMode::Chat),
+      "enginex".to_string(),
+    );
+    let ctx = ctx().with_state(crate::daemon::context::PersistedState::new(state, None));
+    let body = last_params_list_handler(&ctx).await.unwrap();
+    assert_eq!(
+      body["last_params"][0]["model_path"], "enginex://row",
+      "{body}"
+    );
   }
 
   #[tokio::test]

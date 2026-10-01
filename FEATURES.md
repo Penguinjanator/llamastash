@@ -72,9 +72,9 @@ A single binary plays TUI, CLI, and background daemon. The first client (TUI or 
 
 Run as many models as your hardware can hold. Each launch gets its own port, auto-allocated from a configurable inclusive range (default `41100..=41300`, override via [`daemon.port_range`](docs/usage.md#schema)). Every running model follows a `Launching → Loading → Ready → Stopping → Stopped` state machine with `/health` probing — you see when a model is actually serving versus still loading weights.
 
-### DeepSeek-V4 via the ds4 backend (experimental)
+### DeepSeek-V4 via ds4 as a generic server
 
-For antirez's DeepSeek-V4 Flash/PRO GGUFs, llamastash runs [`ds4-server`](https://github.com/antirez/ds4) (the purpose-built engine) instead of llama.cpp. It's **default-on when the `ds4-server` binary resolves** (`ds4.binary` or `PATH`); force it with `[ds4]` config, `--ds4`, or `LLAMASTASH_DS4=1`. A compatible GGUF auto-routes to ds4 for chat/completions and **falls back to llama.cpp otherwise — never a refusal** (a current llama.cpp, **b9840+**, runs `deepseek4` too; older builds fail the load with `unknown model architecture: 'deepseek4'`). `--backend ds4` / `--backend llamacpp` override either way; embedding/rerank always route to llama.cpp. Six ds4-native launch knobs (`power`, `tokens`, `threads`, `kv_disk_dir`, `kv_disk_space_mb`, `ssd_streaming`) surface in the TUI and as `start` flags, and when a model won't fit RAM the launcher auto-enables SSD streaming so it loads from disk instead of OOM-killing mid-load. The TUI badges ds4-routed rows and `doctor` flags a compatible-but-unavailable model. See [`docs/usage.md` § ds4 backend](docs/usage.md#ds4-backend).
+antirez's [`ds4-server`](https://github.com/antirez/ds4) runs the DeepSeek-V4 Flash/PRO GGUFs as a `backend.generic` entry. Its flags (`--ctx`, `--power`, `--kv-disk-dir`, `--ssd-streaming`, `--mtp`, `--dspark`, and the rest) are declared as knobs, so they show in the TUI launch editor and presets, and a preset pins the `generic-ds4` server and the MTP or DSpark head file. llama.cpp (**b9840+**) runs these GGUFs too and is the default server. See [`docs/usage.md` § Running ds4 as a generic server](docs/usage.md#running-ds4-as-a-generic-server).
 
 ### GPU-aware built-in arch defaults
 
@@ -169,7 +169,7 @@ The wizard's recommender without the install / download / config-write steps. Up
 
 ### `llamastash integrations` — point your AI tools at the proxy
 
-Patches the config of each tool you pick — OpenCode, Aider, Continue.dev, Zed, pi.dev — with the proxy URL and every model you have favorited, and writes the sourceable `env.sh` / `claude-code.sh` snippets. `llamastash integrations pi` for one tool, bare for an interactive multiselect. Merges preserve your own keys, API keys are written as env references rather than literals, and each model is named the way `/v1/models` publishes it, so a GGUF file and a safetensors repo both resolve. Same step `init` runs, without the wizard. See [`docs/usage.md` § `llamastash integrations`](docs/usage.md#llamastash-integrations-tools).
+Patches the config of each tool you pick — OpenCode, Aider, Continue.dev, Zed, pi.dev, Codex CLI — with the proxy URL and every model you have favorited, and writes the sourceable `env.sh` / `claude-code.sh` snippets. For reasoning models whose chat template lists effort levels (Qwen3.8: `low`, `medium`, `xhigh`), pi, OpenCode and Zed get their effort pickers wired to those levels. Codex gets its own `codex --profile llamastash` file, so your `config.toml` is untouched. `llamastash integrations pi` for one tool, bare for an interactive multiselect. Merges preserve your own keys, API keys are written as env references rather than literals, and each model is named the way `/v1/models` publishes it, so a GGUF file and a safetensors repo both resolve. Same step `init` runs, without the wizard. See [`docs/usage.md` § `llamastash integrations`](docs/usage.md#llamastash-integrations-tools).
 
 ### Reproducible pulls via `--revision <SHA>`
 
@@ -239,7 +239,7 @@ llama.cpp is the direct, zero-overhead default backend. For engines llama.cpp ca
 
 Lemonade is a *managed-multiplexer* — one long-lived umbrella process serving many models behind an OpenAI-compatible API. LlamaStash:
 
-- **finds** `lemond` (explicit `lemonade.binary` or `PATH`) and **supervises** the shared umbrella — it never downloads or installs it;
+- **finds** `lemond` (`backend.lemonade.servers` or `PATH`) and **supervises** the shared umbrella — it never downloads or installs it;
 - **discovers** the umbrella's models from `/api/v1/models` and tags them with the `lemonade` backend (list-only);
 - **routes** inference for a Lemonade model through the loopback proxy to the umbrella (`/api/v1/...`);
 - **evicts** idle Lemonade models by API unload (the umbrella stays up and autoloads on the next request), never SIGTERM.

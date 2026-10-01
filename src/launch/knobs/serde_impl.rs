@@ -294,7 +294,7 @@ mod tests {
   fn a_legacy_entry_folds_flat_native_and_sibling_keys_into_one_map() {
     let entry: BTreeMap<String, yaml_serde::Value> = yaml_serde::from_str(
       "ctx: 4096\nflash_attn: true\nmode: embedding\nmtp: off\n\
-       extras:\n  - --rope-freq-base\nbackend_knobs:\n  ssd_streaming: \"false\"\n",
+       extras:\n  - --rope-freq-base\nbackend_knobs:\n  enforce_eager: \"false\"\n",
     )
     .unwrap();
     let set = fold_legacy_entry(&entry, &["extras", "backend", "server", "default"]);
@@ -303,7 +303,7 @@ mod tests {
     assert_eq!(set.str(id("mode")), Some("embedding"), "mode is a knob now");
     assert_eq!(set.bool(id("mtp")), Some(false), "off parses as a bool");
     assert_eq!(
-      set.bool(id("ssd-streaming")),
+      set.bool(id("enforce-eager")),
       Some(false),
       "native knobs come up out of backend_knobs"
     );

@@ -131,8 +131,8 @@ pub fn materialize_preset(name: &str, body: &PresetBody, model_path: PathBuf) ->
     .as_deref()
     .map(crate::launch::params::BackendChoice::from_id)
     .unwrap_or_default();
-  let backend_id = backend
-    .explicit_id()
+  let backend_id = crate::backend::runtime_knob_scope(&model_path, body.server.as_deref())
+    .or(backend.explicit_id())
     .unwrap_or(crate::backend::DEFAULT_BACKEND_ID);
 
   let mode = knobs
@@ -298,6 +298,15 @@ impl EffectivePresets {
       _ => None,
     }
   }
+  /// The preset a `<model>@<name>` address names. Compared with `name_matches`
+  /// because the address half is case-insensitive: `@Coder` and `@coder` are
+  /// one launch, so they must not resolve different presets.
+  pub fn named(&self, name: &str) -> Option<&NamedPreset> {
+    self
+      .presets
+      .iter()
+      .find(|p| crate::launch::resolve::name_matches(Some(&p.name), name))
+  }
 }
 
 /// Resolve a model's effective preset set from the config store: the union
@@ -402,11 +411,15 @@ mod tests {
   /// the preset launched at the engine default instead of the size asked for.
   #[test]
   fn a_preset_context_window_survives_whichever_key_it_lands_under() {
+    let other = crate::test_support::backend_declaring("max-model-len");
     for (backend_id, yaml) in [
-      ("ds4", "knobs:\n  ctx: 8192\nbackend: ds4\n"),
-      ("llamacpp", "knobs:\n  ctx: 8192\nbackend: llamacpp\n"),
+      (other, format!("knobs:\n  ctx: 8192\nbackend: {other}\n")),
+      (
+        "llamacpp",
+        "knobs:\n  ctx: 8192\nbackend: llamacpp\n".to_string(),
+      ),
     ] {
-      let body: crate::config::PresetBody = yaml_serde::from_str(yaml).expect("parse");
+      let body: crate::config::PresetBody = yaml_serde::from_str(&yaml).expect("parse");
       let np = materialize_preset("p", &body, PathBuf::from("/m/x.gguf"));
       assert_eq!(
         np.params.ctx,

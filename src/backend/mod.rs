@@ -43,7 +43,7 @@
 //! file-less backend-registry model rides the same persisted maps as GGUF
 //! rows — reusable by any future backend.
 
-pub mod ds4;
+pub mod generic;
 pub mod identity;
 pub mod lemonade;
 pub mod llama_cpp;
@@ -63,13 +63,18 @@ pub use server::{
 /// this instead of the literal, so they name no specific backend.
 pub const DEFAULT_BACKEND_ID: &str = "llamacpp";
 
+/// `LaunchParams::launch_config` key a backend sets when its server accepts only
+/// one `model` value in a request body. The proxy writes that value into every
+/// body it forwards to the launch.
+pub const REQUEST_MODEL_KEY: &str = "request_model";
+
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::backend::ds4::Ds4Backend;
+use crate::backend::generic::GenericBackend;
 use crate::backend::identity::ModelIdentity;
 use crate::backend::lemonade::LemonadeBackend;
 use crate::backend::llama_cpp::LlamaCppBackend;
@@ -127,11 +132,11 @@ pub enum Readiness {
   /// the probe waiting until its timeout — matching today's behavior.
   HttpPoll { path: String, ready_status: u16 },
   /// Poll `path` until it returns `ready_status` **and** the JSON body
-  /// advertises a model id in `expect_model_ids`. ds4 needs this because it
-  /// leaves its reserved port *unbound* for the entire multi-minute load, so
-  /// a status-only 200 could come from any process that grabbed the port
-  /// meanwhile — matching the advertised alias confirms the real backend
-  /// bound. Falls back to the timeout if the id never matches.
+  /// advertises a model id in `expect_model_ids`. For a server that leaves its
+  /// reserved port *unbound* for a long load, where a status-only 200 could
+  /// come from any process that grabbed the port meanwhile — matching the
+  /// advertised id confirms the real server bound. Falls back to the timeout
+  /// if the id never matches.
   HttpPollModelId {
     path: String,
     ready_status: u16,
@@ -142,8 +147,7 @@ pub enum Readiness {
 /// The HF-credential subset stripped from a backend child's environment.
 /// `HF_*` are llamastash's own pull tokens/config, which a launched inference
 /// server has no reason to see — stripping them keeps the credential blast
-/// radius small. This is the whole strip set ds4 needs (it reads no env
-/// config); llama.cpp's [`crate::backend::llama_cpp::LLAMA_ENV_STRIP`] carries
+/// radius small. llama.cpp's [`crate::backend::llama_cpp::LLAMA_ENV_STRIP`] carries
 /// the same four vars plus its `LLAMA_ARG_*` argv-override guards.
 pub const CREDENTIAL_ENV_STRIP: &[&str] = &[
   "HF_TOKEN",
@@ -173,6 +177,12 @@ pub struct ProcessLaunchSpec {
   pub readiness: Readiness,
   /// Probe budget (the caller has already applied `scale_for_model`).
   pub probe: ProbeOptions,
+  /// Environment variables to set on the child, applied after `env_remove`.
+  pub env: Vec<(String, OsString)>,
+  /// The shortest SIGTERM-to-SIGKILL grace any stop path may use for this
+  /// child. A GPU server killed mid-kernel can hang the device, so a slow
+  /// stopper declares its own floor and no caller's shorter grace undercuts it.
+  pub min_stop_grace: std::time::Duration,
 }
 
 /// The result of translating the resolved knob IR into "how to start
@@ -331,7 +341,7 @@ pub trait Backend {
   /// Network-affecting flag heads this backend refuses in `extras` /
   /// native-knob values **on top of** the base loopback/credential denylist
   /// ([`crate::launch::params::FORBIDDEN_ADVANCED_PREFIXES`]). Default empty:
-  /// llama.cpp and Lemonade add nothing. ds4 adds `--cors` / `--dist-`.
+  /// llama.cpp and Lemonade add nothing.
   fn forbidden_extra_heads(&self) -> &'static [&'static str] {
     &[]
   }
@@ -343,6 +353,29 @@ pub trait Backend {
   /// auto-pins them.
   fn serves_web_ui(&self) -> bool {
     false
+  }
+
+  /// Rewrite a forwarded request body for `endpoint` (the client-facing path,
+  /// e.g. `/v1/messages`) before it reaches the engine, or `None` to forward
+  /// `body` unchanged.
+  ///
+  /// Default `None`. A client sends a field the engine's own translator drops,
+  /// and only the engine knows the spelling it does read — so the remap lives
+  /// with the backend instead of naming an engine or a client in the generic
+  /// proxy. Callers must treat the body as opaque bytes; a rewrite that leaves
+  /// bytes untouched is a bug the client sees as a corrupt request.
+  ///
+  /// Whatever a rewrite does has to be switchable off: it overrides what the
+  /// launch itself configured, and a user who wants the engine's own default
+  /// needs a way back. Read the setting from `ctx` (see
+  /// [`crate::daemon::context::MethodContext::backend`]).
+  fn rewrite_request_body(
+    &self,
+    _ctx: &MethodContext,
+    _endpoint: &str,
+    _body: &[u8],
+  ) -> Option<Vec<u8>> {
+    None
   }
 
   /// Seed daemon-config-derived launch knobs into `params.backend_knobs`, fresh
@@ -417,8 +450,8 @@ pub trait Backend {
   /// The model ids a backend's `/v1/models` may advertise for one of its
   /// launches — the adoption/readiness id contract (D-adopt / D-ready).
   /// Empty (the default) means "match by the recorded file path/basename"
-  /// (llama.cpp's rule, applied by the orphan sweep). ds4 returns its fixed
-  /// alias set, since it never echoes the path.
+  /// (llama.cpp's rule, applied by the orphan sweep). A server that reports a
+  /// fixed alias instead of the path returns that alias set.
   fn adoption_model_ids(&self) -> &'static [&'static str] {
     &[]
   }
@@ -429,10 +462,9 @@ pub trait Backend {
   ///
   /// Default (llama.cpp): the `/v1/models` id matches the recorded path or its
   /// basename (`crate::daemon::orphans::models_endpoint_matches`); `argv` is
-  /// unused. ds4 overrides — it echoes a fixed alias, never the path, so it
-  /// cross-checks `argv`'s `-m` against `recorded_path` **and** confirms the
-  /// endpoint advertises a ds4 alias. Names no backend at the call site; the
-  /// sweep resolves the recorded backend tag and calls this.
+  /// unused. A server that reports a fixed alias instead of the path overrides
+  /// this to cross-check `argv` against `recorded_path`. Names no backend at
+  /// the call site; the sweep resolves the recorded backend tag and calls this.
   async fn adoption_matches(
     &self,
     recorded_path: &Path,
@@ -444,7 +476,8 @@ pub trait Backend {
   }
 
   /// Whether this backend **auto-claims** `header` beyond the default identity
-  /// rule — the header-level routing predicate (ds4's arch + quant contract).
+  /// rule — a header-level routing predicate (for example an arch plus a quant
+  /// contract).
   ///
   /// Default `false`: llama.cpp (runs every GGUF) and a registry backend
   /// (Lemonade) claim nothing *specially* here. Discovery records the first
@@ -452,10 +485,11 @@ pub trait Backend {
   /// badge / launch routing read that — so a new special-routing backend needs
   /// only override this, with no discovery edit.
   /// Config-only enablement, for boot decisions taken before the full
-  /// [`MethodContext`] exists (the discovery task is spawned first). Same
-  /// predicate as [`Backend::available`], reading only what `DaemonOptions`
-  /// already has. Default `false` — a backend opts in alongside
-  /// [`Backend::projects_hf_repos`].
+  /// [`MethodContext`] exists (the discovery task is spawned first, and the
+  /// `daemon start` precheck runs before any daemon). Same predicate as
+  /// [`Backend::available`], reading only what `DaemonOptions` already has.
+  /// Default `false`; a backend that can be enabled and has a binary to check
+  /// overrides it.
   fn enabled_in_config(
     &self,
     _config: &BackendConfig,
@@ -491,12 +525,12 @@ pub trait Backend {
     false
   }
 
-  /// Whether this backend serves `mode`. Default `true` — serves chat /
-  /// embedding / rerank alike. A backend that serves only some modes overrides
-  /// this; an `Auto` launch in an unserved mode falls back to the identity
-  /// default (so e.g. embeddings route to the generic backend), a routing
-  /// input, not an error.
-  fn serves_mode(&self, _mode: LaunchMode) -> bool {
+  /// Whether a launch of `path` on `server` serves `mode`. Default `true` —
+  /// serves chat / embedding / rerank alike. A backend that serves only some
+  /// modes overrides this; an `Auto` launch in an unserved mode falls back to
+  /// the identity default, a routing input, not an error. The proxy refuses an
+  /// embeddings or rerank request bound for a launch that does not serve it.
+  fn serves_mode(&self, _path: &Path, _server: Option<&str>, _mode: LaunchMode) -> bool {
     true
   }
 
@@ -545,7 +579,7 @@ pub trait Backend {
 
   /// Probe one server binary for the GPU **devices** it can target (the exact
   /// `--device` selectors it accepts). Default empty — a backend with no
-  /// device-selection surface (ds4 / lemonade). llama.cpp overrides with its
+  /// device-selection surface (Lemonade). llama.cpp overrides with its
   /// `--list-devices` probe.
   fn probe_devices(&self, _binary: &Path) -> Vec<Device> {
     Vec::new()
@@ -575,7 +609,7 @@ pub trait Backend {
   /// Default-ordering weight among the servers a model supports (higher first).
   /// Orders both the launch **server** knob and `supported_backends`, and picks
   /// the no-selection default. Default `0`; a purpose-built backend that should
-  /// win the auto-route (ds4 over llama.cpp) returns a higher value.
+  /// win the auto-route over llama.cpp returns a higher value.
   fn launch_priority(&self) -> i32 {
     0
   }
@@ -592,10 +626,12 @@ pub trait Backend {
   fn resolve_launch_binary(
     &self,
     _ctx: &MethodContext,
-    default_binary: PathBuf,
+    default_binary: Option<PathBuf>,
     port: u16,
   ) -> Result<(PathBuf, u16), String> {
-    Ok((default_binary, port))
+    default_binary
+      .map(|b| (b, port))
+      .ok_or_else(|| format!("no `{}` server binary found", self.id()))
   }
 
   /// Resolve this backend's **Auto** native knobs for a launch given live host
@@ -650,6 +686,16 @@ pub trait Backend {
     false
   }
 
+  /// Whether this launch keeps its weights and cache in GPU allocations only,
+  /// with nothing placed on the CPU. `layer_count` is the model's block count
+  /// when the caller has a header. Feeds
+  /// [`crate::launch::admission::gtt_only_budget`]: CPU-side memory counts
+  /// against a container's RAM limit, GPU allocations do not. Default `false`
+  /// keeps the RAM check.
+  fn gpu_resident(&self, _params: &LaunchParams, _layer_count: Option<u64>) -> bool {
+    false
+  }
+
   /// Whether the backend's executable is present on this host (the `status`
   /// `installed` signal), independent of the enablement toggle. Default
   /// [`Self::available`]; a backend with a separate enablement config overrides
@@ -693,8 +739,8 @@ pub trait Backend {
   /// [`Config`](crate::config::Config). Default: none. `doctor` collects across
   /// [`Backends::all`] so its check flow names no backend; each finding carries
   /// a stable string id (kept additive, so `schema_version` never bumps for a
-  /// new backend). A backend with host-specific diagnostics (ds4's "compatible
-  /// model present but the engine is unavailable") overrides this and builds its
+  /// new backend). A backend with host-specific diagnostics ("compatible model
+  /// present but the engine is unavailable") overrides this and builds its
   /// findings via [`Finding::from_parts`](crate::init::doctor::Finding::from_parts).
   /// `config`-only (not `ctx`) because `doctor` runs CLI-side with no
   /// [`MethodContext`]; a backend reads its own sub-config + does its own scan.
@@ -755,6 +801,57 @@ pub trait Backend {
     None
   }
 
+  /// Install whatever this backend declares in `config.yaml` beyond plain
+  /// settings (runtime knob tables), before anything that parses knobs —
+  /// presets, `last_params` — reads them. `Err` is a config-load refusal.
+  /// Default: nothing to install.
+  fn install_config(&self, _config: &BackendConfig) -> Result<(), String> {
+    Ok(())
+  }
+
+  /// The knob scope a launch of `path` on `server` resolves knobs under, when
+  /// this backend declares its knobs per model or server at runtime rather than
+  /// in [`Backend::knobs`]. `None` (the default) means the backend id itself.
+  fn knob_scope(&self, _path: &Path, _server: Option<&str>) -> Option<&'static str> {
+    None
+  }
+
+  /// Knob values configured for `path` on `server` that apply when no layer
+  /// sets one. They resolve below every real layer and are never persisted.
+  /// Default: none.
+  fn config_default_knobs(
+    &self,
+    _path: &Path,
+    _server: Option<&str>,
+  ) -> crate::launch::knobs::KnobSet {
+    crate::launch::knobs::KnobSet::new()
+  }
+
+  /// Whether this backend can run the catalog model at `path` by config, on
+  /// top of header routing. Discovery appends the backend to such a row's
+  /// `supported_backends`, after the auto default. Default `false`.
+  fn serves_path(&self, _path: &Path) -> bool {
+    false
+  }
+
+  /// Whether this backend's server `server_id` runs the model at `path`, for
+  /// scoping a row's server choices. Default `true`: a backend's servers are
+  /// interchangeable builds.
+  fn server_serves(&self, _server_id: &str, _path: &Path) -> bool {
+    true
+  }
+
+  /// File-less catalog rows this backend contributes on each rescan, from its
+  /// config or its own API. Default: none. Keeps the discovery task free of
+  /// backend names; it calls this for every backend.
+  async fn config_catalog_rows(
+    &self,
+    _config: &BackendConfig,
+    _force: &std::collections::BTreeMap<String, bool>,
+  ) -> Vec<crate::discovery::DiscoveredModel> {
+    Vec::new()
+  }
+
   /// Every basename this backend's server binary can carry — the names the
   /// `$PATH` locator searches for and the orphan sweep recognises an
   /// *unmanaged* instance by. The **first** entry is the primary marker (the
@@ -795,21 +892,6 @@ pub trait Backend {
         .process_markers()
         .iter()
         .any(|m| basename_matches_marker(&name, m))
-  }
-
-  /// A backend-specific KV-cache byte model for `header`, or `None` to use the
-  /// generic GQA/MLA estimate.
-  ///
-  /// Keyed on the **header** (arch + shape), not on which backend actually runs
-  /// the model: KV geometry is a property of the weights, so
-  /// [`crate::gguf::memory::kv_bytes`] consults every backend's override and a
-  /// `deepseek4` GGUF gets ds4's compressed-cache figure even when it falls
-  /// back to llama.cpp. Default `None` — llama.cpp / Lemonade use the generic
-  /// path. `arch` is the resolved `general.architecture` the estimator keys on
-  /// (passed alongside the header so the gate matches the pre-seam behavior
-  /// exactly, independent of what the header's own arch key says).
-  fn kv_bytes(&self, _header: &GgufHeader, _arch: Option<&str>, _ctx_len: u64) -> Option<u64> {
-    None
   }
 
   /// The accelerator classes this backend can run models on.
@@ -922,9 +1004,9 @@ pub trait Backend {
 pub struct BackendConfig {
   pub llamacpp: crate::backend::llama_cpp::LlamaCppConfig,
   pub lemonade: crate::backend::lemonade::LemonadeConfig,
-  pub ds4: crate::backend::ds4::Ds4Config,
   pub vllm: crate::backend::vllm::VllmConfig,
   pub sglang: crate::backend::sglang::SglangConfig,
+  pub generic: crate::backend::generic::GenericConfig,
 }
 
 /// Zero-cost, exhaustive dispatch over the available backends.
@@ -939,12 +1021,12 @@ pub enum Backends {
   LlamaCpp(LlamaCppBackend),
   /// Lemonade (`lemond`) managed-multiplexer — one umbrella, many models.
   Lemonade(LemonadeBackend),
-  /// ds4 (DwarfStar) — direct process-per-model for DeepSeek V4 GGUFs.
-  Ds4(Ds4Backend),
   /// vLLM — direct process-per-model for safetensors HF repos.
   Vllm(VllmBackend),
   /// SGLang — direct process-per-model for safetensors HF repos.
   Sglang(SglangBackend),
+  /// Any OpenAI-compatible server declared in `config.yaml`.
+  Generic(GenericBackend),
 }
 
 /// Forward a [`Backend`] call to whichever [`Backends`] variant is active.
@@ -960,9 +1042,9 @@ macro_rules! for_each_backend {
     match $self {
       Backends::LlamaCpp($b) => $body,
       Backends::Lemonade($b) => $body,
-      Backends::Ds4($b) => $body,
       Backends::Vllm($b) => $body,
       Backends::Sglang($b) => $body,
+      Backends::Generic($b) => $body,
     }
   };
 }
@@ -979,10 +1061,16 @@ impl Backends {
     vec![
       Backends::LlamaCpp(LlamaCppBackend::new()),
       Backends::Lemonade(LemonadeBackend::new()),
-      Backends::Ds4(Ds4Backend::new()),
       Backends::Vllm(VllmBackend::new()),
       Backends::Sglang(SglangBackend::new()),
+      Backends::Generic(GenericBackend::new()),
     ]
+  }
+
+  /// The backend whose [`Backend::id`] is `id`, or `None` for an unknown id.
+  /// For a recorded id string (a launch's `resolved_backend`, a status row).
+  pub fn from_id(id: &str) -> Option<Backends> {
+    Self::all().into_iter().find(|b| b.id() == id)
   }
 }
 
@@ -1001,8 +1089,7 @@ pub fn routed_backend_for(header: &GgufHeader) -> Option<String> {
 /// Every backend that can serve a disk GGUF with `header`, **priority-ordered**
 /// (highest [`Backend::launch_priority`] first, ties broken by registration
 /// order). The first entry is the auto-route default. A backend is included when
-/// it `auto_routes` the header (special routing, e.g. ds4 for a compatible
-/// DeepSeek-V4) **or** it is the identity-default backend for a plain GGUF
+/// it `auto_routes` the header (special routing) **or** it is the identity-default backend for a plain GGUF
 /// ([`DEFAULT_BACKEND_ID`], always able to run a local file). Discovery records
 /// this per model; the `list` badge / right-pane badges show all of them, and
 /// launch routing prefers the first available one. Names no backend beyond the
@@ -1012,7 +1099,7 @@ pub fn supported_backends_for(header: &GgufHeader) -> Vec<String> {
     .into_iter()
     .filter(|b| b.auto_routes(header) || b.id() == DEFAULT_BACKEND_ID)
     .collect();
-  // Stable sort by priority descending — ds4 (20) before llamacpp (10).
+  // Stable sort by priority descending.
   backends.sort_by_key(|b| std::cmp::Reverse(b.launch_priority()));
   backends.into_iter().map(|b| b.id().to_string()).collect()
 }
@@ -1036,6 +1123,15 @@ impl Backend for Backends {
 
   fn serves_web_ui(&self) -> bool {
     for_each_backend!(self, b => b.serves_web_ui())
+  }
+
+  fn rewrite_request_body(
+    &self,
+    ctx: &MethodContext,
+    endpoint: &str,
+    body: &[u8],
+  ) -> Option<Vec<u8>> {
+    for_each_backend!(self, b => b.rewrite_request_body(ctx, endpoint, body))
   }
 
   fn seed_launch_knobs(&self, ctx: &MethodContext, params: &mut LaunchParams) {
@@ -1088,10 +1184,6 @@ impl Backend for Backends {
     for_each_backend!(self, b => b.adoption_matches(recorded_path, argv, port, probe_timeout).await)
   }
 
-  fn kv_bytes(&self, header: &GgufHeader, arch: Option<&str>, ctx_len: u64) -> Option<u64> {
-    for_each_backend!(self, b => b.kv_bytes(header, arch, ctx_len))
-  }
-
   fn auto_routes(&self, header: &GgufHeader) -> bool {
     for_each_backend!(self, b => b.auto_routes(header))
   }
@@ -1115,8 +1207,8 @@ impl Backend for Backends {
     for_each_backend!(self, b => b.project_hf_repos(candidates))
   }
 
-  fn serves_mode(&self, mode: LaunchMode) -> bool {
-    for_each_backend!(self, b => b.serves_mode(mode))
+  fn serves_mode(&self, path: &Path, server: Option<&str>, mode: LaunchMode) -> bool {
+    for_each_backend!(self, b => b.serves_mode(path, server, mode))
   }
 
   fn refuses(&self, arch: Option<&str>, path: &Path) -> Option<String> {
@@ -1154,7 +1246,7 @@ impl Backend for Backends {
   fn resolve_launch_binary(
     &self,
     ctx: &MethodContext,
-    default_binary: PathBuf,
+    default_binary: Option<PathBuf>,
     port: u16,
   ) -> Result<(PathBuf, u16), String> {
     for_each_backend!(self, b => b.resolve_launch_binary(ctx, default_binary, port))
@@ -1171,6 +1263,10 @@ impl Backend for Backends {
 
   fn bypasses_admission(&self, params: &LaunchParams) -> bool {
     for_each_backend!(self, b => b.bypasses_admission(params))
+  }
+
+  fn gpu_resident(&self, params: &LaunchParams, layer_count: Option<u64>) -> bool {
+    for_each_backend!(self, b => b.gpu_resident(params, layer_count))
   }
 
   fn projected_cache_bytes(
@@ -1229,6 +1325,38 @@ impl Backend for Backends {
     for_each_backend!(self, b => b.synthetic_identity(path))
   }
 
+  fn install_config(&self, config: &BackendConfig) -> Result<(), String> {
+    for_each_backend!(self, b => b.install_config(config))
+  }
+
+  fn knob_scope(&self, path: &Path, server: Option<&str>) -> Option<&'static str> {
+    for_each_backend!(self, b => b.knob_scope(path, server))
+  }
+
+  fn config_default_knobs(
+    &self,
+    path: &Path,
+    server: Option<&str>,
+  ) -> crate::launch::knobs::KnobSet {
+    for_each_backend!(self, b => b.config_default_knobs(path, server))
+  }
+
+  fn serves_path(&self, path: &Path) -> bool {
+    for_each_backend!(self, b => b.serves_path(path))
+  }
+
+  fn server_serves(&self, server_id: &str, path: &Path) -> bool {
+    for_each_backend!(self, b => b.server_serves(server_id, path))
+  }
+
+  async fn config_catalog_rows(
+    &self,
+    config: &BackendConfig,
+    force: &std::collections::BTreeMap<String, bool>,
+  ) -> Vec<crate::discovery::DiscoveredModel> {
+    for_each_backend!(self, b => b.config_catalog_rows(config, force).await)
+  }
+
   fn process_markers(&self) -> &'static [&'static str] {
     for_each_backend!(self, b => b.process_markers())
   }
@@ -1277,6 +1405,69 @@ impl Backend for Backends {
   }
 }
 
+/// Install every backend's config-declared runtime state (see
+/// [`Backend::install_config`]). Run at config load, before presets parse.
+pub fn install_backend_config(config: &BackendConfig) -> Result<(), String> {
+  Backends::all()
+    .iter()
+    .try_for_each(|b| b.install_config(config))
+}
+
+/// The knob scope a launch of `path` on `backend` resolves under: the
+/// backend's runtime scope for that model, else the backend id. Every knob
+/// lookup that knows the model passes this instead of the bare id.
+pub fn knob_scope_for(backend: &Backends, path: &Path, server: Option<&str>) -> &'static str {
+  backend
+    .knob_scope(path, server)
+    .unwrap_or_else(|| backend.id())
+}
+
+/// [`knob_scope_for`] from a backend id, for surfaces that hold the id rather
+/// than a [`Backends`]. An unknown id scopes to the default backend.
+pub fn knob_scope_by_id(backend_id: &str, path: &Path, server: Option<&str>) -> &'static str {
+  let backend = Backends::from_id(backend_id).unwrap_or_else(default_backend);
+  knob_scope_for(&backend, path, server)
+}
+
+/// The runtime knob scope for `path` on `server`, when some backend declares
+/// one. For code that has the model and server but not the backend (a preset
+/// body). A model with no server pick has none: its default backend runs it.
+pub fn runtime_knob_scope(path: &Path, server: Option<&str>) -> Option<&'static str> {
+  let backends = Backends::all();
+  match server {
+    Some(_) => backends.iter().find_map(|b| b.knob_scope(path, server)),
+    None => backends
+      .iter()
+      .find(|b| b.synthetic_identity(path).is_some())
+      .and_then(|b| b.knob_scope(path, None)),
+  }
+}
+
+/// The context window config sets for a launch of `path` on `server` when no
+/// preset or flag sets one, e.g. a server entry's `ctx: true` knob `default:`.
+/// Picks the backend the way [`runtime_knob_scope`] does.
+pub fn config_default_ctx(path: &Path, server: Option<&str>) -> Option<u32> {
+  let backends = Backends::all();
+  let backend = match server {
+    Some(_) => backends
+      .iter()
+      .find(|b| b.knob_scope(path, server).is_some()),
+    None => backends
+      .iter()
+      .find(|b| b.synthetic_identity(path).is_some()),
+  }?;
+  let scope = backend.knob_scope(path, server)?;
+  backend
+    .config_default_knobs(path, server)
+    .u32_by_concept(scope, crate::launch::knobs::def::Concept::ContextLength)
+}
+
+/// Whether config itself declares models to list, so a daemon with
+/// scanning off still has a catalog.
+pub fn config_declares_models(config: &BackendConfig) -> bool {
+  config.generic.declares_rows()
+}
+
 /// Map a model's [`ModelIdentity`] to the backend that runs it.
 ///
 /// The identity-keyed rule (the **auto** half of R17): a GGUF identity binds to
@@ -1287,10 +1478,9 @@ impl Backend for Backends {
 pub fn backend_for_identity(identity: &ModelIdentity) -> Backends {
   match identity {
     ModelIdentity::Gguf(_) => Backends::LlamaCpp(LlamaCppBackend::new()),
-    ModelIdentity::Backend(id) => Backends::all()
-      .into_iter()
-      .find(|b| b.id() == id.backend)
-      .unwrap_or_else(|| Backends::LlamaCpp(LlamaCppBackend::new())),
+    ModelIdentity::Backend(id) => {
+      Backends::from_id(&id.backend).unwrap_or_else(|| Backends::LlamaCpp(LlamaCppBackend::new()))
+    }
   }
 }
 
@@ -1304,10 +1494,9 @@ pub fn resolve_backend(identity: &ModelIdentity, choice: BackendChoice) -> Backe
     BackendChoice::Auto => backend_for_identity(identity),
     // Force the named backend from the registry; an unknown id (shouldn't reach
     // here — the CLI/IPC boundary validates) falls back to the identity rule.
-    BackendChoice::Explicit(id) => Backends::all()
-      .into_iter()
-      .find(|b| b.id() == id)
-      .unwrap_or_else(|| backend_for_identity(identity)),
+    BackendChoice::Explicit(id) => {
+      Backends::from_id(&id).unwrap_or_else(|| backend_for_identity(identity))
+    }
   }
 }
 
@@ -1580,7 +1769,7 @@ pub fn resolve_identity_for_path(
 /// only.
 ///
 /// A bare `contains` was safe while every marker was a long compound basename
-/// (`llama-server`, `ds4-server`), where a `-cuda` / `-vulkan` build suffix is
+/// (`llama-server`, `lemond`), where a `-cuda` / `-vulkan` build suffix is
 /// certainly the same program and `comm`'s 15-char cap can truncate it. It
 /// stops being safe once a backend registers a short single-token marker: a
 /// four-character token is a substring of unrelated tools on the host, and
@@ -1642,9 +1831,7 @@ pub fn is_managed_multiplexer(id: &str) -> bool {
 /// re-adopted process's real argv when the OS still has it, and reaches for this
 /// only once the process is gone or unreadable.
 pub fn adopted_process_name(backend_id: &str) -> &'static str {
-  Backends::all()
-    .iter()
-    .find(|b| b.id() == backend_id)
+  Backends::from_id(backend_id)
     .and_then(|b| b.process_markers().first().copied())
     // Unknown / marker-less id falls back to the default backend's own marker.
     .or_else(|| default_backend().process_markers().first().copied())
@@ -1663,6 +1850,8 @@ pub fn adopted_process_name(backend_id: &str) -> &'static str {
 /// routing backend needs only its trait overrides.
 pub fn resolve_backend_for_launch(
   identity: &ModelIdentity,
+  path: &Path,
+  server: Option<&str>,
   choice: BackendChoice,
   supported_backends: &[String],
   mode: LaunchMode,
@@ -1671,11 +1860,11 @@ pub fn resolve_backend_for_launch(
   match choice {
     BackendChoice::Auto => {
       // Walk the priority-ordered supported list; take the first backend that
-      // is available and serves this mode (so a compatible ds4 model falls back
-      // to llama.cpp when ds4 is absent, or on an embedding/rerank launch).
+      // is available and serves this mode (so a model falls back to llama.cpp
+      // when its preferred engine is absent, or on an embedding/rerank launch).
       for id in supported_backends {
-        if let Some(b) = Backends::all().into_iter().find(|b| b.id() == id.as_str()) {
-          if b.available(ctx) && b.serves_mode(mode) {
+        if let Some(b) = Backends::from_id(id) {
+          if b.available(ctx) && b.serves_mode(path, server, mode) {
             return b;
           }
         }
@@ -1754,6 +1943,8 @@ mod tests {
       binary: PathBuf::from("/usr/bin/llama-server"),
       argv: vec![OsString::from("--port"), OsString::from("41100")],
       env_remove: vec!["LLAMA_ARG_HOST"],
+      env: Vec::new(),
+      min_stop_grace: std::time::Duration::ZERO,
       readiness: Readiness::HttpPoll {
         path: "/health".to_string(),
         ready_status: 200,
@@ -1910,6 +2101,8 @@ mod tests {
         OsString::from("13305"),
       ],
       env_remove: vec![],
+      env: Vec::new(),
+      min_stop_grace: std::time::Duration::ZERO,
       readiness: Readiness::HttpPoll {
         path: "/live".to_string(),
         ready_status: 200,
@@ -1946,7 +2139,10 @@ mod tests {
     // construction (one `all()` line), which is what makes it surface in
     // `status` / `doctor` / `--backend` without editing those sites.
     let ids: Vec<&str> = Backends::all().iter().map(|b| b.id()).collect();
-    assert_eq!(ids, vec!["llamacpp", "lemonade", "ds4", "vllm", "sglang"]);
+    assert_eq!(
+      ids,
+      vec!["llamacpp", "lemonade", "vllm", "sglang", "generic"]
+    );
     // Forwarding through the macro reaches each variant's real lifecycle.
     let by_id: std::collections::BTreeMap<&str, Lifecycle> = Backends::all()
       .iter()
@@ -1954,7 +2150,6 @@ mod tests {
       .collect();
     assert_eq!(by_id["llamacpp"], Lifecycle::ProcessPerModel);
     assert_eq!(by_id["lemonade"], Lifecycle::ManagedMultiplexer);
-    assert_eq!(by_id["ds4"], Lifecycle::ProcessPerModel);
     assert_eq!(by_id["vllm"], Lifecycle::ProcessPerModel);
     assert_eq!(by_id["sglang"], Lifecycle::ProcessPerModel);
   }
@@ -1984,9 +2179,7 @@ mod tests {
     let top = claimants
       .iter()
       .max_by_key(|id| {
-        Backends::all()
-          .iter()
-          .find(|b| b.id() == **id)
+        Backends::from_id(id)
           .map(|b| b.launch_priority())
           .unwrap_or(i32::MIN)
       })
@@ -2022,58 +2215,8 @@ mod tests {
     );
   }
 
-  fn ds4_header() -> GgufHeader {
-    use crate::gguf::header::{GgufValue, TensorInfo};
-    use std::collections::HashMap;
-    let mut metadata = HashMap::new();
-    metadata.insert(
-      "general.architecture".to_string(),
-      GgufValue::String("deepseek4".to_string()),
-    );
-    GgufHeader {
-      version: 3,
-      tensor_count: 2,
-      metadata,
-      tensors: vec![
-        TensorInfo {
-          name: "blk.0.ffn_gate_exps.weight".to_string(),
-          dims: vec![4096, 4096],
-          ggml_type: 16, // IQ2_XXS — a routed-expert quant ds4 accepts
-        },
-        TensorInfo {
-          name: "token_embd.weight".to_string(),
-          dims: vec![4096, 4096],
-          ggml_type: 1, // F16
-        },
-      ],
-    }
-  }
-
   #[test]
-  fn backends_forward_defaulted_methods_to_variants() {
-    // Regression guard: `Backends` must forward every *defaulted* trait method
-    // to the active variant, else it silently returns the trait default rather
-    // than the override. Two cheap sentinels: serves_mode (a variant overrides
-    // Embedding → false; the default is true) and auto_routes (drives routing,
-    // reached through routed_backend_for).
-    let ds4 = Backends::Ds4(Ds4Backend::new());
-    assert!(
-      !ds4.serves_mode(LaunchMode::Embedding),
-      "Backends must forward serves_mode to the variant"
-    );
-    assert!(ds4.serves_mode(LaunchMode::Chat));
-    assert!(Backends::LlamaCpp(LlamaCppBackend::new()).serves_mode(LaunchMode::Embedding));
-
-    // routed_backend_for exercises Backends::auto_routes forwarding end to end:
-    // a compatible header resolves to the claiming backend's id.
-    let h = ds4_header();
-    assert!(
-      ds4.auto_routes(&h),
-      "Backends must forward auto_routes to the variant"
-    );
-    assert_eq!(routed_backend_for(&h), Some("ds4".to_string()));
-
-    // A plain header claims no special routing → falls back to identity.
+  fn a_plain_header_claims_no_special_routing() {
     use crate::gguf::header::GgufValue;
     use std::collections::HashMap;
     let mut m = HashMap::new();

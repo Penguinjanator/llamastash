@@ -34,7 +34,7 @@ pub use orchestrate::{ensure_umbrella, umbrella_launch_id};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct LemonadeConfig {
-  /// Tri-state enablement, mirroring [`crate::backend::ds4::Ds4Config::enabled`]:
+  /// Tri-state enablement:
   /// unset = auto/on-when-`lemond`-found, `false` = force off, `true` = force on.
   #[serde(default)]
   pub enabled: Option<bool>,
@@ -58,7 +58,6 @@ impl LemonadeConfig {
   /// (`--lemonade` / `LLAMASTASH_LEMONADE`). Actual activation still requires
   /// the `lemond` binary to resolve — this only encodes intent (default-on
   /// unless explicitly `enabled: false`, which the force flag overrides).
-  /// Mirrors [`crate::backend::ds4::Ds4Config::intends_enabled`].
   pub fn intends_enabled(&self, force: bool) -> bool {
     force || self.enabled != Some(false)
   }

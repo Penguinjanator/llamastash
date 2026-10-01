@@ -55,7 +55,7 @@ fn row_for(entry: &ModelEntry) -> DiscoveredModel {
   DiscoveredModel {
     path: synthetic_path(name),
     parent: PathBuf::from(crate::backend::lemonade::LEMONADE_PATH_SCHEME),
-    source: ModelSource::Lemonade,
+    source: ModelSource::Backend(super::LEMONADE_BACKEND_ID),
     metadata: Some(ModelMetadata {
       arch: None,
       total_parameters: None,
@@ -78,7 +78,7 @@ fn row_for(entry: &ModelEntry) -> DiscoveredModel {
     // Lemonade serves registry models by name, not local GGUFs — there's no
     // companion projector to detect, so no multimodal signal.
     multimodal: None,
-    // Registry-served, not a local GGUF — never ds4-routable, and it runs on
+    // Registry-served, not a local GGUF — never auto-routed elsewhere, and it runs on
     // Lemonade and nowhere else, so scope the launch picker's server row to
     // Lemonade's own server(s) instead of the whole host catalog.
     supported_backends: vec![crate::backend::lemonade::LEMONADE_BACKEND_ID.to_string()],
@@ -146,7 +146,9 @@ mod tests {
       .collect();
     assert_eq!(names, vec!["Qwen2.5-0.5B-Instruct", "Llama-3.1-8B"]);
     // Every row is tagged Lemonade with a synthetic (file-less) path.
-    assert!(rows.iter().all(|r| r.source == ModelSource::Lemonade));
+    assert!(rows
+      .iter()
+      .all(|r| r.source == ModelSource::Backend("lemonade")));
     assert_eq!(
       rows[0].path,
       PathBuf::from("lemonade://Qwen2.5-0.5B-Instruct")

@@ -122,6 +122,82 @@ fn every_declared_knob_reaches_every_surface() {
   }
 }
 
+const RUNTIME_PATH: &str = "generic://parity-entry";
+
+/// A config-declared model with one knob of each kind a config can declare.
+fn install_runtime_entry() {
+  let yaml = r#"
+servers:
+  - name: parity-entry
+    binary: /opt/engine
+    ready: /health
+    knobs:
+      - {flag: --context-size, id: parity-ctx, ctx: true}
+      - --parity-speculative
+"#;
+  let config = llamastash::backend::BackendConfig {
+    generic: yaml_serde::from_str(yaml).unwrap(),
+    ..Default::default()
+  };
+  llamastash::backend::install_backend_config(&config).expect("entry installs");
+}
+
+/// **1b.** A knob declared in `config.yaml` reaches the same surfaces: the
+/// `--` tail (as extras, for the daemon to lift), the editor scoped to that
+/// model, and a preset round-trip.
+#[test]
+fn every_config_declared_knob_reaches_every_surface() {
+  install_runtime_entry();
+  let path = std::path::Path::new(RUNTIME_PATH);
+  let (backend, _) = llamastash::backend::synthetic_identity_for_path(path)
+    .map(|(id, b)| (b, id))
+    .expect("the entry is claimed");
+  let scope = llamastash::backend::knob_scope_by_id(&backend, path, None);
+  let defs = knobs::for_backend(scope);
+  assert_eq!(defs.len(), 2);
+  for def in defs {
+    let id = def.knob_id();
+    let raw = sample_for(def);
+
+    // CLI: no top-level flag. A `--` tail token stays in extras and reaches
+    // the engine as-is, because the same spelling is a plain engine flag on
+    // every other model.
+    let token = OsString::from(format!("--{}={raw}", def.id));
+    let (parsed, extras) =
+      llamastash::cli::tail_args::parse_tail_args(std::slice::from_ref(&token)).unwrap();
+    assert!(parsed.is_empty() && extras == vec![token], "`{}`", def.id);
+
+    let mut picker = llamastash::tui::launch_picker::LaunchPickerState::for_model("m");
+    picker.model_backend = llamastash::launch::params::BackendChoice::from_id(&backend);
+    picker.model_path = Some(path.to_path_buf());
+    assert!(
+      picker.ordered_fields().contains(&row(id)),
+      "`{}` has no editor row",
+      def.id
+    );
+    picker
+      .commit_text(id, &raw)
+      .unwrap_or_else(|e| panic!("`{}` rejects its own sample: {e}", def.id));
+    assert!(picker.user_knobs.contains(id));
+
+    let mut set = knobs::KnobSet::new();
+    set.set(id, KnobValue::Set(Scalar::Str(raw.clone())));
+    let body = llamastash::config::PresetBody {
+      knobs: set,
+      extras: None,
+      backend: None,
+      server: None,
+    };
+    let yaml = yaml_serde::to_string(&body).unwrap();
+    let back: llamastash::config::PresetBody = yaml_serde::from_str(&yaml).unwrap();
+    assert!(
+      reaches(&back.knobs, def),
+      "`{}` did not survive a preset round-trip:\n{yaml}",
+      def.id
+    );
+  }
+}
+
 fn row(id: knobs::KnobId) -> llamastash::tui::launch_picker::PickerField {
   llamastash::tui::launch_picker::PickerField::Knob(id)
 }
@@ -404,9 +480,20 @@ fn registry_is_valid() {
 /// and renders an empty editor, which is always an oversight.
 #[test]
 fn every_backend_declares_resolvable_knobs() {
+  install_runtime_entry();
   for b in Backends::all() {
     let defs = Backend::knobs(&b);
-    assert!(!defs.is_empty(), "{} declares no knobs", Backend::id(&b));
+    if defs.is_empty() {
+      // Declared per model in config instead; a configured model must get a
+      // scope holding its knobs.
+      let scope = Backend::knob_scope(&b, std::path::Path::new(RUNTIME_PATH), None);
+      assert!(
+        scope.is_some_and(|s| !knobs::for_backend(s).is_empty()),
+        "{} declares no knobs, compiled in or per model",
+        Backend::id(&b)
+      );
+      continue;
+    }
     for d in defs {
       assert_eq!(
         knobs::resolve_id_for(Backend::id(&b), d.id),

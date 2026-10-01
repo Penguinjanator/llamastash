@@ -87,7 +87,7 @@ pub fn list_human(
   }
   // Show the BACKEND column when any model surfaces a backend beyond the
   // default `llamacpp` — either a non-default primary or more than one supported
-  // backend (a ds4-compatible file lists `ds4|llamacpp`). Matches the TUI's
+  // backend (a file two backends claim lists both, `<other>|llamacpp`). Matches the TUI's
   // `multi_backend` gate.
   let show_backend = rows.iter().any(|r| {
     r.supported_backends.len() > 1
@@ -214,7 +214,7 @@ fn addressable_name(row: &CatalogRow, run: Option<&RunningRow>) -> String {
 }
 
 /// Backend badge for a catalog row: every backend that can serve it,
-/// priority-ordered (`ds4|llamacpp`), else the daemon's single tag, else
+/// priority-ordered (`<other>|llamacpp`), else the daemon's single tag, else
 /// `placeholder`. Shared by the `list` BACKEND column and `show`'s header
 /// row so the two surfaces can never name different backends for one model.
 /// The table formatter clips the cell if it overflows.
@@ -792,6 +792,13 @@ pub fn status_json(snap: &StatusSnapshot) -> Value {
       obj.insert("default".into(), serde_json::json!(r.preset_default));
       // Resolved backend, mirrored from IPC `status`.
       obj.insert("backend".into(), serde_json::json!(r.backend));
+      // The backend's stop-grace floor, omitted when there is none, as in IPC.
+      if r.stop_grace_secs > 0 {
+        obj.insert(
+          "stop_grace_secs".into(),
+          serde_json::json!(r.stop_grace_secs),
+        );
+      }
       Value::Object(obj)
     })
     .collect();
@@ -855,6 +862,12 @@ pub fn status_json(snap: &StatusSnapshot) -> Value {
     }
   }
   body
+}
+
+/// The body every failing `--json` command prints on stdout.
+pub fn print_json_error(code: i32, message: &str) {
+  let body = serde_json::json!({"error": {"code": code, "message": message}});
+  println!("{}", pretty_json(&body));
 }
 
 /// Pretty-print `serde_json::Value` as the canonical CLI JSON form.
@@ -1090,14 +1103,17 @@ mod tests {
       "single-backend host hides the column: {single:?}"
     );
     // A non-`llamacpp` prediction flips it on.
-    let mut ds4 = row("deepseek", "deepseek4", "Q2_K", 4096);
-    ds4.backend = Some("ds4".to_string());
-    let multi = list_human(&[llama, ds4], &HashMap::new(), false);
+    let mut other = row("qwen", "qwen3", "Q4_K", 4096);
+    other.backend = Some("enginex".to_string());
+    let multi = list_human(&[llama, other], &HashMap::new(), false);
     assert!(
       multi.contains("BACKEND"),
       "multi-backend host shows the column"
     );
-    assert!(multi.contains("ds4"), "the ds4 value renders: {multi:?}");
+    assert!(
+      multi.contains("enginex"),
+      "the enginex value renders: {multi:?}"
+    );
   }
 
   #[test]
@@ -1216,12 +1232,12 @@ mod tests {
   #[test]
   fn backend_badge_is_the_one_rule_both_surfaces_render() {
     // `list`'s BACKEND column and `show`'s header row share this helper, so a
-    // ds4-compatible file can never read `ds4|llamacpp` on one surface and
+    // file two backends serve can never read `other|llamacpp` on one surface and
     // `llamacpp` on the other.
     let mut multi = row("ds", "deepseek4", "IQ2_XXS", 8192);
-    multi.supported_backends = vec!["ds4".into(), "llamacpp".into()];
+    multi.supported_backends = vec!["other".into(), "llamacpp".into()];
     multi.backend = Some("llamacpp".into());
-    assert_eq!(backend_badge(&multi, "?"), "ds4|llamacpp");
+    assert_eq!(backend_badge(&multi, "?"), "other|llamacpp");
 
     // Untagged by the daemon → the caller's placeholder, not a guess from
     // the row's `source`.
@@ -1523,6 +1539,7 @@ mod tests {
         preset_default: None,
         preset: None,
         backend: None,
+        stop_grace_secs: 0,
       }],
       external: vec![ExternalRow {
         pid: 999,
@@ -1675,6 +1692,7 @@ mod tests {
       preset_default: None,
       preset: None,
       backend: None,
+      stop_grace_secs: 0,
     }
   }
 

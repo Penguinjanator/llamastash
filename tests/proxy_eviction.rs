@@ -16,10 +16,11 @@ use std::time::Duration;
 
 use llamastash::backend::llama_cpp::LlamaCppBackend;
 use llamastash::config::loader::PortRange;
-use llamastash::daemon::context::{LaunchEnv, MethodContext};
+use llamastash::daemon::context::{LaunchEnv, MethodContext, PersistedState};
 use llamastash::daemon::probe::ProbeOptions;
 use llamastash::daemon::registry::SupervisorRegistry;
 use llamastash::daemon::shutdown::ShutdownToken;
+use llamastash::daemon::state_store::DaemonState;
 use llamastash::daemon::supervisor::{
   spawn as supervisor_spawn, LaunchOrigin, ManagedModel, ManagedSpawn, ManagedState,
 };
@@ -102,19 +103,33 @@ async fn pre_launch(
 }
 
 async fn build_state(registry: SupervisorRegistry, log_dir: &Path) -> Arc<ProxyState> {
+  build_state_with(
+    registry,
+    log_dir,
+    PersistedState::new(DaemonState::default(), None),
+  )
+  .await
+}
+
+async fn build_state_with(
+  registry: SupervisorRegistry,
+  log_dir: &Path,
+  persisted: PersistedState,
+) -> Arc<ProxyState> {
   let catalog = ModelCatalog::new();
   let token = ShutdownToken::new();
   let env = LaunchEnv {
-    binary: fake_binary(),
+    binary: Some(fake_binary()),
     port_range: allocate_port_range(),
     log_dir: log_dir.to_path_buf(),
     probe: fast_probe(),
     arch_defaults: BTreeMap::new(),
-    servers: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+    servers: Default::default(),
     default_launch_mode: Default::default(),
   };
   let ctx = MethodContext::with_catalog(token, catalog)
     .with_supervisors(registry)
+    .with_state(persisted)
     .with_launch_env(env);
   ProxyState::from_context(&ctx, false, true, DEFAULT_BODY_LIMIT_BYTES)
 }
@@ -149,6 +164,52 @@ async fn sweep_evicts_idle_auto_start_supervisor() {
       }
       _ => sleep(Duration::from_millis(20)).await,
     }
+  }
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+/// An evicted launch must leave the registry and `state.running` the way an
+/// explicit stop does. A leftover row keeps holding its launch name, so the next
+/// `<model>@<name>` auto-start was refused with "already running as L2".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eviction_drops_the_launch_and_its_running_row() {
+  let dir = unique_temp("autostart-prune");
+  let log_dir = dir.join("logs");
+  std::fs::create_dir_all(&log_dir).unwrap();
+  let registry = SupervisorRegistry::new();
+  let model = pre_launch(&log_dir, &registry, LaunchOrigin::AutoStart).await;
+  let (launch_id, _) = registry.snapshot().await.remove(0);
+  let row = llamastash::test_support::running_row("/tmp/ls-pe.gguf")
+    .launch_id(launch_id.as_str())
+    .port(model.port())
+    .name("coder")
+    .build();
+  let persisted = PersistedState::new(
+    DaemonState {
+      running: vec![row],
+      ..Default::default()
+    },
+    None,
+  );
+  let state = build_state_with(registry.clone(), &log_dir, persisted.clone()).await;
+
+  state.touch_mru(model.id()).await;
+  sleep(Duration::from_millis(5)).await;
+  eviction::sweep_once(&state, Duration::from_nanos(1)).await;
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(5);
+  loop {
+    let gone = registry.len().await == 0 && persisted.snapshot().await.running.is_empty();
+    if gone {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "evicted launch still registered or persisted: registry={}, running={:?}",
+      registry.len().await,
+      persisted.snapshot().await.running,
+    );
+    sleep(Duration::from_millis(20)).await;
   }
   std::fs::remove_dir_all(&dir).ok();
 }

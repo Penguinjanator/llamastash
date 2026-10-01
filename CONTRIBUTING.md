@@ -19,6 +19,7 @@ Thanks for the interest. llamastash is still pre-1.0 and the API surface is movi
 
 ```bash
 cargo build
+make test                                  # lint + nextest + doctests, as CI runs them (cargo install cargo-nextest)
 cargo test --features test-fixtures        # includes the integration suite
 cargo clippy --all-targets -- -D warnings  # CI pins this
 cargo fmt --check                          # CI pins this
@@ -65,7 +66,7 @@ The daemon allocates its own control-plane port if `48134` is taken (random in `
 
 1. Branch off `main`.
 2. Keep commits logically split — one cohesive change per commit when reasonable. Conventional commit prefixes (`feat:`, `fix:`, `refactor:`, `test:`, `docs:`) are encouraged.
-3. Make sure `cargo test --features test-fixtures` and `cargo clippy -- -D warnings` both pass locally.
+3. Make sure `make test` passes locally.
 4. Open the PR against `main`. The description should at minimum say *what* the change does, *why*, and how it was tested.
 
 ## Security

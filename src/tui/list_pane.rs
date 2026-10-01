@@ -77,7 +77,7 @@ pub enum ListRow {
     weights_bytes: Option<u64>,
     /// Mode hint surfaced at discovery time.
     mode_hint: String,
-    /// Backend the model routes to (`llamacpp` / `lemonade` / `ds4`) — the
+    /// Backend the model routes to (`llamacpp` / `lemonade`) — the
     /// daemon's prediction for idle rows, the resolved value for running rows.
     /// Empty when unknown. Only rendered on multi-backend hosts.
     backend: String,
@@ -154,7 +154,7 @@ pub struct RunningLaunchRow {
   pub state: SurfaceState,
   /// Launch device selector (`CUDA0`, `Vulkan1`, etc.) when set.
   pub device: Option<String>,
-  /// The backend the launch resolved to (`llamacpp` / `lemonade` / `ds4`),
+  /// The backend the launch resolved to (`llamacpp` / `lemonade`),
   /// for the Backend column — the honest resolved value, which can differ from
   /// the catalog prediction under a `--backend` override.
   pub backend: Option<String>,
@@ -2263,9 +2263,9 @@ mod tests {
     let idle = fake("/m/a.gguf", "/m");
     let run_m = fake("/m/b.gguf", "/m");
     let mut backend_by_path = BTreeMap::new();
-    // The daemon predicts both would route to ds4…
-    backend_by_path.insert(idle.path.clone(), "ds4".to_string());
-    backend_by_path.insert(run_m.path.clone(), "ds4".to_string());
+    // The daemon predicts both would route to another backend…
+    backend_by_path.insert(idle.path.clone(), "enginex".to_string());
+    backend_by_path.insert(run_m.path.clone(), "enginex".to_string());
     // …but the running one was launched `--backend llamacpp` (resolved wins).
     let running = vec![RunningLaunchRow {
       launch_id: "L1".into(),
@@ -2300,7 +2300,7 @@ mod tests {
     );
     assert_eq!(
       backend_of("/m/a.gguf"),
-      Some("ds4".to_string()),
+      Some("enginex".to_string()),
       "idle catalog row shows the daemon's prediction"
     );
   }

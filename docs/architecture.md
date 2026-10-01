@@ -52,7 +52,7 @@ flowchart LR
     subgraph external[External]
         LS1[llama-server PID 1]
         LS2[llama-server PID 2]
-        DS4[ds4-server PID<br/>DeepSeek-V4]
+        GEN[generic server PID<br/>ds4 / gufo / Halogen]
         FS[(filesystem)]
     end
 
@@ -70,28 +70,28 @@ flowchart LR
     SCAN --> FS
     SUP --> LS1
     SUP --> LS2
-    SUP --> DS4
+    SUP --> GEN
     SUP --> RES
 ```
 
 - **Daemon-on-demand.** The TUI and CLI both try to attach via `runtime.json` (URL + bearer token written by the daemon at startup). If absent or stale, they fork/exec `llamastash daemon start` (which detaches by default) and retry once the new daemon publishes a fresh `runtime.json`.
 - **Control plane.** Loopback HTTP/1.1 on `127.0.0.1:48134` (with a small scan window if the slot is taken; deliberately above IANA's registered range and outside the `1143x` proxy family). Every route except `GET /health` requires a `Bearer` token validated in constant time. The token is 32 bytes from `OsRng`, rotated per daemon start, and persisted to `$XDG_STATE_HOME/llamastash/runtime.json` (mode `0600`) alongside the resolved URL. Wire protocol: JSON-RPC 2.0 envelopes carried in `POST /rpc` bodies.
-- **Proxy.** An HTTP/1.1 listener enabled by default. In normal mode it prefers `127.0.0.1:11435`; in Ollama-compat mode it prefers `127.0.0.1:11434`. It routes `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/rerank`, plus the Anthropic `/v1/messages` + `/v1/messages/count_tokens` (llama-server speaks these natively), by resolving `body.model` through the same fuzzy resolver as `llamastash start <ref>` and forwarding byte-for-byte to the matching `llama-server` child (auto-starting it if not running; falling back to a Ready model on launch failure with `x-llamastash-served-by` + `x-llamastash-fallback-reason` headers). Anthropic-shape clients (Claude Code via `ANTHROPIC_BASE_URL`) authenticate with the `x-api-key` header; `Bearer` and browser `Basic` are also accepted. It is the **only** listener that can be exposed to the LAN — `proxy.host` / `--proxy-host` binds a routable address, gated behind a bearer key (`proxy.api_key`, auto-provisioned; the daemon refuses a non-loopback bind with no key unless `--insecure-no-auth`). The control plane and `llama-server` children always stay loopback. TLS is still deferred, so LAN mode is plaintext. Every request body is buffered under `proxy.max_body_size` (default 16 MiB; `0` disables the check); anything larger is refused with HTTP 413 `payload_too_large` naming the configured limit. Implementation: `src/proxy/` (auth: `src/proxy/auth.rs`); user docs: [`usage.md §Proxy (OpenAI-compatible listener)`](usage.md#proxy-openai-compatible-listener); design: [`plans/2026-05-21-001-feat-proxy-router-plan.md`](plans/2026-05-21-001-feat-proxy-router-plan.md), [`plans/2026-06-09-001-feat-lan-exposed-proxy-auth-plan.md`](plans/2026-06-09-001-feat-lan-exposed-proxy-auth-plan.md).
+- **Proxy.** An HTTP/1.1 listener enabled by default. In normal mode it prefers `127.0.0.1:11435`; in Ollama-compat mode it prefers `127.0.0.1:11434`. It routes `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/rerank`, plus the Anthropic `/v1/messages` + `/v1/messages/count_tokens` (llama-server speaks these natively), by resolving `body.model` through the same fuzzy resolver as `llamastash start <ref>` and forwarding byte-for-byte to the matching `llama-server` child (auto-starting it if not running; falling back to a Ready model on launch failure with `x-llamastash-served-by` + `x-llamastash-fallback-reason` headers). Anthropic-shape clients (Claude Code via `ANTHROPIC_BASE_URL`) authenticate with the `x-api-key` header; `Bearer` and browser `Basic` are also accepted. The forwarded body is the client's bytes with at most two surgical edits: `body.model` when the launch pins a request-model name, and the serving backend's `Backend::rewrite_request_body` (default no-op — llama.cpp maps Anthropic `output_config.effort` onto `chat_template_kwargs.reasoning_effort`, a field llama.cpp's own `/v1/messages` translation drops, under `backend.llamacpp.map_anthropic_effort`). Every other entry is copied exactly as the client sent it; see [`plans/2026-09-30-002-feat-anthropic-effort-mapping-plan.md`](plans/2026-09-30-002-feat-anthropic-effort-mapping-plan.md). It is the **only** listener that can be exposed to the LAN — `proxy.host` / `--proxy-host` binds a routable address, gated behind a bearer key (`proxy.api_key`, auto-provisioned; the daemon refuses a non-loopback bind with no key unless `--insecure-no-auth`). The control plane and `llama-server` children always stay loopback. TLS is still deferred, so LAN mode is plaintext. Every request body is buffered under `proxy.max_body_size` (default 16 MiB; `0` disables the check); anything larger is refused with HTTP 413 `payload_too_large` naming the configured limit. Implementation: `src/proxy/` (auth: `src/proxy/auth.rs`); user docs: [`usage.md §Proxy (OpenAI-compatible listener)`](usage.md#proxy-openai-compatible-listener); design: [`plans/2026-05-21-001-feat-proxy-router-plan.md`](plans/2026-05-21-001-feat-proxy-router-plan.md), [`plans/2026-06-09-001-feat-lan-exposed-proxy-auth-plan.md`](plans/2026-06-09-001-feat-lan-exposed-proxy-auth-plan.md).
 - **State separation.** XDG-aware. `$XDG_STATE_HOME/llamastash/state.json` for favorites / last-params / running snapshot (persisted). `runtime.json` alongside it for the per-instance URL + bearer token (removed on shutdown). `$XDG_CONFIG_HOME/llamastash/config.yaml` for user-authored config, including the writable `presets:` store. `$XDG_CACHE_HOME/llamastash/logs/<id>-<ts>.log` for per-launch logs.
 
 ## Backends
 
-llama.cpp is the direct, zero-overhead default; other engines plug in behind the `Backend` trait (`src/backend/`). Four ship today:
+llama.cpp is the direct, zero-overhead default; other engines plug in behind the `Backend` trait (`src/backend/`). Six ship today:
 
-- **llama.cpp** (`src/backend/llama_cpp/`) — direct, process-per-model. Spawns one `llama-server` child per launch. The default for every GGUF that isn't ds4-routed. Upstream ships the same server twice: as standalone `llama-server`, and inside the unified `llama` app that llama.cpp's own installer puts on `$PATH` (the only binary that installer leaves you with; release tarballs and distro packages carry both). Both are declared in `process_markers`, so both are searched in that order on `$PATH` and swept as external processes under either name, and `serve_prefix` adds the `serve` subcommand the unified app needs ahead of the flags, for the launch argv and the `--list-devices` probe alike. Because that one binary also runs `cli`, `download`, and the rest, `argv_is_server` re-checks a swept process's argv for the subcommand, so only `llama serve` is reported as an unmanaged server. The flags themselves are identical between the two, so nothing else in the tree branches on which one resolved.
-- **Lemonade** (`src/backend/lemonade/`) — **experimental**, a managed multiplexer for NPU / multi-engine inference. LlamaStash supervises one `lemond` umbrella and delegates per-model load/unload. Default-on when the `lemond` binary resolves (like ds4), unless `backend.lemonade.enabled: false`; `--lemonade` / `LLAMASTASH_LEMONADE` force it on. See [Lemonade setup](lemonade-setup.md).
-- **ds4 (DwarfStar)** (`src/backend/ds4/`) — **experimental**, direct, process-per-model, DeepSeek-V4-only. Spawns one `ds4-server` child. Default-on when the `ds4-server` binary resolves (`backend.ds4` / `--ds4` / `LLAMASTASH_DS4`); zero footprint when absent. New and lightly road-tested; llama.cpp stays the stable default and runs DeepSeek-V4 too on a current build (b9840+).
-
+- **llama.cpp** (`src/backend/llama_cpp/`) — direct, process-per-model. Spawns one `llama-server` child per launch. The default for every GGUF. Upstream ships the same server twice: as standalone `llama-server`, and inside the unified `llama` app that llama.cpp's own installer puts on `$PATH` (the only binary that installer leaves you with; release tarballs and distro packages carry both). Both are declared in `process_markers`, so both are searched in that order on `$PATH` and swept as external processes under either name, and `serve_prefix` adds the `serve` subcommand the unified app needs ahead of the flags, for the launch argv and the `--list-devices` probe alike. Because that one binary also runs `cli`, `download`, and the rest, `argv_is_server` re-checks a swept process's argv for the subcommand, so only `llama serve` is reported as an unmanaged server. The flags themselves are identical between the two, so nothing else in the tree branches on which one resolved.
+- **Lemonade** (`src/backend/lemonade/`) — **experimental**, a managed multiplexer for NPU / multi-engine inference. LlamaStash supervises one `lemond` umbrella and delegates per-model load/unload. Default-on when the `lemond` binary resolves (like vLLM), unless `backend.lemonade.enabled: false`; `--lemonade` / `LLAMASTASH_LEMONADE` force it on. See [Lemonade setup](lemonade-setup.md).
 - **vLLM** (`src/backend/vllm/`) — **experimental**, direct, process-per-model, safetensors-only. Spawns one `vllm serve` child per launch for a HuggingFace repo the GGUF scanner does not claim. Default-on when a `vllm` launcher resolves (`backend.vllm` / `--vllm` / `LLAMASTASH_VLLM`); zero footprint when absent. Three things differ from the GGUF backends and shape the code: the model argument is a **directory** (a resolved snapshot, not a weight file), so the launch claims its path through `synthetic_identity` before anything tries to read a GGUF header; detection is a **filesystem check only**, because vLLM constructs its argument parser through a device probe and fails with `Failed to infer device type` on a GPU-less host, so an exec-based probe would report "not installed" exactly where a user is configuring it by hand; and readiness needs `/v1/models` to advertise the served name, since engine init (profiling + KV-cache build) runs 10-27 s on a 0.5B and longer on real models. `--served-model-name` is always emitted so the catalog name — the repo id — is what reaches `/v1/models` instead of a cache path. See [vLLM setup](vllm-setup.md).
 
 - **SGLang** (`src/backend/sglang/`) — **experimental**, direct, process-per-model, safetensors-only; the same rows as vLLM, through `sglang serve`. Default-on when a `sglang` launcher resolves (`backend.sglang` / `--sglang` / `LLAMASTASH_SGLANG`); zero footprint when absent. Launch priority 4, below vLLM's 5, so with both installed a repo lists both and `auto` picks vLLM. What differs from vLLM is memory: SGLang has no byte-level KV cap, so its unified-memory guard (`src/backend/sglang/guard.rs`) divides the shared byte budget (`launch::admission::unified_kv_cache_budget`) by the model's KV bytes per token read from `config.json` and passes `--max-total-tokens`; unreadable geometry refuses the launch. `resolved_ctx` comes from `/get_server_info`. Two projectors for one snapshot merge into one catalog row (`daemon::discovery_task::merge_by_path`).
 
-**Selection seam.** A plain (auto) launch picks a backend by model identity. The R13 rule — "a GGUF binds llama.cpp" — gains one exception: `ds4::ds4_compatible(header)`, a header-level predicate (arch `deepseek4` + a per-tensor-role quant contract), routes a compatible GGUF to ds4 when ds4 is available and the mode is chat/completions, and **falls back to llama.cpp otherwise — never a refusal** (a b9840+ llama.cpp runs DeepSeek-V4 too; an older build fails the load with `unknown model architecture: 'deepseek4'`). The one predicate feeds all three consumers — daemon selection (`daemon/launch_service.rs`), TUI backend derivation (`tui/app.rs`), and the CLI list badge (`discovery/catalog.rs`) — so a row badges `ds4` only when a plain launch would actually route there. `--backend <id>` overrides in either direction. `ds4-server` advertises a **static two-entry `/v1/models` list** (`deepseek-v4-flash`, `deepseek-v4-pro`) regardless of which file is loaded, while `/v1/chat/completions` echoes the request `model` back verbatim — there is no alias rewrite, so the proxy relists your catalog by file name and forwards the request model untouched. Readiness therefore needs `GET /v1/models` → 200 **and** a body advertising one of those aliases (ds4 loads weights before it binds, so a bare 200 already means resident, and the alias guards the multi-minute unbound-port window). Orphan re-adoption matches the alias set and cross-checks the process argv `-m` against the recorded path (PID-reuse guard); the external sweep learns the `ds4-server` marker alongside `llama-server`.
+- **Generic** (`src/backend/generic/`) — process-per-model, config-declared. Runs any OpenAI-compatible server from a `backend.generic.servers[]` entry: binary, args and env with placeholders, string and on/off (`switch`) knobs, readiness path, stop-grace floor, and an optional `body.model` rewrite. ds4 (DeepSeek-V4) runs this way since its dedicated backend was removed after 0.4.0. An entry with `model` (a glob / path / model id) is a server option (`generic-<name>`) on the catalog GGUF rows it matches: `configured_servers` lists it, `serves_path` makes discovery append `generic` to those rows' `supported_backends` after the default, and `server_serves` scopes the TUI Server row. An entry without `model` is its own row at `generic://<name>` (`config_catalog_rows`, `synthetic_identity`). Knobs are declared per entry, so they live in runtime knob tables (see the knob registry) rather than `Backend::knobs()`, which is empty. Everything engine-specific is the user's (wrapper scripts, loopback binding, cleanup); the documented rules are in `docs/usage.md` § Generic backend. See plan `2026-09-26-001`.
+
+**Selection seam.** A plain (auto) launch picks a backend by model identity: a GGUF binds llama.cpp (R13) and a safetensors repo binds vLLM or SGLang. A generic entry with `model` is offered next to llama.cpp but never becomes the default; a preset's `server:` or `--server` picks it. `--backend <id>` overrides. The `auto_routes` / `launch_priority` hooks that let a backend claim a GGUF ahead of llama.cpp remain in the contract with no implementer since ds4 was removed.
 
 ### The knob registry
 
@@ -127,6 +127,21 @@ backend's vocabulary first (`resolve_id_for`), and `by_concept` will read a
 sibling backend's spelling of the same idea, because config and CLI keys are
 resolved before the serving backend is known.
 
+**Runtime knob tables.** A backend whose knobs come from `config.yaml` (generic)
+installs them at config load (`Backend::install_config`, pass 1 of
+`config::loader::parse_config`, before presets parse) as leaked `&'static KnobDef`
+slices in a table keyed by a *knob scope* (`generic:<entry>`), separate from the
+compiled-in `OnceLock` registry. `registry::for_backend(scope)` and every lookup
+built on it accept a scope wherever they accept a backend id; `resolve_id` /
+`def_for` fall back to the tables after the compiled-in set, so `KnobSet`
+deserialization finds them. Call sites that know the model pass
+`knob_scope_for(backend, path, server)` instead of the bare id (launch
+resolution, the TUI editor and running view, preset materialisation). The CLI
+`--` tail parser resolves compiled-in knobs only, so a config knob's spelling
+stays a plain engine flag on every other model. Entry `default:` values resolve
+as a `ServerDefault`-labelled layer below every real one (`config_default_knobs`)
+and are never persisted.
+
 Config→backend projections (`jinja`, `strict_fit`, `fit_ctx_floor`, `cors`) are
 deliberately **not** knobs: they are daemon config, not user launch intent, and
 ride a separate `launch_config` map seeded by `seed_launch_knobs`.
@@ -150,7 +165,11 @@ A new backend is **one new module plus the minimum central wiring**; removing on
 | `status.backends` + badge availability | `Backends::all()` over the status hooks — `available`, `installed`, `status_enabled`, `binary_path`, `status_accelerators`, `status_extra` |
 | Orphan sweep | `external_process_markers` / `adopted_process_name` come from `process_markers`, matched by `basename_matches_marker`; a basename match is re-checked against the argv through `external_argv_is_server`, so a backend whose server is one mode of a multi-command binary can disown the other modes. A re-adopted row prints the process's real argv, falling back to `adopted_process_name` only once the OS no longer has it |
 | Umbrella (infra) launches | `supervise_at_boot` at daemon boot (each backend self-gates on `available`, so a process-per-model backend does nothing and `daemon::run_foreground` names none of them); running-launch walkers skip via `is_infra_launch` (`umbrella_launch_id`); idle eviction resolves the owner via `umbrella_owner` and stops the delegated models it serves, which unloads them from the umbrella while keeping it up. The TUI shared-marker and tab-gating key on `is_managed_multiplexer`. Everything delegation-specific (the umbrella-unload call, "what's resident") stays private to the backend module — the trait exposes no `unload_delegated` / `resident_delegated_model`. |
-| Proxy | embed/rerank refusal keys on `serves_mode`; `/ui` on `serves_web_ui` (default off) |
+| Proxy | embed/rerank refusal keys on `serves_mode`; `/ui` on `serves_web_ui` (default off); a forwarded request body is rewritten only through `rewrite_request_body` (default no-op), which the llama.cpp module uses to remap an Anthropic field its engine drops |
+| File-less catalog rows | `config_catalog_rows`, called for every backend on each rescan: Lemonade lists its umbrella's models, generic its model-less entries. `discovery_task` names no backend |
+| Config-matched rows | `serves_path` appends a backend to a catalog row's `supported_backends` after the default; `server_serves` scopes that backend's servers per row in the TUI |
+| Runtime knobs | `install_config` (config load), `knob_scope` + `config_default_knobs` (per model and server); see the knob registry above |
+| Stop grace | `ProcessLaunchSpec.min_stop_grace` is kept on the supervised model; `ManagedModel::stop` raises every caller's grace to it, so IPC stop, `stop_all`, idle eviction and shutdown all honour it. `status` rows carry `stop_grace_secs` and `shutdown` returns the longest one, so the CLI waits long enough |
 | `init` adopt-path hint | `binary_serves` decides whether a hand-picked path looks like a server, so `init` names no binary of its own |
 | TUI display | generic id chip; the editor and the running knob view are both generated from `Backend::knobs()`; `DEFAULT_BACKEND_ID` / `default_backend` / `BackendChoice::from_id` cover the "default backend" and id→choice sites |
 | Non-replayable knobs | `KnobDef.volatile` marks a knob a backend treats as a here-and-now judgement rather than a preference; `knobs_for_persist` drops them (alongside the daemon's own `auto_set`) so a one-off `--preset` cannot silently become permanent |
@@ -160,11 +179,11 @@ A new backend is **one new module plus the minimum central wiring**; removing on
 
 ### Servers (per-backend builds)
 
-A **server** is one build/binary of a backend — llama.cpp's ROCm build, its Vulkan build, `ds4-server`, `lemond`. A backend has 1..N of them, configured as a per-backend `servers: [{binary, name?}]` array (first entry is the default, and the `--llama-server` / `LLAMASTASH_LLAMA_SERVER` target). Every configured binary is its own selectable server — no dedup across builds, though the device *catalog* still dedups selectors within and across builds, and host GPU detection keeps its own PCI dedup.
+A **server** is one build/binary of a backend — llama.cpp's ROCm build, its Vulkan build, `vllm`, `lemond`. A backend has 1..N of them, configured as a per-backend `servers: [{binary, name?}]` array (first entry is the default, and the `--llama-server` / `LLAMASTASH_LLAMA_SERVER` target). Every configured binary is its own selectable server — no dedup across builds, though the device *catalog* still dedups selectors within and across builds, and host GPU detection keeps its own PCI dedup.
 
-Neutral `Device` / `Server` / `ServerConfig` / `ServerSpec` types live in `crate::backend` (`server.rs`). The boot builds the catalog generically over `Backends::all()` via three trait hooks: `configured_servers` (enumerate), `probe_devices` (one binary's `--list-devices`, llama.cpp-only), and `launch_priority` (ds4 `20` > llamacpp `10` > lemonade `0` — orders the server knob, `supported_backends`, and the no-selection default).
+Neutral `Device` / `Server` / `ServerConfig` / `ServerSpec` types live in `crate::backend` (`server.rs`). The boot builds the catalog generically over `Backends::all()` via three trait hooks: `configured_servers` (enumerate), `probe_devices` (one binary's `--list-devices`, llama.cpp-only), and `launch_priority` (llamacpp `10` > vllm `5` > sglang `4` > lemonade `0` — orders the server knob, `supported_backends`, and the no-selection default).
 
-Server ids auto-derive with a hyphen separator: `<backend>-<gpu_backend>` when unique (`llamacpp-rocm`) → `<backend>-<binary-dir>` on a colliding gpu tag → `-N`, overridable per-server with `name:`. A **device-less** server (ds4, lemonade, a CPU-only build — nothing to probe, so no detectable compute type) gets the bare backend id (`ds4`, `lemonade`), `-N` on collision; label its real compute type with an explicit `name:` (e.g. `ds4-rocm`).
+Server ids auto-derive with a hyphen separator: `<backend>-<gpu_backend>` when unique (`llamacpp-rocm`) → `<backend>-<binary-dir>` on a colliding gpu tag → `-N`, overridable per-server with `name:`. A **device-less** server (vLLM, Lemonade, a CPU-only build — nothing to probe, so no detectable compute type) gets the bare backend id (`vllm`, `lemonade`), `-N` on collision; label its real compute type with an explicit `name:` (e.g. `vllm-rocm`).
 
 Launch is two-level, server → device. `LaunchParams.server: Option<ServerId>` and `start --server <id>` pick the binary and — when `--backend` is unset — the backend; the selector→binary lookup keys on the owning server, and the pick persists in `last_params`. `status` carries a `servers` array (`{id, backend_id, binary, name, devices}`) that every launch-device surface reads. In the TUI the picker shows a `server` row under `preset` when a model has more than one compatible server; cycling it re-scopes the Device row and multi-GPU gating to that server's devices, and on a cross-backend switch it swaps the knob set. The Device row is a checkbox list scoped to the selected server — `←/→` walk a cursor, `Space` toggles the cursor GPU; the value serializes catalog-ordered (`ROCm0,ROCm1`), and selecting all N or clearing the last one normalizes to unset (llama.cpp's default is all GPUs). `LLAMASTASH_DEBUG_FAKE_GPUS=N` (debug builds) fans out the launch device catalog as well as host metrics, so this is exercisable on a single-GPU host.
 
@@ -178,15 +197,15 @@ Not covered: cross-server physical-GPU dedupe — `--list-devices` surfaces no P
 
 ### MTP (multi-token prediction) speculative decoding
 
-Auto-detected and on by default, on llama.cpp and ds4. Two capability signals resolve at discovery scan: an *embedded* head (`ModelMetadata.mtp`, from `{arch}.nextn_predict_layers > 0` — Qwen3.5/3.6, GLM-4.x, DeepSeek) and a *separate* head (`DiscoveredModel.mtp_head` via `scanner::find_mtp_head`, an `mtp-*.gguf` sibling — the Gemma-4 shape). `mtp-*.gguf` heads are excluded from the launchable catalog like mmproj (`is_mtp_companion`).
+Auto-detected and on by default, on llama.cpp. Two capability signals resolve at discovery scan: an *embedded* head (`ModelMetadata.mtp`, from `{arch}.nextn_predict_layers > 0` — Qwen3.5/3.6, GLM-4.x, DeepSeek) and a *separate* head (`DiscoveredModel.mtp_head` via `scanner::find_mtp_head`, an `mtp-*.gguf` sibling — the Gemma-4 shape). `mtp-*.gguf` heads are excluded from the launchable catalog like mmproj (`is_mtp_companion`).
 
-Enable is a **launch-only tri-state**, `MtpEnable { Auto, On, Off }` (`--mtp auto|on|off`) — there is no `config.yaml` entry; it persists in `last_params` / presets like any other launch choice. Intent and truth are separate channels: the user's choice is the declared `mtp` knob (`Bool` + `AutoKind::Capability`, so an unset or `Auto` knob means "capability decides"), read through `LaunchParams::mtp_intent`, written through `MtpEnable::store` — the one home for that mapping; `compose_and_spawn` resolves it against real capability into a transient `LaunchParams.mtp_directive` (`resolve_mtp_directive`), which is never written back onto the knob. llama.cpp's `compose` emits `--spec-type draft-mtp` (plus `--model-draft <head>` for a separate head) **before `--fit-ctx`**, so `--fit` is MTP-aware. The per-step draft count is the neutral `mtp-draft-n` knob (`--mtp-draft-n`): llama.cpp maps it to `--spec-draft-n-max`, ds4 to its `mtp_draft` native knob, so one flag works on either backend and no backend-specific scalar rides the neutral IR.
+Enable is a **launch-only tri-state**, `MtpEnable { Auto, On, Off }` (`--mtp auto|on|off`) — there is no `config.yaml` entry; it persists in `last_params` / presets like any other launch choice. Intent and truth are separate channels: the user's choice is the declared `mtp` knob (`Bool` + `AutoKind::Capability`, so an unset or `Auto` knob means "capability decides"), read through `LaunchParams::mtp_intent`, written through `MtpEnable::store` — the one home for that mapping; `compose_and_spawn` resolves it against real capability into a transient `LaunchParams.mtp_directive` (`resolve_mtp_directive`), which is never written back onto the knob. llama.cpp's `compose` emits `--spec-type draft-mtp` (plus `--model-draft <head>` for a separate head) **before `--fit-ctx`**, so `--fit` is MTP-aware. The per-step draft count is the neutral `mtp-draft-n` knob (`--mtp-draft-n`): llama.cpp maps it to `--spec-draft-n-max`, so no backend-specific scalar rides the neutral IR.
 
-The flag is emitted only when genuinely capable — passing it to a non-MTP model is a hard server launch failure, so a force-on against a non-capable model warns and skips, and a non-chat launch (embedding / rerank) never speculates. A user already hand-driving speculation through `extras` defers the whole path, via the `Backend::speculation_set_in_extras` predicate (llama.cpp matches `--spec-type` through the neutral `extras_have_flag`), asked before `resolve_mtp_directive` so the generic path names no flag. DeepSeek-V4 MTP is ds4-only: ds4's own `--mtp` / `--mtp-draft` / `--mtp-margin` knobs auto-pair an `mtp-*.gguf` sidecar found beside the model; that sidecar is never fed to llama.cpp's `--spec-type`. DSpark rides the same `--mtp` slot behind the `dspark` knob, but pairs through `find_draft_head` with the literal `deepseek4-dspark` arch its support GGUF declares, rather than the `<arch>_mtp_support` shape `find_mtp_head` derives; `dspark` with no resolvable support file drops the DSpark knobs pre-spawn, since ds4-server refuses `--dspark` without `--mtp` only after the full load. `ssd_streaming` and a paired `mtp` head are mutually exclusive in `ds4-server` (it exits *after* loading the full model), so `mtp_stream_conflict` reconciles them pre-spawn — an auto-paired head yields to streaming, auto-streaming yields to a user-set head, and two explicit choices are refused through `NativeKnobResolution::refusal`.
+The flag is emitted only when genuinely capable — passing it to a non-MTP model is a hard server launch failure, so a force-on against a non-capable model warns and skips, and a non-chat launch (embedding / rerank) never speculates. A user already hand-driving speculation through `extras` defers the whole path, via the `Backend::speculation_set_in_extras` predicate (llama.cpp matches `--spec-type` through the neutral `extras_have_flag`), asked before `resolve_mtp_directive` so the generic path names no flag. A generic server entry gets no MTP automation; ds4's `--mtp` head is an ordinary `mtp-model` knob set in a preset.
 
-Surfaces: a `↯` capability glyph in the TUI (`discovery::MTP_LEGEND`), the generated `mtp` knob row shown only for MTP-capable models (its quad ring is `cycle_bool`'s inherited → auto → on → off), and per-model `status` `params.mtp` `{enable, active, acceptance, draft_accepted, draft_generated}`. `enable` reports intent off the knob; `active` reports truth. `active` (`Backend::mtp_active`) and `acceptance` (`Backend::draft_acceptance`) come from the owning backend, not the generic directive: llama.cpp reports active off the emitted `--spec-type` and parses its own `draft acceptance = …` log line, while ds4 reports active off its paired head and publishes no acceptance figure — its MTP counters are debug-env-gated and per-decode-step, and the one cumulative `accept_rate` belongs to DSpark and prints at session close, so `acceptance` is null by design.
+Surfaces: a `↯` capability glyph in the TUI (`discovery::MTP_LEGEND`), the generated `mtp` knob row shown only for MTP-capable models (its quad ring is `cycle_bool`'s inherited → auto → on → off), and per-model `status` `params.mtp` `{enable, active, acceptance, draft_accepted, draft_generated}`. `enable` reports intent off the knob; `active` reports truth. `active` (`Backend::mtp_active`) and `acceptance` (`Backend::draft_acceptance`) come from the owning backend, not the generic directive: llama.cpp reports active off the emitted `--spec-type` and parses its own `draft acceptance = …` log line,.
 
-The MTP path names no backend: llama.cpp's flags and log parse live in `backend/llama_cpp/` (`compose.rs` + `telemetry`), ds4's in `backend/ds4/`, and detection is generic and header-keyed. `pull`'s `download_repo` grabs mmproj and MTP-head siblings alongside the model (one per kind by default; `--no-companions` / `--all-companions`, same-repo name-pattern only). See [`plans/2026-07-14-001-feat-mtp-speculative-decoding-plan.md`](plans/2026-07-14-001-feat-mtp-speculative-decoding-plan.md).
+The MTP path names no backend: llama.cpp's flags and log parse live in `backend/llama_cpp/` (`compose.rs` + `telemetry`), and detection is generic and header-keyed. `pull`'s `download_repo` grabs mmproj and MTP-head siblings alongside the model (one per kind by default; `--no-companions` / `--all-companions`, same-repo name-pattern only). See [`plans/2026-07-14-001-feat-mtp-speculative-decoding-plan.md`](plans/2026-07-14-001-feat-mtp-speculative-decoding-plan.md).
 
 ### One weight figure per launch
 
@@ -194,21 +213,13 @@ The MTP path names no backend: llama.cpp's flags and log parse live in `backend/
 
 The streamed sizes ride on `ModelMetadata::lazy_tensor_bytes`, per tensor rather than pre-summed, because `--lazy-mode auto` applies a 4 GiB size threshold per tensor and the mode is a launch-time argument (`on` drops the threshold, `off` disables streaming and the subtraction with it). For a split GGUF the scanner concatenates every shard's list: the tensor usually lives in a later shard while only shard 1 is parsed, so a shard-1-only list reports none. mmap is irrelevant to any of this — see `gguf::memory::streamed_bytes`.
 
+On a UMA host the gate budgets `min(ram_free, gtt_free)` (`admission::effective_free_bytes`). Inside an LXC container on an AMD APU (`util::process::linux_lxc_container`: `/run/systemd/container`, `container=` in `/proc/1/environ`, or an LXC cgroup path) `MemTotal` is the container limit, and amdgpu GTT allocations are not charged to that limit. So a launch the backend reports as fully GPU-resident (`Backend::gpu_resident`; llama.cpp: every layer offloaded, no `n-cpu-moe`, `device` not `none`) budgets GTT free alone, and `engine_pool_total_bytes` uses the GTT total so both sides of the gate use one pool. Any launch with CPU-side weights keeps the `min` rule, because the container limit applies to them. Admission can therefore admit more in an LXC container than on the same box's bare metal only for a fully offloaded launch. The TUI VRAM gauge also skips its RAM clamp in that container case.
+
 `--force` on `start` turns an admission refusal into a warning and launches anyway, and reserves the projected demand on the ledger regardless (`Ledger::reserve`) so a second launch is not admitted against memory the forced one is already taking. The warning reaches the human output and the `--json` `warnings` array alike. It rides `StartParams::force` and is CLI-only by construction: the proxy's auto-start path builds `StartParams::default()`, so a request from the network can never set it.
 
-### ds4 admission and knobs
+### DeepSeek-V4 KV estimate
 
-Declares 19 knobs in `src/backend/ds4/knobs.rs`, keyed by the flag `ds4-server` itself takes: `ctx`, `power`, `tokens`, `threads`, `kv-disk-dir`, `kv-disk-space-mb`, `ssd-streaming` and its tuning family (`ssd-streaming-cache-experts` / `ssd-streaming-preload-experts` / `ssd-streaming-cold`), the bools `warm-weights` / `quality`, the MTP set `mtp` / `mtp-model` / `mtp-draft-n` / `mtp-margin`, and the DSpark trio `dspark` / `dspark-confidence` / `dspark-strict`. Each gets a `start` flag, an editor row and a preset key with no per-surface wiring. The long tail of `ds4-server` flags rides `extras`. ds4 extends the loopback/credential denylist with `--cors` and `--dist-` (`DS4_FORBIDDEN_EXTRA_HEADS`).
-
-`ds4-server`'s flag set is **build-dependent** — DwarfStar moves fast, and flags that a given build rejects may parse in the next one. Verify against the live `ds4-server --help` (and its `runtime` / `steering` / `kv-cache` / `distributed` topic pages) before assuming a flag is typed, extras, or unsupported.
-
-deepseek4 KV is modeled from the header (`backend::ds4::ds4_kv_bytes`, the `Backend::kv_bytes` hook: per-layer `attention.compress_ratios` + `attention.key_length`), which tracks ds4's two-tier compressed cache — roughly 0.5 GiB at 16k ctx and 11 GiB at 1M for Flash — instead of the naive GQA figure the generic path would emit (`head_count_kv=1 × key_length × full ctx`, about 86 GiB at 1M). The admission gate still under-projects ds4's *full* runtime residency, because the expert working set beyond raw weights isn't modeled. So ds4's `resolve_native_knobs` auto-enables `ssd_streaming` when the resident estimate (`ds4_resident_estimate`, about 1.25× weights) exceeds effective free memory: the below-floor launch loads from disk instead of OOM-killing mid-load (`ds4-server` sets its own `oom_score_adj=1000`). That is the uniform Auto-knob behavior — an unset knob resolving from live host context — not a special case. An explicit `ssd_streaming: true/false` is respected and skips the auto path, and the auto-enabled value is **not** frozen into `last_params`, so it re-evaluates from live free memory each launch rather than sticking the OOM gate off after RAM frees up.
-
-`--kv-disk-dir` is ds4's own persistent cache, reused across restarts. LlamaStash never subdir-mangles or cleans it, and it holds conversation-derived state under ds4's umask at the path the user typed — so point it at a private, user-owned directory.
-
-The one surviving pre-spawn refusal is the split PRO half-files (`…-Layers00-30` / `…-Layers-31-output`, `is_ds4_split_half`): "ds4 distributed mode unsupported".
-
-Not covered: distributed / split-GGUF PRO mode, embeddings and rerank on ds4, ds4 in `init`, recommender and benchmark integration.
+deepseek4 KV is modeled from the header in `gguf::memory` (per-layer `attention.compress_ratios` + `attention.key_length`: a raw recent window plus `ctx / ratio` compressed rows of F32 latents), whichever server runs the file. The generic GQA figure over-counts ~8x at long context. ds4 itself runs as a `backend.generic` entry (`docs/usage.md` § Running ds4 as a generic server).
 
 ## Proxy comparison — Ollama, LM Studio, llamastash
 
@@ -287,6 +298,26 @@ request can say *which* copy it wants. The rules, all in one place:
   it is an explicit choice, not a default. Scoped to `LaunchOrigin::AutoStart`:
   a request body carries only `model`, so the address is a client's only
   channel, while `start --name` and the TUI already have `--preset`.
+- **The name a preset launch takes** is the reverse rule. A manual launch with a
+  preset and no name (`start --preset coder`, a launch file, a TUI preset stop)
+  is named after the preset in `compose_and_spawn`, before the duplicate gate,
+  so it gets the same `<model>@coder` address and a second copy is refused like
+  a duplicate `--name`. A preset name that is not a launch name, or a managed
+  multiplexer model, leaves the launch unnamed.
+- **A named reference with no launch of that name** goes to the model's only
+  launch when that launch is unnamed and the name is not one of the model's
+  presets (`route::decide`), instead of loading a second copy with the same
+  settings. A Ready launch is forwarded to; a loading one is reached by dropping
+  the name, so the unnamed auto-start attaches to it and waits. A name that is a
+  preset still auto-starts under it.
+- **A server that accepts one `model` value** (a generic entry with
+  `rewrite_model: true`) sets `backend::REQUEST_MODEL_KEY` in its
+  `launch_config`; `forward_to_upstream` then writes that value into
+  `body.model`, so a plain or cross-named request still reaches it.
+- **A plain reference to a model that runs more than once** goes to a Ready
+  unnamed launch before a named one (a named launch has its own address), then
+  to the newest by `L#` counter (`route::pick_ready_launch`). The counter is
+  compared as a number, so `L10` is newer than `L9`.
 - **The published ids** come from two different places by design. Catalog rows
   are published through `published_id_index` (`util::paths`); named rows come
   from the live launch registry, and take their model half out of that same
@@ -319,6 +350,8 @@ stateDiagram-v2
     Error --> [*]: dismiss
     Stopped --> [*]
 ```
+
+A Ready process that exits without a stop request (a crash, the kernel OOM killer) goes to `Error`, with its exit code or signal and its last log lines as the cause. The row stays in `status` and the TUI until the user stops it; the proxy skips it, and a new request auto-starts a replacement.
 
 Each launch is owned by a `ManagedModel`. The supervisor health-probes `/health` every 500 ms during `Loading`; transitions to `Ready` on first 200 OK. After Ready, a longer 30 s liveness re-check runs in the background.
 
@@ -359,11 +392,57 @@ dies with it and nothing external respawns it, so an agent pointed at the
 proxy URL sees a dead port until something re-attaches. Proxy traffic
 counts as activity precisely so that doesn't happen mid-session.
 
+## Daemon stop and restart
+
+Every client-side path that has to know the daemon is gone waits on one
+function, `daemon::restart::shutdown_and_wait`: call the `shutdown` RPC, then
+poll the lockfile until the old process is gone. Four callers — `daemon stop`,
+`daemon restart`, the TUI's `Ctrl+R`, and the `--llama-server` reconcile in
+`cli::client::connect_or_spawn`, which re-spawns the running daemon on a
+different `llama-server`. Waiting on the lockfile is the whole point. The RPC
+only *requests* teardown — the daemon still has to drain connections, stop
+every managed launch, and drop its `flock` — so a caller that returns on the
+answer races the replacement launch into "already running". The reconcile's
+deleted helper polled `Client::connect` instead, and that only reads
+`runtime.json` — it never probes the port — so it returned as soon as the
+handshake file disappeared, which is before the lock is dropped
+(`run_foreground` stops the managed launches, removes the handshake, then lets
+the lock guard go), and otherwise just slept its fixed 3 s. The window here is
+the longest child stop grace the daemon reported plus 5 s, floored at 10 s. It
+reports `Stopped`, `NoChannel` (nothing reachable over IPC — the caller then
+decides between "genuinely down" and a stale PID that needs signalling), or
+`StillExiting { pid }`. `daemon restart` refuses to spawn on that last one;
+plain `stop` calls it success, and the reconcile logs and re-spawns anyway — a
+failed background reconcile should not fail the command that triggered it. A
+handshake that points at a process no longer holding the lock is cleared on the
+way out, so a crash does not wedge the next start.
+
+The TUI's `Ctrl+K` is the one client-side shutdown outside that function: it
+fires a bare `shutdown` RPC and returns immediately, because nothing is re-spawned
+behind it and the TUI must not block on the teardown.
+
+`daemon restart` resolves the new daemon's options (`prepare_start`) before it
+stops anything, so a flag or a `config.yaml` that cannot produce a daemon
+fails while the old one is still up. It then waits on the state dir those
+options resolved to rather than the ambient one, so a restart driven with
+`--state-dir` acts on that daemon. `shutdown_and_wait` also drops its IPC
+client before it polls: the control plane drains down to zero active
+connections, and a client left attached makes that drain run its full 2 s.
+
+The restart's start half is the CLI's `daemon start` path unchanged — same
+flag set (`DaemonStartArgs`), same config migration, LAN proxy-key
+provisioning, and backend precheck. The TUI's restart skips that half: it
+re-spawns the `DaemonOptions` its own dispatch resolved when the TUI opened,
+passed through as the child's argv. The daemon that comes up re-reads
+`config.yaml` either way.
+
 ## Model identity
 
 `(canonical absolute path, BLAKE3 of GGUF header bytes)`. The header is small (up to ~1 MB); hashing it gives an identity that survives renames but doesn't fingerprint the whole weight file.
 
 The discovery scanner emits one entry per canonical path — symlinks dedupe to their target — so the same model file doesn't appear twice. Split GGUFs (`model-00001-of-00003.gguf`) collapse into a single entry whose launch target is shard 1.
+
+**Rescans.** The daemon rescans on a debounced filesystem event (500 ms) and every 5 minutes (`discovery::watcher`). Open and read-only close events are dropped, because the scan's own directory walk and header reads produce them; passing them on made each rescan trigger the next. A rescan re-reads a header only on a `metadata_cache` miss (changed mtime or size, or a changed split sibling list), and the header parser steps over the tokenizer tables (`tokenizer.ggml.tokens` keeps only its reasoning markers).
 
 **User-visible names** are derived, never stored, and all live in `util::paths`:
 
@@ -382,7 +461,7 @@ The discovery scanner emits one entry per canonical path — symlinks dedupe to 
 
 ## Backend-neutral substrate seams
 
-Two extension seams exist so a safetensors/HF-format engine plugs in as a small predicate + projection + knob table, not a rewrite. The discovery seam has two consumers, vLLM and SGLang, which share its eligibility predicate (`serves_safetensors_only`), row projection (`project_safetensors_row`), snapshot detection and repo-id recovery — a leaf owns only its backend id; MLX is a follow-up plan. The per-backend native-knobs seam already has a consumer: the ds4 backend.
+Two extension seams exist so a safetensors/HF-format engine plugs in as a small predicate + projection + knob table, not a rewrite. The discovery seam has two consumers, vLLM and SGLang, which share its eligibility predicate (`serves_safetensors_only`), row projection (`project_safetensors_row`), snapshot detection and repo-id recovery — a leaf owns only its backend id; MLX is a follow-up plan. The per-backend native-knobs seam has consumers in vLLM and SGLang.
 
 - **Two-layer discovery.** `discovery::hf_repos` is a backend-neutral enumerator that walks the **same** HF hub cache roots GGUF discovery scans and yields neutral `HfRepoCandidate` rows for non-GGUF repos (safetensors present, GGUF absent). A shared `config_to_metadata()` maps `config.json` + `tokenizer_config.json` into the generic `ModelMetadata` fields (arch, native ctx, chat template, tokenizer, mode hint, config-dim param estimate). A future engine supplies only an `eligible(&HfRepoCandidate) -> bool` predicate + a `project(candidate) -> DiscoveredModel` that stamps its `ModelSource` and overlays engine-specific quant. `ModelMetadata` carries an optional `quant_label: Option<String>` for non-GGML affine quant strings; GGUF leaves it `None`, so GGUF output is unchanged. The enumerator shares the cache **roots** with GGUF discovery, not its freshness machinery: it is a one-shot synchronous walk with no `notify` watcher or rescan-on-change wiring. The consuming leaf (MLX, plan 002) is what wires it into the rescan loop so safetensors rows refresh on pull/delete the way GGUF rows do — until then "same scan" means "same roots," not "same auto-refresh."
 - **Per-backend knob declarations.** `Backend::knobs()` returns the `KnobDef`s a backend owns, declared in `src/backend/<id>/knobs.rs` and nowhere else. Every surface is generated from them — the CLI derives a flag, the TUI a row, persistence a key — so a new engine plugs in as a predicate plus a knob table rather than three parallel edits. Values live in one `KnobSet` on `LaunchParams`, and `emit_argv` turns them into launch input from each knob's declared `flag` + `Emit`, applying the same loopback/credential strip `compose` enforces on extras. See § The knob registry.
@@ -471,7 +550,8 @@ Beyond the `models` / `external` / `gpu` shapes, the `status` response carries t
   - `latest_rss_bytes: Option<u64>` and `latest_cpu_pct: Option<f32>` from the per-launch resource sampler; both are `None` until roughly one tick (~1 s) after launch. Delegated rows on a managed multiplexer carry the shared umbrella process's reading, not a per-model figure — the TUI flags these with a `*`, and the umbrella's own row is hidden from the TUI running list (but kept in `status` / CLI).
   - `preset_count: u32` (how many presets the model resolves, per-model ∪ arch) and `default: Option<String>` (the config-only default preset name). The full set lives in `presets_list`.
   - `preset: Option<String>` — the preset this launch actually resolved: the name a client flattened (`start --preset`, a launch file, the TUI's named cycle stop, sent as the `preset` start param), the one a `<model>@<name>` auto-start address selected, or the model's config `default:` on a no-selection launch. Omitted entirely when no preset was in play (`--preset auto` included), the same only-when-set convention `name` uses. Distinct from `default` above, which is the config hint regardless of what launched. Rendered as a read-only `preset` row in the TUI running view and in `show`'s running block.
-  - `backend: String` — the backend the launch actually resolved to, stamped on the running snapshot at spawn, so it stays honest for a ds4-compatible file launched `--backend llamacpp`.
+  - `backend: String` — the backend the launch actually resolved to, stamped on the running snapshot at spawn, so it stays honest when `--backend` overrides the routing prediction.
+  - `stop_grace_secs: u64` — the backend's floor under every stop grace (a generic entry's `stop_grace_secs`), omitted when there is none. The `shutdown` response carries the longest one as `stop_grace_secs`, and `daemon stop` waits that long plus a margin.
   - `params.knobs` — the knobs the launch dispatched with, keyed by declared id; `params.server` — the server id the launch picked (`null` when it took the backend's default), rendered as a read-only `server` row in the TUI running view.
 
 `status.gpu` is **live**: with the host-metrics sampler attached it reflects the freshest GPU probe, so late driver loads and hotplug changes propagate within one `gpu.reprobe_interval_secs` period (default 60 s) instead of staying pinned to the boot snapshot. Setting that key to `0` opts out and pins `status.gpu` to the boot reading.

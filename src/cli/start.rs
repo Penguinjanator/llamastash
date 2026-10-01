@@ -167,7 +167,20 @@ pub async fn handle(args: StartArgs, cli: &Cli, config: &Config) -> CliResult {
 
   // An explicit flag beats the preset's pin; the preset beats nothing at all.
   let backend = args.backend.as_deref().or(params.backend.as_deref());
-  let server = args.server.as_deref().or(params.server.as_deref());
+  let mut server = args.server.as_deref().or(params.server.as_deref());
+  // The daemon lets a server's own backend win over the requested one, and it
+  // cannot tell a preset's pin from a typed `--server`. Drop a pin that belongs
+  // to another backend here, so `--backend` still wins over it.
+  if let (Some(want), None, Some(pinned)) = (
+    args.backend.as_deref(),
+    args.server.as_deref(),
+    params.server.as_deref(),
+  ) {
+    let status = crate::cli::resolve::fetch_status(&mut client).await?;
+    if pinned_server_is_foreign(&status.servers, pinned, want) {
+      server = None;
+    }
+  }
   // Already trimmed and charset-checked by the flag's value parser, so what the
   // daemon receives is exactly what it can stamp and compare.
   let launch_name = args.name.as_deref();
@@ -600,6 +613,21 @@ fn parse_cli_knobs(
   Ok((knobs, extras))
 }
 
+/// Whether the `status.servers` catalog says `pinned` belongs to a backend
+/// other than `want`. An unknown id is not foreign: the daemon drops it anyway.
+fn pinned_server_is_foreign(servers: &Value, pinned: &str, want: &str) -> bool {
+  if want == "auto" {
+    return false;
+  }
+  servers
+    .as_array()
+    .into_iter()
+    .flatten()
+    .find(|s| s.get("id").and_then(Value::as_str) == Some(pinned))
+    .and_then(|s| s.get("backend_id").and_then(Value::as_str))
+    .is_some_and(|owner| owner != want)
+}
+
 #[allow(clippy::too_many_arguments)] // one arg per launch knob the CLI can set
 fn build_payload(
   model_path: &str,
@@ -858,6 +886,23 @@ mod tests {
     let b = partial_params_from_preset(&bare);
     assert_eq!(b.backend, None);
     assert_eq!(b.server, None);
+  }
+
+  #[test]
+  fn a_pinned_server_of_another_backend_is_foreign() {
+    let servers = serde_json::json!([
+      { "id": "eng-a-rocm", "backend_id": "eng-a" },
+      { "id": "eng-b-one", "backend_id": "eng-b" },
+    ]);
+    assert!(pinned_server_is_foreign(&servers, "eng-b-one", "eng-a"));
+    assert!(!pinned_server_is_foreign(&servers, "eng-a-rocm", "eng-a"));
+    assert!(!pinned_server_is_foreign(&servers, "eng-b-one", "auto"));
+    assert!(!pinned_server_is_foreign(&servers, "gone", "eng-a"));
+    assert!(!pinned_server_is_foreign(
+      &Value::Null,
+      "eng-b-one",
+      "eng-a"
+    ));
   }
 
   /// An explicit flag beats the preset's pin, the preset beats nothing.

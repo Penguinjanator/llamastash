@@ -10,7 +10,7 @@ Read the relevant doc before non-trivial work in that area; don't re-derive from
 
 | Area | Doc |
 |---|---|
-| What's actually in the binary — modules, lifecycle, IPC, `status` shape, backend internals, servers, MTP, ds4 admission | `docs/architecture.md` |
+| What's actually in the binary — modules, lifecycle, IPC, `status` shape, backend internals, servers, MTP | `docs/architecture.md` |
 | CLI subcommands, flags, JSON shapes, config keys, exit codes, keybindings | `docs/usage.md` |
 | Failure modes an end user hits | `docs/troubleshooting.md` |
 | Design intent + tradeoffs, per feature | `docs/plans/*.md` (dated, one per feature) |
@@ -19,8 +19,6 @@ Read the relevant doc before non-trivial work in that area; don't re-derive from
 | Everything still open | `TODO.md` |
 | Real-hardware UAT | `docs/testing/hardware-uat.md` |
 | Built-in `(arch, gpu_backend)` defaults table | `src/launch/AGENTS.md` (loads when working under `src/launch/`) |
-
-v1's nine Implementation Units (1 scaffold, 2 daemon/IPC, 3 GGUF, 4 discovery, 5 launch/supervisor, 6 TUI shell, 7 right-pane tabs, 8 CLI, 9 release) are defined in `docs/plans/2026-05-13-001-feat-llamatui-v1-launcher-plan.md`. Identify the unit before a non-trivial change; commit subjects use `feat(unit5):` / `fix(unit3):`.
 
 ## Rules
 
@@ -38,25 +36,40 @@ v1's nine Implementation Units (1 scaffold, 2 daemon/IPC, 3 GGUF, 4 discovery, 5
 
 **TUI glyphs are single-cell text-presentation BMP symbols.** Emoji-presentation codepoints (`⚡` U+26A1, anything in an emoji block or carrying a default emoji variation selector) render double-width and colored, which breaks column alignment. Pick from the geometric / arrow / symbol text ranges already in `src/tui/glyphs.rs` and eyeball it with `--render` before committing.
 
-**Style:** plain facts and numbers over jargon. Conventional-commit prefixes (`feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`), unit-scoped where it fits.
+**Style:** plain facts and numbers over jargon. Conventional-commit prefixes (`feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`), scoped by feature or area (`tui`, `proxy`, `vllm`, `generic`, …). The `unitN` scopes in older history are the v1 plan's units and are not used for new work.
 
 ## Build, test, lint
 
 ```bash
 make build                                                 # release: cargo build --release
-make test                                                  # cargo test --features test-fixtures — required for CI parity
-cargo test --features test-fixtures --test <name>          # one integration binary
+make test                                                  # lint + nextest + doctests with test-fixtures, as CI runs them
+cargo nextest run --features test-fixtures                 # full suite without lint
+cargo nextest run --features test-fixtures --test <name>   # one integration binary
 make lint                                                  # fmt --check + clippy -D warnings
 make audit                                                 # maintainer bundle → target/audit; make audit-summary for the headline
 ```
 
 Prefer `make` targets — they carry the standard flags (forgetting `--features test-fixtures` on tests is the classic mistake). See the `Makefile` for the rest, including `make uat-*`.
 
+Run tests with `cargo nextest run`, not `cargo test`. nextest runs tests from all binaries in parallel; `cargo test` runs the binaries one after another. The full suite takes ~20 s under nextest and ~35 s under `cargo test` (measured 2026-10-01). CI uses nextest too. nextest skips doctests; run them with `cargo test --doc --features test-fixtures`.
+
 `--features test-fixtures` gates `fake_llama_server` (`tests/fixtures/`), the `_test_sleep` IPC method, and `src/gguf/test_fixtures`. `--features uat` gates the maintainer-only `llamastash uat` subcommand, never shipped in release binaries. Two-space indent is enforced by `rustfmt.toml`; clippy denies `shadow_unrelated`, so rename rather than reuse a `let` binding in the same scope.
 
 Inline `#[cfg(test)] mod tests` per file is the default; `tests/` for daemon-spawning scenarios. Integration tests bind a temp dir per test (`unique_temp_dir(label)`) — never share `state_dir` between tests or they race the lockfile.
 
 **Never hand out a bare `llamastash <args>` for a dev task** — it resolves to whatever is on `PATH`, not the working tree, so it won't reflect the change under test. Use `cargo run -- <args>`, a `make` target, or `cargo build` + `./target/debug/llamastash <args>`, and isolate side-by-side daemons with `LLAMASTASH_STATE_DIR` + a non-default `--proxy-port` so you never touch the user's real daemon. Bare `llamastash` is only for genuine model-management work the user is doing with the tool.
+
+## Context budget
+
+Every command's output lands in context. Don't pay twice for the same check.
+
+- **Git hooks run the gates.** pre-commit: `cargo fmt` + `make lint` + `make doc`. pre-push: the same plus `cargo nextest run` and doctests, with `test-fixtures`. Both skip when no Rust file changed. Don't run these by hand before a commit or push; read the hook output only when it fails.
+- **While coding, run the narrowest check:** `cargo check`, one test by name, or one `--test <name>` binary, through `cargo nextest run`. Batch edits, then check once. No full `make test` after each edit; pre-push runs it.
+- **Reviews start from CI.** `gh pr checks <n>` or `gh run list -c <sha>` for the head commit. Green: don't re-run fmt, clippy, or tests locally; review the diff. Red: `gh run view <id> --log-failed`, reproduce only that job. Pending: `gh pr checks <n> --watch`, don't race it locally.
+- **Filter output.** `2>&1 | tail -n 40` or `rg 'FAILED|panicked|^error'` on cargo runs; `gh ... --json <fields> --jq` instead of full dumps.
+- **Don't re-run a check whose inputs haven't changed** since it last passed.
+- **Docs-only changes need no cargo runs.** The hooks skip them too.
+- **Read narrowly.** Pick the doc from the table above, then `rg -n` + a line range. Don't read large files whole.
 
 ## End-to-end CLI validation (required for user-visible changes)
 
@@ -93,7 +106,7 @@ JSON-RPC 2.0 over `POST /rpc`; `src/ipc/methods.rs` is the dispatch table, `src/
 
 A new backend is **one new module plus the minimum central wiring**; removing one is deleting the module plus that wiring. **No backend id-string or name may appear — in code *or comments* — outside these three places:**
 
-1. `src/backend/<id>/` — **all** its logic, behind trait methods: argv/launch translation, `resolve_launch_binary`, identity, its knob declarations in `<id>/knobs.rs`, `seed_launch_knobs`, `auto_routes`, `serves_mode`, `serves_web_ui`, `refuses`, `kv_bytes`, `process_markers` / `argv_is_server` / `binary_serves`, availability (`available` / `installed` / `status_*`), and — for a managed multiplexer — the `start` / `stop` overrides, `umbrella_launch_id`, and `supervise_at_boot`. Delegation specifics (umbrella-unload, "what's resident") stay private to the module. A process-per-model backend leaves `start` / `stop` on their defaults and never touches lifecycle plumbing.
+1. `src/backend/<id>/` — **all** its logic, behind trait methods: argv/launch translation, `resolve_launch_binary`, identity, its knob declarations in `<id>/knobs.rs`, `seed_launch_knobs`, `auto_routes`, `serves_mode`, `serves_web_ui`, `refuses`, `process_markers` / `argv_is_server` / `binary_serves`, availability (`available` / `installed` / `status_*`), and — for a managed multiplexer — the `start` / `stop` overrides, `umbrella_launch_id`, and `supervise_at_boot`. Delegation specifics (umbrella-unload, "what's resident") stay private to the module. A process-per-model backend leaves `start` / `stop` on their defaults and never touches lifecycle plumbing.
 2. `src/backend/mod.rs` — `pub mod <id>;`, the `use <id>::{…}`, a `Backends` variant, one `for_each_backend!` arm, one line in `Backends::all()`, and a `BackendConfig` field only if it has a `backend.<id>:` block.
 3. Its typed config struct, owned by its own module, re-exported from `crate::config` for path stability.
 
@@ -107,10 +120,10 @@ The hook-by-hook table of how the generic tree stays agnostic is in `docs/archit
 
 Deliberate omissions, not gaps. Don't "fix" these without a decision.
 
-- **Loopback-only, same-UID.** Control plane on `:11436` (bearer-authed), proxy on `:11435` (`:11434` in Ollama-compat mode). `--host` / `--listen` / `--bind` / `--api-key` / `--ssl-*` / `--port` are refused via `advanced[]` (`--port` because an extras copy beats the reserved port), and `LLAMA_ARG_*` env vars are stripped before spawn. ds4 extends the denylist with `--cors` / `--dist-`. LAN bind + bearer key are opt-in; the loopback default has no auth, no TLS, no peercred.
+- **Loopback-only, same-UID.** Control plane on `:11436` (bearer-authed), proxy on `:11435` (`:11434` in Ollama-compat mode). `--host` / `--listen` / `--bind` / `--api-key` / `--ssl-*` / `--port` are refused via `advanced[]` (`--port` because an extras copy beats the reserved port), and `LLAMA_ARG_*` env vars are stripped before spawn. vLLM and SGLang extend the denylist with their own auth/CORS flags. LAN bind + bearer key are opt-in; the loopback default has no auth, no TLS, no peercred.
 - **Proxy scope.** OpenAI `/v1/*` plus the Anthropic `/v1/messages` surface are forwarded (no body translation); `/ui` reverse-proxies the running model's stock llama.cpp web UI on one port-stable origin. Still deferred from R34: MCP, fallback tuning, TLS for a LAN-exposed proxy. → `docs/architecture.md`, plans `2026-05-21-001` / `2026-06-15-001`.
 - **Presets live in `config.yaml`, not `state.json`** — that is the writable source of truth, written comment-safe through `config::yaml_edit`. A knob delegated to the engine's fitter is the bare token `auto` (**not** `{auto:true}`); a literal `"auto"` value needs the `{value: auto}` escape. Same encoding in `config.yaml`, `--json`, and `state.json`. No `export`, no `presets_set_default`, no TUI list/delete. → `docs/architecture.md` § Named presets, plans `2026-06-22-001` / `2026-06-30-001`.
-- **Five backends; llama.cpp is the stable default.** Lemonade, ds4, vLLM and SGLang are experimental and default-on only when their binary resolves. A ds4-compatible GGUF that can't use ds4 **falls back to llama.cpp — never a refusal**. R13 ("a disk GGUF binds llama.cpp") has exactly this one exception — vLLM and SGLang are not more: they claim safetensors repos, never GGUF. → `docs/architecture.md` § Backends.
+- **Five backends; llama.cpp is the stable default.** Lemonade, vLLM and SGLang are experimental and default-on only when their binary resolves; the generic backend is stable and runs only what `config.yaml` declares (ds4, gufo, Halogen and others), and never becomes a GGUF's default. R13 ("a disk GGUF binds llama.cpp") has no exceptions: vLLM and SGLang claim safetensors repos, never GGUF. → `docs/architecture.md` § Backends.
 - **`--json` is the agent contract**, not the TTY rendering. Every non-interactive command supports it and emits a wrapped object with a stable shape. Colors and padded tables are TTY-gated (TTY + no `NO_COLOR` + no `--no-colors`); piped output stays `\t`-separated so `awk -F\t` pipelines keep working, and `--json` is byte-stable regardless. `llamastash config` is interactive-only (no JSON). `stop --all` refuses without `--yes` in a non-TTY. → `docs/usage.md`.
 - **Exit codes** follow `<sysexits.h>` numerically with project-specific meanings — pin against `src/cli/exit_codes.rs` (table in `docs/usage.md § Exit codes`), not the libc constants. `doctor` always exits `0`.
 - **Single binary, three roles.** TUI, CLI, and daemon are all `llamastash`; the daemon spawns on demand when a client finds no socket.

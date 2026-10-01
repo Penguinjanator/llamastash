@@ -113,11 +113,10 @@ pub async fn poll_until_ready(
 }
 
 /// Like [`poll_until_ready`], but the ready condition is `ready_status`
-/// **and** the response body advertising one of `expect_ids` (ds4's fixed
-/// `/v1/models` alias set). A 200 whose body id doesn't match keeps polling:
-/// ds4 leaves its reserved port unbound during the multi-minute load, so a
-/// bare 200 could be a foreign process that grabbed the port before the real
-/// backend bound. Empty `expect_ids` degrades to a status-only check.
+/// **and** the response body advertising one of `expect_ids`. A 200 whose
+/// body id doesn't match keeps polling: a server that leaves its reserved port
+/// unbound during a long load could have its port taken by a foreign process
+/// before it binds. Empty `expect_ids` degrades to a status-only check.
 pub async fn poll_until_ready_model_id(
   port: u16,
   opts: ProbeOptions,
@@ -157,9 +156,8 @@ pub async fn poll_until_ready_model_id(
 ///   derived name (`gpt`, `base`) was then satisfied by any foreign server
 ///   that grabbed the reserved port during the engine-init window, which is
 ///   the exact threat this check exists to close.
-/// - *Prefix*, because ds4 registers the `deepseek-v4-` family prefix rather
-///   than its two exact aliases, so `-flash` / `-pro` / a future `-turbo` all
-///   pass without this list chasing upstream.
+/// - *Prefix*, so a backend can register a model-family prefix rather than
+///   each exact alias, and new variants pass without the list chasing upstream.
 ///
 /// A body with no parseable `data` array never matches, so a non-OpenAI
 /// responder stays unready instead of being accidentally accepted.
@@ -231,14 +229,14 @@ pub(crate) fn served_model_entries(body: &[u8]) -> Option<Vec<serde_json::Value>
 
 /// One probe attempt that also captures the response body (for the model-id
 /// readiness check). Returns `(status, whole-response-as-lossy-string)`,
-/// reading up to a 16 KiB cap — ds4's `/v1/models` list is well under that.
+/// reading up to a 16 KiB cap.
 async fn probe_once_body(
   port: u16,
   op_timeout: Duration,
   request: &[u8],
 ) -> std::io::Result<(u16, String)> {
   const CAP: usize = 16 * 1024;
-  let connect = TcpStream::connect(("127.0.0.1", port));
+  let connect = connect_loopback(port);
   let mut sock = tokio::time::timeout(op_timeout, connect)
     .await
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))??;
@@ -265,10 +263,34 @@ async fn probe_once_body(
   Ok((status, String::from_utf8_lossy(&acc).into_owned()))
 }
 
+/// Connect to `127.0.0.1:port` from a source port other than `port`.
+///
+/// The launch pool sits inside Linux's ephemeral range (32768-60999), so while
+/// a child is still loading (gufo and ds4-server bind only after the load) the kernel
+/// can pick `port` itself as the probe's source port. The SYN then reaches its
+/// own socket, the connection "succeeds", and the leftover socket holds the
+/// port so the child's `bind()` fails. Binding the source port first and
+/// retrying on a match rules the self-connect out.
+async fn connect_loopback(port: u16) -> std::io::Result<TcpStream> {
+  let target = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+  for _ in 0..8 {
+    let sock = tokio::net::TcpSocket::new_v4()?;
+    sock.bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))?;
+    if sock.local_addr()?.port() == port {
+      continue;
+    }
+    return sock.connect(target).await;
+  }
+  Err(std::io::Error::new(
+    std::io::ErrorKind::AddrInUse,
+    "no source port distinct from the target",
+  ))
+}
+
 /// One probe attempt. Returns the HTTP status code on success;
 /// connect / read errors come back as `Err`.
 async fn probe_once(port: u16, op_timeout: Duration, request: &[u8]) -> std::io::Result<u16> {
-  let connect = TcpStream::connect(("127.0.0.1", port));
+  let connect = connect_loopback(port);
   let mut sock = tokio::time::timeout(op_timeout, connect)
     .await
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))??;
@@ -343,8 +365,8 @@ mod tests {
     );
   }
 
-  /// ds4 registers the family prefix rather than its exact aliases, so prefix
-  /// matching against the parsed ids has to keep working.
+  /// A family prefix rather than exact aliases: prefix matching against the
+  /// parsed ids has to keep working.
   #[test]
   fn a_family_prefix_still_matches_a_real_alias() {
     let body = "HTTP/1.1 200 OK\r\n\r\n\
@@ -504,6 +526,16 @@ mod tests {
         );
       }
       ProbeOutcome::Ready => panic!("port 1 should not be ready"),
+    }
+  }
+
+  #[tokio::test]
+  async fn connect_loopback_never_uses_the_target_as_its_source_port() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    for _ in 0..50 {
+      let s = connect_loopback(port).await.unwrap();
+      assert_ne!(s.local_addr().unwrap().port(), port);
     }
   }
 }

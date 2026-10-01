@@ -2,7 +2,7 @@
 
 vLLM serves **safetensors HuggingFace repos** — the non-GGUF half of your model
 cache. It sits alongside llama.cpp rather than competing for the same files: a
-GGUF still binds llama.cpp (or ds4), and a safetensors repo binds vLLM.
+GGUF still binds llama.cpp, and a safetensors repo binds vLLM.
 
 LlamaStash never installs vLLM. You supply the launcher; the backend is on by
 default whenever a `vllm` is found, and contributes nothing when it isn't.
@@ -139,8 +139,15 @@ vLLM has ~240 flags; the rest ride the `-- <extras>` tail. A handful are
 refused there because they would undo the loopback-only posture or spawn
 processes the supervisor cannot reap: `--api-key`, `--allowed-origins`,
 `--allowed-local-media-path`, `--pipeline-parallel-size` (and its `-pp` alias),
-the `--data-parallel-*` family (and `-dp`), and `--distributed-executor-backend`
-(which is how Ray is selected), plus the shared `--host` / `--ssl-*` denylist.
+the `--data-parallel-*` family, and `--distributed-executor-backend` (which is
+how Ray is selected), plus the shared `--host` / `--ssl-*` denylist.
+
+The data-parallel short aliases are refused too: `-dp`, `-dpn`, `-dpr`, `-dpl`,
+`-dpa`, `-dpp`, `-dpb`, `-dph`, `-dpe` and `-dpm` (vLLM 0.30.0). Data-parallel
+mode starts extra API servers and engine processes on ports LlamaStash never
+reserved (`-dpm` runs a supervisor that launches one API server per rank), so
+LlamaStash couldn't track, stop or keep them on loopback. The denylist compares
+whole flag names, so each short spelling is listed on its own.
 
 `--config` is refused as well. It points vLLM at a YAML file whose flags are
 spliced in ahead of the launcher's own, so anything in that file would override
@@ -197,7 +204,7 @@ channel where it is labelled for what it is.
   untouched; there the fraction applies to real VRAM.
 - **The model name is the repo id.** LlamaStash passes `--served-model-name`, so
   `/v1/models` and your requests use `owner/name`, not the cache path.
-- **No GGUF on vLLM.** A GGUF binds llama.cpp (or ds4). vLLM claims safetensors
+- **No GGUF on vLLM.** A GGUF binds llama.cpp. vLLM claims safetensors
   repos only.
 - **Single-host only.** Tensor parallel across local GPUs is exposed;
   multi-node and Ray are out of scope.
@@ -224,5 +231,5 @@ channel where it is labelled for what it is.
   Because the proxy relays the upstream CORS headers onto its stable port, any
   page you visit can read completions off the loopback listener while this is
   on. Set `backend.vllm.cors: false` to pin `--allowed-origins '[]'`; the other
-  backends have no equivalent exposure, since llama.cpp and ds4 keep CORS off
-  by default and refuse `--cors` in the extras tail.
+  backends have no equivalent exposure, since llama.cpp keeps CORS off
+  by default.

@@ -73,9 +73,7 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
       .find(|b| b.umbrella_launch_id().as_ref() == Some(&launch_id))
       .or_else(|| {
         let id = running_snap.map(|r| r.resolved_backend.as_str())?;
-        crate::backend::Backends::all()
-          .into_iter()
-          .find(|b| b.id() == id)
+        crate::backend::Backends::from_id(id)
       })
       .unwrap_or_else(crate::backend::default_backend);
     let resolved_backend = owner.id().to_string();
@@ -136,8 +134,8 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
       "ready_at": ready_at,
       "state": state_obj,
       "params": params_json,
-      // Backend this launch actually resolved to (`llamacpp` / `ds4` /
-      // `lemonade`) — the TUI keys its ds4 badge / knob panel on this, not on
+      // Backend this launch actually resolved to (`llamacpp` /
+      // `lemonade`) — the TUI keys its backend badge / knob panel on this, not on
       // the routing prediction.
       "backend": resolved_backend,
       "latest_rss_bytes": latest_rss_bytes,
@@ -165,6 +163,12 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
     // hint above.
     if let Some(preset) = running_snap.and_then(|r| r.preset.clone()) {
       row["preset"] = json!(preset);
+    }
+    // The backend's floor under every stop grace, omitted when there is none
+    // so ordinary rows keep their shape.
+    let min_grace = model.min_stop_grace().as_secs();
+    if min_grace > 0 {
+      row["stop_grace_secs"] = json!(min_grace);
     }
     models.push(row);
   }
@@ -222,9 +226,7 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
       // shape-identical. `active` comes from the owning backend; acceptance is
       // null for a delegated model (it shares the umbrella's log, so per-model
       // draft figures aren't separable). Owner resolved via the registry.
-      let owner = crate::backend::Backends::all()
-        .into_iter()
-        .find(|b| b.id() == running_snap.resolved_backend)
+      let owner = crate::backend::Backends::from_id(&running_snap.resolved_backend)
         .unwrap_or_else(crate::backend::default_backend);
       let params_json = json!({
         "model_path": running_snap.params.model_path,
@@ -360,7 +362,7 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
   // tools), so what the picker offers is precisely what `llama-server` accepts.
   // Empty array when no binary is configured.
   let servers = match ctx.launch.as_ref() {
-    Some(env) => serde_json::to_value(&*env.servers.read().await).unwrap_or(Value::Null),
+    Some(env) => serde_json::to_value(&*env.servers.current().await).unwrap_or(Value::Null),
     None => Value::Array(Vec::new()),
   };
   let backends = backends_status(ctx).await;
@@ -379,7 +381,8 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
       "server_path": ctx
         .launch
         .as_ref()
-        .map(|env| env.binary.display().to_string()),
+        .and_then(|env| env.binary.as_ref())
+        .map(|b| b.display().to_string()),
       "ipc_url": ctx.ipc_url,
     },
   });
@@ -406,7 +409,7 @@ async fn backends_status(ctx: &MethodContext) -> Value {
   let device_accels: Vec<crate::backend::Accelerator> = match ctx.launch.as_ref() {
     Some(env) => env
       .servers
-      .read()
+      .current()
       .await
       .iter()
       .flat_map(|s| s.devices.iter())

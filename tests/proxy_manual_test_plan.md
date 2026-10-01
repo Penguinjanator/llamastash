@@ -363,7 +363,7 @@ These are deliberate scope boundaries documented elsewhere; the manual
 plan calls them out so a user-reported "doesn't work" can be triaged
 fast.
 
-**Claude Code CLI and Anthropic SDK clients now work** — point them at the proxy with `ANTHROPIC_BASE_URL` (key as `x-api-key`). The proxy forwards `/v1/messages` + `/v1/messages/count_tokens` to llama-server's native Anthropic endpoints; tool calling needs `--jinja` (on by default via `jinja: true`). See [`docs/usage.md §Anthropic-shape clients`](../docs/usage.md).
+**Claude Code CLI and Anthropic SDK clients now work** — point them at the proxy with `ANTHROPIC_BASE_URL` (key as `x-api-key`). The proxy forwards `/v1/messages` + `/v1/messages/count_tokens` to llama-server's native Anthropic endpoints; tool calling needs `--jinja` (on by default via `jinja: true`). See [`docs/usage.md §Anthropic-shape clients`](../docs/usage.md). Claude Code's `/effort` works on a llama.cpp model through the mapping in `src/backend/llama_cpp/effort.rs`; re-check it against a real engine with [`scripts/effort-live-check.sh`](../scripts/effort-live-check.sh), which prints the token counts of `output_config.effort` next to the same values sent as `chat_template_kwargs.reasoning_effort` (they must agree) and against an unmapped engine.
 
 | Client | Status | Why | Tracked |
 |---|---|---|---|

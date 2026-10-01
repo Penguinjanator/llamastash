@@ -160,6 +160,7 @@ pub fn enumerate(root: PathBuf, cache: Option<MetadataCache>) -> mpsc::Receiver<
           multimodal: None,
           supported_backends: crate::backend::supported_backends_for(&read.header),
           mtp_head: None,
+          split_siblings: Vec::new(),
         },
         Ok(Err(e)) => CachedParse {
           metadata: None,
@@ -167,6 +168,7 @@ pub fn enumerate(root: PathBuf, cache: Option<MetadataCache>) -> mpsc::Receiver<
           multimodal: None,
           supported_backends: Vec::new(),
           mtp_head: None,
+          split_siblings: Vec::new(),
         },
         Err(join_err) => {
           log::warn!("ollama parser task panicked: {join_err}");

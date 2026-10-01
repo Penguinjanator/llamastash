@@ -744,9 +744,10 @@ fn focused_row_is_deletable(app: &App, rows: &[list_pane::ListRow]) -> bool {
   use crate::tui::status_icons::SurfaceState;
   match rows.get(app.list_cursor) {
     Some(list_pane::ListRow::Model { state, path, .. }) => {
-      // Lemonade registry models have no local file to unlink — never deletable
-      // (mirrors `events::delete_refusal_reason`).
+      // Lemonade registry and config-declared rows have no local file to
+      // unlink — never deletable (mirrors `events::delete_refusal_reason`).
       crate::backend::lemonade::registry_name_from_path(path).is_none()
+        && app.has_local_file(path)
         && matches!(state, SurfaceState::NotLaunched | SurfaceState::Stopped)
     }
     _ => false,

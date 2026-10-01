@@ -95,7 +95,7 @@ pub struct Config {
   pub proxy: ProxyConfig,
   /// All backend configuration, grouped under `backend:`. Holds the always-on
   /// llama.cpp settings (`binary`, `additional_binaries`, `jinja`,
-  /// `strict_fit`, `fit_ctx_floor`) plus the optional Lemonade / ds4 engines
+  /// `strict_fit`, `fit_ctx_floor`) plus the optional engines
   /// (each default-on when its binary resolves). Each backend owns its own
   /// typed struct in its own module; see [`crate::backend::BackendConfig`].
   #[serde(default)]
@@ -810,22 +810,55 @@ fn relocated_keys(contents: &str) -> Vec<(&'static str, &'static str)> {
     .collect()
 }
 
+/// Pass 1 of the config load: parse only the `backend:` block and install
+/// what backends declare there (runtime knob tables), so pass 2's presets can
+/// resolve those knob ids. A `backend:` block that fails to parse is left for
+/// pass 2 to report with its full path.
+fn install_backend_block(contents: &str) -> Result<(), String> {
+  let Ok(doc) = yaml_serde::from_str::<yaml_serde::Value>(contents) else {
+    return Ok(());
+  };
+  let Some(block) = doc.get("backend") else {
+    return Ok(());
+  };
+  let Ok(backend) = yaml_serde::from_value::<crate::backend::BackendConfig>(block.clone()) else {
+    return Ok(());
+  };
+  crate::backend::install_backend_config(&backend)
+}
+
 fn parse_config(contents: &str, path: &Path) -> LoadedConfig {
+  if let Err(error) = install_backend_block(contents) {
+    return LoadedConfig {
+      config: Config::default(),
+      warning: Some(format!("invalid config file {}: {error}", path.display())),
+      relocated_keys: Vec::new(),
+    };
+  }
   match yaml_serde::from_str::<Config>(contents) {
     Ok(config) => LoadedConfig {
       config,
       warning: None,
       relocated_keys: relocated_keys(contents),
     },
-    Err(error) => LoadedConfig {
-      config: Config::default(),
-      warning: Some(format!(
-        "failed to parse config file {}: {}",
-        path.display(),
-        error
-      )),
-      relocated_keys: Vec::new(),
-    },
+    Err(error) => {
+      let error = error.to_string();
+      // The ds4 backend was removed; its block is now a generic server entry.
+      let hint = if error.contains("unknown field `ds4`") {
+        " (the ds4 backend was removed: run ds4-server as a `backend.generic` server, \
+         see docs/usage.md#running-ds4-as-a-generic-server)"
+      } else {
+        ""
+      };
+      LoadedConfig {
+        config: Config::default(),
+        warning: Some(format!(
+          "failed to parse config file {}: {error}{hint}",
+          path.display()
+        )),
+        relocated_keys: Vec::new(),
+      }
+    }
   }
 }
 
@@ -1216,6 +1249,16 @@ keybindings:
       warning.contains("failed to parse config file"),
       "warning should name the failure: {warning}"
     );
+    fs::remove_dir_all(dir).expect("temp test dir should be removed");
+  }
+
+  #[test]
+  fn a_leftover_ds4_block_points_at_the_generic_example() {
+    let dir = temp_test_dir("ds4_block");
+    let path = dir.join("config.yaml");
+    fs::write(&path, "backend:\n  ds4:\n    enabled: true\n").expect("write failed");
+    let warning = load_config_from_path(&path).warning.expect("rejected");
+    assert!(warning.contains("backend.generic"), "{warning}");
     fs::remove_dir_all(dir).expect("temp test dir should be removed");
   }
 
@@ -1782,7 +1825,7 @@ proxy:
     assert!(loaded.warning.is_none());
     assert_eq!(
       loaded.config.backend.lemonade.enabled, None,
-      "lemonade `enabled` defaults to unset (on-when-found intent, like ds4)"
+      "lemonade `enabled` defaults to unset (on-when-found intent)"
     );
     assert!(loaded.config.backend.lemonade.servers.is_empty());
     assert_eq!(loaded.config.backend.lemonade.port, 13305);

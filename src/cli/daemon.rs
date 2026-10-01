@@ -8,6 +8,7 @@
 //! stdout/stderr. The historical complaint was that bare `daemon start`
 //! ran in the foreground and looked stuck.
 //! `stop` — connect to the daemon and call `shutdown`.
+//! `restart` — the `stop` path, then the `start` path with the same flags.
 //! `status` — connect to the daemon and report PID + uptime; emits "not
 //! running" if the socket is missing or the connection fails.
 
@@ -15,11 +16,13 @@ use std::{collections::BTreeMap, net::IpAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 
-use crate::cli::cli_args::{Cli, DaemonAction};
+use crate::cli::cli_args::{Cli, DaemonAction, DaemonStartArgs};
 use crate::config::{Config, DefaultLaunchMode, DEFAULT_FIT_CTX_FLOOR, MAX_CTX_TOKENS};
 use crate::daemon::discovery_task::DiscoveryOptions;
 use crate::daemon::{
-  existing_daemon_pid, run_foreground, runtime_file, start_detached, DaemonOptions, StartOutcome,
+  existing_daemon_pid,
+  restart::{shutdown_and_wait, StopOutcome},
+  run_foreground, runtime_file, start_detached, DaemonOptions, StartOutcome,
 };
 use crate::discovery::known_caches::{default_set, RootResolution};
 use crate::ipc::{Client, ClientError};
@@ -27,51 +30,60 @@ use crate::launch::binary::{locate as locate_binary, LocateInputs};
 use crate::util::paths::{home_dir, state_dir};
 
 /// Top-level dispatch for `daemon <action>`. The full `Cli` and merged
-/// `Config` flow through so `handle_start` can resolve discovery roots
-/// from user flags + config; status / stop ignore them.
+/// `Config` flow through so the start path can resolve discovery roots
+/// from user flags + config; status ignores them, stop only needs the
+/// state directory.
 pub async fn handle(action: DaemonAction, cli: &Cli, config: &Config) -> Result<()> {
   match action {
-    DaemonAction::Start {
-      foreground,
-      state_dir,
-      proxy_port,
-      ollama_compat,
-      no_proxy_fallback,
-      proxy_host,
-      insecure_no_auth,
-      lemonade,
-      ds4,
-      vllm,
-      sglang,
-      force,
-    } => {
-      let force_flags = [
-        (crate::backend::lemonade::LEMONADE_BACKEND_ID, lemonade),
-        (crate::backend::ds4::DS4_BACKEND_ID, ds4),
-        (crate::backend::vllm::VLLM_BACKEND_ID, vllm),
-        (crate::backend::sglang::SGLANG_BACKEND_ID, sglang),
-      ];
-      handle_start(
-        foreground,
-        force,
-        BuildOptionsArgs {
-          state_dir,
-          proxy_port,
-          proxy_host,
-          ollama_compat,
-          no_proxy_fallback,
-          insecure_no_auth,
-          backend_force: force_flags
-            .into_iter()
-            .map(|(id, on)| (id.to_string(), on))
-            .collect(),
-          ..BuildOptionsArgs::new(cli, config)
-        },
-      )
-      .await
-    }
+    DaemonAction::Start(args) => handle_start(&args, cli, config).await,
+    DaemonAction::Restart(args) => handle_restart(&args, cli, config).await,
     DaemonAction::Stop { force } => handle_stop(force).await,
     DaemonAction::Status { json } => handle_status(json).await,
+  }
+}
+
+/// `daemon restart`: resolve the new daemon's options first, then stop the
+/// running daemon and run the same start path with them. Resolving first is
+/// what keeps a bad flag or a broken `config.yaml` from taking the running
+/// daemon down for nothing. A daemon that is still hanging around when the
+/// stop window closes is an error here, not a start — starting on top of a
+/// half-dead daemon would just surface the confusing "already running" line
+/// instead of the real problem.
+async fn handle_restart(args: &DaemonStartArgs, cli: &Cli, config: &Config) -> Result<()> {
+  let opts = prepare_start(args, cli, config)?;
+  match stop_daemon(&opts.state_dir, false).await? {
+    StopOutcome::StillExiting { pid } => Err(anyhow::anyhow!(
+      "daemon restart: pid {pid} was still exiting when the wait window closed; \
+       run `llamastash daemon stop --force` and retry"
+    )),
+    StopOutcome::Stopped | StopOutcome::NoChannel => launch_start(opts, args.foreground).await,
+  }
+}
+
+/// Assemble the [`BuildOptionsArgs`] shared by `daemon start` and
+/// `daemon restart`, including the per-backend force flags.
+fn start_build_args<'a>(
+  args: &DaemonStartArgs,
+  cli: &'a Cli,
+  config: &'a Config,
+) -> BuildOptionsArgs<'a> {
+  let force_flags = [
+    (crate::backend::lemonade::LEMONADE_BACKEND_ID, args.lemonade),
+    (crate::backend::vllm::VLLM_BACKEND_ID, args.vllm),
+    (crate::backend::sglang::SGLANG_BACKEND_ID, args.sglang),
+  ];
+  BuildOptionsArgs {
+    state_dir: args.state_dir.clone(),
+    proxy_port: args.proxy_port,
+    proxy_host: args.proxy_host,
+    ollama_compat: args.ollama_compat,
+    no_proxy_fallback: args.no_proxy_fallback,
+    insecure_no_auth: args.insecure_no_auth,
+    backend_force: force_flags
+      .into_iter()
+      .map(|(id, on)| (id.to_string(), on))
+      .collect(),
+    ..BuildOptionsArgs::new(cli, config)
   }
 }
 
@@ -99,17 +111,24 @@ fn migrate_knob_config(cli: &Cli) -> Option<Config> {
   }
 }
 
-/// `daemon start`: the two flags that steer this function, plus the overrides
-/// it hands straight to [`build_options`].
-async fn handle_start(foreground: bool, force: bool, args: BuildOptionsArgs<'_>) -> Result<()> {
-  let cli = args.cli;
+/// `daemon start`: resolve the options, then bring the daemon up.
+async fn handle_start(args: &DaemonStartArgs, cli: &Cli, config: &Config) -> Result<()> {
+  let opts = prepare_start(args, cli, config)?;
+  launch_start(opts, args.foreground).await
+}
+
+/// Resolve the `daemon start` / `daemon restart` flags into the options the
+/// daemon boots with. Everything that can fail on user input or config lives
+/// here, and it starts nothing, so `daemon restart` runs it while the old
+/// daemon is still up and a failure leaves that daemon alone.
+fn prepare_start(args: &DaemonStartArgs, cli: &Cli, config: &Config) -> Result<DaemonOptions> {
   // Bring a pre-registry `config.yaml` to the unified knob shape before
   // anything reads it. The daemon owns config writes, so this is the one
   // place it can run; a plain CLI command must never rewrite the user's file.
   // Idempotent, backs the original up first, and preserves comments.
   let migrated_config = migrate_knob_config(cli);
 
-  let mut opts = build_options(args)?;
+  let mut opts = build_options(start_build_args(args, cli, config))?;
   if let Some(fresh) = migrated_config {
     // `config` was parsed from the pre-migration text, so its preset blocks
     // are in the old shape. Take the rewritten file's.
@@ -119,9 +138,16 @@ async fn handle_start(foreground: bool, force: bool, args: BuildOptionsArgs<'_>)
   // in the parent (or the foreground process) so the generated key is
   // printed to the user's terminal; the detached child re-reads it
   // from config. No-op for loopback / pre-set key / --insecure-no-auth.
-  provision_proxy_key(&mut opts, cli, foreground)?;
+  provision_proxy_key(&mut opts, cli, args.foreground)?;
   // Ride `--force` through to the detached child so it skips the precheck too.
-  opts.force = force;
+  opts.force = args.force;
+  Ok(opts)
+}
+
+/// Bring the daemon up from [`prepare_start`]'s options, detached by default,
+/// or report the one already running.
+async fn launch_start(opts: DaemonOptions, foreground: bool) -> Result<()> {
+  let force = opts.force;
   // Fail-fast: refuse to come up silently degraded when an *indicated* backend
   // can't initialize. `--force` opts out (start degraded; the failed backend is
   // simply unavailable). Skipped when a daemon is already running — that call
@@ -187,8 +213,9 @@ async fn handle_start(foreground: bool, force: bool, args: BuildOptionsArgs<'_>)
 }
 
 /// Fail-fast gate for `daemon start`: refuse to come up silently degraded when
-/// an *indicated* backend can't initialize. llama.cpp is always indicated, so a
-/// missing `llama-server` fails; Lemonade is indicated only when enabled, so a
+/// an *indicated* backend can't initialize. llama.cpp is indicated unless
+/// another backend is enabled, so a missing `llama-server` fails only on a host
+/// with nothing else to launch; Lemonade is indicated only when enabled, so a
 /// missing `lemond` binary or an already-held umbrella port fails. `--force`
 /// skips this whole gate and starts degraded. The port check is a fast
 /// bind-probe (not a readiness wait), so it never delays startup; every message
@@ -200,7 +227,12 @@ async fn handle_start(foreground: bool, force: bool, args: BuildOptionsArgs<'_>)
 /// render each backend's failure separately.
 pub(crate) fn precheck_indicated_backends(opts: &DaemonOptions) -> std::result::Result<(), String> {
   let mut failures: Vec<String> = Vec::new();
-  if opts.binary.is_none() {
+  let other_backend_enabled = crate::backend::Backends::all().iter().any(|b| {
+    use crate::backend::Backend as _;
+    b.id() != crate::backend::DEFAULT_BACKEND_ID
+      && b.enabled_in_config(&opts.backend, &opts.backend_force)
+  });
+  if opts.binary.is_none() && !other_backend_enabled {
     failures.push(
       "llama-server binary not found — point `--llama-server` / `LLAMASTASH_LLAMA_SERVER` at it, \
        run `llamastash init` to install one, or `llamastash daemon start --force` to start without \
@@ -209,8 +241,8 @@ pub(crate) fn precheck_indicated_backends(opts: &DaemonOptions) -> std::result::
     );
   }
   // Lemonade is flagged only when *explicitly* requested (`--lemonade` / env,
-  // or `lemonade.enabled: true`); the default-on-when-found path stays silent
-  // when `lemond` is simply absent (zero footprint, like ds4).
+  // or `backend.lemonade.enabled: true`); the default-on-when-found path stays silent
+  // when `lemond` is simply absent (zero footprint, like vLLM).
   let lemonade_force = opts
     .backend_force
     .get(crate::backend::lemonade::LEMONADE_BACKEND_ID)
@@ -221,7 +253,7 @@ pub(crate) fn precheck_indicated_backends(opts: &DaemonOptions) -> std::result::
     if crate::backend::lemonade::resolve_lemond_binary(&opts.backend.lemonade).is_none() {
       if lemonade_explicit {
         failures.push(
-          "lemonade is enabled but no `lemond` binary was found — set `lemonade.binary` or put \
+          "lemonade is enabled but no `lemond` binary was found — set `backend.lemonade.servers` or put \
            `lemond` on PATH (see docs/lemonade-setup.md), or `llamastash daemon start --force` to \
            start without it."
             .to_string(),
@@ -239,33 +271,11 @@ pub(crate) fn precheck_indicated_backends(opts: &DaemonOptions) -> std::result::
       // `daemon stop && daemon start --lemonade` fail for up to a minute.
       failures.push(format!(
         "lemonade umbrella port 127.0.0.1:{} is already in use — stop whatever holds it \
-         (e.g. a manually started `lemond`) or set `lemonade.port`, or `llamastash daemon start \
+         (e.g. a manually started `lemond`) or set `backend.lemonade.port`, or `llamastash daemon start \
          --force` to start without the managed umbrella.",
         opts.backend.lemonade.port
       ));
     }
-  }
-  // ds4 is indicated only when *explicitly* requested (`--ds4` / env, or
-  // `ds4.enabled: true`) — the default-on-when-found path stays silent when
-  // the binary is simply absent (zero footprint, D4). An explicit request
-  // with no resolvable binary fails fast, naming the configured path.
-  let ds4_force = opts
-    .backend_force
-    .get(crate::backend::ds4::DS4_BACKEND_ID)
-    .copied()
-    .unwrap_or(false);
-  let ds4_explicit = ds4_force || opts.backend.ds4.enabled == Some(true);
-  if ds4_explicit
-    && crate::backend::ds4::resolve_ds4_binary(opts.backend.ds4.primary_binary()).is_none()
-  {
-    let where_ = match opts.backend.ds4.primary_binary() {
-      Some(p) => format!("`ds4.servers` ({})", p.display()),
-      None => "`ds4-server` on PATH".to_string(),
-    };
-    failures.push(format!(
-      "ds4 was requested but no `ds4-server` binary was found at {where_} — build ds4-server and \
-       add it to `backend.ds4.servers` (see docs/usage.md), or `llamastash daemon start --force` to start without it."
-    ));
   }
   if failures.is_empty() {
     Ok(())
@@ -408,56 +418,52 @@ fn print_provisioned_key(host: IpAddr, port: u16, key: &str, persisted: bool) {
   );
 }
 
-async fn handle_stop(force: bool) -> Result<()> {
-  let attach_dir = state_dir().context("could not resolve state directory")?;
+/// `daemon stop`: the shared graceful shutdown
+/// ([`crate::daemon::restart::shutdown_and_wait`]), falling back to a PID
+/// signal when there is no usable IPC channel. `daemon restart` reuses the
+/// same call so both surfaces wait the same way for the old process to let go
+/// of its lockfile. `attach_dir` comes from the caller so a `daemon restart
+/// --state-dir X` waits on X and not on whatever the ambient env resolves to.
+async fn stop_daemon(attach_dir: &std::path::Path, force: bool) -> Result<StopOutcome> {
   if !force {
-    match Client::connect(&attach_dir).await {
-      Ok(mut client) => {
-        let _ = client.call("shutdown", None).await?;
-        // Wait (bounded) for the process to actually exit. `shutdown`
-        // only *requests* teardown; returning while the old daemon
-        // still holds the lockfile (and its `lemond` umbrella is still
-        // dying) makes a chained `daemon stop && daemon start` race
-        // straight into "already running" / a half-released umbrella
-        // port. Ten seconds covers the slowest observed teardown
-        // (umbrella SIGTERM→SIGKILL escalation is 5 s); on timeout we
-        // fall back to the old fire-and-forget message.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-          match existing_daemon_pid(&attach_dir) {
-            None => {
-              println!("{}", crate::cli::colors::success("daemon: stopped"));
-              return Ok(());
-            }
-            Some(pid) => {
-              if std::time::Instant::now() >= deadline {
-                println!(
-                  "{} ({} {})",
-                  crate::cli::colors::success("daemon: shutdown requested"),
-                  crate::cli::colors::dim("still exiting, pid"),
-                  pid
-                );
-                return Ok(());
-              }
-              tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-          }
-        }
+    match shutdown_and_wait(attach_dir).await? {
+      StopOutcome::Stopped => {
+        println!("{}", crate::cli::colors::success("daemon: stopped"));
+        return Ok(StopOutcome::Stopped);
       }
+      exiting @ StopOutcome::StillExiting { .. } => return Ok(exiting),
       // No IPC channel — either the daemon is genuinely down, or it's
       // a stale process that didn't publish runtime.json. The
       // `existing_daemon_pid` check below distinguishes the two.
-      Err(ClientError::Connect(_)) => {}
-      Err(other) => return Err(other).context("daemon stop"),
+      StopOutcome::NoChannel => {}
     }
   }
-  match existing_daemon_pid(&attach_dir) {
+  match existing_daemon_pid(attach_dir) {
     None => {
+      // Nothing holds the lock, so any `runtime.json` still sitting here is a
+      // handshake whose URL is dead. Dropping it keeps the next command from
+      // aiming at a process that is gone.
+      runtime_file::remove(attach_dir);
       println!("{}", crate::cli::colors::dim("daemon: not running"));
-      Ok(())
+      Ok(StopOutcome::NoChannel)
     }
-    Some(pid) => force_stop_via_pid(pid, &attach_dir),
+    Some(pid) => force_stop_via_pid(pid, attach_dir),
   }
+}
+
+/// `daemon stop`: reports the outcome of [`stop_daemon`] the way the
+/// standalone command always has.
+async fn handle_stop(force: bool) -> Result<()> {
+  let attach_dir = state_dir().context("could not resolve state directory")?;
+  if let StopOutcome::StillExiting { pid } = stop_daemon(&attach_dir, force).await? {
+    println!(
+      "{} ({} {})",
+      crate::cli::colors::success("daemon: shutdown requested"),
+      crate::cli::colors::dim("still exiting, pid"),
+      pid
+    );
+  }
+  Ok(())
 }
 
 /// Best-effort PID-based shutdown. Used when the IPC channel is
@@ -465,7 +471,7 @@ async fn handle_stop(force: bool) -> Result<()> {
 /// Sends `SIGTERM` via [`ProcessControl`], waits up to ~3s for the
 /// lockfile to release, then surfaces a clear next-step (`SIGKILL`)
 /// if the daemon ignores the signal.
-fn force_stop_via_pid(pid: i32, attach_dir: &std::path::Path) -> Result<()> {
+fn force_stop_via_pid(pid: i32, attach_dir: &std::path::Path) -> Result<StopOutcome> {
   use crate::util::process_control::{platform_default, SignalTarget};
   use std::time::{Duration, Instant};
   if pid <= 0 {
@@ -484,7 +490,7 @@ fn force_stop_via_pid(pid: i32, attach_dir: &std::path::Path) -> Result<()> {
       "{}",
       crate::cli::colors::dim(&format!("daemon: pid {pid} already exited"))
     );
-    return Ok(());
+    return Ok(StopOutcome::Stopped);
   }
   pc.signal_graceful(SignalTarget::SinglePid(pid_u));
   let deadline = Instant::now() + Duration::from_secs(3);
@@ -501,7 +507,7 @@ fn force_stop_via_pid(pid: i32, attach_dir: &std::path::Path) -> Result<()> {
         "{}",
         crate::cli::colors::success(&format!("daemon: stopped (pid {pid})"))
       );
-      return Ok(());
+      return Ok(StopOutcome::Stopped);
     }
     std::thread::sleep(Duration::from_millis(50));
   }
@@ -514,13 +520,12 @@ fn force_stop_via_pid(pid: i32, attach_dir: &std::path::Path) -> Result<()> {
 /// Every backend that can be force-enabled, paired with the env var that does
 /// it alongside its CLI flag. The one place in the daemon CLI that names
 /// backends, which is the sanctioned boundary: the flags are user-facing
-/// surface (`--lemonade`, `--ds4`, `--vllm`, `--sglang`).
+/// surface (`--lemonade`, `--vllm`, `--sglang`).
 const FORCE_FLAG_ENV: &[(&str, &str)] = &[
   (
     crate::backend::lemonade::LEMONADE_BACKEND_ID,
     "LLAMASTASH_LEMONADE",
   ),
-  (crate::backend::ds4::DS4_BACKEND_ID, "LLAMASTASH_DS4"),
   (crate::backend::vllm::VLLM_BACKEND_ID, "LLAMASTASH_VLLM"),
   (
     crate::backend::sglang::SGLANG_BACKEND_ID,
@@ -599,8 +604,10 @@ pub(crate) fn build_options(args: BuildOptionsArgs<'_>) -> Result<DaemonOptions>
   // paths. Without this the daemon would come up healthy, the catalog
   // would stay empty forever, and the user would see "no models found"
   // with no signal that it's a config dead-end.
+  // Models declared in config count as something to list.
   crate::config::validate_scan_settings(
-    cli.no_scan || env_no_scan_v || config.disable_scan,
+    (cli.no_scan || env_no_scan_v || config.disable_scan)
+      && !crate::backend::config_declares_models(&config.backend),
     &cli.model_paths,
     &env_paths,
     &config.model_paths,
@@ -669,7 +676,7 @@ pub(crate) fn build_options(args: BuildOptionsArgs<'_>) -> Result<DaemonOptions>
     }
   }
   // Backend config: clone the whole `backend:` block (llama.cpp knobs +
-  // lemonade + ds4), then apply the `LLAMASTASH_*` env overrides + range clamp
+  // lemonade + vLLM + SGLang + generic), then apply the `LLAMASTASH_*` env overrides + range clamp
   // onto the llama.cpp fit knobs. `jinja` stays config-only (factory `true`) —
   // unlike the opt-in booleans below it defaults *on* and the `"1"`-truthy env
   // contract can't express "force off" — so it rides through from the clone.
@@ -998,6 +1005,20 @@ mod tests {
   use crate::config::Config;
   use crate::discovery::ModelSource;
 
+  /// The env lock, with every `LLAMASTASH_*` variable the shell exported
+  /// cleared: `build_options` reads them, so an exported
+  /// `LLAMASTASH_NO_SCAN=1` failed every test here. Tests set what they need
+  /// after taking it.
+  fn hermetic_env() -> std::sync::MutexGuard<'static, ()> {
+    let guard = crate::cli::test_lock::serialize();
+    for (key, _) in std::env::vars_os() {
+      if key.to_string_lossy().starts_with("LLAMASTASH_") {
+        std::env::remove_var(key);
+      }
+    }
+    guard
+  }
+
   fn parse_cli(args: &[&str]) -> Cli {
     Cli::try_parse_from(std::iter::once("llamastash").chain(args.iter().copied())).expect("parse")
   }
@@ -1186,7 +1207,7 @@ mod tests {
 
   #[test]
   fn build_options_threads_config_proxy_block_into_daemon_options() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     // Regression: before this wiring landed, config.proxy.port was
     // parsed and validated but `build_options` never copied it onto
     // DaemonOptions.proxy. The daemon silently ran with
@@ -1219,7 +1240,7 @@ mod tests {
 
   #[test]
   fn build_options_threads_the_daemon_and_gpu_blocks_into_daemon_options() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["daemon", "start"]);
     let config = Config {
       daemon: crate::config::DaemonConfig {
@@ -1250,7 +1271,7 @@ mod tests {
   /// zero-second tick would busy-loop.
   #[test]
   fn build_options_resolves_zero_valued_daemon_and_gpu_keys() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["daemon", "start"]);
     let config = Config {
       daemon: crate::config::DaemonConfig {
@@ -1279,7 +1300,7 @@ mod tests {
 
   #[test]
   fn build_options_clamps_an_out_of_range_metrics_interval() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["daemon", "start"]);
     let config = Config {
       daemon: crate::config::DaemonConfig {
@@ -1294,7 +1315,7 @@ mod tests {
 
   #[test]
   fn build_options_threads_auto_fit_options_from_config() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     std::env::remove_var("LLAMASTASH_DEFAULT_LAUNCH_MODE");
     std::env::remove_var("LLAMASTASH_FIT_CTX_FLOOR");
     std::env::remove_var("LLAMASTASH_STRICT_FIT");
@@ -1322,7 +1343,7 @@ mod tests {
 
   #[test]
   fn build_options_auto_fit_env_overrides_config() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["daemon", "start"]);
     let config = Config {
       default_launch_mode: DefaultLaunchMode::Auto,
@@ -1353,7 +1374,7 @@ mod tests {
 
   #[test]
   fn build_options_fit_ctx_floor_out_of_range_falls_back_to_factory() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     std::env::remove_var("LLAMASTASH_FIT_CTX_FLOOR");
     let cli = parse_cli(&["daemon", "start"]);
     for bad in [0u32, 2_000_000] {
@@ -1377,7 +1398,7 @@ mod tests {
 
   #[test]
   fn build_options_proxy_port_cli_overrides_config_value() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["daemon", "start"]);
     let config = Config {
       proxy: crate::config::loader::ProxyConfig {
@@ -1406,7 +1427,7 @@ mod tests {
 
   #[test]
   fn build_options_no_cli_override_falls_back_to_config_then_default() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     // Defaults all the way down: no CLI override, no proxy block in
     // config → daemon uses ProxyConfig::default(), which resolves to
     // 11435 (default mode) when nothing pins `port` explicitly.
@@ -1420,7 +1441,7 @@ mod tests {
 
   #[test]
   fn build_options_ollama_compat_cli_flag_flips_mode_and_default_port() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["daemon", "start"]);
     let config = Config::default();
     let opts = build_options(BuildOptionsArgs {
@@ -1437,7 +1458,7 @@ mod tests {
 
   #[test]
   fn build_options_ollama_compat_or_combines_config_cli_env() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     // Config-only: config says compat=true, CLI flag off → enabled.
     let cli = parse_cli(&["daemon", "start"]);
     let config_compat = Config {
@@ -1468,7 +1489,7 @@ mod tests {
 
   #[test]
   fn build_options_proxy_host_cli_overrides_config() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["daemon", "start"]);
     let config = Config {
       proxy: crate::config::loader::ProxyConfig {
@@ -1493,7 +1514,7 @@ mod tests {
 
   #[test]
   fn build_options_proxy_host_from_config_when_no_cli() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["daemon", "start"]);
     let config = Config {
       proxy: crate::config::loader::ProxyConfig {
@@ -1509,7 +1530,7 @@ mod tests {
 
   #[test]
   fn build_options_insecure_no_auth_or_combines_config_cli() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["daemon", "start"]);
     // CLI flag on, config off → on.
     let opts_cli = build_options(BuildOptionsArgs {
@@ -1537,7 +1558,7 @@ mod tests {
 
   #[test]
   fn build_options_proxy_host_and_key_from_env() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let prev_host = std::env::var_os("LLAMASTASH_PROXY_HOST");
     let prev_key = std::env::var_os("LLAMASTASH_PROXY_API_KEY");
     std::env::set_var("LLAMASTASH_PROXY_HOST", "0.0.0.0");
@@ -1571,7 +1592,7 @@ mod tests {
     // backstop (is_none) stayed silent.
     // Serialize + clear the proxy env overrides so a concurrent
     // env-driven test can't leak a key into this one.
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let prev_key = std::env::var_os("LLAMASTASH_PROXY_API_KEY");
     std::env::remove_var("LLAMASTASH_PROXY_API_KEY");
     let cli = parse_cli(&["daemon", "start"]);
@@ -1716,7 +1737,7 @@ mod tests {
 
   #[test]
   fn build_options_no_proxy_fallback_cli_flag_clears_fallback_enabled() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["daemon", "start"]);
     let config = Config::default();
     // Default is fallback_enabled = true.
@@ -1734,7 +1755,7 @@ mod tests {
 
   #[test]
   fn build_options_no_proxy_fallback_or_combines_config_cli() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     // Config-only: config has fallback_enabled=false, CLI off → disabled.
     let cli = parse_cli(&["daemon", "start"]);
     let config_off_fallback = Config {
@@ -1793,6 +1814,32 @@ mod tests {
   }
 
   #[test]
+  fn precheck_needs_llama_server_only_when_no_other_backend_is_enabled() {
+    let dir = crate::test_support::unique_temp_dir("ls-precheck", "no-llama");
+    let mut opts = DaemonOptions::rooted_at(dir);
+    // Keep a developer's own engines on PATH out of the result.
+    opts.backend.vllm.enabled = Some(false);
+    opts.backend.sglang.enabled = Some(false);
+    opts.backend.lemonade.enabled = Some(false);
+    assert!(opts.binary.is_none());
+    let err = precheck_indicated_backends(&opts).expect_err("nothing to launch");
+    assert!(err.contains("llama-server"), "{err}");
+
+    let entry = |binary: &str| {
+      yaml_serde::from_str(&format!(
+        "servers:\n  - {{name: only, binary: {binary}, ready: /health}}\n"
+      ))
+      .expect("generic config")
+    };
+    opts.backend.generic = entry("/nonexistent/only-serve");
+    precheck_indicated_backends(&opts).expect_err("an entry whose binary is missing can't launch");
+
+    let exe = std::env::current_exe().unwrap();
+    opts.backend.generic = entry(&exe.display().to_string());
+    precheck_indicated_backends(&opts).expect("a generic entry can launch without llama-server");
+  }
+
+  #[test]
   fn build_options_lemonade_defaults_on_and_force_flag_captured() {
     let cli = parse_cli(&["daemon", "start"]);
     let config = Config::default();
@@ -1803,7 +1850,7 @@ mod tests {
         .copied()
         .unwrap_or(false)
     };
-    // Default: enablement intent is on (default-on-when-found, like ds4), the
+    // Default: enablement intent is on (default-on-when-found, like vLLM), the
     // config `enabled` stays unset, and no force flag is captured.
     let baseline =
       build_options(BuildOptionsArgs::new(&cli, &config)).expect("build_options baseline");
@@ -1912,7 +1959,7 @@ mod tests {
     // `LLAMASTASH_NO_SCAN` tests: process-global env vars race across
     // parallel test threads (one test's set_var landing between
     // another's remove_var and read), which flaked CI on Windows.
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     // Drive the production helper directly. Two paths joined with the
     // platform separator must round-trip. `join_paths` is the inverse
     // of `split_paths`, so this also documents the public contract
@@ -1931,7 +1978,7 @@ mod tests {
 
   #[test]
   fn env_model_paths_unset_returns_empty() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let prev = std::env::var_os("LLAMASTASH_MODEL_PATHS");
     std::env::remove_var("LLAMASTASH_MODEL_PATHS");
     let parsed = env_model_paths();
@@ -1943,7 +1990,7 @@ mod tests {
 
   #[test]
   fn build_options_rejects_disable_scan_with_no_paths() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     // The dead-end combo: scanning off, zero user paths anywhere.
     // Today this would leave the catalog empty forever — the
     // validator must turn it into a startup error so the user sees
@@ -1961,7 +2008,7 @@ mod tests {
 
   #[test]
   fn build_options_accepts_disable_scan_when_cli_path_supplied() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["--no-scan", "--model-path", "/work/keep", "daemon", "start"]);
     let config = Config::default();
     assert!(
@@ -1972,7 +2019,7 @@ mod tests {
 
   #[test]
   fn build_options_accepts_disable_scan_when_config_path_supplied() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     let cli = parse_cli(&["--no-scan", "daemon", "start"]);
     let config = Config {
       model_paths: vec![PathBuf::from("/work/cfg")],
@@ -1986,7 +2033,7 @@ mod tests {
 
   #[test]
   fn env_no_scan_accepts_documented_truthy_values() {
-    let _env = crate::cli::test_lock::serialize();
+    let _env = hermetic_env();
     // `1` is what the README documents; `true`/`yes`/`on` ride along
     // because every other LLAMASTASH_* bool in this binary accepts
     // them, and a script that already uses LLAMASTASH_OFFLINE=true

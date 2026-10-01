@@ -101,6 +101,20 @@ pub const SGLANG_FORBIDDEN_EXTRA_HEADS: &[&str] = &[
   "--served-model-name",
 ];
 
+/// Denylisted heads that take no value (SGLang 0.5.20 `srt/arg_groups`: a
+/// `bool` field is `store_true`). `--sidecar-args` is a list but takes one JSON
+/// string, because its `type_parser` skips `nargs="+"`.
+const SGLANG_FORBIDDEN_EXTRA_VALUES: &[(&str, crate::launch::params::FlagValues)] = {
+  use crate::launch::params::FlagValues::None;
+  &[
+    ("--enable-ssl-refresh", None),
+    ("--grpc-mode", None),
+    ("--smg-grpc-mode", None),
+    ("--disaggregation-decode-enable-radix-cache", None),
+    ("--disaggregation-decode-enable-offload-kvcache", None),
+  ]
+};
+
 /// Resolve the launcher, by existence only — see
 /// [`super::resolve_launcher_by_existence`] for why it is never executed.
 pub fn resolve_sglang_binary(configured: Option<&Path>) -> Option<PathBuf> {
@@ -306,7 +320,7 @@ impl Backend for SglangBackend {
   fn resolve_launch_binary(
     &self,
     ctx: &MethodContext,
-    _default_binary: PathBuf,
+    _default_binary: Option<PathBuf>,
     port: u16,
   ) -> Result<(PathBuf, u16), String> {
     // The default binary is the device-owning llama.cpp server; SGLang has to
@@ -333,6 +347,8 @@ impl Backend for SglangBackend {
       binary,
       argv: sglang_argv(params, port),
       env_remove: CREDENTIAL_ENV_STRIP.to_vec(),
+      env: Vec::new(),
+      min_stop_grace: std::time::Duration::ZERO,
       readiness: readiness(&served_model_name(&params.model_path)),
       probe,
     })
@@ -558,6 +574,7 @@ fn sglang_argv(params: &LaunchParams, port: u16) -> Vec<std::ffi::OsString> {
   argv.extend(crate::launch::params::strip_forbidden_extras(
     &params.extras,
     SGLANG_FORBIDDEN_EXTRA_HEADS,
+    SGLANG_FORBIDDEN_EXTRA_VALUES,
     "sglang_argv",
   ));
   argv

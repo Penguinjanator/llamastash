@@ -191,7 +191,8 @@ pub struct LaunchExec {
   pub(crate) reserved_port: u16,
   /// The device-owning default binary the orchestrator chose; a backend with its
   /// own server overrides via [`crate::backend::Backend::resolve_launch_binary`].
-  pub(crate) default_binary: PathBuf,
+  /// `None` when the host has no default server binary.
+  pub(crate) default_binary: Option<PathBuf>,
   /// Size-scaled probe budget.
   pub(crate) probe: crate::daemon::probe::ProbeOptions,
   pub(crate) id: ModelId,
@@ -266,17 +267,26 @@ fn is_pure_fit(selection: LaunchSelection, default_is_auto: bool) -> bool {
 /// selector resolves to a server, stamp its id (and, when the backend is still
 /// `Auto`, its owning backend) so status and Ctrl+P capture report it instead
 /// of falling back to the default.
+/// The device selector that asks for no offload at all.
+const NO_DEVICE_SELECTOR: &str = "none";
+
 fn pick_launch_binary(
   launch_params: &mut LaunchParams,
   picked_server: Option<&crate::backend::Server>,
   selector: Option<&str>,
   servers: &[crate::backend::Server],
-  default_binary: &Path,
-) -> PathBuf {
+  default_binary: Option<&Path>,
+) -> Option<PathBuf> {
   if let Some(server) = picked_server {
-    return server.binary.clone();
+    return Some(server.binary.clone());
   }
   match selector {
+    // `none` means "offload nothing" (CPU only). It is in no server's device
+    // list, so it would otherwise be dropped as stale and the launch would
+    // offload to the GPU.
+    Some(sel) if sel.trim().eq_ignore_ascii_case(NO_DEVICE_SELECTOR) => {
+      default_binary.map(Path::to_path_buf)
+    }
     Some(sel) => match servers
       .iter()
       .find(|s| s.devices.iter().any(|d| d.selector == sel))
@@ -290,7 +300,7 @@ fn pick_launch_binary(
         if launch_params.backend == crate::launch::params::BackendChoice::Auto {
           launch_params.backend = crate::launch::params::BackendChoice::from_id(&srv.backend_id);
         }
-        srv.binary.clone()
+        Some(srv.binary.clone())
       }
       None => {
         // Stale persisted selector or the catalog probe failed. Drop the
@@ -299,39 +309,51 @@ fn pick_launch_binary(
         // `--device` the default binary would reject, and spawn the default
         // binary with auto-select.
         log::warn!(
-          "device selector {sel:?} not in server catalog; dropping it and spawning default binary {}",
-          default_binary.display()
+          "device selector {sel:?} not in server catalog; dropping it and spawning the default binary"
         );
         launch_params.knobs.remove_by_name("device");
-        default_binary.to_path_buf()
+        default_binary.map(Path::to_path_buf)
       }
     },
-    None => default_binary.to_path_buf(),
+    None => default_binary.map(Path::to_path_buf),
   }
 }
 
 /// The live launch of `model_path` that already answers to `name`, if any.
 ///
-/// Rows whose supervisor has errored are skipped. An errored launch keeps its
-/// `state.json` row until it is stopped, but it is not an addressable target (the
-/// proxy skips it and `stop` reports it as a failed stop), so letting it hold the
-/// name would lock the user out of ever relaunching under the name they chose,
-/// with no way to free it except by launch id.
+/// Rows in `dead` (supervisor errored or exited) are skipped. Such a launch keeps
+/// its `state.json` row until it is stopped, but it is not an addressable target,
+/// so letting it hold the name would lock the user out of relaunching under the
+/// name they chose, with no way to free it except by launch id.
 fn name_holder<'a>(
   running: impl IntoIterator<Item = &'a RunningSnapshot>,
   model_path: &Path,
   name: &str,
-  errored: &std::collections::BTreeSet<String>,
+  dead: &std::collections::BTreeSet<String>,
 ) -> Option<&'a RunningSnapshot> {
   running
     .into_iter()
     .filter(|r| r.params.model_path == model_path)
-    .filter(|r| {
-      !r.launch_id
-        .as_ref()
-        .is_some_and(|id| errored.contains(&id.0))
-    })
+    .filter(|r| !r.launch_id.as_ref().is_some_and(|id| dead.contains(&id.0)))
     .find(|r| crate::launch::resolve::name_matches(r.name.as_deref(), name))
+}
+
+/// `model_path`'s effective preset set, read from the same store and catalog
+/// the IPC preset handlers use.
+pub(crate) async fn model_presets(
+  ctx: &MethodContext,
+  model_path: &Path,
+  arch: Option<&str>,
+) -> crate::launch::presets::EffectivePresets {
+  let store = ctx.presets.snapshot().await;
+  let rows = crate::ipc::methods::catalog_rows(ctx).await;
+  crate::launch::presets::effective_presets(
+    &crate::util::paths::model_file_label(model_path),
+    &model_path.display().to_string(),
+    arch,
+    &store,
+    &rows,
+  )
 }
 
 /// The refusal for `--name` on a managed-multiplexer model, or `None` when the
@@ -383,6 +405,18 @@ pub(crate) async fn compose_and_spawn(
   // publishes an address that parses back to a different pair or to none.
   // Normalizing here also means everything downstream — the uniqueness gate,
   // the stamp, the snapshot — sees the same trimmed value the clients send.
+  // The mirror of a proxy auto-start of `<model>@<name>`, which takes its preset
+  // from the name: a manual launch from a named preset takes its name from the
+  // preset, so both reach the same `<model>@<preset>` address.
+  let name_from_preset = parsed.name.is_none()
+    && origin == crate::daemon::supervisor::LaunchOrigin::Manual
+    && parsed
+      .preset
+      .as_deref()
+      .is_some_and(crate::launch::resolve::is_launch_name);
+  if name_from_preset {
+    parsed.name = parsed.preset.clone();
+  }
   if let Some(name) = parsed.name.as_deref() {
     parsed.name = Some(
       crate::launch::resolve::validate_launch_name(name)
@@ -402,8 +436,8 @@ pub(crate) async fn compose_and_spawn(
   // refusal names the launch holding it, so the user knows what to stop without
   // running `status` first.
   //
-  // Two details make this more than a snapshot scan. A launch that already
-  // errored keeps its row until it is stopped but is not an addressable target,
+  // Two details make this more than a snapshot scan. A launch that errored or
+  // exited keeps its row until it is stopped but is not an addressable target,
   // so it must not lock the name forever. And the row is not pushed until
   // `spawn_supervised`, long after this check, so the claim is taken here and
   // held by the guard for the rest of the spawn: without it two concurrent
@@ -411,13 +445,16 @@ pub(crate) async fn compose_and_spawn(
   // serialized the only symptom would be two launches sharing one address.
   let _name_claim = match parsed.name.as_deref() {
     Some(name) => {
-      let mut errored: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+      let mut dead: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
       for (launch_id, model) in ctx.supervisors.snapshot().await {
-        if matches!(model.state().await, ManagedState::Error { .. }) {
-          errored.insert(launch_id.0);
+        if matches!(
+          model.state().await,
+          ManagedState::Error { .. } | ManagedState::Stopped
+        ) {
+          dead.insert(launch_id.0);
         }
       }
-      let holder = name_holder(&state_snap.running, &parsed.model_path, name, &errored);
+      let holder = name_holder(&state_snap.running, &parsed.model_path, name, &dead);
       if let Some(holder) = holder {
         let held_as = holder
           .launch_id
@@ -480,7 +517,10 @@ pub(crate) async fn compose_and_spawn(
   )?;
 
   if let Some(err) = multiplexer_refuses_name(&identity, parsed.name.as_deref()) {
-    return Err(err);
+    if !name_from_preset {
+      return Err(err);
+    }
+    parsed.name = None;
   }
 
   // Pre-spawn refusal (D-guard): on an auto-routed launch, ask every backend
@@ -502,17 +542,7 @@ pub(crate) async fn compose_and_spawn(
   // via the same `effective_presets` the IPC handlers use.
   let is_default_sel = matches!(parsed.selection, LaunchSelection::Default);
   let effective_default = if is_default_sel {
-    let store = ctx.presets.snapshot().await;
-    let rows = crate::ipc::methods::catalog_rows(ctx).await;
-    let key = crate::util::paths::model_file_label(&parsed.model_path);
-    let path_str = parsed.model_path.display().to_string();
-    Some(crate::launch::presets::effective_presets(
-      &key,
-      &path_str,
-      arch.as_deref(),
-      &store,
-      &rows,
-    ))
+    Some(model_presets(ctx, &parsed.model_path, arch.as_deref()).await)
   } else {
     None
   };
@@ -522,17 +552,11 @@ pub(crate) async fn compose_and_spawn(
   // has, since it sends nothing but `body.model`. Scoped to auto-start on
   // purpose: on `start --name` and in the TUI, `--preset` is already how a
   // preset gets chosen, and a launch name there stays independent of one.
-  // Compared with `name_matches`, because the address half is
-  // case-insensitive — `@Coder` and `@coder` are one launch, so they must not
-  // resolve different presets.
   let addressed_preset = match origin {
-    crate::daemon::supervisor::LaunchOrigin::AutoStart => parsed.name.as_deref().and_then(|n| {
-      effective_default.as_ref().and_then(|e| {
-        e.presets
-          .iter()
-          .find(|p| crate::launch::resolve::name_matches(Some(&p.name), n))
-      })
-    }),
+    crate::daemon::supervisor::LaunchOrigin::AutoStart => parsed
+      .name
+      .as_deref()
+      .and_then(|n| effective_default.as_ref().and_then(|e| e.named(n))),
     crate::daemon::supervisor::LaunchOrigin::Manual => None,
   };
   // The preset this launch takes its `PresetDefault` layer from: the one the
@@ -617,12 +641,11 @@ pub(crate) async fn compose_and_spawn(
 
   // Reject an unknown `--server` id up front — before any port/admission
   // reservation — so a typo errors cleanly instead of silently launching on
-  // the default binary with a bogus `params.server` recorded. The catalog
-  // fills in the background at boot, so only reject once it is populated; an
-  // empty catalog means "not known yet" and keeps the id as a best-effort hint
-  // (resolved to the default binary below).
+  // the default binary with a bogus `params.server` recorded. An empty catalog
+  // (nothing probed, or still loading after the wait) keeps the id as a
+  // best-effort hint, resolved to the default binary below.
   if let Some(server_id) = &parsed.server {
-    let servers = env.servers.read().await;
+    let servers = env.servers.loaded().await;
     if !servers.is_empty() && !servers.iter().any(|s| &s.id == server_id) {
       let valid = servers
         .iter()
@@ -706,7 +729,7 @@ pub(crate) async fn compose_and_spawn(
   launch_params.backend = parsed
     .backend
     .clone()
-    .or(identity_default.backend)
+    .or(identity_default.backend.clone())
     .unwrap_or_default();
 
   // Chosen server (a build/binary of a backend). Resolve it from the catalog
@@ -715,26 +738,56 @@ pub(crate) async fn compose_and_spawn(
   // pick subsumes backend selection. An unknown id was already rejected before
   // the port reservation; the only `None` that reaches here is the empty-catalog
   // startup race, which falls back to the default binary.
-  launch_params.server = parsed.server.clone().or(identity_default.server);
+  launch_params.server = parsed.server.clone().or(identity_default.server.clone());
   let picked_server: Option<crate::backend::Server> = match &launch_params.server {
     Some(server_id) => {
-      let servers = env.servers.read().await;
+      let servers = env.servers.loaded().await;
       let found = servers.iter().find(|s| &s.id == server_id).cloned();
-      if found.is_none() {
+      // An inherited server must not override an explicit `--backend`: the
+      // user asked for that backend, so take its default binary instead.
+      let requested = parsed.backend.as_ref().and_then(|b| b.explicit_id());
+      let foreign = parsed.server.is_none()
+        && found
+          .as_ref()
+          .zip(requested)
+          .is_some_and(|(s, want)| s.backend_id != want);
+      if foreign {
+        launch_params.server = None;
+        None
+      } else if found.is_none() {
         // A typed `--server` was already rejected up front. Reaching here
         // means the id came from a preset or a remembered launch and the
         // build is gone (rebuilt llama.cpp, moved machine) — warn and take
         // the default rather than failing a launch the user did not pin.
         log::warn!("server {server_id:?} not in catalog; using the default binary");
         launch_params.server = None;
+        // The remembered backend came with that server. Kept alone it runs
+        // the backend with no server to pick, which a config-declared one
+        // cannot do, so the model's default decides instead.
+        if parsed.backend.is_none() && identity_default.backend_from_last {
+          launch_params.backend = crate::launch::params::BackendChoice::Auto;
+        }
+        None
+      } else {
+        found
       }
-      found
     }
     None => None,
   };
+  // A server is one backend's binary, so the pick decides the backend. The
+  // TUI sends the row's default backend beside the pick; honouring that over
+  // the server ran one engine's argv against another engine's binary.
   if let Some(server) = &picked_server {
-    if launch_params.backend == crate::launch::params::BackendChoice::Auto {
-      launch_params.backend = crate::launch::params::BackendChoice::from_id(&server.backend_id);
+    let from_server = crate::launch::params::BackendChoice::from_id(&server.backend_id);
+    if launch_params.backend != from_server {
+      if launch_params.backend != crate::launch::params::BackendChoice::Auto {
+        log::info!(
+          "server {} belongs to backend {}; overriding the requested backend",
+          server.id,
+          server.backend_id
+        );
+      }
+      launch_params.backend = from_server;
     }
   }
 
@@ -746,12 +799,21 @@ pub(crate) async fn compose_and_spawn(
   // names no backend.
   let inference_backend = crate::backend::resolve_backend_for_launch(
     &identity,
+    &parsed.model_path,
+    launch_params.server.as_deref(),
     launch_params.backend.clone(),
     &supported_backends,
     mode,
     ctx,
   );
   let resolved_backend_id = crate::backend::Backend::id(&inference_backend).to_string();
+  // Every knob lookup below runs under this: the backend id, or the model's
+  // own runtime table when its backend declares knobs per model.
+  let knob_scope = crate::backend::knob_scope_for(
+    &inference_backend,
+    &parsed.model_path,
+    launch_params.server.as_deref(),
+  );
 
   // The model's last successful launch params + the backend it resolved to.
   // Cloned once here and reused for the last-used knob layer below.
@@ -760,8 +822,8 @@ pub(crate) async fn compose_and_spawn(
     .map(|e| (e.params.clone(), e.resolved_backend.clone()));
   // D-contamination: the implicit LastUsed layer + extras inheritance apply
   // only when the stored launch resolved to the *same* backend, so llama.cpp
-  // extras (`--rope-freq-base …`) saved before ds4 existed can't poison a ds4
-  // spawn (and vice versa). Explicit config (presets, inline extras) is
+  // extras (`--rope-freq-base …`) can't poison a spawn of the same model on
+  // another backend (and vice versa). Explicit config (presets, inline extras) is
   // untouched. A legacy row with no tag reads as `llamacpp`.
   let last_params_backend_ok = last_params_entry
     .as_ref()
@@ -794,8 +856,8 @@ pub(crate) async fn compose_and_spawn(
   // Native knobs (not layered by the typed-knob resolver): explicit inline
   // values win verbatim; else a no-selection relaunch inherits the last-used
   // native knobs — but only through the backend-matched `last_params` gate
-  // above (D-contamination), so a ds4 relaunch re-applies its `--power` /
-  // `--kv-disk-*` while a cross-backend run inherits nothing. Empty for
+  // above (D-contamination), so a relaunch re-applies its backend's own knobs
+  // while a cross-backend run inherits nothing. Empty for
   // llama.cpp / Lemonade.
   // Seed the resolved backend's config-derived launch knobs into
   // `backend_knobs`, fresh each launch (config projection, not user intent) —
@@ -831,14 +893,10 @@ pub(crate) async fn compose_and_spawn(
   use crate::launch::knobs::{Concept, KnobValue as KV, Scalar};
   if let Some(c) = parsed.ctx {
     if user_knobs
-      .by_concept(&resolved_backend_id, Concept::ContextLength)
+      .by_concept(knob_scope, Concept::ContextLength)
       .is_none()
     {
-      user_knobs.set_by_concept(
-        &resolved_backend_id,
-        Concept::ContextLength,
-        KV::Set(Scalar::U32(c)),
-      );
+      user_knobs.set_by_concept(knob_scope, Concept::ContextLength, KV::Set(Scalar::U32(c)));
     }
   }
   if let Some(r) = parsed.reasoning {
@@ -886,17 +944,19 @@ pub(crate) async fn compose_and_spawn(
   }
   layers.push((LayerLabel::ArchDefault, yaml_knobs));
   layers.push((LayerLabel::ArchDefault, &builtin_knobs));
-  let mut resolved = crate::launch::knobs::resolve_layered(&resolved_backend_id, &layers);
+  // Defaults the model's own config declares. Labelled as the fallback, so
+  // they read as "where the value comes from when nothing sets it" and are
+  // never persisted.
+  let config_defaults =
+    inference_backend.config_default_knobs(&parsed.model_path, launch_params.server.as_deref());
+  layers.push((LayerLabel::ServerDefault, &config_defaults));
+  let mut resolved = crate::launch::knobs::resolve_layered(knob_scope, &layers);
   // Seed knobs no layer filled per the default launch mode: under
   // `Auto` a layer-less knob delegates to `--fit` (an Auto knob emits
   // nothing, exactly like the unset slot it replaces). The mode is
   // `Config.default_launch_mode` (+ `LLAMASTASH_DEFAULT_LAUNCH_MODE`),
   // threaded through `LaunchEnv`.
-  crate::launch::knobs::seed_layerless(
-    &mut resolved,
-    &resolved_backend_id,
-    env.default_launch_mode,
-  );
+  crate::launch::knobs::seed_layerless(&mut resolved, knob_scope, env.default_launch_mode);
   // A knob some layer supplied that this backend cannot honour is dropped and
   // surfaced rather than silently emitted (R6). The whole-map contamination
   // gate the old shape needed is gone: the resolver carries values across a
@@ -913,10 +973,9 @@ pub(crate) async fn compose_and_spawn(
   // An `Auto` ctx/reasoning collapses to "no inline flag" here
   // (`set_value()` → `None`): `compose` emits nothing and `--fit`
   // governs ctx, the chat template governs reasoning.
-  launch_params.ctx = resolved.knobs.u32_by_concept(
-    &resolved_backend_id,
-    crate::launch::knobs::Concept::ContextLength,
-  );
+  launch_params.ctx = resolved
+    .knobs
+    .u32_by_concept(knob_scope, crate::launch::knobs::Concept::ContextLength);
   launch_params.reasoning = resolved
     .knobs
     .get_by_name("reasoning")
@@ -925,7 +984,7 @@ pub(crate) async fn compose_and_spawn(
     .unwrap_or(false);
   // Provenance for the IPC/CLI response (only knobs a real layer supplied),
   // computed before `resolved.knobs` moves out below.
-  let layer_sources = resolved.real_sources(&resolved_backend_id);
+  let layer_sources = resolved.real_sources(knob_scope);
   launch_params.knobs = resolved.knobs;
   // Close the `knobs.u32(crate::launch::knobs::kid("ctx-size"))` bypass of `MAX_CTX_TOKENS` (the early check
   // only saw the top-level `parsed.ctx`): validate the *resolved* ctx,
@@ -983,27 +1042,34 @@ pub(crate) async fn compose_and_spawn(
     .knobs
     .text_by_name("device")
     .filter(|s| !s.is_empty());
-  let servers_snapshot = env.servers.read().await;
+  // Only a device selector needs the catalog; `seed_binary_caps` probes a binary
+  // the catalog does not list yet, so a plain launch need not wait for it.
+  let servers_snapshot = if selector.is_some() {
+    env.servers.loaded().await
+  } else {
+    env.servers.current().await
+  };
   let launch_binary = pick_launch_binary(
     &mut launch_params,
     picked_server.as_ref(),
     selector.as_deref(),
     &servers_snapshot[..],
-    &env.binary,
+    env.binary.as_deref(),
   );
   // Facts about the *binary* this launch resolved, which only its own backend
   // can interpret — a flag whose spelling differs between builds of the same
   // engine. Runs here because the binary is not known until `pick_launch_binary`
   // returns, and it must land before `compose` reads `launch_config`.
-  inference_backend.seed_binary_caps(&launch_binary, &servers_snapshot[..], &mut launch_params);
+  if let Some(binary) = launch_binary.as_deref() {
+    inference_backend.seed_binary_caps(binary, &servers_snapshot[..], &mut launch_params);
+  }
   drop(servers_snapshot);
 
   // `inference_backend` was resolved up front (before the last_params gate).
   // The orchestrator owns the branch on plan shape below.
 
-  // Backend-specific extras denylist, checked once the backend is known: ds4
-  // adds `--cors` / `--dist-` on top of the base loopback/auth heads already
-  // refused above. Release the port before returning so a retry can reuse it.
+  // Backend-specific extras denylist, checked once the backend is known, on
+  // top of the base loopback/auth heads already refused above. Release the port before returning so a retry can reuse it.
   let extra_heads = crate::backend::Backend::forbidden_extra_heads(&inference_backend);
   if !extra_heads.is_empty() {
     let backend_banned =
@@ -1050,7 +1116,7 @@ pub(crate) async fn compose_and_spawn(
   };
   // Dropped-knob surfacing (R6): typed knobs the user set that the resolved
   // backend can't honor are silently dropped from argv — tell the user which.
-  // ds4 honors only `Ctx`, so a `--flash-attn` on a ds4-routed model warns.
+  // A llama.cpp-only knob on a model another backend serves warns, for example.
   //
   // Against the **user** layer, not the resolved set. The resolved set carries
   // the resolver's own answers (a model-default `reasoning`, an arch default),
@@ -1102,7 +1168,7 @@ pub(crate) async fn compose_and_spawn(
     user_knobs,
     layer_sources,
     auto_set_knobs,
-    volatile_knobs: crate::launch::knobs::volatile_ids(&resolved_backend_id),
+    volatile_knobs: crate::launch::knobs::volatile_ids(knob_scope),
     bypasses_admission,
     force_admission,
     warnings,
@@ -1176,10 +1242,7 @@ pub(crate) async fn spawn_supervised(
   // outside the scan roots) back outside the gate, which is the one case
   // that most needs it.
   let gate_applies = identity.as_gguf().is_some()
-    || crate::backend::Backends::all()
-      .into_iter()
-      .find(|b| crate::backend::Backend::id(b) == resolved_backend_id)
-      .map(|b| crate::backend::Backend::lifecycle(&b))
+    || crate::backend::Backends::from_id(&resolved_backend_id).map(|b| b.lifecycle())
       == Some(crate::backend::Lifecycle::ProcessPerModel);
   if gate_applies {
     if let Some(host_slot) = ctx.host_metrics.as_ref() {
@@ -1191,19 +1254,33 @@ pub(crate) async fn spawn_supervised(
           .ctx
           .or(admission_floor)
           .unwrap_or(crate::config::DEFAULT_FIT_CTX_FLOOR);
-        let free = crate::launch::admission::effective_free_bytes(&snapshot);
+        let backend = crate::backend::Backends::from_id(&resolved_backend_id);
+        // Free and pool total must come from the same pool, so both take one flag.
+        let budget = |layer_count: Option<u64>| {
+          let gpu_resident = backend
+            .as_ref()
+            .is_some_and(|b| crate::backend::Backend::gpu_resident(b, &launch_params, layer_count));
+          let gtt_only = crate::launch::admission::gtt_only_budget(&snapshot, gpu_resident);
+          (
+            crate::launch::admission::effective_free_bytes_for(&snapshot, gtt_only),
+            gtt_only,
+          )
+        };
         let gpu_backend = snapshot.gpu_backend.clone();
         let model_path = launch_params.model_path.clone();
         let knobs = launch_params.knobs.clone();
         let arch_owned = arch.clone();
         let mtp_active = launch_params.mtp_directive.is_some();
-        let demand = if identity.as_gguf().is_some() {
+        let demand_and_free = if identity.as_gguf().is_some() {
           let demand_backend_id = resolved_backend_id.clone();
           tokio::task::spawn_blocking(move || {
             let header = read_gguf_header(&model_path, HeaderReadOptions::default())
               .ok()?
               .header;
-            Some(crate::launch::admission::project_demand(
+            let layer_count = header
+              .string(&["general.architecture"])
+              .and_then(|a| header.u64(&[format!("{a}.block_count")]));
+            let demand = crate::launch::admission::project_demand(
               &header,
               arch_owned.as_deref(),
               &knobs,
@@ -1212,12 +1289,15 @@ pub(crate) async fn spawn_supervised(
               &gpu_backend,
               resident_weight_bytes,
               mtp_active,
-            ))
+            );
+            Some((demand, layer_count))
           })
           .await
           .ok()
           .flatten()
+          .map(|(demand, layer_count)| (demand, budget(layer_count).0))
         } else {
+          let (free, gtt_only) = budget(None);
           // No header, so no per-layer KV estimate. Weights come from
           // `launch_resident_bytes`, which measures a directory when neither
           // the catalog nor `stat` can size it — the same figure the backend
@@ -1232,23 +1312,25 @@ pub(crate) async fn spawn_supervised(
           // own knob vocabulary and may be a pool fraction rather than bytes.
           let host_inputs = crate::launch::admission::DemandInputs {
             free_bytes: free,
-            pool_total_bytes: crate::launch::admission::engine_pool_total_bytes(&snapshot),
+            pool_total_bytes: crate::launch::admission::engine_pool_total_bytes(
+              &snapshot, gtt_only,
+            ),
             weights_bytes: resident_weight_bytes,
           };
-          crate::backend::Backends::all()
-            .into_iter()
-            .find(|b| crate::backend::Backend::id(b) == resolved_backend_id)
+          backend
+            .as_ref()
             .and_then(|b| {
-              crate::backend::Backend::projected_cache_bytes(&b, &launch_params, &host_inputs)
+              crate::backend::Backend::projected_cache_bytes(b, &launch_params, &host_inputs)
             })
             .filter(|_| resident_weight_bytes > 0)
             .map(|cache| {
-              resident_weight_bytes
+              let demand = resident_weight_bytes
                 .saturating_add(cache)
-                .saturating_add(crate::launch::headroom::overhead_band_bytes(&gpu_backend))
+                .saturating_add(crate::launch::headroom::overhead_band_bytes(&gpu_backend));
+              (demand, free)
             })
         };
-        if let Some(demand) = demand {
+        if let Some((demand, free)) = demand_and_free {
           if let Err(refusal) = ctx.admission.try_admit(u64::from(port), demand, free) {
             if force_admission {
               // Never suppressed by another advisory the way the bypass note
@@ -1478,10 +1560,9 @@ pub(crate) async fn backend_for_launch(
     .find(|r| r.launch_id.as_ref() == Some(launch_id))
     .map(|r| r.resolved_backend);
   match backend_id {
-    Some(id) => crate::backend::Backends::all()
-      .into_iter()
-      .find(|b| b.id() == id)
-      .unwrap_or_else(crate::backend::default_backend),
+    Some(id) => {
+      crate::backend::Backends::from_id(&id).unwrap_or_else(crate::backend::default_backend)
+    }
     None => crate::backend::default_backend(),
   }
 }
@@ -1517,6 +1598,8 @@ fn knobs_for_persist(
 struct InheritedIdentity {
   backend: Option<crate::launch::params::BackendChoice>,
   server: Option<String>,
+  /// `backend` came from `last_params`, not the preset.
+  backend_from_last: bool,
 }
 
 /// The backend / server a no-selection launch should reuse.
@@ -1553,9 +1636,13 @@ fn inherited_launch_identity(
       .filter(|v| f(v))
       .or(from_last.as_ref().filter(|v| f(v)))
   };
+  let has_backend =
+    |v: &(crate::launch::params::BackendChoice, Option<String>)| v.0.explicit_id().is_some();
   InheritedIdentity {
-    backend: pick(|(b, _)| b.explicit_id().is_some()).map(|(b, _)| b.clone()),
+    backend: pick(has_backend).map(|(b, _)| b.clone()),
     server: pick(|(_, s)| s.is_some()).and_then(|(_, s)| s.clone()),
+    backend_from_last: !from_preset.as_ref().is_some_and(has_backend)
+      && from_last.as_ref().is_some_and(has_backend),
   }
 }
 
@@ -1649,15 +1736,13 @@ fn spawn_last_params_recorder(
           // the result on the model, so reuse it instead of fetching
           // twice; only fall back to a fetch when the gate didn't run
           // (pinned ctx / no trained-window metadata). The fetch is the
-          // resolved backend's — a backend with no actuals endpoint (ds4)
+          // resolved backend's — a backend with no actuals endpoint
           // returns empty, so the row stays "unavailable" without a wasted
           // probe. Best-effort — an empty result leaves the row unavailable.
           if let Some(port) = params.port {
             let mut actuals = model.actuals().await;
             if actuals.is_empty() {
-              let backend = crate::backend::Backends::all()
-                .into_iter()
-                .find(|b| b.id() == resolved_backend)
+              let backend = crate::backend::Backends::from_id(&resolved_backend)
                 .unwrap_or_else(crate::backend::default_backend);
               actuals = backend.fetch_actuals(port, Duration::from_secs(5)).await;
             }
@@ -1943,13 +2028,41 @@ mod tests {
       None,
       Some("ROCm0"),
       std::slice::from_ref(&rocm),
-      &default,
+      Some(&default),
     );
-    assert_eq!(binary, PathBuf::from("/bin/llama-server-rocm"));
+    assert_eq!(binary, Some(PathBuf::from("/bin/llama-server-rocm")));
     assert_eq!(params.server.as_deref(), Some("llamacpp-rocm"));
     assert_eq!(
       params.backend,
       crate::launch::params::BackendChoice::from_id("llamacpp")
+    );
+  }
+
+  /// `none` asks for no offload. It is in no server's device list, and must
+  /// reach argv rather than be dropped as a stale selector.
+  #[test]
+  fn pick_launch_binary_keeps_the_no_offload_selector() {
+    let mut params = LaunchParams::new(
+      PathBuf::from("/m/a.gguf"),
+      crate::launch::mode::LaunchMode::Chat,
+    );
+    params.knobs.set_by_name("device", "none");
+    let binary = pick_launch_binary(
+      &mut params,
+      None,
+      Some("none"),
+      &[],
+      Some(Path::new("/bin/llama-server")),
+    );
+    assert_eq!(binary, Some(PathBuf::from("/bin/llama-server")));
+    assert_eq!(params.knobs.text_by_name("device"), Some("none".into()));
+    assert!(params.server.is_none());
+
+    params.knobs.set_by_name("device", "Vulkan9");
+    pick_launch_binary(&mut params, None, Some("Vulkan9"), &[], None);
+    assert!(
+      params.knobs.text_by_name("device").is_none(),
+      "a real stale selector is still dropped"
     );
   }
 
@@ -1975,9 +2088,9 @@ mod tests {
       Some(&rocm),
       Some("ROCm0"),
       std::slice::from_ref(&rocm),
-      &default,
+      Some(&default),
     );
-    assert_eq!(binary, PathBuf::from("/bin/llama-server-rocm"));
+    assert_eq!(binary, Some(PathBuf::from("/bin/llama-server-rocm")));
   }
 
   /// A stale selector (no server owns it) drops the `device` knob and falls
@@ -1990,8 +2103,8 @@ mod tests {
     );
     params.knobs.set_by_name("device", "ROCm0");
     let default = PathBuf::from("/bin/llama-server");
-    let binary = pick_launch_binary(&mut params, None, Some("ROCm0"), &[], &default);
-    assert_eq!(binary, default);
+    let binary = pick_launch_binary(&mut params, None, Some("ROCm0"), &[], Some(&default));
+    assert_eq!(binary, Some(default));
     assert!(params.server.is_none());
     assert!(params.knobs.text_by_name("device").is_none());
   }
@@ -2022,10 +2135,11 @@ mod tests {
     // A process launch stamps its `L#` + resolved backend on the running
     // snapshot, so `backend_for_launch` hands the stop to the launch's *real*
     // backend rather than defaulting — the guard for a process-per-model backend
-    // that overrides `stop`. (llama.cpp and ds4 share the default stop today, so
+    // that overrides `stop`. (llama.cpp and that backend share the default stop today, so
     // this is latent-correctness, not observable yet.)
+    let other = crate::test_support::backend_declaring("enforce-eager");
     let ctx = MethodContext::new(ShutdownToken::new());
-    let push = |id_path: &'static str, lid: &'static str, backend: &'static str, port: u16| {
+    let push = |id_path: &'static str, lid: &'static str, backend: &str, port: u16| {
       let identity = ModelIdentity::Gguf(crate::gguf::identity::compute(id_path, b"hdr"));
       let params = LaunchParams::new(PathBuf::from(id_path), LaunchMode::Chat);
       crate::test_support::running_row(id_path)
@@ -2039,7 +2153,7 @@ mod tests {
     ctx
       .state
       .mutate(|s| {
-        s.running.push(push("/m/ds4.gguf", "L1", "ds4", 41100));
+        s.running.push(push("/m/other-model", "L1", other, 41100));
         s.running
           .push(push("/m/llama.gguf", "L2", "llamacpp", 41101));
       })
@@ -2049,8 +2163,8 @@ mod tests {
       backend_for_launch(&ctx, &LaunchId("L1".to_string()))
         .await
         .id(),
-      "ds4",
-      "a ds4-tagged process launch resolves to ds4, not the default backend"
+      other,
+      "a launch tagged with another backend resolves to it, not the default"
     );
     assert_eq!(
       backend_for_launch(&ctx, &LaunchId("L2".to_string()))
@@ -2207,12 +2321,12 @@ mod tests {
     let env = LaunchEnv {
       // Never spawned on this path — the managed-multiplexer arm errors out
       // before any process launch.
-      binary: PathBuf::from("/nonexistent/llama-server"),
+      binary: Some(PathBuf::from("/nonexistent/llama-server")),
       port_range: range,
       log_dir: dir.path().to_path_buf(),
       probe: ProbeOptions::default(),
       arch_defaults: Default::default(),
-      servers: Arc::new(RwLock::new(Vec::new())),
+      servers: Default::default(),
       default_launch_mode: Default::default(),
     };
 
@@ -2295,12 +2409,12 @@ mod tests {
     std::fs::write(&model_path, build_minimal_gguf("llama")).expect("write gguf");
 
     let env = LaunchEnv {
-      binary: PathBuf::from("/nonexistent/llama-server"),
+      binary: Some(PathBuf::from("/nonexistent/llama-server")),
       port_range: crate::test_support::allocate_port_range(8),
       log_dir: dir.path().to_path_buf(),
       probe: ProbeOptions::default(),
       arch_defaults: Default::default(),
-      servers: Arc::new(RwLock::new(Vec::new())),
+      servers: Default::default(),
       default_launch_mode: Default::default(),
     };
     let ctx = MethodContext::new(ShutdownToken::new())
@@ -2494,7 +2608,7 @@ mod tests {
     std::fs::set_permissions(&binary, std::os::unix::fs::PermissionsExt::from_mode(0o755))
       .expect("chmod stub");
     if let Some(env) = ctx.launch.as_mut() {
-      env.binary = binary;
+      env.binary = Some(binary);
     }
 
     let started = compose_and_spawn(
@@ -2584,16 +2698,15 @@ mod tests {
       .as_ref()
       .unwrap()
       .servers
-      .write()
-      .await
-      .push(crate::backend::Server {
+      .fill(vec![crate::backend::Server {
         id: "llamacpp-rocm".into(),
         backend_id: "llamacpp".into(),
         binary: PathBuf::from("/nonexistent/llama-server"),
         name: "llamacpp-rocm".into(),
         devices: Vec::new(),
         caps: Default::default(),
-      });
+      }])
+      .await;
     let parsed = StartParams {
       model_path,
       server: Some("nope".into()),
@@ -2788,6 +2901,33 @@ mod tests {
         err.message
       ),
       Ok(_) => panic!("expected the duplicate-name refusal, got a successful launch"),
+    }
+  }
+
+  /// A preset launch without `--name` goes through the same gate as a named one.
+  #[tokio::test]
+  async fn a_preset_launch_without_a_name_is_named_after_the_preset() {
+    let ctx = MethodContext::new(ShutdownToken::new()).with_state(PersistedState::new(
+      DaemonState {
+        running: vec![named_running("/m/a.gguf", Some("coder"))],
+        ..Default::default()
+      },
+      None,
+    ));
+    let parsed = StartParams {
+      model_path: PathBuf::from("/m/a.gguf"),
+      preset: Some("coder".to_string()),
+      ..Default::default()
+    };
+    match compose_and_spawn(&ctx, parsed, LaunchOrigin::Manual).await {
+      Err(err) => assert!(
+        err
+          .message
+          .contains("name `coder` is already running as L1"),
+        "got: {}",
+        err.message
+      ),
+      Ok(_) => panic!("expected the duplicate-name refusal"),
     }
   }
 

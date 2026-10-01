@@ -426,3 +426,53 @@ async fn wait_for_log_contents(path: &Path, needle: &str, budget: Duration) -> b
     tokio::time::sleep(Duration::from_millis(50)).await;
   }
 }
+
+/// A Ready child that dies without a stop request (the OOM killer's SIGKILL)
+/// becomes an error that says how it ended. It used to read as a clean
+/// `stopped` with a dead pid, indistinguishable from a user stop.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ready_child_killed_from_outside_is_an_error_with_its_signal() {
+  let dir = unique_temp("killed");
+  let port = allocate_port();
+  let params = LaunchParams::new(PathBuf::from("/fixture/m.gguf"), LaunchMode::Chat);
+  let plan = LlamaCppBackend::new().process_spec(&params, port, fake_binary(), fast_probe());
+  let model = spawn(ManagedSpawn {
+    id: fake_id(60),
+    params,
+    port,
+    mode: LaunchMode::Chat,
+    log_path: dir.join("launch.log"),
+    plan,
+    origin: llamastash::daemon::supervisor::LaunchOrigin::Manual,
+    fit_gate: None,
+    resolved_backend: "llamacpp".to_string(),
+  })
+  .await
+  .expect("spawn");
+  wait_for_state(
+    &model,
+    |s| matches!(s, ManagedState::Ready),
+    Duration::from_secs(5),
+  )
+  .await;
+
+  let pid = model.pid().await.expect("pid");
+  // SAFETY: signalling the fixture child this test just spawned.
+  unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+
+  let s = wait_for_state(
+    &model,
+    |s| !matches!(s, ManagedState::Ready),
+    Duration::from_secs(5),
+  )
+  .await;
+  match s {
+    ManagedState::Error { cause } => assert!(
+      cause.contains("exited unexpectedly") && cause.contains("killed by signal 9"),
+      "{cause}"
+    ),
+    other => panic!("expected an error, got {other:?}"),
+  }
+  std::fs::remove_dir_all(&dir).ok();
+}

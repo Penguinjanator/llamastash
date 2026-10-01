@@ -30,40 +30,16 @@ use crate::launch::defaults_table;
 const DASH_PLACEHOLDER: &str = "—";
 
 pub async fn handle(args: ShowArgs, cli: &Cli, config: &Config) -> CliResult {
-  // Every CLI command must support `--json`. Errors flow through the
-  // same machinery: when `--json` is set, a CliExit lands on stdout
-  // as `{"error": {"code": …, "message": …}}` instead of stderr
-  // prose so agents can parse failure shapes without scraping. The
-  // exit code is preserved either way.
-  match build_view(&args, cli, config).await {
-    Ok(view) => {
-      if args.json {
-        println!("{}", pretty_json(&view.envelope));
-      } else {
-        print!(
-          "{}",
-          render_human(&view.row, &view.shards, view.total_bytes, &view.envelope)
-        );
-      }
-      Ok(())
-    }
-    Err(exit) => {
-      if args.json {
-        let body = json!({
-          "error": {
-            "code": exit.code,
-            "message": exit.message.as_deref().unwrap_or(""),
-          },
-        });
-        println!("{}", pretty_json(&body));
-        // Drop the message so `report` doesn't double-print it to
-        // stderr — the JSON body on stdout is the canonical surface.
-        Err(crate::cli::exit_codes::CliExit::code_only(exit.code))
-      } else {
-        Err(exit)
-      }
-    }
+  let view = build_view(&args, cli, config).await?;
+  if args.json {
+    println!("{}", pretty_json(&view.envelope));
+  } else {
+    print!(
+      "{}",
+      render_human(&view.row, &view.shards, view.total_bytes, &view.envelope)
+    );
   }
+  Ok(())
 }
 
 struct ShowView {
@@ -160,11 +136,9 @@ async fn build_view(args: &ShowArgs, cli: &Cli, config: &Config) -> Result<ShowV
   // resolver. Yaml arch_defaults sit on the same layer and win
   // per-field; surface both so the user sees where each field comes
   // from.
-  let arch_key = row.arch.as_deref().unwrap_or("");
-  let builtin_arch_defaults = defaults_table::lookup(arch_key, backend);
-  let yaml_arch_defaults = row
-    .arch
-    .as_deref()
+  let launch_arch = launch_arch(&row);
+  let builtin_arch_defaults = defaults_table::lookup(launch_arch.unwrap_or(""), backend);
+  let yaml_arch_defaults = launch_arch
     .and_then(|a| config.arch_defaults.get(a))
     .cloned();
 
@@ -217,6 +191,17 @@ async fn build_view(args: &ShowArgs, cli: &Cli, config: &Config) -> Result<ShowV
     total_bytes,
     envelope,
   })
+}
+
+/// The arch the launch resolver keys arch defaults on. A config-declared
+/// row's arch is display text: its launch reads no GGUF header. Backend rows
+/// read none either, but no backend sets an arch on them, so Config is the
+/// only source that needs the check today.
+fn launch_arch(row: &CatalogRow) -> Option<&str> {
+  match crate::discovery::ModelSource::from_label(&row.source) {
+    Some(crate::discovery::ModelSource::Config) => None,
+    _ => row.arch.as_deref(),
+  }
 }
 
 /// Resolve `show`'s target to a catalog row, plus the launch name to scope the
@@ -319,8 +304,8 @@ fn render_human(row: &CatalogRow, shards: &[ShardSize], total_bytes: u64, env: &
   }
   header.push(("parent", row.parent.clone()));
   header.push(("source", row.source.clone()));
-  // Same badge the `list` BACKEND column renders, so a ds4-compatible file
-  // reads `ds4|llamacpp` on both surfaces instead of a source-derived guess.
+  // Same badge the `list` BACKEND column renders, so a file two backends can
+  // serve reads `<other>|llamacpp` on both surfaces instead of a source-derived guess.
   header.push((
     "backend",
     crate::cli::output::backend_badge(row, DASH_PLACEHOLDER),
@@ -635,6 +620,15 @@ mod tests {
   }
 
   #[test]
+  fn a_config_row_s_declared_arch_keys_no_arch_defaults() {
+    let mut row = fake_row("/m/a.gguf");
+    row.arch = Some("qwen3next".into());
+    assert_eq!(launch_arch(&row), Some("qwen3next"));
+    row.source = "config".into();
+    assert_eq!(launch_arch(&row), None);
+  }
+
+  #[test]
   fn shard_breakdown_lists_every_shard_with_its_individual_size() {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("m-00001-of-00002.gguf");
@@ -901,7 +895,7 @@ mod tests {
     // byte-identically, so capability fields (multimodal / mtp /
     // supported_backends / split_siblings) can never lag `list --json` again.
     let mut row = fake_row("/m/x.gguf");
-    row.supported_backends = vec!["ds4".into(), "llamacpp".into()];
+    row.supported_backends = vec!["other".into(), "llamacpp".into()];
     row.multimodal = Some(Multimodal {
       vision: true,
       audio: false,
@@ -935,7 +929,7 @@ mod tests {
     );
     assert_eq!(
       envelope.get("supported_backends"),
-      Some(&json!(["ds4", "llamacpp"]))
+      Some(&json!(["other", "llamacpp"]))
     );
     // Show-only sections layer on top.
     for key in ["size", "arch_defaults", "last_params", "running"] {

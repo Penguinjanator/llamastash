@@ -118,9 +118,9 @@ pub struct ManagedRow {
   /// live `status` `params.extras`). Empty for external rows. Lets
   /// `Ctrl+P` save-from-running carry the advanced args into the preset.
   pub extras: Vec<String>,
-  /// Backend this launch actually resolved to (`status` `backend`): `ds4`
-  /// when the launch dispatched to ds4, else `llamacpp` / `lemonade`. Keyed
-  /// on by the ds4 badge / knob panel so a running row reflects the real
+  /// Backend this launch actually resolved to (`status` `backend`): the
+  /// engine the launch dispatched to (`llamacpp`, `lemonade`, and so on). Keyed
+  /// on by the backend badge / knob panel so a running row reflects the real
   /// backend, not the `list_models` routing prediction. `None` when untagged.
   pub backend: Option<String>,
   /// Server (build/binary) id the launch picked (`status` `params.server`),
@@ -294,11 +294,11 @@ pub struct App {
   pub focus: Focus,
   pub models: Vec<DiscoveredModel>,
   /// The daemon's per-model `list_models` `backend` prediction, keyed by
-  /// canonical path (`llamacpp` / `lemonade` / `ds4`). The daemon already
-  /// applied the ds4 availability + quant-contract predicate and the source
+  /// canonical path (`llamacpp` / `lemonade`). The daemon already
+  /// applied each backend's availability + routing predicate and the source
   /// mapping, so this is the single source of truth for "where would a plain
   /// launch of this model route" — it drives the launch picker's
-  /// `model_backend`, the right-pane ds4 badge, and the Models-list Backend
+  /// `model_backend`, the right-pane backend badge, and the Models-list Backend
   /// column, with no backend logic re-derived TUI-side. Refreshed with `models`.
   pub backend_by_path: std::collections::BTreeMap<PathBuf, String>,
   pub favorites: Vec<PathBuf>,
@@ -860,7 +860,7 @@ impl App {
     for row in arr {
       if let Some(m) = parse_list_models_row(row) {
         // Capture the daemon's honest per-row backend prediction (the single
-        // source for the picker, the ds4 badge, and the Backend column).
+        // source for the picker, the backend badge, and the Backend column).
         if let Some(backend) = row.get("backend").and_then(Value::as_str) {
           backend_by_path.insert(m.path.clone(), backend.to_string());
         }
@@ -872,8 +872,8 @@ impl App {
     self.clamp_cursor();
   }
 
-  /// The daemon's predicted backend for `path` (`llamacpp` / `lemonade` /
-  /// `ds4`), or `None` when the model isn't in the current catalog.
+  /// The daemon's predicted backend for `path` (`llamacpp`, `lemonade`, and
+  /// so on), or `None` when the model isn't in the current catalog.
   pub fn predicted_backend(&self, path: &std::path::Path) -> Option<&str> {
     self.backend_by_path.get(path).map(String::as_str)
   }
@@ -1192,7 +1192,7 @@ impl App {
         state: m.state,
         device: m.device.clone(),
         // The backend the launch actually resolved to (honest even for a
-        // `--backend llamacpp` override on a ds4-compatible file).
+        // `--backend llamacpp` override on a file another backend claims).
         backend: m.backend.clone(),
         // User-chosen launch name (from `--name` / `Alt+⏎`), when set.
         launch_name: m.name.clone(),
@@ -1409,6 +1409,16 @@ impl App {
     rows
       .get(self.list_cursor)
       .and_then(|r| r.path().map(|p| p.to_path_buf()))
+  }
+
+  /// Whether `path` names a file on disk that a delete can unlink. A path the
+  /// catalog does not know is treated as a local file.
+  pub fn has_local_file(&self, path: &Path) -> bool {
+    self
+      .models
+      .iter()
+      .find(|m| m.path == path)
+      .is_none_or(|m| m.source.has_local_file())
   }
 
   /// Friendly display label for `path` if the discovery layer
@@ -1629,7 +1639,15 @@ impl App {
     let default_binary = self.daemon_info.server_path.as_deref().map(Path::new);
     let mut out = Vec::new();
     for backend_id in &backends {
-      let of_backend = || self.servers.iter().filter(|s| &s.backend_id == backend_id);
+      let owner = crate::backend::Backends::from_id(backend_id);
+      let of_backend = || {
+        self.servers.iter().filter(|s| {
+          &s.backend_id == backend_id
+            && owner
+              .as_ref()
+              .is_none_or(|b| crate::backend::Backend::server_serves(b, &s.id, path))
+        })
+      };
       let default_id = crate::backend::default_server(of_backend(), default_binary)
         .map(|s| s.id.clone())
         .unwrap_or_default();
@@ -1655,6 +1673,7 @@ impl App {
       .map(|p| self.managed.iter().filter(|m| &m.path == p).count())
       .unwrap_or(0);
     let mut state = LaunchPickerState::for_model(name);
+    state.model_path = path.clone();
     if let Some(p) = &path {
       // Gate the ctx quick-picks to the focused model's trained window.
       state.native_ctx = self
@@ -1749,6 +1768,8 @@ impl App {
         name: np.name.clone(),
         knobs: preset_body_from_launch_params(&np.params).knobs,
         extras: np.params.extras.clone(),
+        server: np.params.server.clone(),
+        backend: np.params.backend.explicit_id().map(str::to_string),
       })
       .collect();
     let default_stop = if eff.default_is_auto() {
@@ -1908,7 +1929,7 @@ impl App {
       .unwrap_or_else(|| crate::util::paths::model_file_label(&path));
 
     // Capture knobs + extras + launch identity from whichever surface is in
-    // view. One map now, so a ds4 launch's `--ssd-streaming` rides with the
+    // view. One map now, so a backend's own knobs ride with the
     // rest, and the identity (which engine / build) pins the preset to the
     // run it was captured from. A running row carries the *resolved*
     // identity; a picker carries the *intended* one (its concrete engine and
@@ -1939,9 +1960,9 @@ impl App {
           .predicted_backend(&path)
           .map(crate::launch::params::BackendChoice::from_id)
           // Mirror `build_default_picker`: pin the explicit default backend
-          // (not `Auto`) when the row has no prediction yet, so a ds4-
-          // compatible GGUF saves the llamacpp build actually shown instead
-          // of letting the daemon's replay auto-routing pick ds4.
+          // (not `Auto`) when the row has no prediction yet, so the preset saves
+          // the llamacpp build actually shown instead of letting the daemon's
+          // replay auto-routing pick another backend.
           .unwrap_or_else(|| {
             crate::launch::params::BackendChoice::from_id(crate::backend::DEFAULT_BACKEND_ID)
           }),
@@ -2341,7 +2362,7 @@ fn discovered_from_catalog_row(cr: &crate::launch::resolve::CatalogRow) -> Disco
     split_siblings: cr.split_siblings.iter().map(PathBuf::from).collect(),
     display_label: cr.display_label.clone(),
     multimodal: cr.multimodal,
-    // Priority-ordered backends this model can run on (`ds4`, `llamacpp`, …).
+    // Priority-ordered backends this model can run on (`llamacpp`, `lemonade`, and so on).
     // Feeds the launch picker's Server row (filters the server catalog).
     supported_backends: cr.supported_backends.clone(),
     mtp_head,
@@ -2489,7 +2510,7 @@ fn parse_status_row(row: &Value) -> Option<ManagedRow> {
         .collect()
     })
     .unwrap_or_default();
-  // The backend this launch actually resolved to (honest ds4 signal).
+  // The backend this launch actually resolved to.
   let backend = row.get("backend").and_then(Value::as_str).map(String::from);
   // The server (build/binary) the launch picked, when one was chosen — drives
   // the running view's read-only `server` row.
@@ -2621,7 +2642,7 @@ mod tests {
       "display_label": "qwen3.5-4b-FLM",
     });
     let parsed = parse_list_models_row(&row).expect("row parses");
-    assert_eq!(parsed.source, ModelSource::Lemonade);
+    assert_eq!(parsed.source, ModelSource::Backend("lemonade"));
     assert_eq!(parsed.source.backend_id(), "lemonade");
   }
 
@@ -2634,7 +2655,7 @@ mod tests {
     use crate::tui::launch_picker::PickerField;
     let mut app = App::new(AppOptions::default());
     let mut row = fake("lemonade://qwen3.5-4b-FLM", "lemonade://");
-    row.source = ModelSource::Lemonade;
+    row.source = ModelSource::Backend("lemonade");
     row.display_label = Some("qwen3.5-4b-FLM".into());
     app.models = vec![row];
     // The picker now reads the daemon's per-row prediction (as `ingest_list_models`
@@ -2725,7 +2746,7 @@ mod tests {
   }
 
   #[test]
-  fn multi_backend_and_is_ds4_path_read_the_daemon_prediction() {
+  fn multi_backend_reads_the_daemon_prediction() {
     let mut app = App::new(AppOptions::default());
     app
       .backend_by_path
@@ -2733,12 +2754,12 @@ mod tests {
     assert!(!app.multi_backend(), "all-llamacpp is single-backend");
     app
       .backend_by_path
-      .insert(PathBuf::from("/m/b.gguf"), "ds4".into());
+      .insert(PathBuf::from("/m/b.gguf"), "enginex".into());
     assert!(app.multi_backend(), "a non-default backend row flips it on");
     // The per-path backend prediction comes straight off the daemon's badge.
     assert_eq!(
       app.predicted_backend(&PathBuf::from("/m/b.gguf")),
-      Some("ds4")
+      Some("enginex")
     );
     assert_eq!(
       app.predicted_backend(&PathBuf::from("/m/a.gguf")),
@@ -3628,7 +3649,7 @@ mod tests {
     // staged) must pin the explicit default backend when the row has no
     // prediction yet — mirroring `build_default_picker` — instead of falling
     // to `Auto`, which on replay lets the daemon's auto-routing pick a
-    // different build (e.g. ds4) than the llamacpp one actually shown.
+    // different build than the llamacpp one actually shown.
     let mut app = App::new(AppOptions::default());
     app.models = vec![fake("/m/phi.gguf", "/m")];
     // A last-used launch with no server pick and no `backend` field on the
@@ -3659,7 +3680,7 @@ mod tests {
       .expect("save dialog opened on the catalog model");
     // No server pick, so the backend falls back to the model's explicit
     // choice — which, with no prediction yet, is the explicit default (not
-    // `Auto`), so a ds4-compatible GGUF saves the llamacpp build shown.
+    // `Auto`), so the preset saves the llamacpp build shown.
     assert_eq!(
       dialog.backend.as_deref(),
       Some("llamacpp"),

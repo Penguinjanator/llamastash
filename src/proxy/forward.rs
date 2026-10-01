@@ -7,10 +7,14 @@
 //!
 //! - Mirror inbound method, path, query, and headers (stripping
 //!   hop-by-hop entries per RFC 7230).
-//! - Send the **buffered body bytes unchanged** — never re-encode,
-//!   never rewrite `body.model`. The plan's Risks row "rewrites
-//!   body.model" makes the case for this; the echo-verification
-//!   test in `tests/proxy_echo_verification.rs` keeps it honest.
+//! - Forward the **buffered body bytes** with at most two surgical edits:
+//!   `body.model` when the launch pins a request-model name, and whatever the
+//!   serving backend needs for its engine
+//!   ([`crate::backend::Backend::rewrite_request_body`]). Both copy every
+//!   untouched entry as the client's own bytes — the body is never re-encoded.
+//!   The plan's Risks row "rewrites body.model" makes the case for this; the
+//!   `received_body` echo assertions in `tests/proxy_routing.rs` keep it
+//!   honest.
 //! - Stream the upstream response body through `http_body_util::StreamBody`
 //!   so SSE chunks land at the client as they arrive. No buffering,
 //!   no per-chunk parse.
@@ -111,16 +115,17 @@ pub(crate) async fn forward_to_upstream(
   // guard's `Drop` decrements the inflight counter — covers happy-
   // path body completion, abandoned client connections, and upstream
   // errors uniformly because the response body owns the guard.
-  let inflight_guard = match acquire_inflight_guard(state, port, served_model_key).await {
-    Some(g) => g,
-    None => {
-      return Ok(error_envelope(
-        StatusCode::BAD_GATEWAY,
-        "upstream_unreachable",
-        "model exited before forwarding could begin",
-      ));
-    }
-  };
+  let (inflight_guard, request_model, backend) =
+    match acquire_inflight_guard(state, port, served_model_key).await {
+      Some(g) => g,
+      None => {
+        return Ok(error_envelope(
+          StatusCode::BAD_GATEWAY,
+          "upstream_unreachable",
+          "model exited before forwarding could begin",
+        ));
+      }
+    };
   // Compose upstream URL: path + query from the original request,
   // host always 127.0.0.1 (loopback only — see plan §Scope Boundaries).
   let path_and_query = inbound_uri
@@ -185,10 +190,21 @@ pub(crate) async fn forward_to_upstream(
   } else {
     &state.http_client
   };
+  // Two surgical body edits, both of which copy every untouched entry as the
+  // client's own bytes: the launch's request-model name, then whatever the
+  // serving backend needs the engine to understand (see
+  // [`crate::backend::Backend::rewrite_request_body`]).
+  let body = outbound_body(
+    &state.ctx,
+    body_bytes,
+    inbound_uri.path(),
+    &backend,
+    request_model.as_deref(),
+  );
   let request = client
     .request(upstream_method, &upstream_url)
     .headers(outbound_headers)
-    .body(body_bytes);
+    .body(body);
 
   let upstream = match request.send().await {
     Ok(r) => r,
@@ -224,7 +240,11 @@ async fn acquire_inflight_guard(
   state: &Arc<ProxyState>,
   port: u16,
   expected_id: &crate::gguf::identity::ModelId,
-) -> Option<crate::daemon::supervisor::InflightGuard> {
+) -> Option<(
+  crate::daemon::supervisor::InflightGuard,
+  Option<String>,
+  crate::backend::Backends,
+)> {
   let snap = state.ctx.supervisors.snapshot().await;
   for (_lid, model) in snap {
     if model.port() != port {
@@ -239,9 +259,67 @@ async fn acquire_inflight_guard(
     ) {
       continue;
     }
-    return Some(model.inflight_guard());
+    let request_model = model
+      .params()
+      .launch_config
+      .get(crate::backend::REQUEST_MODEL_KEY)
+      .cloned();
+    return Some((
+      model.inflight_guard(),
+      request_model,
+      model.backend().clone(),
+    ));
   }
   None
+}
+
+/// The request body as sent upstream: `body` with the launch's request-model
+/// name, then the serving backend's own rewrite for `endpoint`.
+fn outbound_body(
+  ctx: &crate::daemon::context::MethodContext,
+  body: Bytes,
+  endpoint: &str,
+  backend: &crate::backend::Backends,
+  request_model: Option<&str>,
+) -> Bytes {
+  use crate::backend::Backend as _;
+  // Two surgical edits, each copying every untouched entry as the client's own
+  // bytes.
+  let body = match request_model {
+    Some(model) => with_model(body, model),
+    None => body,
+  };
+  match backend.rewrite_request_body(ctx, endpoint, &body) {
+    Some(rewritten) => Bytes::from(rewritten),
+    None => body,
+  }
+}
+
+/// `body` with its top-level `model` set to `model`. Every other entry is
+/// copied as its raw bytes, in order, so key order and nested content survive
+/// and no `Value` tree is built for a multi-MB image body. A body that is not a
+/// JSON object carrying `model` is returned unchanged.
+fn with_model(body: Bytes, model: &str) -> Bytes {
+  let Some(entries) = crate::util::json_body::entries(&body) else {
+    return body;
+  };
+  if !entries.iter().any(|(key, _)| key == "model") {
+    return body;
+  }
+  // Encoding a `&str` cannot fail.
+  let model_value = serde_json::to_vec(&model).expect("string encodes");
+  Bytes::from(crate::util::json_body::write_object(entries.iter().map(
+    |(key, value)| {
+      (
+        key.as_str(),
+        if key == "model" {
+          model_value.as_slice()
+        } else {
+          value.get().as_bytes()
+        },
+      )
+    },
+  )))
 }
 
 /// Translate `reqwest::Response` into `hyper::Response`, preserving
@@ -433,6 +511,78 @@ pub(crate) fn deconstruct(
 mod tests {
   use super::*;
   use http_body_util::BodyExt;
+
+  #[test]
+  fn with_model_replaces_only_a_top_level_model() {
+    let out = with_model(
+      Bytes::from(r#"{"model":"q@other","messages":[{"model":"keep"}],"stream":true}"#),
+      "q",
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["model"], "q");
+    assert_eq!(v["messages"][0]["model"], "keep");
+    assert_eq!(v["stream"], true);
+
+    assert_eq!(
+      with_model(Bytes::from(r#"{"z":1,"model":"a","b":{"y":1,"x":2}}"#), "q"),
+      r#"{"z":1,"model":"q","b":{"y":1,"x":2}}"#.as_bytes(),
+      "key order survives the rewrite"
+    );
+
+    for untouched in [r#"{"messages":[]}"#, "not json", "[1]", ""] {
+      assert_eq!(
+        with_model(Bytes::from(untouched), "q"),
+        untouched.as_bytes()
+      );
+    }
+  }
+
+  #[test]
+  fn outbound_body_forwards_client_bytes_when_there_is_nothing_to_rewrite() {
+    // No effort field and no request-model pin, so every registered backend
+    // forwards the client's exact bytes. What a backend does rewrite is that
+    // backend's own test, in its own module.
+    use crate::backend::{Backend as _, Backends};
+    let ctx = test_ctx();
+    for body in [
+      r#"{"model":"q","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+      r#"{"thinking":{"type":"adaptive"},"stream": true ,"output_config":{"format":{}}}"#,
+    ] {
+      for backend in Backends::all() {
+        assert_eq!(
+          outbound_body(&ctx, Bytes::from(body), "/v1/messages", &backend, None),
+          body.as_bytes(),
+          "{} on {body}",
+          backend.id(),
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn outbound_body_pins_the_launch_request_model() {
+    // The request-model pin is what a config-declared server that checks
+    // `body.model` launches with, so the client's own name never reaches it.
+    let ctx = test_ctx();
+    assert_eq!(
+      outbound_body(
+        &ctx,
+        Bytes::from(r#"{"model":"client-name","stream":true}"#),
+        "/v1/chat/completions",
+        &test_backend(crate::backend::DEFAULT_BACKEND_ID),
+        Some("launch-name"),
+      ),
+      r#"{"model":"launch-name","stream":true}"#.as_bytes(),
+    );
+  }
+
+  fn test_ctx() -> crate::daemon::context::MethodContext {
+    crate::daemon::context::MethodContext::new(crate::daemon::shutdown::ShutdownToken::new())
+  }
+
+  fn test_backend(id: &str) -> crate::backend::Backends {
+    crate::backend::Backends::from_id(id).expect("registered backend")
+  }
 
   #[test]
   fn sanitize_header_value_replaces_non_visible_ascii() {

@@ -154,10 +154,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &Palette) {
   // no chip, since a live value has no inheritance layer to name.
   let resolved_ctx = managed.map(|m| {
     m.resolved_ctx.or_else(|| {
-      let id = m
-        .backend
-        .as_deref()
-        .unwrap_or(crate::backend::DEFAULT_BACKEND_ID);
+      let id = crate::backend::knob_scope_by_id(
+        m.backend
+          .as_deref()
+          .unwrap_or(crate::backend::DEFAULT_BACKEND_ID),
+        &m.path,
+        m.server.as_deref(),
+      );
       crate::launch::knobs::def_for_backend_concept(
         id,
         crate::launch::knobs::Concept::ContextLength,
@@ -177,10 +180,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &Palette) {
     Some(pv) => pv.visible_groups(),
     None => {
       let m = managed.expect("read-only view implies a managed row");
-      let id = m
-        .backend
-        .as_deref()
-        .unwrap_or(crate::backend::DEFAULT_BACKEND_ID);
+      let id = crate::backend::knob_scope_by_id(
+        m.backend
+          .as_deref()
+          .unwrap_or(crate::backend::DEFAULT_BACKEND_ID),
+        &m.path,
+        m.server.as_deref(),
+      );
       // The read-only view answers the same group gates the editor does, from
       // the running launch rather than the form: a placement group is noise on
       // a one-GPU server either way, and so is a speculation group on a model
@@ -217,7 +223,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &Palette) {
               lines.push(inline_warning_row(err, palette));
             }
           } else {
-            lines.push(crate::tui::fmt::kv_row_focused(
+            lines.push(crate::tui::fmt::kv_row_focused_muted(
               def.id,
               pv.value_label(id),
               Some(pv.source_for(id).label()),
@@ -227,6 +233,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &Palette) {
                 || def.ring() != crate::launch::knobs::Ring::None,
               palette,
               show_source,
+              pv.shows_config_default(id),
             ));
           }
         }
@@ -829,8 +836,10 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::Terminal;
     let mut app = App::new(AppOptions::default());
-    let mut picker = LaunchPickerState::for_model("DeepSeek-V4-Flash");
-    picker.model_backend = crate::launch::params::BackendChoice::Explicit("ds4".into());
+    let mut picker = LaunchPickerState::for_model("Qwen3-8B");
+    picker.model_backend = crate::launch::params::BackendChoice::Explicit(
+      crate::test_support::backend_declaring("kv-cache-memory-bytes").into(),
+    );
     app.launch_picker = Some(picker);
     let palette = app.palette();
     let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
@@ -846,12 +855,12 @@ mod tests {
       })
       .collect();
     let row_of = |needle: &str| rows.iter().position(|r| r.contains(needle));
-    // ds4's own tunables are ordinary rows now: they sit under the same group
-    // headers llama.cpp's do, keyed by the flag ds4 itself takes, with the
+    // A non-default backend's own tunables are ordinary rows: they sit under
+    // the same group headers llama.cpp's do, keyed by the flag it takes, with the
     // free-text extras row last of all.
     let header = row_of(crate::launch::knobs::Group::Memory.title())
-      .expect("the shared group header ds4's memory knobs declare");
-    let ssd = row_of("ssd-streaming").expect("a ds4 knob row");
+      .expect("the shared group header its memory knobs declare");
+    let ssd = row_of("kv-cache-memory-bytes").expect("its knob row");
     let extras = row_of("extras").expect("extras row");
     assert!(header < ssd, "group header precedes its knobs");
     assert!(ssd < extras, "extras comes last");

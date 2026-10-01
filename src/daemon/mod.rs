@@ -22,6 +22,7 @@ pub mod preset_store;
 pub mod probe;
 pub mod registry;
 pub mod resources;
+pub mod restart;
 pub mod runtime_file;
 pub mod shutdown;
 pub mod state_store;
@@ -109,13 +110,12 @@ pub struct DaemonOptions {
   /// Aggregate backend config, grouped under `backend:` in `config.yaml`:
   /// llama.cpp launch knobs (`jinja` / `strict_fit` / `fit_ctx_floor`, plus the
   /// per-backend `servers:` arrays, distinct from the resolved default
-  /// [`Self::binary`] above), the `[lemonade]` block, and the `[ds4]` block.
+  /// [`Self::binary`] above) and each optional engine's block.
   /// Each backend reads its own sub-config through its hooks (the server catalog
-  /// is built from `configured_servers`); gate Lemonade activation through
-  /// [`Self::lemonade_available`].
+  /// is built from `configured_servers`).
   pub backend: BackendConfig,
   /// Per-backend force-enable flags keyed by backend id (`--lemonade` /
-  /// `LLAMASTASH_LEMONADE`, `--ds4` / `LLAMASTASH_DS4`). Kept separate from the
+  /// `LLAMASTASH_LEMONADE`, and the same for each optional engine). Kept separate from the
   /// config so the detached re-exec can re-append the flags (env/flag don't
   /// survive detach; config does). An absent key means "not forced".
   pub backend_force: std::collections::BTreeMap<String, bool>,
@@ -157,21 +157,6 @@ pub struct DaemonOptions {
 }
 
 impl DaemonOptions {
-  /// Whether Lemonade activates at boot: enablement intent (the config
-  /// tri-state, or the `--lemonade`/env force) **and** the `lemond` binary
-  /// resolves. Mirrors ds4's on-when-found gate — a `lemond` on `PATH`
-  /// auto-enables Lemonade unless `lemonade.enabled: false`; absent binary =
-  /// zero footprint. Discovery / umbrella / re-exec all gate on this.
-  pub fn lemonade_available(&self) -> bool {
-    let force = self
-      .backend_force
-      .get(crate::backend::lemonade::LEMONADE_BACKEND_ID)
-      .copied()
-      .unwrap_or(false);
-    self.backend.lemonade.intends_enabled(force)
-      && crate::backend::lemonade::resolve_lemond_binary(&self.backend.lemonade).is_some()
-  }
-
   /// Test/utility helper: pin every path under one root directory.
   /// Production callers should prefer `from_defaults` plus the CLI's
   /// `build_options` flow, which threads config-driven overrides
@@ -300,6 +285,12 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
   // binds a TCP listener (§8c) and writes its URL+token into
   // `runtime.json` instead.
 
+  // Config load installs this too; repeating it here covers a daemon built
+  // from `DaemonOptions` alone (tests, embedders). Idempotent.
+  if let Err(e) = crate::backend::install_backend_config(&opts.backend) {
+    log::error!("backend config: {e}");
+  }
+
   // 3. Shutdown plumbing.
   let token = ShutdownToken::new();
   let _signal_task = install_signal_handlers(token.clone());
@@ -309,12 +300,10 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
   // produces a working daemon with an empty catalog — `list_models`
   // returns `{"models": []}`.
   let catalog = ModelCatalog::new();
-  // Lemonade discovery is opt-in and off by default, so a standard install
-  // never contacts `lemond`. Only an enabled backend threads its port in.
+  // Backends decide per rescan whether they contribute rows (Lemonade only
+  // when enabled and installed, so a standard install never contacts
+  // `lemond`).
   let mut discovery_opts = opts.discovery.clone();
-  if opts.lemonade_available() {
-    discovery_opts.lemonade_port = Some(opts.backend.lemonade.port);
-  }
   // Safetensors / HF-repo discovery, generically over whichever backends are
   // available and project rows from the shared enumerator. An install with
   // none enabled contributes an empty list, so the walk never runs and the
@@ -415,7 +404,7 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
   let proxy_status_cell = proxy::server::new_status_cell();
   // Aggregate backend config + per-backend force-enable map, both already
   // post-env-override (`build_options` applied `LLAMASTASH_FIT_CTX_FLOOR` /
-  // `STRICT_FIT` and folded the `--lemonade` / `--ds4` forces). Each backend
+  // `STRICT_FIT` and folded the per-backend force flags). Each backend
   // reads its own sub-config through its hooks; the daemon names no backend.
   let mut ctx = MethodContext::with_catalog(token.clone(), catalog)
     .with_supervisors(supervisors)
@@ -426,59 +415,53 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
     .with_external(external_combined)
     .with_proxy_status(std::sync::Arc::clone(&proxy_status_cell))
     .with_backend(opts.backend.clone(), opts.backend_force.clone());
-  if let Some(binary) = opts.binary.clone() {
-    if let Err(e) = std::fs::create_dir_all(&opts.log_dir) {
-      log::warn!(
-        "could not create log dir {}: {e}; logs may fail to open",
-        opts.log_dir.display()
-      );
-    }
-    let probe = match opts.probe_timeout_secs {
-      Some(secs) => ProbeOptions {
-        timeout: std::time::Duration::from_secs(secs),
-        ..ProbeOptions::default()
-      },
-      None => ProbeOptions::default(),
-    };
-    // The server catalog is populated in the background: each backend's
-    // `configured_servers` + per-binary `--list-devices` probe is best-effort
-    // I/O we must keep off the startup critical path so the detached-start
-    // parent's `runtime.json` wait never trips. The cell starts empty and flips
-    // to the full set once the probe finishes; a launch in that window falls
-    // back to the default `binary`.
-    let servers = Arc::new(tokio::sync::RwLock::new(Vec::new()));
-    ctx = ctx.with_launch_env(LaunchEnv {
-      binary,
-      port_range: opts.port_range,
-      log_dir: opts.log_dir.clone(),
-      probe,
-      arch_defaults: opts.arch_defaults.clone(),
-      servers: Arc::clone(&servers),
-      default_launch_mode: opts.default_launch_mode,
-    });
-    // Build the neutral server catalog generically over `Backends::all()` —
-    // `configured_servers` (per backend) → `probe_devices` (per binary) → id
-    // derivation. Reads `ctx.launch.binary`, so it runs after `with_launch_env`.
-    {
-      let cell = Arc::clone(&servers);
-      let ctx_for_probe = ctx.clone();
-      tokio::spawn(async move {
-        let built =
-          tokio::task::spawn_blocking(move || crate::backend::build_server_catalog(&ctx_for_probe))
-            .await
-            .unwrap_or_default();
-        log::info!(
-          "server catalog: {} server(s), {} device(s)",
-          built.len(),
-          built.iter().map(|s| s.devices.len()).sum::<usize>()
-        );
-        *cell.write().await = built;
-      });
-    }
-  } else {
+  if opts.binary.is_none() {
     log::info!(
-      "daemon started without `llama-server` binary resolved; `start_model` will return an error until one is configured"
+      "daemon started without the default server binary; only backends with their own binary can launch"
     );
+  }
+  if let Err(e) = std::fs::create_dir_all(&opts.log_dir) {
+    log::warn!(
+      "could not create log dir {}: {e}; logs may fail to open",
+      opts.log_dir.display()
+    );
+  }
+  let probe = match opts.probe_timeout_secs {
+    Some(secs) => ProbeOptions {
+      timeout: std::time::Duration::from_secs(secs),
+      ..ProbeOptions::default()
+    },
+    None => ProbeOptions::default(),
+  };
+  // Filled in the background; see `ServerCatalog`.
+  let servers = crate::daemon::context::ServerCatalog::pending();
+  ctx = ctx.with_launch_env(LaunchEnv {
+    binary: opts.binary.clone(),
+    port_range: opts.port_range,
+    log_dir: opts.log_dir.clone(),
+    probe,
+    arch_defaults: opts.arch_defaults.clone(),
+    servers: servers.clone(),
+    default_launch_mode: opts.default_launch_mode,
+  });
+  // Build the neutral server catalog generically over `Backends::all()` —
+  // `configured_servers` (per backend) → `probe_devices` (per binary) → id
+  // derivation. Reads `ctx.launch.binary`, so it runs after `with_launch_env`.
+  {
+    let cell = servers.clone();
+    let ctx_for_probe = ctx.clone();
+    tokio::spawn(async move {
+      let built =
+        tokio::task::spawn_blocking(move || crate::backend::build_server_catalog(&ctx_for_probe))
+          .await
+          .unwrap_or_default();
+      log::info!(
+        "server catalog: {} server(s), {} device(s)",
+        built.len(),
+        built.iter().map(|s| s.devices.len()).sum::<usize>()
+      );
+      cell.fill(built).await;
+    });
   }
 
   // 8a. Per-backend boot infrastructure supervision (opt-in). A managed
@@ -680,7 +663,9 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
   // exits — `daemon stop`, SIGINT, SIGTERM, IPC `shutdown` — we
   // don't want children to leak. The 5 s grace mirrors
   // `default_grace_secs` in the IPC `stop_model` handler.
-  let stopped = crate::ipc::methods::stop_all_managed(&ctx, Duration::from_secs(5)).await;
+  // A backend's own floor (`min_stop_grace`) still applies per child.
+  let stopped =
+    crate::ipc::methods::stop_all_managed(&ctx, crate::ipc::methods::SHUTDOWN_STOP_GRACE).await;
   if !stopped.is_empty() {
     log::info!("shutdown: stopped {} managed launch(es)", stopped.len());
   }
@@ -713,14 +698,14 @@ struct LiveProcess {
 }
 
 fn lookup_live_process(pid: u32) -> LiveProcess {
-  use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
+  use sysinfo::{Pid, ProcessRefreshKind, System};
   // `everything()` over a blank kind: explicit about wanting all
   // process metadata so `start_time()` is reliably populated across
-  // sysinfo versions and platforms. The cost is one extra /proc read
-  // per call, negligible at boot-sweep scale, and it covers the argv
-  // too so reading the real command line is free.
+  // sysinfo versions and platforms. Start from `System::new()`: building
+  // with `with_processes` first refreshes every process (~100ms on a busy
+  // host) before the single-pid refresh below does the real work.
   let refresh = ProcessRefreshKind::everything();
-  let mut sys = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh));
+  let mut sys = System::new();
   sys.refresh_processes_specifics(
     sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
     true,

@@ -156,6 +156,60 @@ async fn ensure_umbrella_is_idempotent() {
   first.stop(Duration::from_secs(3)).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ensure_umbrella_respawns_an_exited_umbrella() {
+  let logs = unique_temp("respawn");
+  std::fs::create_dir_all(&logs).unwrap();
+  let registry = SupervisorRegistry::new();
+  let port = allocate_port();
+
+  let first = ensure_umbrella(&registry, port, umbrella_spec(port), logs.join("a.log"))
+    .await
+    .expect("first ensure");
+  wait_ready(&first).await;
+  first.stop(Duration::from_secs(3)).await;
+  assert_eq!(first.state().await, ManagedState::Stopped);
+
+  let second = ensure_umbrella(&registry, port, umbrella_spec(port), logs.join("b.log"))
+    .await
+    .expect("ensure after exit respawns");
+  wait_ready(&second).await;
+  let registered = registry
+    .get(&umbrella_launch_id())
+    .await
+    .expect("registered");
+  assert_eq!(registered.state().await, ManagedState::Ready);
+  second.stop(Duration::from_secs(3)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ensure_umbrella_waits_for_an_exited_umbrella_s_port() {
+  let logs = unique_temp("respawn-port");
+  std::fs::create_dir_all(&logs).unwrap();
+  let registry = SupervisorRegistry::new();
+  let port = allocate_port();
+
+  let first = ensure_umbrella(&registry, port, umbrella_spec(port), logs.join("a.log"))
+    .await
+    .expect("first ensure");
+  wait_ready(&first).await;
+  first.stop(Duration::from_secs(3)).await;
+
+  // Stand in for a killed umbrella that hasn't released the port yet.
+  let holder = std::net::TcpListener::bind(("127.0.0.1", port)).expect("hold port");
+  let release = tokio::spawn(async move {
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(holder);
+  });
+
+  let second = ensure_umbrella(&registry, port, umbrella_spec(port), logs.join("b.log"))
+    .await
+    .expect("respawn waits for the port instead of failing PortInUse");
+  wait_ready(&second).await;
+  release.await.unwrap();
+  second.stop(Duration::from_secs(3)).await;
+}
+
 /// Regression for the blocking-preload bug: `start_model` used to await
 /// the lemond load inside its IPC reply, so a cold load (up to lemond's
 /// 120 s budget) outlived the CLI's 5 s reply timeout — the client hung
@@ -175,7 +229,7 @@ async fn start_model_replies_promptly_and_records_preload_outcome() {
   let port = allocate_port();
   let env = LaunchEnv {
     // Never spawned: every launch in this test delegates to the umbrella.
-    binary: PathBuf::from("/nonexistent/llama-server"),
+    binary: Some(PathBuf::from("/nonexistent/llama-server")),
     port_range: PortRange {
       start: 41000,
       end: 41999,
@@ -253,7 +307,7 @@ async fn start_model_replies_promptly_and_records_preload_outcome() {
   let elapsed = started.elapsed();
   let body = resp.result.expect("start_model result");
   // A delegated launch returns the *model's* own `L#` handle (drawn from the
-  // same registry counter as any llama.cpp / ds4 launch), not the umbrella id.
+  // same registry counter as any llama.cpp / vLLM launch), not the umbrella id.
   let slow_launch_id = body["launch_id"].as_str().expect("launch_id string");
   assert!(
     slow_launch_id.starts_with('L') && slow_launch_id != umbrella_launch_id().as_str(),

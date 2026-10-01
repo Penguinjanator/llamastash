@@ -164,24 +164,23 @@ pub enum ModelSource {
   Ollama,
   /// An LM Studio models directory.
   LmStudio,
-  /// A model the Lemonade umbrella serves from its own registry — no
-  /// local GGUF file. Populated by the opt-in Lemonade discovery source.
-  ///
-  /// This is the single file-less-source special case, and the only place a
-  /// backend is named for a discovery source. A generic
-  /// `ModelSource::Backend(id)` refactor (pluggable, name-free) is the
-  /// deferred option.
-  Lemonade,
+  /// A model a backend serves from its own registry, with no local file. The
+  /// payload is that backend's id, which is also the source label.
+  Backend(&'static str),
+  /// A model server declared in `config.yaml` rather than found on disk. The
+  /// row's `supported_backends` names the backend that runs it.
+  Config,
 }
 
 impl ModelSource {
   pub fn label(&self) -> &'static str {
-    match self {
+    match *self {
       ModelSource::UserPath => "user",
       ModelSource::HuggingFace => "huggingface",
       ModelSource::Ollama => "ollama",
       ModelSource::LmStudio => "lm-studio",
-      ModelSource::Lemonade => "lemonade",
+      ModelSource::Backend(id) => id,
+      ModelSource::Config => "config",
     }
   }
 
@@ -190,29 +189,41 @@ impl ModelSource {
   /// a discovery source label is read, so consumers map a label to a backend
   /// via [`backend_id`](Self::backend_id) without naming one.
   pub fn from_label(s: &str) -> Option<ModelSource> {
+    use crate::backend::Backend as _;
     match s {
       "user" => Some(ModelSource::UserPath),
       "huggingface" => Some(ModelSource::HuggingFace),
       "ollama" => Some(ModelSource::Ollama),
       "lm-studio" => Some(ModelSource::LmStudio),
-      "lemonade" => Some(ModelSource::Lemonade),
-      _ => None,
+      "config" => Some(ModelSource::Config),
+      other => crate::backend::Backends::all()
+        .into_iter()
+        .map(|b| b.id())
+        .find(|id| *id == other)
+        .map(ModelSource::Backend),
     }
   }
 
   /// The id of the backend that serves models from this source.
   ///
   /// Disk sources (user / HF / Ollama / LM Studio) are all local GGUF files
-  /// served by the direct llama.cpp backend; the Lemonade source is served
-  /// by the Lemonade managed-multiplexer.
+  /// served by the default backend.
   pub fn backend_id(&self) -> &'static str {
-    match self {
-      ModelSource::Lemonade => crate::backend::lemonade::LEMONADE_BACKEND_ID,
-      ModelSource::UserPath
+    match *self {
+      ModelSource::Backend(id) => id,
+      // A config row always carries its backend in `supported_backends`; this
+      // is only the fallback when that backend is unavailable.
+      ModelSource::Config
+      | ModelSource::UserPath
       | ModelSource::HuggingFace
       | ModelSource::Ollama
       | ModelSource::LmStudio => crate::backend::DEFAULT_BACKEND_ID,
     }
+  }
+
+  /// Whether rows from this source point at a file llamastash can delete.
+  pub fn has_local_file(&self) -> bool {
+    !matches!(self, ModelSource::Backend(_) | ModelSource::Config)
   }
 }
 
@@ -258,10 +269,15 @@ mod tests {
     assert_eq!(ModelSource::HuggingFace.label(), "huggingface");
     assert_eq!(ModelSource::Ollama.label(), "ollama");
     assert_eq!(ModelSource::LmStudio.label(), "lm-studio");
-    assert_eq!(ModelSource::Lemonade.label(), "lemonade");
+    assert_eq!(ModelSource::Backend("lemonade").label(), "lemonade");
+    assert_eq!(
+      ModelSource::from_label("lemonade"),
+      Some(ModelSource::Backend("lemonade"))
+    );
+    assert_eq!(ModelSource::from_label("nope"), None);
 
-    // Disk sources resolve to the direct llama.cpp backend; only the
-    // Lemonade source routes to the managed multiplexer.
+    // Disk sources resolve to the default backend; a backend source routes to
+    // its own backend.
     for src in [
       ModelSource::UserPath,
       ModelSource::HuggingFace,
@@ -270,6 +286,6 @@ mod tests {
     ] {
       assert_eq!(src.backend_id(), "llamacpp", "{src:?}");
     }
-    assert_eq!(ModelSource::Lemonade.backend_id(), "lemonade");
+    assert_eq!(ModelSource::Backend("lemonade").backend_id(), "lemonade");
   }
 }

@@ -52,11 +52,11 @@ pub struct LastParamsEntry {
   pub id: ModelIdentity,
   pub params: LaunchParams,
   /// The backend id this launch *resolved* to (`llamacpp` / `lemonade` /
-  /// `ds4`) — the cross-backend contamination guard (D-contamination). The
+  /// `lemonade`) — the cross-backend contamination guard (D-contamination). The
   /// persisted `params.backend` choice stays `auto` for an auto-routed
   /// launch, so it can't serve as the tag. `default`/`skip_serializing_if`
   /// keep a llama.cpp row byte-stable: the field is omitted when it holds the
-  /// `llamacpp` default and reads back as `llamacpp`, so a pre-ds4 `state.json`
+  /// `llamacpp` default and reads back as `llamacpp`, so an older `state.json`
   /// re-serializes identically (matching the `backend_knobs` pattern).
   #[serde(
     default = "default_resolved_backend",
@@ -164,7 +164,7 @@ pub struct RunningSnapshot {
   #[serde(default)]
   pub actuals: crate::daemon::actuals::Actuals,
   /// The backend id this launch *resolved* to (`llamacpp` / `lemonade` /
-  /// `ds4`). Stamped at spawn (unlike `last_params.resolved_backend`, which
+  /// `lemonade`). Stamped at spawn (unlike `last_params.resolved_backend`, which
   /// waits for Ready), so `status` can report the *real* backend on a Loading
   /// row and the orphan sweep can dispatch adoption on it instead of a
   /// fragile process-name match. Same `default`/`skip_serializing_if` as the
@@ -394,17 +394,17 @@ mod tests {
     s.upsert_last_params(
       id("/m/a.gguf", 1),
       fake_params("/m/a.gguf"),
-      "ds4".to_string(),
+      "enginex".to_string(),
     );
     save(&dir, &s).expect("save");
     let back = load(&dir).expect("load");
-    assert_eq!(back.last_params[0].resolved_backend, "ds4");
+    assert_eq!(back.last_params[0].resolved_backend, "enginex");
     // Legacy row without the field deserialises to the llamacpp default:
     // serialise a real entry, strip `resolved_backend`, read it back.
     let entry = LastParamsEntry {
       id: id("/m/legacy.gguf", 2),
       params: fake_params("/m/legacy.gguf"),
-      resolved_backend: "ds4".to_string(),
+      resolved_backend: "enginex".to_string(),
     };
     let mut v = serde_json::to_value(&entry).unwrap();
     v.as_object_mut().unwrap().remove("resolved_backend");
@@ -416,8 +416,8 @@ mod tests {
   #[test]
   fn llamacpp_resolved_backend_is_omitted_from_serialized_shape() {
     // Byte-stability: a llama.cpp row omits `resolved_backend` (defaults back
-    // to llamacpp on load), so a pre-ds4 state.json re-serializes identically.
-    // A non-default tag (ds4) still serializes.
+    // to llamacpp on load), so an older state.json re-serializes identically.
+    // A non-default tag still serializes.
     let llama = LastParamsEntry {
       id: id("/m/a.gguf", 1),
       params: fake_params("/m/a.gguf"),
@@ -428,13 +428,16 @@ mod tests {
       v.as_object().unwrap().get("resolved_backend").is_none(),
       "llamacpp tag must be omitted for byte-stability: {v}"
     );
-    let ds4 = LastParamsEntry {
+    let other = LastParamsEntry {
       id: id("/m/b.gguf", 2),
       params: fake_params("/m/b.gguf"),
-      resolved_backend: "ds4".to_string(),
+      resolved_backend: "enginex".to_string(),
     };
-    let v4 = serde_json::to_value(&ds4).unwrap();
-    assert_eq!(v4["resolved_backend"], "ds4", "non-default tag persists");
+    let v4 = serde_json::to_value(&other).unwrap();
+    assert_eq!(
+      v4["resolved_backend"], "enginex",
+      "non-default tag persists"
+    );
   }
 
   #[test]
@@ -444,10 +447,10 @@ mod tests {
     let dir = temp_state_dir("backend-knobs-rt");
     let mut s = DaemonState::default();
     let mut params = fake_params("/m/a.gguf");
-    params.knobs.set_by_name("kv-disk-dir", "/tmp/kv");
+    params.knobs.set_by_name("kv-cache-memory-bytes", "8G");
     params
       .knobs
-      .set_auto(crate::launch::knobs::kid("ssd-streaming"));
+      .set_auto(crate::launch::knobs::kid("max-model-len"));
     s.upsert_last_params(id("/m/a.gguf", 1), params.clone(), "llamacpp".into());
     save(&dir, &s).expect("save");
     let back = load(&dir).expect("load");

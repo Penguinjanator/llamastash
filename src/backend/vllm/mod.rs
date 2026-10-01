@@ -102,15 +102,39 @@ pub const VLLM_FORBIDDEN_EXTRA_HEADS: &[&str] = &[
   "--data-parallel-",
   // Ray is selected through this, not through a `--ray` flag.
   "--distributed-executor-backend",
-  // Short aliases for the two parallel heads above. The matcher compares whole
-  // heads, so the long forms do not cover them (vLLM 0.27.1 arg_utils.py).
+  // Short aliases for the parallel heads above. The matcher compares whole
+  // heads, so the long forms do not cover them (vLLM 0.30.0 arg_utils.py).
   "-pp",
   "-dp",
+  "-dpn",
+  "-dpr",
+  "-dpl",
+  "-dpa",
+  "-dpp",
+  "-dpb",
+  "-dph",
+  "-dpe",
+  "-dpm",
   // Reads further flags out of a YAML file and splices them in ahead of ours,
   // so every head above — and `--trust-remote-code`, which belongs to the
   // visible knob channel — would be settable through it.
   "--config",
 ];
+
+/// Denylisted heads whose value count isn't one (vLLM 0.30.0 `arg_utils.py`,
+/// `launchers/cli_args.py`).
+const VLLM_FORBIDDEN_EXTRA_VALUES: &[(&str, crate::launch::params::FlagValues)] = {
+  use crate::launch::params::FlagValues::{None, OneOrMore};
+  &[
+    ("--api-key", OneOrMore),
+    ("--data-parallel-hybrid-lb", None),
+    ("--data-parallel-external-lb", None),
+    ("--data-parallel-multi-port-external-lb", None),
+    ("-dph", None),
+    ("-dpe", None),
+    ("-dpm", None),
+  ]
+};
 
 /// Config-projected launch key, not a native knob: it carries a posture
 /// decision from `backend.vllm.cors`, so it belongs nowhere near the picker.
@@ -341,7 +365,7 @@ impl Backend for VllmBackend {
   fn resolve_launch_binary(
     &self,
     ctx: &MethodContext,
-    _default_binary: PathBuf,
+    _default_binary: Option<PathBuf>,
     port: u16,
   ) -> Result<(PathBuf, u16), String> {
     // The default binary is the device-owning llama.cpp server; vLLM has to
@@ -580,6 +604,8 @@ impl VllmBackend {
       binary,
       argv: vllm_argv(params, port),
       env_remove: CREDENTIAL_ENV_STRIP.to_vec(),
+      env: Vec::new(),
+      min_stop_grace: std::time::Duration::ZERO,
       readiness: readiness(&served_model_name(&params.model_path)),
       probe,
     }
@@ -605,7 +631,7 @@ pub fn served_model_name(model_path: &Path) -> String {
 /// Every name vLLM should answer to, primary first.
 ///
 /// vLLM is the first backend behind our proxy that *validates* the request's
-/// `model` field — llama.cpp ignores it, ds4 echoes it back. The proxy forwards
+/// `model` field — llama.cpp ignores it. The proxy forwards
 /// the client's bytes unchanged by design, so a name our own resolver accepted
 /// (it matches case-insensitive substrings) would reach vLLM verbatim and 404
 /// **after** paying a full cold start. `--served-model-name` takes a list, so
@@ -677,6 +703,7 @@ fn vllm_argv(params: &LaunchParams, port: u16) -> Vec<std::ffi::OsString> {
   argv.extend(crate::launch::params::strip_forbidden_extras(
     &params.extras,
     VLLM_FORBIDDEN_EXTRA_HEADS,
+    VLLM_FORBIDDEN_EXTRA_VALUES,
     "vllm_argv",
   ));
   argv
@@ -1191,11 +1218,32 @@ mod tests {
       // above do not cover them.
       "-dp",
       "-pp",
+      "-dpn",
+      "-dpr",
+      "-dpl",
+      "-dpa",
+      "-dpp",
+      "-dpb",
     ] {
       let mut p = params("/c/models--o--n/snapshots/rev");
       p.extras = vec![smuggle.into(), "2".into()];
       let argv = argv_strings(&p, 1).join(" ");
       assert!(!argv.contains(smuggle), "`{smuggle}` survived: {argv}");
+      assert!(
+        !argv.split(' ').any(|a| a == "2"),
+        "`{smuggle}`'s value survived: {argv}"
+      );
+    }
+    // The load-balancer aliases take no value, so the flag after them stays.
+    for switch in ["-dph", "-dpe", "-dpm"] {
+      let mut p = params("/c/models--o--n/snapshots/rev");
+      p.extras = vec![switch.into(), "--enforce-eager".into()];
+      let argv = argv_strings(&p, 1).join(" ");
+      assert!(!argv.contains(switch), "`{switch}` survived: {argv}");
+      assert!(
+        argv.contains("--enforce-eager"),
+        "`{switch}` ate the next flag: {argv}"
+      );
     }
   }
 

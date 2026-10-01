@@ -195,7 +195,7 @@ impl KnobSet {
   /// only in whether this scoping is present, so they all resolve through
   /// here: scoped, it stops another backend's *alias* shadowing this
   /// backend's *canonical* id (llama.cpp aliases `ctx` onto `ctx-size`, while
-  /// ds4 declares `ctx` itself); unscoped, it accepts any spelling
+  /// another backend may declare `ctx` itself); unscoped, it accepts any spelling
   /// [`resolve_id`](super::registry::resolve_id) accepts.
   fn resolve_scoped(backend_id: Option<&str>, name: &str) -> Option<KnobId> {
     match backend_id {

@@ -6,8 +6,9 @@
 //! the user export an env var from their shell rc before the integration
 //! works.
 //!
-//! Local only — reads the resolved config, never contacts the daemon, so
-//! it stays inside a client's short shell-out timeout.
+//! The bare key reads the resolved config only, never the daemon, so it
+//! stays inside a client's short shell-out timeout. `--json` also asks a
+//! running daemon for its proxy address.
 
 use serde_json::json;
 
@@ -15,22 +16,29 @@ use crate::cli::cli_args::{ApiKeyArgs, Cli};
 use crate::cli::exit_codes::CliResult;
 use crate::cli::output::pretty_json;
 use crate::config::Config;
+use crate::init::external::proxy_url;
 
 /// What a keyless loopback proxy hands out. It ignores the value, but
 /// clients that refuse to start without a non-empty key need something —
 /// the same stub the `env.sh` writer emits.
 pub const KEYLESS_STUB: &str = "llamastash";
 
-pub fn handle(args: ApiKeyArgs, _cli: &Cli, config: &Config) -> CliResult {
+pub async fn handle(args: ApiKeyArgs, _cli: &Cli, config: &Config) -> CliResult {
   let configured = config.proxy.effective_api_key();
   let key = configured
     .clone()
     .unwrap_or_else(|| KEYLESS_STUB.to_string());
   if args.json {
+    // The proxy can listen past a busy configured port, or on one a
+    // `daemon start --proxy-port` set without touching config.
+    let base_url = match proxy_url::from_running_daemon().await {
+      Some(url) => url,
+      None => proxy_url::from_config(config),
+    };
     let out = json!({
       "api_key": key,
       "auth": if configured.is_some() { "enforced" } else { "off" },
-      "base_url": format!("http://127.0.0.1:{}/v1", config.proxy.effective_port()),
+      "base_url": base_url,
     });
     println!("{}", pretty_json(&out));
   } else {

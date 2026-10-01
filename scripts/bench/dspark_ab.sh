@@ -17,7 +17,7 @@
 # come from a direct ds4-server run, not a llamastash `stop`.
 #
 # Do NOT set LLAMASTASH_BENCH_DISABLE_DEFAULTS here: it collapses knob
-# resolution to User layers only, stripping the preset backend_knobs that carry
+# resolution to User layers only, stripping the preset knobs that carry
 # `--mtp` / `--dspark`.
 #
 # Usage: scripts/bench/dspark_ab.sh <work-dir> <out.md>
@@ -42,33 +42,39 @@ mkdir -p "$LLAMASTASH_STATE_DIR" "$LLAMASTASH_CONFIG_DIR" "$LLAMASTASH_CACHE_DIR
 PROMPT_CODE='Write a Python function that merges two sorted lists into one sorted list. Code only.'
 PROMPT_PROSE='Explain in three sentences why merge sort is O(n log n).'
 
-# ssd_streaming is pinned false everywhere: streaming and a draft head are
-# mutually exclusive in ds4-server, so letting it auto-enable would silently
-# disarm DSpark and make the two halves incomparable.
+# ds4 runs as a generic server entry; the presets pin it and name the DSpark
+# support file (a generic entry does not auto-pair draft heads).
 {
   echo "backend:"
-  echo "  ds4:"
-  echo "    enabled: true"
-  echo "    servers:"
-  echo "      - binary: $DS4_BIN"
   echo "  lemonade:"
   echo "    enabled: false"
+  echo "  generic:"
+  echo "    servers:"
+  echo "      - name: ds4"
+  echo "        model: \"DeepSeek-V4-*\""
+  echo "        binary: $DS4_BIN"
+  echo "        args: [-m, \"{model}\", --host, \"{host}\", --port, \"{port}\"]"
+  echo "        ready: /v1/models"
+  echo "        knobs:"
+  echo "          - {flag: --ctx, id: ds4-ctx, ctx: true}"
+  echo "          - {flag: --mtp, id: mtp-model}"
+  echo "          - {flag: --dspark, switch: true}"
   echo "presets:"
   for m in "$OLD" "$NEW"; do
     [ -n "$m" ] || continue
     echo "  $(basename "$m"):"
     echo "    entries:"
     echo "      plain:"
-    echo "        ctx: 4096"
-    echo "        backend_knobs:"
-    echo "          ssd_streaming: \"false\""
+    echo "        server: generic-ds4"
+    echo "        knobs:"
+    echo "          ds4-ctx: 4096"
     [ "$m" = "$NEW" ] || continue
     echo "      dspark:"
-    echo "        ctx: 4096"
-    echo "        backend_knobs:"
-    echo "          ssd_streaming: \"false\""
-    echo "          dspark: \"true\""
-    echo "          mtp: $SUPPORT"
+    echo "        server: generic-ds4"
+    echo "        knobs:"
+    echo "          ds4-ctx: 4096"
+    echo "          dspark: true"
+    echo "          mtp-model: $SUPPORT"
   done
 } > "$LLAMASTASH_CONFIG_DIR/config.yaml"
 
@@ -78,7 +84,7 @@ run_config() {
   $BIN stop --all --yes >/dev/null 2>&1
   $BIN daemon stop >/dev/null 2>&1; sleep 2
   $BIN daemon start --force --proxy-port 21435 >/dev/null 2>&1; sleep 4
-  $BIN start "$model" --backend ds4 --preset "$preset" >/dev/null 2>&1
+  $BIN start "$model" --preset "$preset" >/dev/null 2>&1
   st=none
   for _ in $(seq 1 300); do
     st=$($BIN status --json 2>/dev/null | jq -r '.models[0].state // "none"')

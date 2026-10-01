@@ -30,6 +30,11 @@ impl LaunchId {
   pub fn as_str(&self) -> &str {
     &self.0
   }
+
+  /// The counter behind an `L<n>` id; `None` for a reserved id.
+  pub fn counter(&self) -> Option<u64> {
+    self.0.strip_prefix('L')?.parse().ok()
+  }
 }
 
 /// Shared, cheap-to-clone registry of supervisors. `Arc<RwLock<…>>`

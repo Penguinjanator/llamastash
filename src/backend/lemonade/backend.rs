@@ -120,6 +120,8 @@ pub fn umbrella_process_spec(port: u16, binary: PathBuf, probe: ProbeOptions) ->
     // it may legitimately use HF_* to pull models, so nothing is stripped
     // here. (Revisit if lemond honors a loopback-bypass env.)
     env_remove: vec![],
+    env: Vec::new(),
+    min_stop_grace: std::time::Duration::ZERO,
     readiness: Readiness::HttpPoll {
       path: LIVE_PATH.to_string(),
       ready_status: 200,
@@ -131,14 +133,14 @@ pub fn umbrella_process_spec(port: u16, binary: PathBuf, probe: ProbeOptions) ->
 /// Resolve the `lemond` executable the daemon should supervise.
 ///
 /// Resolution order (matches `docs/lemonade-setup.md`):
-///   1. the explicit `lemonade.binary` path, if it points at a file;
+///   1. the explicit `backend.lemonade.servers` entry, if it points at a file;
 ///   2. otherwise `lemond` then `lemonade` on `PATH`.
 ///
 /// Returns the resolved *canonical absolute* path, or `None` when nothing is
 /// found — llamastash never installs `lemond`, so a missing binary is a clean
 /// "backend unavailable" rather than an error to recover from.
 ///
-/// The path is canonicalized so a relative `lemonade.binary` (or a relative
+/// The path is canonicalized so a relative `servers` binary (or a relative
 /// PATH entry) still yields an absolute path: the umbrella is spawned and
 /// registered under this path (it doubles as the supervisor's synthetic model
 /// id), so it must not depend on the daemon's CWD.
@@ -155,7 +157,7 @@ pub fn resolve_lemond_binary(cfg: &crate::config::LemonadeConfig) -> Option<Path
   // test-fixtures build: integration tests spawn the real daemon subprocess,
   // which (with Lemonade default-on) would otherwise pick up — and leak — the
   // developer's system `lemond`. Tests point at an explicit fake
-  // `lemonade.binary` instead.
+  // `servers` binary instead.
   #[cfg(feature = "test-fixtures")]
   {
     None
@@ -287,7 +289,7 @@ impl Backend for LemonadeBackend {
   }
 
   fn available(&self, ctx: &MethodContext) -> bool {
-    // Intent (default-on unless `lemonade.enabled: false`, `--lemonade`/env
+    // Intent (default-on unless `backend.lemonade.enabled: false`, `--lemonade`/env
     // force) AND the `lemond` binary resolves. Consulted by selection and
     // `status`.
     let force = ctx
@@ -297,6 +299,30 @@ impl Backend for LemonadeBackend {
       .unwrap_or(false);
     ctx.backend.lemonade.intends_enabled(force)
       && resolve_lemond_binary(&ctx.backend.lemonade).is_some()
+  }
+
+  fn enabled_in_config(
+    &self,
+    config: &crate::backend::BackendConfig,
+    force: &std::collections::BTreeMap<String, bool>,
+  ) -> bool {
+    config
+      .lemonade
+      .intends_enabled(force.get(LEMONADE_BACKEND_ID).copied().unwrap_or(false))
+      && resolve_lemond_binary(&config.lemonade).is_some()
+  }
+
+  /// Opt-in and list-only: rows come from a running `lemond`, and a standard
+  /// install without it never contacts one.
+  async fn config_catalog_rows(
+    &self,
+    config: &crate::backend::BackendConfig,
+    force: &std::collections::BTreeMap<String, bool>,
+  ) -> Vec<crate::discovery::DiscoveredModel> {
+    if !self.enabled_in_config(config, force) {
+      return Vec::new();
+    }
+    super::discovery::enumerate(config.lemonade.port).await
   }
 
   fn installed(&self, ctx: &MethodContext) -> bool {
@@ -446,7 +472,7 @@ impl Backend for LemonadeBackend {
   fn resolve_launch_binary(
     &self,
     ctx: &MethodContext,
-    _default_binary: PathBuf,
+    _default_binary: Option<PathBuf>,
     _port: u16,
   ) -> Result<(PathBuf, u16), String> {
     // The umbrella supervises its own `lemond` executable on its own configured
@@ -454,7 +480,7 @@ impl Backend for LemonadeBackend {
     match resolve_lemond_binary(&ctx.backend.lemonade) {
       Some(bin) => Ok((bin, ctx.backend.lemonade.port)),
       None => Err(
-        "lemonade backend selected but no `lemond` binary found; set `lemonade.binary` \
+        "lemonade backend selected but no `lemond` binary found; set `backend.lemonade.servers` \
          or put `lemond` on PATH (see docs/lemonade-setup.md)"
           .to_string(),
       ),

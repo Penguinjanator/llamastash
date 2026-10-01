@@ -40,7 +40,7 @@ use crate::init::fetch::{FetchClient, FetchError};
 pub const DISK_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Max bytes per per-file download. 512 GiB accommodates the largest
-/// single-file GGUFs the tool pulls — ds4's DeepSeek-V4 Flash/PRO files run
+/// single-file GGUFs the tool pulls — the DeepSeek-V4 Flash/PRO files run
 /// 81 GB to ~465 GB as *single* files (the old 64 GiB cap refused every one
 /// of them). Enforced via hf-hub's `Api::metadata` HEAD before each download;
 /// the cap is a safety net against runaway metadata, not a model-size policy.

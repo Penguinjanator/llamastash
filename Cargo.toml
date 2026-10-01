@@ -1,6 +1,6 @@
 [package]
 name = "llamastash"
-version = "0.4.0"
+version = "0.5.0"
 authors = ["Deepu K Sasidharan <d4udts@gmail.com>"]
 description = "Zero-overhead, terminal-native local-LLM manager"
 documentation = "https://github.com/llamastash/llamastash"
@@ -13,7 +13,7 @@ license = "MIT"
 edition = "2021"
 rust-version = "1.95"
 # `cargo run` (without --bin) targets the real binary. The fixture
-# `[[bin]]` entries (fake_llama_server, fake_ds4_server) are only built
+# `[[bin]]` fixture entries (fake_llama_server, …) are only built
 # for tests under the `test-fixtures` feature, but cargo's run-target
 # picker checks the manifest before feature resolution, so we still need
 # this hint.
@@ -95,7 +95,7 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 ignore = "0.4"
 libc = "0.2"
 log = "0.4"
-notify-debouncer-mini = { version = "0.7", default-features = false }
+notify = "8.2"
 # OS-randomness source for the per-daemon bearer token. Already in
 # tree transitively via hf-hub; pulled to top-level so the auth
 # module owns its dep. We only use `rand::rngs::OsRng` + `fill_bytes`
@@ -131,7 +131,7 @@ hf-hub = { version = "0.5", default-features = false, features = [
     "rustls-tls",
 ] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
 simplelog = { version = "0.12", default-features = false }
 strum = { version = "0.28", features = ["derive"] }
 # v2 init wizard (Unit 10) + 2026-05-19 interactive wizard work.
@@ -289,17 +289,6 @@ doc = false
 [[bin]]
 name = "fake_lemond"
 path = "tests/fixtures/fake_lemond.rs"
-required-features = ["test-fixtures"]
-bench = false
-test = false
-doc = false
-
-# Fake `ds4-server` for the ds4 backend integration tests — mirrors the real
-# load-before-listen + fixed-alias + no-/health contract. Spawned via
-# `CARGO_BIN_EXE_fake_ds4_server`; injected as `ds4.binary` per-test.
-[[bin]]
-name = "fake_ds4_server"
-path = "tests/fixtures/fake_ds4_server.rs"
 required-features = ["test-fixtures"]
 bench = false
 test = false

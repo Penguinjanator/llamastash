@@ -12,6 +12,12 @@
 //! `config.yaml` is the current format (per Continue's docs as of
 //! 2025–2026 — `config.json` is deprecated; we never write the old
 //! format).
+//!
+//! **Effort: nothing written.** Checked against Continue `main`
+//! `5522c6f44` (release v2.0.0): the OpenAI provider sends a reasoning
+//! effort only for `o*` / `gpt-5+` ids, over the Responses API, fixed to
+//! `medium` (`core/llm/llms/OpenAI.ts`). There is no setting that turns
+//! it on for another model.
 
 use std::path::PathBuf;
 

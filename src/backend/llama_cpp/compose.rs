@@ -3,8 +3,9 @@
 //! This is llama.cpp's argv emitter — it lives with the backend that is
 //! its only caller ([`super::LlamaCppBackend::process_spec`]) rather than in
 //! the neutral `launch::params` IR. The loopback/credential denylist it
-//! enforces on `extras` is the shared [`is_forbidden_head`] guard, which
-//! stays in `launch::params` because the native-knob path reuses it.
+//! enforces on `extras` is the shared
+//! [`crate::launch::params::strip_forbidden_extras`], which every
+//! process-spawning backend uses.
 //!
 //! Order matters: `--host 127.0.0.1` and `--port` come first so the
 //! command line reads well in logs; then `-m <path>`, then mode flags
@@ -25,7 +26,7 @@
 use std::ffi::OsString;
 
 use crate::launch::mode::LaunchMode;
-use crate::launch::params::{is_forbidden_head, LaunchParams};
+use crate::launch::params::LaunchParams;
 
 /// Materialise the argv `Command::args(...)` will hand to
 /// `llama-server`. Caller passes the resolved listening port
@@ -124,28 +125,12 @@ pub(crate) fn compose(params: &LaunchParams, allocated_port: u16) -> Vec<OsStrin
   // an upstream validator was skipped. Last-occurrence semantics in
   // llama-server mean a single `--host 0.0.0.0` here would override
   // the bundled `--host 127.0.0.1` above.
-  let mut iter = params.extras.iter().peekable();
-  while let Some(adv) = iter.next() {
-    let lossy = adv.to_string_lossy();
-    let head = lossy
-      .split('=')
-      .next()
-      .unwrap_or(&lossy)
-      .to_ascii_lowercase();
-    if is_forbidden_head(&head) {
-      log::warn!("compose: stripping forbidden extras flag {lossy:?}");
-      if !lossy.contains('=') {
-        if let Some(next) = iter.peek() {
-          let next_lossy = next.to_string_lossy();
-          if !next_lossy.starts_with('-') {
-            iter.next();
-          }
-        }
-      }
-      continue;
-    }
-    argv.push(adv.clone());
-  }
+  argv.extend(crate::launch::params::strip_forbidden_extras(
+    &params.extras,
+    &[],
+    &[],
+    "compose",
+  ));
   argv
 }
 

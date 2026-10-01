@@ -1,21 +1,24 @@
 //! Which models the patched tool configs register.
 //!
 //! Two sources, in preference order: the model `init`'s download step just
-//! fetched (when it ran), then every favorite in the daemon's catalog. The
-//! ids come from [`crate::launch::resolve::published_ids`], the same rule
+//! fetched (when it ran), then every favorite in the daemon's catalog. A
+//! favorite with presets registers as `<id>@<preset>`, one per preset. The ids come
+//! from [`crate::launch::resolve::published_ids`], the same rule
 //! `/v1/models` publishes under, so what a tool sends back as `body.model`
 //! is a name the proxy already answers to — for a GGUF file, a safetensors
 //! repo, an Ollama blob, or a Lemonade registry entry alike, and for two
 //! same-named GGUFs cached in different roots.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
 
 use serde_json::Value;
 
 use crate::cli::cli_args::Cli;
-use crate::config::Config;
+use crate::config::{Config, ConfigPresetBlock};
 use crate::init::external::PatchModel;
 use crate::init::wizard::ModelSummary;
+use crate::launch::resolve::CatalogRow;
 
 /// Resolved model list plus anything the user should hear about how it was
 /// built. `note` is a human-readable line the wizard prints on non-`--json`
@@ -58,8 +61,9 @@ pub async fn resolve(
 
   let note = match &catalog {
     Some(catalog) => {
-      let mut favs = catalog.favorites();
-      favs.sort_by(|a, b| a.id.cmp(&b.id));
+      let mut favs = catalog.favorites(&config.presets);
+      // By model only: a model's presets keep their default-first order.
+      favs.sort_by(|a, b| a.id.split('@').next().cmp(&b.id.split('@').next()));
       let count = favs.len();
       for f in favs {
         if seen.insert(f.id.clone()) {
@@ -81,7 +85,7 @@ pub async fn resolve(
 /// row publishes under. Held together because the publishing rule is
 /// catalog-wide: no row's id can be decided on its own.
 struct Catalog {
-  rows: Vec<crate::launch::resolve::CatalogRow>,
+  rows: Vec<CatalogRow>,
   ids: Vec<String>,
   favorited: HashSet<String>,
 }
@@ -92,13 +96,61 @@ impl Catalog {
   /// The catalog filter is the same one `favorites list` applies: a favorite
   /// whose file was deleted or moved out of a watched directory is dropped
   /// rather than written into a tool config as an unservable name.
-  fn favorites(&self) -> Vec<PatchModel> {
+  fn favorites(&self, presets: &BTreeMap<String, ConfigPresetBlock>) -> Vec<PatchModel> {
     self
       .rows
       .iter()
       .zip(&self.ids)
       .filter(|(r, _)| self.favorited.contains(&r.path))
-      .map(|(r, id)| PatchModel::from_catalog_row(r, id.clone()))
+      .flat_map(|(r, id)| self.patch_models(r, id, presets))
+      .collect()
+  }
+
+  /// A row registered the way it launches. A model with presets registers one
+  /// `<id>@<preset>` per preset, the default first so a single-slot tool picks
+  /// it, each declaring that preset's context. A model without presets
+  /// registers its plain id. Where no preset sets a context, it is the server
+  /// entry's configured default, then the trained window.
+  fn patch_models(
+    &self,
+    row: &CatalogRow,
+    id: &str,
+    presets: &BTreeMap<String, ConfigPresetBlock>,
+  ) -> Vec<PatchModel> {
+    let mut base = PatchModel::from_catalog_row(row, id.to_string());
+    if row.has_reasoning_hint {
+      base.effort = crate::init::external::effort::from_gguf(Path::new(&row.path)).1;
+    }
+    let path = Path::new(&row.path);
+    let context = |preset_ctx: Option<u32>, server: Option<&str>| {
+      preset_ctx
+        .or_else(|| crate::backend::config_default_ctx(path, server))
+        .map(u64::from)
+        .or(base.context_window)
+    };
+    let eff = crate::launch::presets::effective_presets(
+      &row.name(),
+      &row.path,
+      row.arch.as_deref(),
+      presets,
+      &self.rows,
+    );
+    if eff.presets.is_empty() {
+      let mut m = base.clone();
+      m.context_window = context(None, None);
+      return vec![m];
+    }
+    let default = eff.default_preset().map(|p| p.name.as_str());
+    let mut named: Vec<_> = eff.presets.iter().collect();
+    named.sort_by_key(|p| Some(p.name.as_str()) != default);
+    named
+      .into_iter()
+      .map(|p| {
+        let mut m = base.clone();
+        m.id = format!("{id}@{}", p.name);
+        m.context_window = context(p.params.ctx, p.params.server.as_deref());
+        m
+      })
       .collect()
   }
 
@@ -128,7 +180,17 @@ fn from_download(summary: &ModelSummary, catalog: Option<&Catalog>) -> Option<Pa
       .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
   });
   match gguf {
-    Some(path) => Some(PatchModel::from_id(downloaded_id(path, catalog))),
+    Some(path) => {
+      let (id, row) = downloaded_id(path, catalog);
+      let mut m = PatchModel::from_id(id);
+      let (reasoning, effort) = crate::init::external::effort::from_gguf(path);
+      m.reasoning = reasoning;
+      m.effort = effort;
+      // Vision comes from the scan pairing a projector with the file, so
+      // only a row the catalog already has can say.
+      m.vision = row.and_then(|r| r.multimodal).is_some_and(|mm| mm.vision);
+      Some(m)
+    }
     // No GGUF but files landed: a safetensors repo, pulled whole.
     None => (!summary.files.is_empty()).then(|| PatchModel::from_id(summary.repo.clone())),
   }
@@ -141,17 +203,25 @@ fn from_download(summary: &ModelSummary, catalog: Option<&Catalog>) -> Option<Pa
 /// stem then answers `400 ambiguous_model` forever. Falls back to that stem
 /// when there is no catalog (daemon unreachable) or no row for the file yet
 /// (the scan has not caught up) — which is still the right answer whenever
-/// the name is unique, and the best guess available otherwise.
-fn downloaded_id(path: &std::path::Path, catalog: Option<&Catalog>) -> String {
+/// the name is unique, and the best guess available otherwise. The row is
+/// returned too, when there is one.
+fn downloaded_id<'a>(
+  path: &std::path::Path,
+  catalog: Option<&'a Catalog>,
+) -> (String, Option<&'a CatalogRow>) {
   let stem = || crate::util::paths::model_public_id(path, None);
   let Some(catalog) = catalog else {
-    return stem();
+    return (stem(), None);
   };
   let reference = path.to_string_lossy();
   crate::launch::resolve::resolve_model_with_candidates(&catalog.rows, &reference)
     .ok()
-    .and_then(|row| catalog.published_id(&row.path).map(ToOwned::to_owned))
-    .unwrap_or_else(stem)
+    .and_then(|row| {
+      let id = catalog.published_id(&row.path)?.to_owned();
+      let row = catalog.rows.iter().find(|r| r.path == row.path)?;
+      Some((id, Some(row)))
+    })
+    .unwrap_or_else(|| (stem(), None))
 }
 
 /// The daemon's catalog and favorites in one read.
@@ -291,6 +361,49 @@ mod tests {
       ids,
       favorited: HashSet::new(),
     }
+  }
+
+  /// A favorite with presets registers one `<id>@<preset>` per preset, the
+  /// default first, each with the context that preset launches at. One without
+  /// presets registers its plain id. Writing the trained window for a model
+  /// whose preset launches it smaller made the tool overflow it. The
+  /// server-entry default is covered where [`crate::backend::config_default_ctx`]
+  /// is implemented.
+  #[test]
+  fn favorites_register_every_preset_with_its_context() {
+    let presets: BTreeMap<String, ConfigPresetBlock> = yaml_serde::from_str(
+      "Integ-Model-*:\n  default: long\n  entries:\n    coder: {knobs: {ctx: 131072}}\n    long: {knobs: {ctx: 262144}}\n    plain: {extras: [--x]}\n\
+       Integ-Auto-*:\n  default: auto\n  entries:\n    coder: {knobs: {ctx: 4096}}\n",
+    )
+    .expect("preset yaml");
+    let paths = [
+      "/m/Integ-Model-Q4.gguf",
+      "/m/Integ-Auto-Q4.gguf",
+      "/m/Integ-Bare-Q4.gguf",
+      "/m/Integ-None-Q4.gguf",
+    ];
+    let mut cat = catalog(&paths.iter().map(|p| (*p, "local")).collect::<Vec<_>>());
+    for r in &mut cat.rows {
+      r.native_ctx = (!r.path.contains("None")).then_some(1_000_000);
+    }
+    cat.favorited = paths.iter().map(|p| p.to_string()).collect();
+    let got: Vec<(String, u64)> = cat
+      .favorites(&presets)
+      .into_iter()
+      .map(|m| (m.id.clone(), m.declared_context()))
+      .collect();
+    let want = |id: &str, ctx: u64| (id.to_string(), ctx);
+    assert_eq!(
+      got,
+      vec![
+        want("Integ-Model-Q4@long", 262144),
+        want("Integ-Model-Q4@coder", 131072),
+        want("Integ-Model-Q4@plain", 1_000_000),
+        want("Integ-Auto-Q4@coder", 4096),
+        want("Integ-Bare-Q4", 1_000_000),
+        want("Integ-None-Q4", 32768),
+      ]
+    );
   }
 
   #[test]

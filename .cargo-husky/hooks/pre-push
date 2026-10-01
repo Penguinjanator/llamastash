@@ -50,8 +50,11 @@ make lint
 echo "Executing: make doc"
 make doc
 
-# --test-threads=1 keeps env-var-mutating tests (e.g. util::paths)
-# from racing each other. CI's macOS leg also caps integration
-# tests for the same class of contention.
-echo "Executing: cargo test --features test-fixtures -- --test-threads=1"
-cargo test --features test-fixtures -- --test-threads=1
+# Same runner as CI. nextest runs each test in its own process, so
+# env-var-mutating tests (e.g. util::paths) can't race each other;
+# it skips doctests, so those run separately.
+echo "Executing: cargo nextest run --features test-fixtures --workspace"
+cargo nextest run --features test-fixtures --workspace
+
+echo "Executing: cargo test --doc --features test-fixtures --workspace"
+cargo test --doc --features test-fixtures --workspace

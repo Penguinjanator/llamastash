@@ -14,6 +14,7 @@
 mod actuals;
 pub mod caps;
 mod compose;
+mod effort;
 pub mod knobs;
 pub mod list_devices;
 mod telemetry;
@@ -148,6 +149,17 @@ pub struct LlamaCppConfig {
   /// size. Factory [`crate::config::DEFAULT_FIT_CTX_FLOOR`].
   #[serde(default = "default_fit_ctx_floor")]
   pub fit_ctx_floor: u32,
+  /// Map the Anthropic `output_config.effort` field onto
+  /// `chat_template_kwargs.reasoning_effort` when the proxy forwards
+  /// `/v1/messages` (factory `true`). llama.cpp's own Anthropic translation
+  /// drops that field, so without the mapping a client's effort control does
+  /// nothing on a local model.
+  ///
+  /// Set `false` when the effort should come from the launch or the engine
+  /// default instead: a per-request kwarg overrides both, and a client that
+  /// sends an effort value on every request would otherwise always win.
+  #[serde(default = "default_true")]
+  pub map_anthropic_effort: bool,
 }
 
 fn default_true() -> bool {
@@ -165,6 +177,7 @@ impl Default for LlamaCppConfig {
       jinja: true,
       strict_fit: false,
       fit_ctx_floor: crate::config::DEFAULT_FIT_CTX_FLOOR,
+      map_anthropic_effort: true,
     }
   }
 }
@@ -230,6 +243,8 @@ impl LlamaCppBackend {
         .collect(),
       binary,
       env_remove: LLAMA_ENV_STRIP.to_vec(),
+      env: Vec::new(),
+      min_stop_grace: std::time::Duration::ZERO,
       readiness: Readiness::HttpPoll {
         path: "/health".to_string(),
         ready_status: 200,
@@ -245,6 +260,18 @@ impl Backend for LlamaCppBackend {
   }
   fn id(&self) -> &'static str {
     "llamacpp"
+  }
+
+  fn rewrite_request_body(
+    &self,
+    ctx: &MethodContext,
+    endpoint: &str,
+    body: &[u8],
+  ) -> Option<Vec<u8>> {
+    if !ctx.backend.llamacpp.map_anthropic_effort {
+      return None;
+    }
+    effort::rewrite_request_body(endpoint, body)
   }
 
   fn lifecycle(&self) -> Lifecycle {
@@ -280,14 +307,31 @@ impl Backend for LlamaCppBackend {
     ctx
       .launch
       .as_ref()
-      .map(|e| e.binary.exists())
-      .unwrap_or(false)
+      .and_then(|e| e.binary.as_ref())
+      .is_some_and(|b| b.exists())
+  }
+
+  fn resolve_launch_binary(
+    &self,
+    _ctx: &MethodContext,
+    default_binary: Option<PathBuf>,
+    port: u16,
+  ) -> Result<(PathBuf, u16), String> {
+    default_binary.map(|b| (b, port)).ok_or_else(|| {
+      "llama-server binary not found — point `--llama-server` / `LLAMASTASH_LLAMA_SERVER` at it \
+       or run `llamastash init` to install one"
+        .to_string()
+    })
   }
 
   fn binary_path(&self, ctx: &MethodContext) -> Option<String> {
     // The daemon-resolved server path, surfaced verbatim (present even when the
     // file is missing, so `status` can show *what* it looked for vs `installed`).
-    ctx.launch.as_ref().map(|e| e.binary.display().to_string())
+    ctx
+      .launch
+      .as_ref()
+      .and_then(|e| e.binary.as_ref())
+      .map(|b| b.display().to_string())
   }
 
   fn configured_servers(&self, ctx: &MethodContext) -> Vec<super::ServerSpec> {
@@ -295,9 +339,9 @@ impl Backend for LlamaCppBackend {
     let mut out = Vec::new();
     // Primary server = the daemon-resolved binary (CLI flag > env > config >
     // PATH); its name hint comes from the first configured `servers` entry.
-    if let Some(env) = ctx.launch.as_ref() {
+    if let Some(binary) = ctx.launch.as_ref().and_then(|e| e.binary.clone()) {
       out.push(super::ServerSpec {
-        binary: env.binary.clone(),
+        binary,
         name: cfg.servers.first().and_then(|s| s.name.clone()),
       });
     }
@@ -362,7 +406,7 @@ impl Backend for LlamaCppBackend {
   }
 
   fn launch_priority(&self) -> i32 {
-    // The stable default engine; ds4 outranks it for a compatible DeepSeek-V4.
+    // The stable default engine.
     10
   }
 
@@ -459,6 +503,44 @@ impl Backend for LlamaCppBackend {
     actuals::fetch_props_actuals(port, timeout).await
   }
 
+  fn gpu_resident(&self, params: &LaunchParams, layer_count: Option<u64>) -> bool {
+    use crate::launch::knobs::{kid, KnobValue};
+    let k = &params.knobs;
+    if k
+      .str(kid("device"))
+      .is_some_and(|d| d.eq_ignore_ascii_case("none"))
+      || k.u32(kid("n-cpu-moe")).is_some_and(|n| n > 0)
+    {
+      return false;
+    }
+    // Unset or `auto` is `--fit`, which offloads every layer when they fit.
+    let all_layers = match k.get(kid("n-gpu-layers")) {
+      None | Some(KnobValue::Auto) => true,
+      Some(_) => k
+        .u32(kid("n-gpu-layers"))
+        .zip(layer_count)
+        .is_some_and(|(n, layers)| u64::from(n) >= layers),
+    };
+    // A hand-passed placement flag can move work to the CPU; don't parse it.
+    const PLACEMENT_FLAGS: &[&str] = &[
+      "-ngl",
+      "--gpu-layers",
+      "--n-gpu-layers",
+      "-dev",
+      "--device",
+      "-cmoe",
+      "--cpu-moe",
+      "-ncmoe",
+      "--n-cpu-moe",
+      "-ot",
+      "--override-tensor",
+    ];
+    all_layers
+      && !PLACEMENT_FLAGS
+        .iter()
+        .any(|f| crate::launch::params::extras_have_flag(&params.extras, f))
+  }
+
   fn speculation_set_in_extras(&self, extras: &[std::ffi::OsString]) -> bool {
     // llama-server *appends* spec types rather than replacing, so emitting ours
     // on top of a hand-passed `--spec-type` would leave two configured.
@@ -488,6 +570,32 @@ mod tests {
   use super::*;
   use crate::launch::mode::LaunchMode;
   use std::ffi::OsString;
+
+  #[test]
+  fn anthropic_effort_mapping_is_switchable_off() {
+    // The mapping overrides whatever effort the launch itself set, so a user
+    // who wants the engine default has to be able to turn it off.
+    let mut ctx =
+      crate::daemon::context::MethodContext::new(crate::daemon::shutdown::ShutdownToken::new());
+    let body = r#"{"output_config":{"effort":"xhigh"}}"#;
+    let backend = LlamaCppBackend::new();
+
+    ctx.backend.llamacpp.map_anthropic_effort = true;
+    let rewritten = backend
+      .rewrite_request_body(&ctx, "/v1/messages", body.as_bytes())
+      .expect("mapped by default");
+    assert_eq!(
+      String::from_utf8(rewritten).expect("utf-8 json"),
+      r#"{"output_config":{"effort":"xhigh"},"chat_template_kwargs":{"reasoning_effort":"xhigh"}}"#,
+    );
+
+    ctx.backend.llamacpp.map_anthropic_effort = false;
+    assert_eq!(
+      backend.rewrite_request_body(&ctx, "/v1/messages", body.as_bytes()),
+      None,
+      "off means the client's bytes go through untouched"
+    );
+  }
 
   #[test]
   fn speculation_set_in_extras_defers_to_a_hand_passed_spec_type() {
@@ -520,6 +628,28 @@ mod tests {
       .expect("parses its own log format");
     assert_eq!((got.accepted, got.generated), (105, 161));
     assert!(b.draft_acceptance(&[]).is_none());
+  }
+
+  #[test]
+  fn gpu_resident_only_when_nothing_is_placed_on_the_cpu() {
+    let b = LlamaCppBackend::new();
+    let with = |knobs: crate::launch::knobs::KnobSet, extras: &[&str]| {
+      let mut p = LaunchParams::new(PathBuf::from("/m/x.gguf"), LaunchMode::Chat);
+      p.knobs = knobs;
+      p.extras = extras.iter().map(std::ffi::OsString::from).collect();
+      p
+    };
+    let layers = Some(64);
+    assert!(b.gpu_resident(&with(crate::knobset! {}, &[]), layers));
+    assert!(b.gpu_resident(&with(crate::knobset! { n_gpu_layers: auto }, &[]), layers));
+    assert!(b.gpu_resident(&with(crate::knobset! { n_gpu_layers: 99 }, &[]), layers));
+    assert!(!b.gpu_resident(&with(crate::knobset! { n_gpu_layers: 32 }, &[]), layers));
+    assert!(!b.gpu_resident(&with(crate::knobset! { n_gpu_layers: 99 }, &[]), None));
+    assert!(!b.gpu_resident(&with(crate::knobset! { n_gpu_layers: 0 }, &[]), layers));
+    assert!(!b.gpu_resident(&with(crate::knobset! { n_cpu_moe: 8 }, &[]), layers));
+    assert!(!b.gpu_resident(&with(crate::knobset! { device: "none" }, &[]), layers));
+    assert!(!b.gpu_resident(&with(crate::knobset! {}, &["-ngl", "0"]), layers));
+    assert!(!b.gpu_resident(&with(crate::knobset! {}, &["--device=none"]), layers));
   }
 
   fn spec_of(plan: LaunchPlan) -> ProcessLaunchSpec {

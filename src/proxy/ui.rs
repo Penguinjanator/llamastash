@@ -49,7 +49,7 @@ struct RunningEntry {
   port: u16,
   name: String,
   /// Whether this backend serves a browser web UI `/ui` can reverse-proxy
-  /// (D-ui). ds4 serves none, so its rows are never auto-pinned and render
+  /// (D-ui). A backend that serves none has rows that are never auto-pinned and render
   /// non-selectable in the chooser.
   serves_ui: bool,
 }
@@ -129,10 +129,10 @@ fn active_pin(headers: &HeaderMap, running: &[RunningEntry]) -> Option<String> {
 }
 
 /// Apply the selection rule over the running list, honoring the UI-less
-/// exclusion (D-ui): a backend that serves no web UI (ds4) is never
+/// exclusion (D-ui): a backend that serves no web UI is never
 /// auto-pinned and never satisfies a cookie pin — it can only appear in the
 /// chooser as a non-selectable row. The "no model running" page stays
-/// reserved for *zero* running models, so a running ds4 model never reads as
+/// reserved for *zero* running models, so a running UI-less model never reads as
 /// "nothing running".
 fn resolve_target(headers: &HeaderMap, mut running: Vec<RunningEntry>) -> UiTarget {
   if running.is_empty() {
@@ -339,7 +339,7 @@ fn chooser_html(running: &[RunningEntry], active: Option<&str>) -> String {
         port = e.port,
       ));
     } else {
-      // UI-less backend (ds4): shown so the user knows it is running, but not
+      // UI-less backend: shown so the user knows it is running, but not
       // a link — it serves no web UI to open.
       items.push_str(&format!(
         "<li class=\"no-ui\"><span class=\"name\">{name}</span>\
@@ -562,7 +562,7 @@ mod tests {
 
   #[test]
   fn resolve_target_lone_ui_less_model_shows_chooser_not_none() {
-    // A single running ds4 model (UI-less) must NOT auto-pin and must NOT
+    // A single running UI-less model must NOT auto-pin and must NOT
     // read as "nothing running" — it renders the chooser (D-ui).
     let running = vec![entry_ui("L1", 41100, "deepseek-v4-flash", false)];
     assert!(matches!(
@@ -573,8 +573,8 @@ mod tests {
 
   #[test]
   fn resolve_target_ui_less_is_excluded_from_autopin_and_cookie() {
-    // With one ds4 (UI-less) + one llama (UI) running and no cookie, the
-    // chooser lists both — ds4 non-selectable, llama selectable.
+    // With one UI-less + one llama (UI) running and no cookie, the
+    // chooser lists both — UI-less non-selectable, llama selectable.
     let running = vec![
       entry_ui("L1", 41100, "deepseek-v4-flash", false),
       entry_ui("L2", 41101, "qwen3", true),
@@ -582,13 +582,16 @@ mod tests {
     match resolve_target(&HeaderMap::new(), running) {
       UiTarget::Chooser(entries) => {
         let html = chooser_html(&entries, None);
-        assert!(html.contains("no web UI"), "ds4 row marked no-ui: {html}");
+        assert!(
+          html.contains("no web UI"),
+          "UI-less row marked no-ui: {html}"
+        );
         assert!(html.contains("/ui/?target=L2"), "llama row selectable");
-        assert!(!html.contains("/ui/?target=L1"), "ds4 row not a link");
+        assert!(!html.contains("/ui/?target=L1"), "UI-less row not a link");
       }
       _ => panic!("expected chooser"),
     }
-    // A cookie pinned to the UI-less ds4 model is ignored (it can't serve UI).
+    // A cookie pinned to the UI-less model is ignored (it can't serve UI).
     let mut headers = HeaderMap::new();
     headers.insert(hyper::header::COOKIE, "ls_ui_target=L1".parse().unwrap());
     let pinned = vec![entry_ui("L1", 41100, "deepseek-v4-flash", false)];

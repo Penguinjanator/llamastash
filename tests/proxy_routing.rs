@@ -35,7 +35,9 @@ use llamastash::gguf::identity::ModelId;
 use llamastash::gguf::metadata::{ModeHint, ModelMetadata, Quant};
 use llamastash::launch::mode::LaunchMode;
 use llamastash::launch::params::LaunchParams;
-use llamastash::proxy::server::{loopback_addr, new_status_cell, serve, ProxyStatus, StatusCell};
+use llamastash::proxy::server::{
+  loopback_addr, new_status_cell, serve_with_options, ProxyStatus, ServeOptions, StatusCell,
+};
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
 use serde_json::Value;
@@ -160,13 +162,20 @@ async fn spawn_fake_supervisor(
 async fn spawn_listener_with_state(
   state: Arc<ProxyState>,
 ) -> (SocketAddr, ShutdownToken, tokio::task::JoinHandle<()>) {
+  spawn_listener_with_options(state, ServeOptions::default()).await
+}
+
+async fn spawn_listener_with_options(
+  state: Arc<ProxyState>,
+  options: ServeOptions,
+) -> (SocketAddr, ShutdownToken, tokio::task::JoinHandle<()>) {
   let token = ShutdownToken::new();
   let status: StatusCell = new_status_cell();
   let bind_addr = loopback_addr(0);
   let token_for_task = token.clone();
   let status_for_task = Arc::clone(&status);
   let handle = tokio::spawn(async move {
-    serve(state, bind_addr, token_for_task, status_for_task)
+    serve_with_options(state, bind_addr, token_for_task, status_for_task, options)
       .await
       .expect("proxy serve returns Ok");
   });
@@ -450,6 +459,56 @@ async fn anthropic_messages_endpoint_forwards() {
   assert_eq!(ct_status, 200);
   let ct: Value = serde_json::from_slice(&ct_body).expect("json body");
   assert!(ct["input_tokens"].is_number());
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, listener_handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anthropic_messages_effort_reaches_the_upstream_body() {
+  // What the upstream actually receives, end to end through the proxy: the
+  // launch's backend is resolved from its recorded id, and that backend's
+  // effort mapping is in the bytes the engine sees. A launch recorded against a
+  // different real backend shows up here, where each unit test on its own would
+  // still pass; an unknown id cannot, since it falls back to the default backend
+  // and maps anyway.
+  let dir = unique_temp("effort");
+  let catalog_path = "/fixture/qwen-chat.gguf";
+  let registry = SupervisorRegistry::new();
+  let (model, _port, _id) = spawn_fake_supervisor(catalog_path, &dir, LaunchMode::Chat).await;
+  let launch_id = registry.next_id();
+  registry.insert(launch_id, model.clone()).await;
+
+  let state = proxy_state_with(
+    vec![discovered(catalog_path, Some("qwen-chat"), "qwen3")],
+    registry,
+  )
+  .await;
+  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+
+  // Nothing to map, so the upstream sees the client's exact bytes.
+  let plain =
+    r#"{"model":"qwen-chat","max_tokens":16,"thinking":{"type":"adaptive"},"stream":true}"#;
+  let (status, _h, response_body) = http_post(addr, "/v1/messages", plain, &[]).await;
+  assert_eq!(status, 200);
+  let parsed: Value = serde_json::from_slice(&response_body).expect("json body");
+  assert_eq!(
+    parsed["received_body"].as_str().expect("echo"),
+    plain,
+    "an unmapped body arrives byte-identical"
+  );
+
+  // The Anthropic effort field arrives as the kwarg the engine reads, and
+  // nothing else in the body moved.
+  let effort = r#"{"model":"qwen-chat","max_tokens":16,"output_config":{"effort":"xhigh"}}"#;
+  let (status, _h, response_body) = http_post(addr, "/v1/messages", effort, &[]).await;
+  assert_eq!(status, 200);
+  let parsed: Value = serde_json::from_slice(&response_body).expect("json body");
+  assert_eq!(
+    parsed["received_body"].as_str().expect("echo"),
+    r#"{"model":"qwen-chat","max_tokens":16,"output_config":{"effort":"xhigh"},"chat_template_kwargs":{"reasoning_effort":"xhigh"}}"#,
+  );
 
   let _ = model.stop(Duration::from_secs(3)).await;
   shutdown_listener(shutdown, listener_handle).await;
@@ -932,16 +991,22 @@ async fn partial_request_closes_within_header_read_timeout() {
   // wired into hyper::server::conn::http1::Builder actually fires.
   // A client that opens a TCP socket, writes a partial request
   // line, then idles must have its connection closed by the proxy
-  // within HEADER_READ_TIMEOUT (30s production; 35s budget here so
-  // CI noise doesn't flake). If a future tweak drops the timeout
-  // from the builder chain, this test hangs past the budget.
+  // once the configured timeout elapses. A short timeout keeps the
+  // test fast; if a future tweak drops it from the builder chain,
+  // the read blocks past the budget and this test fails.
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
   use tokio::net::TcpStream;
+
+  const TIMEOUT: Duration = Duration::from_secs(1);
 
   let dir = unique_temp("partial");
   let registry = SupervisorRegistry::new();
   let state = proxy_state_with(Vec::new(), registry).await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let options = ServeOptions {
+    header_read_timeout: TIMEOUT,
+    ..ServeOptions::default()
+  };
+  let (addr, shutdown, listener_handle) = spawn_listener_with_options(state, options).await;
 
   let mut sock = TcpStream::connect(addr).await.expect("connect");
   // Partial request line, no newline, no Host header. Server waits
@@ -949,11 +1014,19 @@ async fn partial_request_closes_within_header_read_timeout() {
   sock.write_all(b"GET /he").await.expect("write partial");
   sock.flush().await.ok();
 
+  let started = std::time::Instant::now();
   let mut buf = vec![0u8; 64];
-  let read = tokio::time::timeout(Duration::from_secs(35), sock.read(&mut buf)).await;
+  let read = tokio::time::timeout(TIMEOUT * 5, sock.read(&mut buf)).await;
   let n = read
-    .expect("proxy failed to close partial-request connection within HEADER_READ_TIMEOUT budget")
+    .expect(
+      "proxy failed to close partial-request connection within the header-read timeout budget",
+    )
     .expect("read");
+  assert!(
+    started.elapsed() >= TIMEOUT / 2,
+    "connection closed after {:?}, well before the {TIMEOUT:?} header-read timeout",
+    started.elapsed()
+  );
   // `read` of 0 = clean EOF (peer closed). Hyper closes the socket
   // once the timeout fires; we don't expect any response bytes.
   assert_eq!(n, 0, "expected EOF on timeout; got {n} bytes: {buf:?}");

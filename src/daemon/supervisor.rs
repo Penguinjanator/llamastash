@@ -234,6 +234,13 @@ struct ManagedInner {
   /// supervisors with `inflight > 0` so a mid-stream generation
   /// can't get SIGTERM'd out from under the caller.
   inflight: std::sync::atomic::AtomicU64,
+  /// The backend's floor under every stop grace (see
+  /// [`crate::backend::ProcessLaunchSpec::min_stop_grace`]).
+  min_stop_grace: Duration,
+  /// The backend this launch resolved to, resolved once at spawn from
+  /// [`ManagedSpawn::resolved_backend`]. The proxy asks it whether a forwarded
+  /// request body needs an engine-specific rewrite.
+  backend: Backends,
 }
 
 impl ManagedModel {
@@ -259,6 +266,18 @@ impl ManagedModel {
 
   pub fn origin(&self) -> LaunchOrigin {
     self.inner.origin
+  }
+
+  /// The shortest grace [`Self::stop`] will use, whatever the caller asks.
+  pub fn min_stop_grace(&self) -> Duration {
+    self.inner.min_stop_grace
+  }
+
+  /// The backend that produced this launch. An unknown / unmatched id on
+  /// [`ManagedSpawn`] resolves to the default backend, so this is always a
+  /// real one.
+  pub fn backend(&self) -> &Backends {
+    &self.inner.backend
   }
 
   /// Snapshot the concurrent-request counter. The idle-TTL sweeper
@@ -347,8 +366,9 @@ impl ManagedModel {
     self.inner.ring.lock().await.tail(max)
   }
 
-  /// Trigger graceful shutdown: SIGTERM, `grace` to honor it, then
-  /// SIGKILL. Returns once the child has fully exited.
+  /// Trigger graceful shutdown: SIGTERM, `grace` (raised to the backend's
+  /// [`Self::min_stop_grace`]) to honor it, then SIGKILL. Returns once the
+  /// child has fully exited.
   ///
   /// Signal delivery is guarded against PID reuse: we re-check that
   /// the `Child` handle still reports a non-reaped pid under the
@@ -363,7 +383,7 @@ impl ManagedModel {
       return self.state().await;
     }
     signal_child_with_guard(self, SignalFlavour::Graceful).await;
-    let deadline = Instant::now() + grace;
+    let deadline = Instant::now() + grace.max(self.inner.min_stop_grace);
     loop {
       if let Some(child) = self.inner.child.lock().await.as_mut() {
         if let Ok(Some(_status)) = child.try_wait() {
@@ -452,6 +472,9 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
   for var in &input.plan.env_remove {
     cmd.env_remove(var);
   }
+  for (key, value) in &input.plan.env {
+    cmd.env(key, value);
+  }
   // Stamp an inheritance marker so a future daemon — possibly a
   // restart of this one, possibly an unrelated llamastash instance
   // on the same machine — can recognise this `llama-server` as
@@ -491,6 +514,11 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
     mode: input.mode,
     params: input.params.clone(),
     log_path: input.log_path.clone(),
+    // One registry lookup per launch, shared by the readiness probe and the
+    // proxy's per-request body rewrite. An unmatched id falls back to the
+    // default backend.
+    backend: Backends::from_id(&input.resolved_backend)
+      .unwrap_or_else(crate::backend::default_backend),
     ready_at: RwLock::new(None),
     state: RwLock::new(ManagedState::Launching),
     pid: RwLock::new(pid),
@@ -500,6 +528,7 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
     actuals: RwLock::new(super::actuals::Actuals::default()),
     origin: input.origin,
     inflight: std::sync::atomic::AtomicU64::new(0),
+    min_stop_grace: input.plan.min_stop_grace,
   });
   let model = ManagedModel { inner };
 
@@ -578,15 +607,12 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
   // Strict-fit ctx-clamp gate: the caller populates this only for
   // fit-governed launches; `None` leaves the readiness path unchanged.
   let fit_gate = input.fit_gate;
-  // Resolve the launch's backend so the probe reads actuals from the right
-  // engine (only when a fit gate is present) — no endpoint hard-coded here.
-  let probe_backend = Backends::all()
-    .into_iter()
-    .find(|b| b.id() == input.resolved_backend)
-    .unwrap_or_else(crate::backend::default_backend);
+  // The launch's backend, already resolved on the supervisor, so the probe can
+  // read actuals from the right engine with no endpoint hard-coded here.
+  let probe_backend = model.backend().clone();
   spawn_supervised("probe", async move {
     let outcome = match &expect_model_ids {
-      // ds4: 200 on `/v1/models` plus a body advertising a ds4 alias.
+      // 200 on the readiness path plus a body advertising an expected id.
       Some(ids) => {
         probe::poll_until_ready_model_id(
           probe_model.inner.port,
@@ -710,19 +736,20 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
             ManagedState::Error { .. } | ManagedState::Stopped => {
               // Already classified; preserve the more-specific cause.
             }
-            ManagedState::Ready | ManagedState::Stopping => {
+            ManagedState::Stopping => {
               *state = ManagedState::Stopped;
             }
+            // Nobody asked it to stop (a crash, the OOM killer): an error with
+            // the reason, kept until the user stops it, not a clean `stopped`.
+            ManagedState::Ready => {
+              *state = ManagedState::Error {
+                cause: exit_cause("process exited unexpectedly", status, &tail),
+              };
+            }
             ManagedState::Launching | ManagedState::Loading => {
-              let mut cause = format!(
-                "process exited before becoming ready (status: {:?})",
-                status.code()
-              );
-              if !tail.is_empty() {
-                cause.push_str("; last stderr lines:\n");
-                cause.push_str(&tail.join("\n"));
-              }
-              *state = ManagedState::Error { cause };
+              *state = ManagedState::Error {
+                cause: exit_cause("process exited before becoming ready", status, &tail),
+              };
             }
           }
           drop(state);
@@ -1059,9 +1086,31 @@ pub(crate) mod test_support {
         actuals: RwLock::new(crate::daemon::actuals::Actuals::default()),
         origin: LaunchOrigin::Manual,
         inflight: std::sync::atomic::AtomicU64::new(0),
+        min_stop_grace: Duration::ZERO,
+        backend: crate::backend::Backends::from_id(crate::backend::DEFAULT_BACKEND_ID)
+          .expect("the default backend is registered"),
       }),
     }
   }
+}
+
+/// `what` plus how the child ended (exit code, or the signal that killed it)
+/// and its last log lines.
+fn exit_cause(what: &str, status: std::process::ExitStatus, tail: &[String]) -> String {
+  #[cfg(unix)]
+  let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+  #[cfg(not(unix))]
+  let signal: Option<i32> = None;
+  let mut cause = match (status.code(), signal) {
+    (Some(code), _) => format!("{what} (exit code {code})"),
+    (None, Some(sig)) => format!("{what} (killed by signal {sig})"),
+    (None, None) => what.to_string(),
+  };
+  if !tail.is_empty() {
+    cause.push_str("; last stderr lines:\n");
+    cause.push_str(&tail.join("\n"));
+  }
+  cause
 }
 
 #[cfg(test)]

@@ -14,10 +14,9 @@
 //! 3. `now - last_request_at >= ttl` — Ollama-style last-touch
 //!    deadline.
 //!
-//! When all three hold, the sweeper calls `model.stop(5 s grace)`
-//! and logs the eviction. The supervisor's state-machine watcher
-//! handles the rest (Ready → Stopping → Stopped) and the registry's
-//! `prune_terminated` worker eventually removes the row.
+//! When all three hold, the sweeper stops the launch through its
+//! backend's `stop` (5 s grace), the same path as `stop_model`, so the
+//! supervisor and its `state.running` row are dropped with it.
 //!
 //! TTL = 0 disables eviction entirely; the daemon skips spawning
 //! the sweeper task at all in that case (see `daemon::mod.rs`).
@@ -113,11 +112,8 @@ pub(crate) fn decide(
 /// One sweep pass. Public for integration tests; production use
 /// comes via [`run`].
 ///
-/// Per-row `model.stop(GRACE).await` is dispatched via `tokio::spawn`
-/// so a sweep with N eligible rows doesn't serialise into `N × grace`
-/// seconds of cadence drift. The supervisor's own state-machine
-/// watcher drives Ready → Stopping → Stopped regardless of who's
-/// awaiting the stop future.
+/// Each stop is dispatched via `tokio::spawn` so a sweep with N eligible
+/// rows doesn't serialise into `N × grace` seconds of cadence drift.
 pub async fn sweep_once(state: &Arc<ProxyState>, ttl: Duration) {
   let snap = state.ctx.supervisors.snapshot().await;
   for (launch_id, model) in snap {
@@ -152,8 +148,15 @@ pub async fn sweep_once(state: &Arc<ProxyState>, ttl: Duration) {
       served = model.params().model_path.display(),
       idle = idle_for,
     );
+    let ctx = state.ctx.clone();
     tokio::spawn(async move {
-      let _ = model.stop(EVICT_STOP_GRACE).await;
+      use crate::backend::Backend;
+      // A bare `model.stop` left the row in `state.running`, where it kept
+      // holding the launch name and refused the next `<model>@<name>`.
+      let backend = crate::daemon::launch_service::backend_for_launch(&ctx, &launch_id).await;
+      let _ = backend
+        .stop(&ctx, &launch_id, EVICT_STOP_GRACE.as_secs())
+        .await;
     });
   }
 }

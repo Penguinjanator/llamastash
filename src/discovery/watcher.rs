@@ -1,11 +1,10 @@
 //! Live-update the discovered-model list via a debounced filesystem
 //! watcher (origin: R22).
 //!
-//! `notify-debouncer-mini` coalesces rapid bursts (e.g., copying a
-//! split-shard set, or `hf-hub` writing many `.part` files in quick
-//! succession) into one event per quiet window — 500 ms by default
-//! per the plan. Each event surfaces to the caller as a [`WatchEvent`]
-//! over an `mpsc::Receiver`; the daemon's discovery task consumes
+//! Events are coalesced (e.g., copying a split-shard set, or `hf-hub`
+//! writing many `.part` files in quick succession) into one event per
+//! debounce window — 500 ms by default per the plan. Each event surfaces
+//! to the caller as a [`WatchEvent`] over an `mpsc::Receiver`; the daemon's discovery task consumes
 //! these and re-runs the affected scan slice to refresh
 //! `list_models`.
 //!
@@ -15,11 +14,13 @@
 //! mean a permanently invisible model. The tick fires on the same
 //! channel with [`WatchEvent::PeriodicRescan`].
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::mpsc as std_mpsc;
+use std::time::{Duration, Instant};
 
-use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
+use notify::event::{AccessKind, AccessMode};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
 /// What the watcher reports. Consumers don't need to distinguish
@@ -112,12 +113,80 @@ impl Default for WatcherOptions {
   }
 }
 
-/// Handle that keeps the debouncer alive. Dropping it stops the
-/// filesystem watcher and the periodic-rescan task; in-flight events
-/// already on the channel are still deliverable.
+/// Handle that keeps the watcher alive. Dropping it stops the
+/// filesystem watcher, its debounce thread and the periodic-rescan task;
+/// in-flight events already on the channel are still deliverable.
 pub struct WatcherHandle {
-  _debouncer: Debouncer<RecommendedWatcher>,
+  _watcher: RecommendedWatcher,
   _periodic_task: tokio::task::JoinHandle<()>,
+}
+
+/// Whether an event can change what a scan finds. Opens and read-only closes
+/// are dropped: the scan's own directory walk and header reads produce them,
+/// so passing them on made every rescan schedule the next one.
+fn changes_content(kind: &EventKind) -> bool {
+  match kind {
+    EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+    EventKind::Access(_) => false,
+    _ => true,
+  }
+}
+
+/// Collect raw event paths and send them as one [`WatchEvent::Changed`] once
+/// `debounce` has passed since the first of them. Returns when the watcher
+/// (the only sender) is dropped.
+fn debounce_loop(
+  raw: std_mpsc::Receiver<Vec<PathBuf>>,
+  tx: mpsc::Sender<WatchEvent>,
+  debounce: Duration,
+) {
+  let mut pending: BTreeSet<PathBuf> = BTreeSet::new();
+  let mut deadline: Option<Instant> = None;
+  loop {
+    let next = match deadline {
+      None => raw
+        .recv()
+        .map_err(|_| std_mpsc::RecvTimeoutError::Disconnected),
+      Some(d) => raw.recv_timeout(d.saturating_duration_since(Instant::now())),
+    };
+    match next {
+      Ok(paths) => {
+        deadline.get_or_insert_with(|| Instant::now() + debounce);
+        pending.extend(paths);
+      }
+      Err(std_mpsc::RecvTimeoutError::Timeout) => {
+        deadline = None;
+        if !flush(&tx, &mut pending) {
+          return;
+        }
+      }
+      Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+        flush(&tx, &mut pending);
+        return;
+      }
+    }
+  }
+}
+
+/// Send `pending` as one event. `false` once the consumer is gone.
+fn flush(tx: &mpsc::Sender<WatchEvent>, pending: &mut BTreeSet<PathBuf>) -> bool {
+  if pending.is_empty() {
+    return true;
+  }
+  let paths: Vec<PathBuf> = std::mem::take(pending).into_iter().collect();
+  // `try_send` so a slow consumer can't pin this thread; a dropped burst is
+  // reconciled by the periodic rescan. Warn so watcher pressure shows in logs
+  // rather than as "models take 5 minutes to show up after a download spike".
+  match tx.try_send(WatchEvent::Changed { paths }) {
+    Ok(()) => true,
+    Err(mpsc::error::TrySendError::Full(_)) => {
+      log::warn!(
+        "watcher channel full; dropping fs event burst (will reconcile on next periodic rescan)"
+      );
+      true
+    }
+    Err(mpsc::error::TrySendError::Closed(_)) => false,
+  }
 }
 
 /// Begin watching `roots`. Returns a receiver that yields
@@ -132,37 +201,24 @@ pub struct WatcherHandle {
 pub fn start(
   roots: Vec<WatchRoot>,
   opts: WatcherOptions,
-) -> Result<(WatcherHandle, mpsc::Receiver<WatchEvent>), notify_debouncer_mini::notify::Error> {
+) -> Result<(WatcherHandle, mpsc::Receiver<WatchEvent>), notify::Error> {
   let (tx, rx) = mpsc::channel(opts.channel_capacity);
 
-  let tx_for_debouncer = tx.clone();
-  let mut debouncer = new_debouncer(opts.debounce, move |res: DebounceEventResult| match res {
-    Ok(events) => {
-      let paths: Vec<PathBuf> = events.into_iter().map(|e| e.path).collect();
-      if paths.is_empty() {
-        return;
+  let (raw_tx, raw_rx) = std_mpsc::channel::<Vec<PathBuf>>();
+  let mut watcher =
+    notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+      Ok(event) if changes_content(&event.kind) && !event.paths.is_empty() => {
+        let _ = raw_tx.send(event.paths);
       }
-      // Channel send from a sync (debouncer-owned) thread. We use
-      // `try_send` rather than `blocking_send` so a slow consumer
-      // can't pin the debouncer thread for an unbounded period; if
-      // the channel is full we drop the burst and let the periodic
-      // rescan tick recover. The warn level is deliberate so users
-      // see watcher pressure in logs rather than discovering it as
-      // "models take 5 minutes to show up after a download spike".
-      match tx_for_debouncer.try_send(WatchEvent::Changed { paths }) {
-        Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(_)) => {
-          log::warn!("watcher channel full; dropping fs event burst (will reconcile on next periodic rescan)");
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-          log::debug!("watcher channel closed mid-event");
-        }
-      }
-    }
-    Err(err) => {
-      log::warn!("filesystem watcher error: {err}");
-    }
-  })?;
+      Ok(_) => {}
+      Err(err) => log::warn!("filesystem watcher error: {err}"),
+    })?;
+  let tx_for_debounce = tx.clone();
+  let debounce = opts.debounce;
+  std::thread::Builder::new()
+    .name("llamastash-watch-debounce".into())
+    .spawn(move || debounce_loop(raw_rx, tx_for_debounce, debounce))
+    .map_err(|e| notify::Error::generic(&format!("debounce thread: {e}")))?;
 
   for root in &roots {
     if !root.path.exists() {
@@ -172,10 +228,7 @@ pub fn start(
       );
       continue;
     }
-    if let Err(e) = debouncer
-      .watcher()
-      .watch(&root.path, RecursiveMode::from(root.mode))
-    {
+    if let Err(e) = watcher.watch(&root.path, RecursiveMode::from(root.mode)) {
       log::warn!("watcher: cannot watch {}: {e}", root.path.display());
     }
   }
@@ -205,7 +258,7 @@ pub fn start(
 
   Ok((
     WatcherHandle {
-      _debouncer: debouncer,
+      _watcher: watcher,
       _periodic_task: periodic_task,
     },
     rx,
@@ -401,6 +454,62 @@ mod tests {
       "immediate child creation must fire a Changed event"
     );
     fs::remove_dir_all(&root).ok();
+  }
+
+  /// The scan reads every directory and header under a root; if those reads
+  /// counted as changes, each rescan would trigger the next one.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn reads_do_not_fire_a_changed_event() {
+    let root = temp_root("reads");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("sub/model.gguf"), b"GGUF\x03").unwrap();
+    let opts = WatcherOptions {
+      periodic_rescan: Duration::from_secs(3600),
+      ..fast_opts()
+    };
+    let (_handle, mut rx) =
+      start(vec![WatchRoot::recursive(root.clone())], opts).expect("start watcher");
+    // macOS reports the tree created before `start()` shortly after the watcher
+    // comes up, as one `Changed` over all three paths.
+    drain_until_quiet(&mut rx, GAP).await;
+
+    // The first touch of the tree is warm-up, not measurement. On Windows the
+    // first `read_dir` after the watch starts surfaces one `Changed` naming the
+    // directory read, one debounce window later. Every later read round was
+    // silent across 6 of 6 Windows transcripts, so it is a first-touch effect
+    // and not something the reads do each time.
+    read_tree(&root);
+    drain_until_quiet(&mut rx, GAP).await;
+
+    // Steady state: the same reads again, nothing may fire. This is what keeps
+    // the scan from feeding the watcher and the watcher from feeding the scan.
+    for _ in 0..5 {
+      read_tree(&root);
+    }
+    let got = tokio::time::timeout(GAP, rx.recv()).await;
+    assert!(got.is_err(), "reads must not fire an event, got {got:?}");
+
+    fs::write(root.join("sub/model.gguf"), b"GGUF\x03\x00").unwrap();
+    let after_write = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+      .await
+      .expect("a write fires an event")
+      .expect("channel open");
+    assert!(matches!(after_write, WatchEvent::Changed { .. }));
+    fs::remove_dir_all(&root).ok();
+  }
+
+  /// Window used to decide that no more events are coming.
+  const GAP: Duration = Duration::from_millis(500);
+
+  /// Read what the scan would read under `root`.
+  fn read_tree(root: &std::path::Path) {
+    let _ = fs::read_dir(root.join("sub")).unwrap().count();
+    let _ = fs::read(root.join("sub/model.gguf")).unwrap();
+  }
+
+  /// Take events until `rx` has been silent for `gap`.
+  async fn drain_until_quiet(rx: &mut tokio::sync::mpsc::Receiver<WatchEvent>, gap: Duration) {
+    while let Ok(Some(_)) = tokio::time::timeout(gap, rx.recv()).await {}
   }
 
   #[test]

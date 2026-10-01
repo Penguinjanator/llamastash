@@ -31,7 +31,7 @@ Both shapes of the binary work. llama.cpp's own installer (`llama.app`) ships a 
 
 **Symptom:** `llamastash list` exits `65` (`DaemonUnreachable`) even though `daemon.pid` is present and locked. The recorded daemon is dead but the handshake file (`runtime.json`) didn't get cleaned up.
 
-**Fix:** `daemon stop --force` falls back to a PID-targeted graceful-then-kill that also clears the handshake. If that's unreachable too, remove the handshake + lockfile manually:
+**Fix:** `daemon stop --force` falls back to a PID-targeted graceful-then-kill that also clears the handshake. The reverse state — `runtime.json` present, nothing holding the lock — is cleared on its own: `daemon stop` and `daemon restart` find no lock holder, delete the handshake, and report `daemon: not running`. If neither is reachable, remove the handshake + lockfile manually:
 
 ```bash
 state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/llamastash"
@@ -200,22 +200,23 @@ llamastash logs <launch-id> -f
 
 Once the underlying launch issue is fixed, the fallback path stops firing. To turn the fallback off entirely is tracked as a deferred decision in `TODO.md §R1` (`proxy.fallback: false`).
 
+## Config rejected: unknown field ds4
+
+**Symptom:** every command fails with ``backend: unknown field `ds4` `` and a note that the ds4 backend was removed.
+
+**Cause:** ds4 was a dedicated backend up to 0.4.0. It now runs as a `backend.generic` entry, and the old `backend.ds4:` block no longer parses.
+
+**Fix:** follow the migration steps in [Running ds4 as a generic server](usage.md#running-ds4-as-a-generic-server): replace the block with the generic entry, add `server: generic-ds4` to your ds4 presets, and restart the daemon.
+
 ## My DeepSeek-V4 model launched on llama.cpp, not ds4
 
-**This is expected in several cases** — ds4 is preferred, not required, and a current llama.cpp (**b9840+**) runs DeepSeek-V4 too, so an auto launch never refuses. Walk the checklist:
-
-- **ds4-server not found.** ds4 is default-on only when the binary resolves. Check `llamastash status --json | jq '.backends[] | select(.id=="ds4")'` — `installed: false` means no `ds4-server` on `PATH` and no valid `backend.ds4.servers`. See the [ds4 backend](usage.md#ds4-backend) setup.
-- **ds4 force-disabled.** `backend.ds4.enabled: false` in config turns it off even when the binary is present.
-- **The GGUF isn't ds4-compatible.** A generic third-party `deepseek4` quant (K-quants on attention tensors, Q6_K experts) fails ds4's quant contract and stays a llama.cpp model. `llamastash list --json | jq '.models[] | {name, backend}'` badges `ds4` only on files that would actually route there.
-- **Embedding / rerank mode.** `--mode embedding` or `--mode rerank` routes a compatible model to llama.cpp — ds4 serves chat/completions only.
-
-**Force it:** `llamastash start <model> --backend ds4` bypasses the predicate (ds4-server surfaces its own error if the file is a genuine mismatch).
+**This is expected.** llama.cpp is the default server for every GGUF, and a generic entry never becomes the default. Pick ds4 per launch with `--server generic-ds4`, or pin it in a preset with `server: generic-ds4` and make that preset the model's `default:`. `llamastash list` shows `llamacpp|generic` on the rows the entry's `model:` matches; if a DeepSeek-V4 row shows only `llamacpp`, the glob doesn't match its name.
 
 ## DeepSeek-V4 fails on llama.cpp: `unknown model architecture: 'deepseek4'`
 
-**Symptom:** a DeepSeek-V4 GGUF routed to llama.cpp — no `ds4-server` installed, or you passed `--backend llamacpp` — dies at load with `error loading model: unknown model architecture: 'deepseek4'`. It fails in milliseconds, before any tensor loads.
+**Symptom:** a DeepSeek-V4 GGUF launched on llama.cpp dies at load with `error loading model: unknown model architecture: 'deepseek4'`. It fails in milliseconds, before any tensor loads.
 
-**Cause:** your `llama-server` predates DeepSeek-V4 support. It landed in llama.cpp **b9840** ([ggml-org/llama.cpp#24162](https://github.com/ggml-org/llama.cpp/pull/24162), merged 2026-06-29); older builds don't know the `deepseek4` architecture and reject the file outright. This is the failure mode behind the "fall back to llama.cpp, never a refusal" caveat — the fallback only degrades gracefully on a b9840+ build.
+**Cause:** your `llama-server` predates DeepSeek-V4 support. It landed in llama.cpp **b9840** ([ggml-org/llama.cpp#24162](https://github.com/ggml-org/llama.cpp/pull/24162), merged 2026-06-29); older builds don't know the `deepseek4` architecture and reject the file outright.
 
 **Fix:** update `llama-server` to **b9840 or newer** (a GitHub release binary, `brew upgrade llama.cpp`, or a source build from that merge onward) and point `backend.llamacpp.servers` at it. Confirm the resolved binary and its build:
 
@@ -224,7 +225,15 @@ llamastash status --json | jq -r '.daemon.server_path'
 "$(llamastash status --json | jq -r '.daemon.server_path')" --version   # want: version >= 9840
 ```
 
-Or install `ds4-server` so compatible GGUFs route to ds4 instead. (On a b9840+ llama.cpp, Flash Attention is currently auto-disabled for the deepseek4 graph — the model still loads and runs.)
+Or run the file on ds4 instead, through a [generic server entry](usage.md#running-ds4-as-a-generic-server). (On a b9840+ llama.cpp, Flash Attention is currently auto-disabled for the deepseek4 graph — the model still loads and runs.)
+
+## A model shows `error: process exited unexpectedly`
+
+**Symptom:** a model that was `ready` now shows `error` in `status` or the TUI, with `process exited unexpectedly (killed by signal 9)` or `(exit code N)` and the last lines of its log.
+
+**Cause:** the model process died without being asked to stop. `killed by signal 9` is SIGKILL, which is what the kernel's OOM killer sends; check `journalctl -k | grep -i oom`. An exit code is the engine's own failure; the log lines show why.
+
+**Fix:** the row stays until you stop it: `llamastash stop <model>` (or the stop key in the TUI, `Ctrl+s` by default). A new request to the proxy starts a fresh copy either way.
 
 ## `launch refused: needs N GiB but only M is free`
 
@@ -238,32 +247,27 @@ Weights the engine streams from the mapping rather than holding resident are alr
 
 ## ds4 model out-of-memories at load
 
-**Symptom:** a DeepSeek-V4 launch is admitted, then the backend dies allocating VRAM/RAM. These GGUFs are 81–300+ GB; the practical floor is ~128 GB (CUDA/ROCm) / ~96 GB (Metal).
+**Symptom:** a DeepSeek-V4 launch on ds4 dies allocating memory. These GGUFs are 81-300+ GB; the practical floor is about 128 GB on CUDA/ROCm and 96 GB on Metal.
 
-**Fix:** set the **`ssd_streaming` native knob** to stream weights from disk instead of requiring full residency. This is the one launch where the pre-spawn admission gate is deliberately skipped. Two caveats:
+**Fix:** set `ssd-streaming: true` in the preset so `ds4-server` streams weights from disk. LlamaStash's admission check still sizes the launch from the GGUF, so a launch that doesn't fit is refused before spawn; add `start --force` for a streaming launch. Don't combine it with `mtp-model`: `ds4-server` refuses streaming with a draft head, after the full load. (Verified: an 86 GB Flash IQ2_XXS reached Ready with streaming on a 121 GB box, and ran out of memory without it.)
 
-- The bypass keys on the **native knob only**. An extras-spelled `-- --ssd-streaming` reaches ds4-server but still hits LlamaStash's admission gate first, so the launch can be refused before spawn. Use the native knob (launch picker / preset), not the extras tail.
-- Every deepseek4 launch also prints **"KV demand not modeled for deepseek4"** — the admission estimate omits the KV term for this arch, so it can admit a launch that then OOMs at a large context. Watch your memory headroom and lower `--ctx` if a load stalls.
+## ds4 split PRO half-file fails to load
 
-(Verified: an 86 GB Flash IQ2XXS reached Ready via `ssd_streaming` on a 121 GB box, and OOMed without it.)
+**Symptom:** launching `DeepSeek-V4-Pro-Q4K-Layers00-30.gguf` or `*-Layers-31-output.gguf` fails in the engine.
 
-## ds4 split PRO half-file refused
+**Cause:** those two files are one split PRO model that ds4 runs only in distributed mode, which LlamaStash doesn't support. Neither half loads on its own in any engine. Use a single-file DeepSeek-V4 GGUF (the `*-Pro-IQ2XXS-*-Instruct` and Flash quants are single-file).
 
-**Symptom:** launching `DeepSeek-V4-Pro-Q4K-Layers00-30.gguf` or `…-Layers-31-output.gguf` is refused before spawn with "ds4 distributed mode unsupported".
+## ds4-server's `/v1/models` lists two models when one is running
 
-**This is the design.** Those two files are one split PRO model that ds4 runs only in distributed mode, which LlamaStash does not support — each half is unloadable on its own by either engine. Use a **single-file** DeepSeek-V4 GGUF instead (the `…-Pro-IQ2XXS-…-Instruct` and Flash quants are single-file). `--backend ds4` bypasses the guard if you want ds4-server to surface its own error.
+**Symptom:** `curl http://127.0.0.1:<port>/v1/models` against a ds4 launch returns **two** entries, `deepseek-v4-flash` and `deepseek-v4-pro`, even though only one model is loaded.
 
-## ds4 `/v1/models` lists two models when one is running
+**This is ds4-server behavior, not a LlamaStash bug.** ds4-server advertises a fixed two-entry menu on `/v1/models` regardless of which GGUF is resident. `/v1/chat/completions` serves the loaded model and echoes back the `model` name you sent. Through the LlamaStash proxy you never see the menu: the proxy publishes your own catalog on its `/v1/models` and forwards your request model, which ds4 echoes back.
 
-**Symptom:** `curl http://127.0.0.1:<port>/v1/models` against a ds4 backend returns **two** entries — `deepseek-v4-flash` and `deepseek-v4-pro` — even though only one model is loaded.
+## Generic server fails an embeddings or rerank request
 
-**This is ds4-server behavior, not a LlamaStash bug.** ds4-server advertises a fixed two-entry menu on `/v1/models` regardless of which GGUF is resident; it is not a report of what is loaded. `/v1/chat/completions` serves the one loaded model and **echoes back the `model` name you sent** (no fixed-alias rewrite). You normally never see any of this through LlamaStash: the proxy publishes your *own* catalog by file name on its `/v1/models`, and forwards your request model to the backend, which echoes it — so you request and get back the same name. The two aliases only surface if you curl ds4-server's port directly.
+**Symptom:** a `POST /v1/embeddings` or `/v1/rerank` request for a model on a generic entry (ds4-server, Halogen, gufo) fails with the engine's own error, often after starting it.
 
-## ds4 embeddings / rerank request fails
-
-**Symptom:** a `POST /v1/embeddings` or `/v1/rerank` request that resolves to a running ds4 model returns a JSON error ("the ds4 backend serves chat/completions only, not embeddings or rerank").
-
-**This is the design.** ds4-server has no embeddings/rerank endpoints. Launch the model on llama.cpp for those modes — a plain `--mode embedding` / `--mode rerank` launch of a ds4-compatible GGUF already routes to llama.cpp automatically. Reserve ds4 for chat/completions.
+**Fix:** most of these servers answer chat only. Add `modes: [chat]` to the entry in `config.yaml`; the proxy then refuses those requests with `400 unsupported_endpoint` without starting the model. Send embeddings to a model that serves them, such as a GGUF embedder on llama.cpp.
 
 ## `--mtp on` didn't enable MTP (or a launch failed with "context type MTP requested")
 
@@ -271,17 +275,11 @@ Weights the engine streams from the mapping rather than holding resident are alr
 
 **This is the gate working (or the lack of one).** MTP only works on a model that ships a draft head — an embedded one (`{arch}.nextn_predict_layers > 0`) or a separate `mtp-*.gguf` sibling. llamastash checks first: `--mtp on` on a non-capable model warns and skips rather than emitting the flag and bricking the launch. If you bypass llamastash and pass `--spec-type draft-mtp` yourself in `extras`, llama-server has no such guard and fails to load. Fix: use `--mtp auto` (the default) so llamastash only enables MTP when the model can actually do it, and let `pull` fetch the `mtp-*.gguf` head for separate-head models (`--all-companions` if the default one-per-kind missed it).
 
-## Codex / Responses-API client can't reach a ds4 model
-
-**Symptom:** a client that speaks only the OpenAI Responses API (`POST /v1/responses`) — e.g. recent Codex CLI — can't drive a ds4 model through the proxy.
-
-**Known gap.** ds4-server speaks `/v1/responses`, but the LlamaStash proxy does not route it yet (tracked in `TODO.md`). Use a Chat Completions (`/v1/chat/completions`) or Anthropic Messages (`/v1/messages`) client against the proxy for now.
-
 ## `state.json` quarantined after downgrading LlamaStash
 
-**Symptom:** after running a newer LlamaStash that launched a ds4 model and then reverting to an older binary, the daemon quarantines `state.json` as `state.json.broken-<ts>` and boots with defaults.
+**Symptom:** after running a newer LlamaStash and then reverting to an older binary, the daemon quarantines `state.json` as `state.json.broken-<ts>` and boots with defaults.
 
-**This is expected pre-release.** The ds4 work added a `resolved_backend` tag on last-params **and running-snapshot** rows and a `"ds4"` backend value the older binary's state schema doesn't understand, so it rejects the file rather than misreading it. LlamaStash keeps no backward-compatibility guarantees before the first stable release. Favorites / last-params / the running snapshot reset for that boot; named presets live in `config.yaml` and survive. Don't hop between old and new binaries against one state dir.
+**This is expected pre-release.** A newer binary can write state fields or backend values an older binary's schema doesn't understand, so the older one rejects the file rather than misreading it. LlamaStash keeps no backward-compatibility guarantees before the first stable release. Favorites / last-params / the running snapshot reset for that boot; named presets live in `config.yaml` and survive. Don't hop between old and new binaries against one state dir.
 
 ## vLLM shows as not installed even though it runs
 
@@ -325,6 +323,22 @@ Same cause and fix as vLLM above: detection is a filesystem check for a `sglang`
 
 **The token cap came out smaller than `--ctx`.** On a tight host the shared budget divided by a large model's per-token cost can be fewer tokens than the requested window; the launch proceeds with the warning rather than refusing. Raise `max_total_tokens` if the host can take it, or lower `--ctx`.
 
+## Generic server returns 404 `model_not_found`
+
+Some engines (gufo) answer only to the name they were started with. Pass `{name}` to the engine's served-name flag (`--served-model-name "{name}"`), and send the model's full id: a partial name the proxy resolves still reaches the engine as you typed it, since the proxy does not rewrite `model`.
+
+## Generic entry edits don't show up
+
+Entries and their knobs are read when a process starts. Run `llamastash daemon restart` and reopen the TUI after editing `backend.generic`. A daemon and a TUI started on different versions of the file disagree about which knobs exist.
+
+## Generic launch leaves a container or process behind
+
+llamastash sends one SIGTERM to the launch's process group and SIGKILLs after `stop_grace_secs`. A wrapper that runs `docker run` in the foreground and gets SIGKILLed leaves the container running. Use the wrapper shape in `docs/usage.md` § Generic backend (`docker run -d`, a `trap` that runs `docker stop`, `docker wait` in the foreground), set `stop_grace_secs` above your `docker stop -t`, and remove leftovers at wrapper start (`docker rm -f "llamastash-<engine>-$port"`). There is no orphan adoption for generic launches after a daemon crash.
+
+## Generic server is reachable from the LAN
+
+llamastash can't see what a foreign binary binds. Pass `{host}` (always `127.0.0.1`) to the engine's bind flag. For a container whose server binds `0.0.0.0` inside (Halogen 0.14.0's `all` mode does), publish the port on loopback only (`-p 127.0.0.1:$port:<inner>`) instead of `--network host`. Check with `ss -ltn | grep <port>`.
+
 ## HuggingFace pull
 
-`llamastash pull <owner/repo[:filename.gguf]>` downloads a GGUF into the HuggingFace cache layout the scanner already reads, so the model shows up in `list` / the TUI right after. The TUI's `d` HuggingFace dialog is the interactive face of the same worker. If a download stalls, check network / egress and that the repo + filename resolve on huggingface.co; a failed pull exits `69` (`PULL_FAILED`). The per-file cap is 512 GiB (raised for ds4's single-file DeepSeek-V4 GGUFs).
+`llamastash pull <owner/repo[:filename.gguf]>` downloads a GGUF into the HuggingFace cache layout the scanner already reads, so the model shows up in `list` / the TUI right after. The TUI's `d` HuggingFace dialog is the interactive face of the same worker. If a download stalls, check network / egress and that the repo + filename resolve on huggingface.co; a failed pull exits `69` (`PULL_FAILED`). The per-file cap is 512 GiB (raised for the single-file DeepSeek-V4 GGUFs).

@@ -25,6 +25,7 @@ use std::sync::Arc;
 use http_body_util::{BodyExt, Limited};
 use hyper::body::{Bytes, Incoming};
 
+use crate::daemon::registry::LaunchId;
 use crate::daemon::supervisor::ManagedState;
 use crate::discovery::DiscoveredModel;
 use crate::gguf::identity::ModelId;
@@ -265,7 +266,7 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
   // both the model (path) and the name; the name is threaded through to
   // `auto_start` so a second named launch of the same model gets its own
   // flight and its own addressable id.
-  let (name, resolved) = match resolve_model_with_candidates(&rows, &requested) {
+  let (mut name, resolved) = match resolve_model_with_candidates(&rows, &requested) {
     Ok(r) => (None, r),
     Err(_) => {
       let (m, n) = match parse_named_reference(&requested) {
@@ -307,21 +308,21 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
     return decide_umbrella_route(state, requested, &resolved).await;
   }
 
-  // Walk the supervisor snapshot for a Ready entry serving the
-  // resolved row's path. Two HashMap lookups + one state read each
-  // — well within the hot-path budget the plan asks for.
-  let sup_snap = state.ctx.supervisors.snapshot().await;
-  // When a name is present we must map a launch's port back to its name to
+  // Walk the supervisor snapshot for Ready entries serving the resolved row's
+  // path. When a name is present we must map a launch back to its name to
   // confirm the match; read the state snapshot once (not per-iteration).
-  let state_snap = if name.is_some() {
+  let sup_snap = state.ctx.supervisors.snapshot().await;
+  let mut state_snap = if name.is_some() {
     Some(state.ctx.state.snapshot().await)
   } else {
     None
   };
-  for (launch_id, model) in sup_snap.into_iter() {
-    if !same_path(&model.id().path, &resolved.path) {
-      continue;
-    }
+  let same_model: Vec<_> = sup_snap
+    .into_iter()
+    .filter(|(_, model)| same_path(&model.id().path, &resolved.path))
+    .collect();
+  let mut ready = Vec::new();
+  for (launch_id, model) in same_model.iter().cloned() {
     // When a name is present, only a launch with that name is a match.
     if let (Some(n), Some(st)) = (&name, &state_snap) {
       if !st
@@ -333,15 +334,57 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
       }
     }
     if matches!(model.state().await, ManagedState::Ready) {
-      return RouteDecision::ReadyAt {
-        port: model.port(),
-        served_model_id: served_name_for_row(&resolved),
-        served_model_key: model.id().clone(),
-        upstream_path_prefix: None,
-        fallback: false,
-        fallback_reason: None,
-      };
+      ready.push((launch_id, model));
     }
+  }
+  if ready.len() > 1 && state_snap.is_none() {
+    state_snap = Some(state.ctx.state.snapshot().await);
+  }
+  let running = state_snap.as_ref().map_or(&[][..], |s| &s.running[..]);
+  let keys: Vec<(LaunchId, u16)> = ready.iter().map(|(id, m)| (id.clone(), m.port())).collect();
+  let mut target = pick_ready_launch(&keys, running).map(|i| ready[i].1.clone());
+
+  // A `<model>@<name>` with no launch of that name goes to the model's only
+  // launch when that one is unnamed, instead of loading a second copy with the
+  // same settings. A name that is one of the model's presets still auto-starts,
+  // because it asks for different settings. A launch still loading is reached
+  // by dropping the name: the unnamed auto-start attaches to it and waits. If
+  // that load then fails, the auto-start brings up an unnamed copy, not `@<name>`.
+  if target.is_none() {
+    if let (Some(n), Some(st), [(launch_id, model)]) = (&name, &state_snap, &same_model[..]) {
+      let model_state = model.state().await;
+      if !is_named(&st.running, launch_id, model.port())
+        && matches!(
+          model_state,
+          ManagedState::Launching | ManagedState::Loading | ManagedState::Ready
+        )
+        && crate::daemon::launch_service::model_presets(
+          &state.ctx,
+          std::path::Path::new(&resolved.path),
+          resolved.arch.as_deref(),
+        )
+        .await
+        .named(n)
+        .is_none()
+      {
+        if model_state == ManagedState::Ready {
+          target = Some(model.clone());
+        } else {
+          name = None;
+        }
+      }
+    }
+  }
+
+  if let Some(model) = target {
+    return RouteDecision::ReadyAt {
+      port: model.port(),
+      served_model_id: served_name_for_row(&resolved),
+      served_model_key: model.id().clone(),
+      upstream_path_prefix: None,
+      fallback: false,
+      fallback_reason: None,
+    };
   }
 
   // Catalog matched but no supervisor is in Ready state — dispatch
@@ -354,6 +397,34 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
     arch,
     name,
   }
+}
+
+/// Which of several Ready launches of one model a request goes to: an unnamed
+/// launch over a named one (a named launch has its own address), then the
+/// newest (highest `L#`). Returns an index into `ready`, `None` when it is empty.
+fn pick_ready_launch(
+  ready: &[(LaunchId, u16)],
+  running: &[crate::daemon::state_store::RunningSnapshot],
+) -> Option<usize> {
+  ready
+    .iter()
+    .enumerate()
+    .max_by_key(|(_, (id, port))| (!is_named(running, id, *port), id.counter().unwrap_or(0)))
+    .map(|(i, _)| i)
+}
+
+fn is_named(
+  running: &[crate::daemon::state_store::RunningSnapshot],
+  id: &LaunchId,
+  port: u16,
+) -> bool {
+  running.iter().any(|r| {
+    r.name.is_some()
+      && match &r.launch_id {
+        Some(mine) => mine == id,
+        None => r.port == port,
+      }
+  })
 }
 
 /// Routing decision for a managed-multiplexer-backed model. A managed
@@ -371,7 +442,7 @@ async fn decide_umbrella_route(
   use crate::backend::{Backend, Backends};
   let backend_id =
     crate::discovery::ModelSource::from_label(&resolved.source).map(|s| s.backend_id());
-  let backend = backend_id.and_then(|id| Backends::all().into_iter().find(|b| b.id() == id));
+  let backend = backend_id.and_then(Backends::from_id);
   let umbrella_id = backend.as_ref().and_then(|b| b.umbrella_launch_id());
   let umbrella = match umbrella_id {
     Some(id) => state.ctx.supervisors.get(&id).await,
@@ -430,16 +501,14 @@ pub(crate) async fn running_model_backend(
     .find(|e| e.id.as_gguf().map(|g| g.path == id.path).unwrap_or(false))
     .map(|e| e.resolved_backend.clone())
   {
-    return Backends::all().into_iter().find(|b| b.id() == tag);
+    return Backends::from_id(&tag);
   }
   let cat = state.ctx.catalog.snapshot().await;
   let rb = cat
     .iter()
     .find(|m| m.path == id.path)
     .and_then(|m| m.default_backend().map(str::to_string))?;
-  Backends::all()
-    .into_iter()
-    .find(|b| b.id() == rb && b.available(&state.ctx))
+  Backends::from_id(&rb).filter(|b| b.available(&state.ctx))
 }
 
 /// The backend an `Auto` launch of `row` would land on — resolved through the
@@ -468,6 +537,8 @@ pub(crate) async fn would_route_backend(
   });
   Some(crate::backend::resolve_backend_for_launch(
     &identity,
+    &m.path,
+    None,
     crate::launch::params::BackendChoice::Auto,
     &m.supported_backends,
     launch_mode,
@@ -761,6 +832,31 @@ async fn collect_fallback_candidates(state: &Arc<ProxyState>) -> Vec<FallbackCan
 mod tests {
   use super::fallback_reason_for;
 
+  #[test]
+  fn pick_ready_launch_prefers_unnamed_then_newest() {
+    use super::{pick_ready_launch, LaunchId};
+    let l = |n: u64| (LaunchId::from_counter(n), 41000 + n as u16);
+    let named = |n: u64, name: &str| crate::daemon::state_store::RunningSnapshot {
+      launch_id: Some(LaunchId::from_counter(n)),
+      port: 41000 + n as u16,
+      name: Some(name.to_string()),
+      ..crate::test_support::running_row("/m.gguf").build()
+    };
+    // Numeric, not lexicographic: L10 is newer than L9.
+    assert_eq!(pick_ready_launch(&[l(9), l(10)], &[]), Some(1));
+    // An unnamed launch beats a newer named one.
+    assert_eq!(
+      pick_ready_launch(&[l(2), l(5)], &[named(5, "coder")]),
+      Some(0)
+    );
+    // All named: the newest.
+    assert_eq!(
+      pick_ready_launch(&[l(3), l(4)], &[named(3, "a"), named(4, "b")]),
+      Some(1)
+    );
+    assert_eq!(pick_ready_launch(&[], &[]), None);
+  }
+
   // ─── 413 envelope ──────────────────────────────────────────────
   //
   // The 413 message names the in-force cap twice: rounded human unit
@@ -898,79 +994,6 @@ mod tests {
       row.mode_hint.as_deref(),
       Some("embedding"),
       "proxy auto-start needs embedding hint to add --embeddings"
-    );
-  }
-
-  #[tokio::test]
-  async fn mode_guard_refuses_embeddings_to_chat_only_backend() {
-    use crate::backend::Backend;
-    use crate::daemon::context::MethodContext;
-    use crate::daemon::shutdown::ShutdownToken;
-    use crate::discovery::ModelCatalog;
-    use crate::launch::mode::LaunchMode;
-
-    // A chat-only backend available on this host (ds4 is the real one; any
-    // existing file satisfies its binary resolver). The guard is generic —
-    // asserted via `serves_mode`, not by naming the backend.
-    let exe = std::env::current_exe().unwrap();
-    let ds4_cfg = crate::config::Ds4Config {
-      enabled: Some(true),
-      servers: vec![crate::backend::ServerConfig {
-        binary: exe,
-        name: None,
-      }],
-    };
-
-    // A chat model routed to that backend → auto-start lands on a backend that
-    // doesn't serve embeddings, so an embeddings/rerank request must be refused.
-    let mut chat = discovered_with_mode(ModeHint::Chat);
-    chat.path = std::path::PathBuf::from("/m/deepseek.gguf");
-    chat.supported_backends = vec![
-      crate::backend::ds4::DS4_BACKEND_ID.to_string(),
-      crate::backend::DEFAULT_BACKEND_ID.to_string(),
-    ];
-    let chat_row = catalog_row_from_discovered(&chat);
-
-    // A compatible-but-embedding-hint model routes to the default backend
-    // (which serves embeddings), so it must NOT be guarded.
-    let mut embed = discovered_with_mode(ModeHint::Embedding);
-    embed.path = std::path::PathBuf::from("/m/embed.gguf");
-    embed.supported_backends = vec![
-      crate::backend::ds4::DS4_BACKEND_ID.to_string(),
-      crate::backend::DEFAULT_BACKEND_ID.to_string(),
-    ];
-    let embed_row = catalog_row_from_discovered(&embed);
-
-    let catalog = ModelCatalog::new();
-    catalog.upsert(chat).await;
-    catalog.upsert(embed).await;
-    let ctx = MethodContext::with_catalog(ShutdownToken::new(), catalog).with_backend(
-      crate::backend::BackendConfig {
-        ds4: ds4_cfg,
-        ..Default::default()
-      },
-      std::collections::BTreeMap::new(),
-    );
-    let state = crate::proxy::state::ProxyState::from_context(
-      &ctx,
-      false,
-      true,
-      super::DEFAULT_BODY_LIMIT_BYTES,
-    );
-
-    let chat_backend = super::would_route_backend(&state, &chat_row)
-      .await
-      .expect("chat row resolves a backend");
-    assert!(
-      !chat_backend.serves_mode(LaunchMode::Embedding),
-      "compatible chat model auto-starts on a chat-only backend → embeddings guard fires"
-    );
-    let embed_backend = super::would_route_backend(&state, &embed_row)
-      .await
-      .expect("embed row resolves a backend");
-    assert!(
-      embed_backend.serves_mode(LaunchMode::Embedding),
-      "embedding-hint model routes to an embedding-capable backend → not guarded"
     );
   }
 

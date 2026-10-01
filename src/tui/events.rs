@@ -1206,6 +1206,9 @@ fn delete_refusal_reason(app: &App) -> Option<&'static str> {
     if crate::backend::lemonade::registry_name_from_path(&path).is_some() {
       return Some("model is managed by Lemonade — delete it via Lemonade");
     }
+    if !app.has_local_file(&path) {
+      return Some("model is declared in config.yaml — remove it there");
+    }
   }
   if let Some(managed) = app.focused_managed() {
     return Some(match managed.state {
@@ -1825,8 +1828,8 @@ fn apply_launch_submit(app: &mut App, writer: Option<&mpsc::Sender<WriterCmd>>) 
     extras,
     mode,
     prefer_port: picker.prefer_port,
-    // Scoping value, not a user override: a ds4 scope sends `Auto` so the
-    // daemon routes (and the split-half guard fires). See `launch_backend`.
+    // Scoping value, not a user override: a scope sends `Auto` so the daemon
+    // routes. See `launch_backend`.
     backend: picker.launch_backend(),
     selection,
     // Chosen server build (or `None` for the priority default). The daemon
@@ -2039,7 +2042,7 @@ pub fn spawn_writer(
   tokio::spawn(async move {
     while let Some(cmd) = rx.recv().await {
       if matches!(cmd, WriterCmd::RestartDaemon) {
-        handle_restart_daemon(&socket, daemon_opts.clone()).await;
+        handle_restart_daemon(&socket, daemon_opts.clone(), feedback.clone()).await;
         continue;
       }
       let mut client = match Client::connect(&socket).await {
@@ -2100,59 +2103,90 @@ pub fn spawn_writer(
   tx
 }
 
-/// Two-phase daemon restart: ask the running daemon to shut down,
-/// wait until it has fully released its lockfile, then
-/// `start_detached` a fresh daemon with the same options the parent
-/// dispatcher resolved. Best-effort throughout — every failure logs
-/// and the TUI keeps running so the user can retry from the keymap.
+/// Two-phase daemon restart: the shared graceful stop
+/// ([`crate::daemon::restart::shutdown_and_wait`] — the same one
+/// `llamastash daemon restart` runs), then `start_detached` a fresh daemon
+/// with the same options the parent dispatcher resolved. Best-effort
+/// throughout — every failure logs and raises an error toast, and the TUI
+/// keeps running so the user can retry from the keymap.
 ///
-/// Why poll the lockfile and not just the socket: the daemon's
-/// cleanup sequence is (1) accept-loop exit, (2) up to 2s connection
-/// drain, (3) `stop_all_managed`, (4) remove socket file,
-/// (5) drop lockfile. Waiting only for the socket to become
-/// unconnectable can return before step 5, so the replacement child's
-/// `acquire` contends on the still-held `flock`, exits with
-/// `AlreadyRunning`, and `start_detached` reports a failure. The user
-/// then sees "daemon connecting…" indefinitely until they retry.
+/// Why wait on the lockfile and not just the socket: the daemon's cleanup
+/// sequence is (1) accept-loop exit, (2) up to 2s connection drain, (3)
+/// `stop_all_managed`, (4) remove socket file, (5) drop lockfile. Returning on
+/// "socket no longer connectable" can happen before step 5, so the replacement
+/// child's `acquire` contends on the still-held `flock`, exits with
+/// `AlreadyRunning`, and `start_detached` reports a failure. The user then
+/// sees "daemon connecting…" indefinitely until they retry.
 async fn handle_restart_daemon(
   socket: &std::path::Path,
   daemon_opts: Option<crate::daemon::DaemonOptions>,
+  feedback: Option<mpsc::Sender<Event>>,
 ) {
-  match Client::connect(socket).await {
-    Ok(mut client) => {
-      if let Err(e) = client.call("shutdown", None).await {
-        log::warn!("restart: shutdown call failed: {e}");
-      }
+  use crate::daemon::restart::StopOutcome;
+
+  // The confirm dialog leaves "daemon restarting…" on screen, so a restart
+  // that gives up has to say so in the TUI rather than only in the log.
+  async fn bail(feedback: &Option<mpsc::Sender<Event>>, message: impl Into<String>) {
+    let message = message.into();
+    log::warn!("restart: {message}");
+    if let Some(fb) = feedback {
+      let _ = fb
+        .send(Event::Refresh(RefreshTick::WriterError {
+          method: "restart_daemon",
+          message,
+        }))
+        .await;
     }
-    Err(e) => log::warn!("restart: connect-for-shutdown failed: {e}"),
+  }
+
+  // The state dir to wait on: the resolved options carry it, and `socket` is
+  // the attach dir the TUI itself opened with.
+  let state_dir = daemon_opts
+    .as_ref()
+    .map(|o| o.state_dir.clone())
+    .unwrap_or_else(|| socket.to_path_buf());
+  match crate::daemon::restart::shutdown_and_wait(&state_dir).await {
+    Ok(StopOutcome::Stopped) | Ok(StopOutcome::NoChannel) => {}
+    Ok(StopOutcome::StillExiting { pid }) => {
+      bail(
+        &feedback,
+        format!(
+          "daemon (pid {pid}) was still exiting when the wait ended; no new daemon was started. \
+           Run `daemon stop --force` and restart again."
+        ),
+      )
+      .await;
+      return;
+    }
+    Err(e) => {
+      bail(
+        &feedback,
+        format!("could not ask the daemon to shut down: {e}"),
+      )
+      .await;
+      return;
+    }
   }
   let opts = match daemon_opts {
     Some(o) => o,
     None => match crate::daemon::DaemonOptions::from_defaults() {
       Ok(o) => o,
       Err(e) => {
-        log::warn!("restart: default DaemonOptions: {e}");
+        bail(&feedback, format!("no daemon options to restart with: {e}")).await;
         return;
       }
     },
   };
-  // Wait for the old daemon to fully release its lockfile. 8s covers
-  // the worst case (2s connection drain + 5s `stop_all_managed`
-  // grace + cleanup margin); children that stop cleanly return well
-  // before the grace deadline.
-  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-  while std::time::Instant::now() < deadline {
-    if crate::daemon::existing_daemon_pid(&opts.state_dir).is_none() {
-      break;
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-  }
   match crate::daemon::start_detached(opts) {
     Ok(crate::daemon::StartOutcome::AlreadyRunning(_)) => {
-      log::warn!("restart: daemon is still running; restart did not spawn a new process");
+      bail(
+        &feedback,
+        "a daemon is still running, so no new one was started",
+      )
+      .await;
     }
     Ok(_) => log::info!("restart: daemon re-spawned"),
-    Err(e) => log::warn!("restart: start_detached failed: {e}"),
+    Err(e) => bail(&feedback, format!("re-spawn failed: {e}")).await,
   }
 }
 
@@ -2758,6 +2792,22 @@ mod tests {
       toast.contains("Lemonade"),
       "expected a Lemonade-delete toast, got `{toast}`"
     );
+  }
+
+  #[test]
+  fn ctrl_d_on_config_declared_model_refuses_with_toast() {
+    let mut app = App::new(Default::default());
+    let mut row = fake_model_for_events("cfg://my-server", "cfg://");
+    row.source = crate::discovery::ModelSource::Config;
+    app.models = vec![row];
+    app.go_top();
+    pump_input(&mut app, key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert!(
+      app.confirm_dialog.is_none(),
+      "config-declared row must not stage a delete"
+    );
+    let toast = app.toast_message().unwrap_or("");
+    assert!(toast.contains("config.yaml"), "got `{toast}`");
   }
 
   #[test]

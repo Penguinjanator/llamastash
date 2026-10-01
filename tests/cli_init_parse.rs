@@ -130,6 +130,7 @@ fn init_install_each_simple_variant() {
   for (raw, expected) in [
     ("brew", InstallOverride::Brew),
     ("gh-releases", InstallOverride::GhReleases),
+    ("gh-releases:vulkan", InstallOverride::GhReleasesVulkan),
     ("existing", InstallOverride::Existing),
   ] {
     match parse(&["init", "--install", raw]).command {

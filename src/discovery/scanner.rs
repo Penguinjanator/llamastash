@@ -748,13 +748,29 @@ fn parallel_parse_limit() -> usize {
     .unwrap_or(4)
 }
 
+/// Every rescan walks the same roots, so a missing one is a warning once and a
+/// debug line after that.
+fn warn_missing_root_once(root: &Path) {
+  static WARNED: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+  let first = WARNED
+    .lock()
+    .unwrap_or_else(|e| e.into_inner())
+    .insert(root.to_path_buf());
+  if first {
+    log::warn!("scan root does not exist: {}", root.display());
+  } else {
+    log::debug!("scan root does not exist: {}", root.display());
+  }
+}
+
 /// Synchronous file-system walk. Returns every `.gguf` file under
 /// `root` honouring gitignore semantics and the caller's exclude
 /// globs. Unreadable subdirectories are logged and skipped rather
 /// than aborting the walk.
 fn collect_gguf_paths(root: &Path, excludes: &[String]) -> Vec<PathBuf> {
   if !root.exists() {
-    log::warn!("scan root does not exist: {}", root.display());
+    warn_missing_root_once(root);
     return Vec::new();
   }
   let mut builder = WalkBuilder::new(root);
@@ -874,10 +890,19 @@ async fn parse_into_model(
 
   // Cache lookup first. A hit short-circuits the header read entirely.
   if let Some(c) = cache {
-    if let Some(hit) = c.get(&path, mtime, size).await {
+    if let Some(mut hit) = c.get(&path, mtime, size).await {
+      if hit.split_siblings != siblings {
+        if siblings.is_empty() {
+          // The cached figures are shard sums; with no siblings left there is
+          // nothing to re-sum from, so re-read the first shard on its own.
+          return parse_uncached(path, parent, source, siblings, mtime, size, Some(c)).await;
+        }
+        apply_split_shard_aggregates(&mut hit.metadata, &path, &siblings).await;
+        hit.split_siblings = siblings.clone();
+        c.put(path.clone(), mtime, size, hit.clone()).await;
+      }
       let mut hit_metadata = hit.metadata;
       apply_split_total_weights(&mut hit_metadata, &path, &siblings).await;
-      apply_split_shard_aggregates(&mut hit_metadata, &path, &siblings).await;
       return DiscoveredModel {
         path,
         parent,
@@ -893,6 +918,18 @@ async fn parse_into_model(
     }
   }
 
+  parse_uncached(path, parent, source, siblings, mtime, size, cache).await
+}
+
+async fn parse_uncached(
+  path: PathBuf,
+  parent: PathBuf,
+  source: ModelSource,
+  siblings: Vec<PathBuf>,
+  mtime: Option<std::time::SystemTime>,
+  size: u64,
+  cache: Option<&MetadataCache>,
+) -> DiscoveredModel {
   // On a cache miss, parse the model header and detect its mmproj
   // modality + separate MTP head together on one blocking-pool hop.
   // Detection runs only here (not on warm cache hits) so periodic
@@ -922,7 +959,7 @@ async fn parse_into_model(
         None,
       )
     });
-  let cached = match parsed {
+  let mut cached = match parsed {
     // Compute the routing verdict from the same header parse (free — no extra
     // IO) so the `list_models` hot path never re-reads tensor info. The
     // registry decides; this site names no backend.
@@ -932,6 +969,7 @@ async fn parse_into_model(
       multimodal,
       supported_backends: crate::backend::supported_backends_for(&read.header),
       mtp_head,
+      split_siblings: Vec::new(),
     },
     Err(e) => CachedParse {
       metadata: None,
@@ -939,14 +977,16 @@ async fn parse_into_model(
       multimodal,
       supported_backends: Vec::new(),
       mtp_head,
+      split_siblings: Vec::new(),
     },
   };
+  apply_split_shard_aggregates(&mut cached.metadata, &path, &siblings).await;
+  cached.split_siblings = siblings.clone();
   if let Some(c) = cache {
     c.put(path.clone(), mtime, size, cached.clone()).await;
   }
   let mut metadata = cached.metadata;
   apply_split_total_weights(&mut metadata, &path, &siblings).await;
-  apply_split_shard_aggregates(&mut metadata, &path, &siblings).await;
   DiscoveredModel {
     path,
     parent,
@@ -1790,6 +1830,53 @@ mod tests {
       "split parameter count must sum every shard's tensor elements"
     );
     assert_eq!(md.parameter_label.as_deref(), Some("2M"));
+    fs::remove_dir_all(&dir).ok();
+  }
+
+  /// A warm rescan must not re-read shard headers: at a few rescans a second
+  /// that re-parse is what held the daemon near 1 GiB. A changed sibling list
+  /// still re-reads them.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn split_shard_sums_are_cached_until_the_sibling_list_changes() {
+    use crate::discovery::metadata_cache::MetadataCache;
+    use crate::gguf::test_fixtures::FixtureBuilder;
+    let dir = temp_dir("split-cache");
+    let shard = FixtureBuilder::new()
+      .with_arch("qwen3")
+      .with_tensor("token_embd.weight", &[1000, 1000], 0)
+      .build();
+    let opts = ScanOptions {
+      metadata_cache: Some(MetadataCache::new(8)),
+      ..ScanOptions::default()
+    };
+    let params = || async {
+      let roots = vec![ScanRoot {
+        path: dir.clone(),
+        source: ModelSource::UserPath,
+      }];
+      let mut rx = scan(roots, opts.clone());
+      rx.recv().await.unwrap().metadata.unwrap().total_parameters
+    };
+
+    fs::write(dir.join("m-00001-of-00002.gguf"), &shard).unwrap();
+    assert_eq!(params().await, Some(1_000_000));
+
+    fs::write(dir.join("m-00002-of-00002.gguf"), &shard).unwrap();
+    assert_eq!(params().await, Some(2_000_000), "a new shard is summed");
+
+    fs::write(dir.join("m-00002-of-00002.gguf"), b"not a gguf").unwrap();
+    assert_eq!(
+      params().await,
+      Some(2_000_000),
+      "an unchanged sibling list reuses the cached sum"
+    );
+
+    fs::remove_file(dir.join("m-00002-of-00002.gguf")).unwrap();
+    assert_eq!(
+      params().await,
+      Some(1_000_000),
+      "removing every sibling drops the cached sum"
+    );
     fs::remove_dir_all(&dir).ok();
   }
 

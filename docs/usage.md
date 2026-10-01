@@ -66,8 +66,8 @@ model_paths: # Extra dirs to scan. Repeatable on the CLI as -p/--model-path.
   - /opt/llms
 
 backend: # Per-engine config, one block per backend. llama.cpp is the
-         # always-on default (no enable toggle); lemonade + ds4 are
-         # optional, each default-on when its own binary resolves.
+         # always-on default (no enable toggle); lemonade, vllm and sglang
+         # are optional, each default-on when its own binary resolves.
   llamacpp:
     servers: # Build/binary variants. First = default (auto/no-device launches),
              # and the target of --llama-server / LLAMASTASH_LLAMA_SERVER. Each is
@@ -81,13 +81,13 @@ backend: # Per-engine config, one block per backend. llama.cpp is the
     fit_ctx_floor: 16384 # Min --fit-ctx window. Env: LLAMASTASH_FIT_CTX_FLOOR.
     strict_fit: false # Refuse (vs degrade) an unplaceable --fit. Env: LLAMASTASH_STRICT_FIT.
     jinja: true # Emit --jinja every launch (tool calling). Config-only.
-  ds4: # See §"ds4 backend" below.
-    # servers: [{ binary: /opt/ds4/ds4-server }] # ds4-server path; else PATH.
-    # enabled: # tri-state: unset=auto, true=force on, false=force off.
+    map_anthropic_effort: true # Map Anthropic output_config.effort to the engine kwarg. Config-only.
   lemonade:
     # servers: [{ binary: /opt/lemonade/lemond }] # lemond path; else PATH.
-    # enabled: # tri-state (see ds4).
+    # enabled: # tri-state: unset=auto, true=force on, false=force off.
     # port: 13305 # lemond umbrella port.
+  generic: # Any other OpenAI-compatible server (ds4, gufo, Halogen). See §"Generic backend".
+    # servers: [{ name: ds4, model: "DeepSeek-V4-*", binary: /opt/ds4/ds4-server, ... }]
 
 disable_scan: false # Equivalent to LLAMASTASH_NO_SCAN=1.
 disable_default_cache_paths:
@@ -279,7 +279,7 @@ These work on every subcommand (clap marks them `global`):
 -v, --verbose              Debug logging.
 ```
 
-The colored-output policy OR-es three off-conditions: `--no-colors`, `NO_COLOR` env (non-empty), or non-TTY stdout. Any one silences colors. `--json` output is byte-stable regardless — pin agents against `--json`, not against the human form. `--help` follows the same policy: it shows styled section headers and flags on a TTY and stays plain bytes when piped, `NO_COLOR` is set, or `--no-colors` is passed.
+The colored-output policy OR-es three off-conditions: `--no-colors`, `NO_COLOR` env (non-empty), or non-TTY stdout. Any one silences colors. `--json` output is byte-stable regardless — pin agents against `--json`, not against the human form. A command run with `--json` that fails prints `{"error": {"code": <exit code>, "message": "..."}}` on stdout instead of the `✗` line on stderr, and exits with the same code. `--help` follows the same policy: it shows styled section headers and flags on a TTY and stays plain bytes when piped, `NO_COLOR` is set, or `--no-colors` is passed.
 
 Report-style commands (`list`, `status`, `presets list`, `favorites list`, `last-params`, `daemon status`) render padded + colored tables on a TTY and plain tab-separated rows when piped. The padded form is purely a human affordance; the TSV path stays byte-stable so existing `awk -F\t` / `column -t` pipelines keep working unchanged. Action-style commands (`daemon start/stop`, `start`, `stop`) keep their single-line shape but pick up value-color highlights on launch-id / port / pid / state when colors are enabled.
 
@@ -339,15 +339,15 @@ Launch a model. `run` is a visible alias for `start` — same flags, same behavi
 ```
 llamastash start <ref> [--name LABEL] [--preset NAME] [--ctx N] [--port N] [--wait] [--force]
                      [--reasoning on|off] [--mode chat|embedding|rerank]
-                     [--backend auto|ds4|llamacpp|lemonade|vllm|sglang] [--server <id>]
+                     [--backend auto|llamacpp|lemonade|vllm|sglang|generic] [--server <id>]
                      [--<advanced-knob> ...] [-- <llama-server-flags>...]
 ```
 
-`--name <label>` names this launch, so the same model can run several times at once and each copy stays addressable as `<model-ref>@<label>`. A name is trimmed and limited to letters, digits, `-` and `_` — anything else (a space, an `@`) is a usage error at parse time, because the address would not parse back to this launch; the daemon enforces the same rule for raw JSON-RPC callers. A second live launch of the *same* model under the *same* name is refused, and the refusal names the launch already holding it (`name `coder` is already running as L3`); the same name on a *different* model is fine. `--json` reports the accepted name back as `launch_name`, with or without `--wait`. Because a reference is only read as `<model>@<name>` when the name half follows that same rule, a mistyped `qwen3@my coder` is treated as a plain model reference and simply misses, rather than starting anything. Names are not config: they live as long as the launch and are gone once it stops. A `llamastash daemon stop` stops every managed launch with the daemon, so nothing is left to name; if the daemon *crashes*, its `llama-server` children keep serving and the next start surfaces each as a read-only `external` row that still carries its name — `status` shows `<model>@<name>` and `stop <name>` reaches it, but it is not re-published on `/v1/models` (routing needs a supervisor, and there is none), so the next proxy request for that address starts a fresh launch beside it.
+`--name <label>` names this launch, so the same model can run several times at once and each copy stays addressable as `<model-ref>@<label>`. A name is trimmed and limited to letters, digits, `-` and `_` — anything else (a space, an `@`) is a usage error at parse time, because the address would not parse back to this launch; the daemon enforces the same rule for raw JSON-RPC callers. A second live launch of the *same* model under the *same* name is refused, and the refusal names the launch already holding it (`name `coder` is already running as L3`); the same name on a *different* model is fine. `--json` reports the accepted name back as `launch_name`, with or without `--wait`. Without `--name`, a launch from a named preset (`--preset coder`, a launch file, a TUI preset stop) takes the preset's name, so it gets the same `<model-ref>@coder` address a proxy request for that preset would auto-start; running that preset a second time on the same model is refused like a duplicate `--name`, so pass `--name` for another copy. Because a reference is only read as `<model>@<name>` when the name half follows that same rule, a mistyped `qwen3@my coder` is treated as a plain model reference and simply misses, rather than starting anything. Names are not config: they live as long as the launch and are gone once it stops. A `llamastash daemon stop` stops every managed launch with the daemon, so nothing is left to name; if the daemon *crashes*, its `llama-server` children keep serving and the next start surfaces each as a read-only `external` row that still carries its name — `status` shows `<model>@<name>` and `stop <name>` reaches it, but it is not re-published on `/v1/models` (routing needs a supervisor, and there is none), so the next proxy request for that address starts a fresh launch beside it.
 
-`--backend` defaults to `auto` (picks the engine by model identity — a DeepSeek-V4 GGUF routes to the [ds4 backend](#ds4-backend) when available, everything else to llama.cpp). Override it to force a specific engine.
+`--backend` defaults to `auto` (picks the engine by model identity: a GGUF runs on llama.cpp, a safetensors repo on vLLM or SGLang). Override it to force a specific engine.
 
-`--server <id>` picks a specific **server** — one build/binary of a backend (`llamacpp-vulkan`, `llamacpp-cuda`, `ds4` or a named `ds4-rocm`). It determines which binary spawns and, when `--backend` is unset, which backend runs the model (the server's owning backend). Server ids auto-derive as `<backend>-<compute>` from each build's own device names (or the bare backend id for a device-less engine like ds4/lemonade), overridable with a per-server `name:`; list them from `status` (the `servers` array; `status --json` mirrors it). A `--device <selector>` already implies its owning server, so `--server` is for picking a build with no device pin. The pick persists in `last_params`, so a relaunch reuses it — in the TUI it reopens the launch picker's `server` row on that build.
+`--server <id>` picks a specific **server** — one build/binary of a backend (`llamacpp-vulkan`, `llamacpp-cuda`, `vllm`, or a generic entry's `generic-<name>`). It determines which binary spawns and, when `--backend` is unset, which backend runs the model (the server's owning backend). Server ids auto-derive as `<backend>-<compute>` from each build's own device names (or the bare backend id for a device-less engine like vLLM or Lemonade), overridable with a per-server `name:`; list them from `status` (the `servers` array; `status --json` mirrors it). A `--device <selector>` already implies its owning server, so `--server` is for picking a build with no device pin. The pick persists in `last_params`, so a relaunch reuses it — in the TUI it reopens the launch picker's `server` row on that build.
 
 Every knob any backend declares is a first-class `start` flag — `--n-gpu-layers`, `--threads`, `--device`, `--tensor-split`, `--main-gpu`, `--split-mode`, `--flash-attn`, `--cache-type-k`/`-v`, `--batch-size`, `--load-mode`, and the same for every other backend's own tunables. The flag is spelled the way the engine spells it. Run `start --help` for the full list, grouped by the backend that declares each; `llamastash knobs` lists them with value ranges and choices. Flags, editor rows and preset keys are all generated from one declaration per knob, so no surface can be missing one. Booleans take `--flash-attn` (= on) or `--flash-attn=false`. Anything `start` doesn't recognise as a knob — including `llama-server`'s single-dash shorts like `-ngl` — still works verbatim after `--`. A knob set both inline and after `--` resolves to the `--` value.
 
@@ -531,7 +531,7 @@ A `default:` under a key is the model's **standing launch config** (hand-edited;
 
 Picking a preset explicitly (`start --preset <name>`, or the TUI cycle) overrides the default for that launch. `start --preset auto` is the clean per-launch "ignore everything, fit fresh" gesture. In the TUI, the preset cycle (`last used → auto → named…`) marks whichever stop is the configured default with `(default)` and opens on it, and the preset row shows the count of available presets (`preset (N)`).
 
-Alongside its knobs an entry may pin launch **identity**: `mode:` (`chat` / `embedding` / `rerank`), `backend:`, and `server:` (a build id, as shown on the TUI's Server row). These say *what runs* rather than how it is tuned, and they apply on every surface: `start --preset`, a `default:` preset on plain `start` and on proxy auto-start, and the TUI preset cycle. An explicit `--mode` / `--backend` / `--server` still wins over the pin. A `mode:` pin also answers a model whose GGUF hint is `unknown`, which `start` would otherwise refuse with "pass `--mode`". Only a pinned preset carries a mode forward; a one-off `start --mode embedding` is not remembered for the next plain launch, so an embedding request can never lock a chat model out of chat.
+Alongside its knobs an entry may pin launch **identity**: `mode:` (`chat` / `embedding` / `rerank`), `backend:`, and `server:` (a build id, as shown on the TUI's Server row). These say *what runs* rather than how it is tuned, and they apply on every surface: `start --preset`, a `default:` preset on plain `start` and on proxy auto-start, and the TUI preset cycle. An explicit `--mode` / `--backend` / `--server` still wins over the pin, and a pinned or last-used `server:` of another backend is dropped when `--backend` names a different one. A `mode:` pin also answers a model whose GGUF hint is `unknown`, which `start` would otherwise refuse with "pass `--mode`". Only a pinned preset carries a mode forward; a one-off `start --mode embedding` is not remembered for the next plain launch, so an embedding request can never lock a chat model out of chat.
 
 An entry knob set to `auto` delegates that knob to llama-server's `--fit` (e.g. `n_gpu_layers: auto`); `auto` is a reserved token, so to pin a knob to the *literal* string value `auto`, use the escape `{ value: auto }`. The app writes entries in block style (flow `{ ctx: 8192 }` is also accepted when you hand-author). Presets carry no `port` (it is per-launch, auto-assigned). Changes the CLI/TUI make are live immediately; hand-edits to `config.yaml` need a `llamastash daemon restart` to be picked up. See `config.example.yaml` for the full shape. On the first `daemon start` after upgrading, an older `config.yaml` is rewritten in place into the `knobs:` shape with a `.pre-knobs.bak` copy beside it; the daemon logs what it migrated. Comments above a key survive that rewrite, comments *between* two knobs inside a migrated entry do not (the entry body is regenerated), which is what the backup is for. Until that first start, a read that does not reach the daemon (`--no-spawn`) sees an unmigrated entry's knobs as empty.
 
@@ -559,13 +559,18 @@ Each row's `params` object carries a `knobs` map — every knob the launch dispa
 
 ```
 llamastash daemon start [--foreground|-f]
+llamastash daemon restart [--foreground|-f]
 llamastash daemon stop  [--force|-f]
 llamastash daemon status [--json]   # PID + uptime + connections + managed launches
 ```
 
 `daemon start` detaches into the background by default and returns once the socket is bound. Pass `--foreground` (or `-f`) to keep the daemon attached to the terminal — useful when a process supervisor (systemd, runit, container `CMD`) owns the lifecycle and needs to see stdout/stderr directly.
 
-`daemon stop` calls the IPC `shutdown` RPC, then waits (up to 10 s) for the daemon process to actually exit before printing `daemon: stopped` — so `daemon stop && daemon start` never races the dying daemon's lockfile or its managed `lemond` umbrella. If teardown outlives the wait it falls back to `daemon: shutdown requested (still exiting, pid N)`. When `runtime.json` is missing (the IPC channel can't be opened because a stale daemon from an older version is holding the lockfile) pass `--force` (or `-f`) to fall back to a `SIGTERM` on the PID recorded in `daemon.pid`. The CLI auto-detects this state on every command and prints the exact `kill` / `--force` invocation needed.
+Without `llama-server`, `daemon start` refuses unless another backend is enabled (Lemonade, vLLM, SGLang, or a `backend.generic` entry). On such a host those backends launch as usual and only llama.cpp launches fail. `--force` starts the daemon either way.
+
+`daemon restart` is `stop` followed by `start`: it shuts the running daemon down over IPC, waits for that process to exit, then brings a new one up. It takes the same flag set as `daemon start` (`--proxy-port`, `--ollama-compat`, `--proxy-host`, the backend opt-ins, `--force`, `--foreground`), and that is how the new daemon is configured — those flags are per-invocation, so repeat the ones the running daemon was started with. Use it after hand-editing `config.yaml`, which the daemon only reads at boot. Three differences from typing the pair yourself. The new daemon's flags and `config.yaml` are resolved before the running daemon is touched, so a bad flag or a broken config file leaves the running daemon up. With nothing running it is just `start`. And if the old daemon is still exiting when the stop window closes, `restart` fails instead of starting on top of a daemon that has not let go of the lockfile (`daemon stop --force`, then retry). The fail-fast backend check is the exception: it runs in the start half, because the running daemon legitimately holds the ports that check probes. Running models go down with the old daemon and are not brought back — `start` what you need afterwards.
+
+`daemon stop` calls the IPC `shutdown` RPC, then waits for the daemon process to actually exit before printing `daemon: stopped` — up to 10 s, or the longest managed-launch stop grace plus 5 s when that is longer — so `daemon stop && daemon start` never races the dying daemon's lockfile or its managed `lemond` umbrella. If teardown outlives the wait it falls back to `daemon: shutdown requested (still exiting, pid N)`. When `runtime.json` is missing (the IPC channel can't be opened because a stale daemon from an older version is holding the lockfile) pass `--force` (or `-f`) to fall back to a `SIGTERM` on the PID recorded in `daemon.pid`. The CLI auto-detects this state on every command and prints the exact `kill` / `--force` invocation needed. A `runtime.json` left behind by a crash — a handshake with no process holding the lock — is cleared by `stop` and `restart`, which then report `daemon: not running`.
 
 `daemon status --json` emits the raw `version` IPC response (the same `{name, version, protocol_version, pid, uptime_seconds, connections}` object an agent would get by hitting the UDS directly). The plain form is a human key/value block and is not a stable machine contract — agents should always use `--json`.
 
@@ -593,25 +598,24 @@ llamastash start <model> --mtp-draft-n 5  # tokens drafted per step (backend def
 
 `--mtp` is a **launch-only** setting (there is no `config.yaml` key to set it globally), but it persists in `last_params` and in named presets like any other launch choice, so `mtp: off` / `mtp: on` in a preset entry's `knobs:` map pins it — including under `default:`, where it now applies to a plain `start` and a TUI launch that left the row alone. That matters most for pinning MTP **off** on a model where speculation costs more than it saves. `--mtp-draft-n` works whichever backend serves the model, and rides the `mtp-draft-n` knob, so `-- --mtp off` / `-- --mtp-draft-n 5` in the extras tail work too. The TUI launch picker shows the same control as an `mtp` row cycling inherited → auto → on → off, but only for MTP-capable models; it shows your intent, not the resolved answer (`status`'s `active` reports that). Forcing it on a model that has no draft head **warns and skips** rather than failing the launch (emitting the flag blind is a hard server error). If you drive speculative decoding yourself through the `-- <extras>` tail, llamastash defers entirely and adds nothing.
 
-Under the hood, each backend maps this onto its own flags — the serving backend enables speculation with the resolved draft head (and `--mtp-draft-n` when set), emitted **before** the fit step so context reservation stays MTP-aware. **DeepSeek-V4 on the ds4 backend** uses ds4's own `mtp` / `mtp_draft` / `mtp_margin` native knobs, auto-pairing a sidecar found next to the model. ds4 publishes no draft-acceptance figure, so `acceptance` stays null on a ds4 launch even while MTP is active.
-
-ds4 cannot stream weights from disk and speculate at the same time — `ssd_streaming` and an MTP draft head are mutually exclusive in ds4-server. llamastash reconciles them before launching: whichever of the two it enabled on your behalf gives way (an auto-paired sidecar is dropped so a memory-pressured launch can still stream; auto-streaming is skipped so a head you asked for survives), and it refuses the launch up front when you set both explicitly. Watch for the notice in either direction.
+Under the hood, each backend maps this onto its own flags — the serving backend enables speculation with the resolved draft head (and `--mtp-draft-n` when set), emitted **before** the fit step so context reservation stays MTP-aware. A generic server entry has no MTP automation: `--mtp` does nothing there, and you pass the engine's own draft-head flag through a knob. For DeepSeek-V4 on ds4 that's the `mtp-model` knob, set in a preset (see [Running ds4 as a generic server](#running-ds4-as-a-generic-server)).
 
 #### DSpark speculative decoding
 
-DSpark is ds4's second speculative engine for DeepSeek-V4 Flash: a support model that reads the target's hidden states and proposes up to five tokens per step, which the Flash model then verifies. It replaces the one-stage MTP head for that run rather than stacking with it, and it rides the same `mtp` knob — `mtp` points at the support GGUF, `dspark` turns the runtime on.
+DSpark is ds4's second speculative engine for DeepSeek-V4 Flash: a support model that reads the target's hidden states and proposes up to five tokens per step, which the Flash model then verifies. It replaces the one-stage MTP head for that run rather than stacking with it, and it takes the same `--mtp` slot: `mtp-model` points at the support GGUF, and `dspark` turns the runtime on. With the ds4 generic entry from [Running ds4 as a generic server](#running-ds4-as-a-generic-server):
 
 ```yaml
 presets:
-  DeepSeek-V4-Flash-...-0731.gguf:
+  DeepSeek-V4-Flash-*-0731.gguf:
     entries:
-      dspark:
+      ds4-dspark:
+        server: generic-ds4
         knobs:
           dspark: true
-          ssd-streaming: false   # streaming and a draft head are exclusive
+          mtp-model: /path/to/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 ```
 
-Leave `mtp` unset and llamastash auto-pairs the support GGUF sitting beside the model (it declares its own `deepseek4-dspark` architecture, so it is matched by header, not by filename). With `dspark` on and no support file resolvable, the DSpark knobs are dropped with a notice instead of handing ds4-server a `--dspark` it will reject after the full weight load.
+`ds4-server` refuses `--dspark` without an `--mtp` file, and only after the full weight load, so always set both.
 
 **Measure before you trust it.** DSpark is experimental, and on current ds4 builds it is often a net decode *loss* even at high acceptance. The per-accepted-token replay ds4 runs to preserve greedy identity can cancel the whole speculative saving (upstream ds4 issues [#695](https://github.com/antirez/ds4/issues/695), [#731](https://github.com/antirez/ds4/issues/731), [#733](https://github.com/antirez/ds4/issues/733) report this on Metal and M3 Ultra at 70-83% acceptance; measured here on ROCm/gfx1151 at 80% acceptance, 13.7 t/s falls to 7.0 t/s). ds4 also emits no acceptance figure through its API, so llamastash cannot surface one. Check it yourself with `DS4_DSPARK_STATS=1` on the ds4 binary (counters flush on clean exit) or `DS4_DSPARK_PROBE=1` for per-cycle stage status.
 
@@ -629,83 +633,9 @@ llamastash pull owner/repo:model.gguf --no-companions # base file only
 llamastash pull owner/repo:model.gguf --all-companions # every projector precision / head
 ```
 
-## ds4 backend
-
-> **⚠️ Experimental.** ds4 support is new and lightly road-tested (validated on a single Strix Halo / ROCm host). Its behaviour, config keys, and defaults may change between releases. llama.cpp is the stable default and runs DeepSeek-V4 too on a current build (**b9840+**), so ds4 is never required — if anything here misbehaves, force llama.cpp with `--backend llamacpp` or `backend.ds4.enabled: false`.
-
-[ds4](https://github.com/antirez/ds4) (antirez's DwarfStar) is a third backend: a direct, process-per-model engine that runs the `ds4-server` binary for the DeepSeek-V4 Flash/PRO GGUFs at [huggingface.co/antirez/deepseek-v4-gguf](https://huggingface.co/antirez/deepseek-v4-gguf). It is the purpose-built engine for those files (disk KV cache, SSD streaming); a current llama.cpp (**b9840+**) also runs DeepSeek-V4, so ds4 is preferred, never required.
-
-> **Minimum llama.cpp version for these GGUFs.** DeepSeek-V4 support landed in llama.cpp **b9840** ([ggml-org/llama.cpp#24162](https://github.com/ggml-org/llama.cpp/pull/24162), merged 2026-06-29). On **b9840 or newer** — a release binary or a source build from that merge onward — llama.cpp loads antirez's Flash/PRO GGUFs; on anything older it fails immediately with `error loading model: unknown model architecture: 'deepseek4'`. This matters because ds4's "falls back to llama.cpp, never a refusal" (below) only degrades gracefully when your llama.cpp is new enough — an older `llama-server` turns that fallback into a hard load error. Point `backend.llamacpp.servers` at a b9840+ build if you rely on the fallback. (Note: on the llama.cpp backend, Flash Attention is currently auto-disabled for the deepseek4 graph; it loads and runs without it.)
-
-**You supply the binary.** LlamaStash does not install ds4-server — build it from the repo (`git clone https://github.com/antirez/ds4 && cd ds4 && make`) and either put `ds4-server` on `PATH` or point `backend.ds4.servers` at it. ds4 is **default-on the moment the binary resolves**; it stays completely dormant when it doesn't (no discovery, no new JSON fields on other rows).
-
-Enable / configure:
-
-```yaml
-backend:
-  ds4:
-    # binary: /opt/ds4/ds4-server   # explicit path; else `ds4-server` on PATH
-    # enabled:                       # tri-state:
-    #   (unset)  auto — on when the binary is found (the default)
-    #   true     force on
-    #   false    force off even when the binary is present
-```
-
-`--ds4` on `daemon start` and `LLAMASTASH_DS4=1` also force ds4 on (OR-merged with the config, and carried through the detached daemon re-exec).
-
-### Which GGUFs run on ds4
-
-Routing is automatic and keys on a header-level compatibility predicate — arch `deepseek4` **plus** ds4's quant contract (routed-expert tensors `ffn_*_exps` in `IQ2_XXS` / `Q2_K` / `Q4_K`, every other tensor in `F32` / `F16` / `Q8_0` / `I32`). Both published Flash/PRO variants pass; a generic third-party `deepseek4` K-quant does not and stays an ordinary llama.cpp model.
-
-- A **compatible** GGUF launches on ds4 when ds4 is available and the mode is chat/completions.
-- Otherwise it **falls back to llama.cpp** — never a refusal, on a **b9840+** llama.cpp (see the version note above); an older `llama-server` fails the load with `unknown model architecture: 'deepseek4'`.
-- `start <model> --backend ds4` forces ds4 (it surfaces its own error if the file is a mismatch); `--backend llamacpp` forces llama.cpp on a compatible file. `--backend` accepts `auto` (default) | `ds4` | `llamacpp` | `lemonade`.
-- `--mode embedding` / `--mode rerank` on a compatible model routes to llama.cpp — ds4 serves chat/completions only.
-- The split PRO half-files (`…-Layers00-30.gguf` / `…-Layers-31-output.gguf`) are refused before spawn with "ds4 distributed mode unsupported"; use a single-file DeepSeek-V4 GGUF. Single-file PRO quants (e.g. the `…-Pro-IQ2XXS-…-Instruct` variants) are fine.
-
-### ds4 knobs
-
-ds4 declares its own tunables, each named for the flag `ds4-server` itself takes. Every one is a `start --<flag>`, a row in the TUI launch picker, and a preset key — set it wherever suits and the same run reproduces from any of the three.
-
-| Knob             | ds4-server flag      | What it does |
-| ---------------- | -------------------- | ------------ |
-| `power`          | `--power`            | GPU duty-cycle target, 1–100 (ds4 default 100) |
-| `tokens`         | `--tokens`           | Default max output tokens when a client omits a limit |
-| `threads`        | `--threads`          | CPU helper-thread count for host-side work |
-| `kv_disk_dir`    | `--kv-disk-dir`      | Directory for ds4's persistent disk KV cache (see privacy note below) |
-| `kv_disk_space_mb` | `--kv-disk-space-mb` | Disk KV cache budget in MB (ds4 default 4096 when enabled) |
-| `ssd_streaming`  | `--ssd-streaming`    | Stream weights from disk (below-RAM-floor mode; skips the admission gate). Mutually exclusive with `mtp` |
-| `ssd_streaming_cache_experts` | `--ssd-streaming-cache-experts` | SSD streaming: resident routed-expert cap — exact count `N` or routed memory budget `NGB` (ds4 auto: 80% of the working set) |
-| `ssd_streaming_preload_experts` | `--ssd-streaming-preload-experts` | SSD streaming: upfront popularity preload count (DeepSeek auto-seeds when unset) |
-| `ssd_streaming_cold` | `--ssd-streaming-cold` | SSD streaming: skip the default popularity-based expert-cache preload |
-| `warm_weights`   | `--warm-weights`     | Touch mapped tensor pages at startup to reduce first-use stalls |
-| `quality`        | `--quality`          | Prefer exact kernels where faster approximate paths exist |
-| `mtp`            | `--mtp`              | Path to the MTP draft-head sidecar (auto-paired from a sibling when unset; see [MTP speculative decoding](#mtp-speculative-decoding)) |
-| `mtp_draft`      | `--mtp-draft`        | Tokens drafted per step (also set by the neutral `--mtp-draft-n`) |
-| `mtp_margin`     | `--mtp-margin`       | Acceptance margin for the draft verifier |
-| `dspark`         | `--dspark`           | DSpark block speculation off the support GGUF in `mtp` (greedy decoding only; see [DSpark](#dspark-speculative-decoding)) |
-| `dspark_confidence` | `--dspark-confidence` | Prune proposals below this confidence, `0`–`1` (ds4 default `0.7`; `0` forces fixed five-token blocks) |
-| `dspark_strict`  | `--dspark-strict`    | Load the DSpark support model but keep target-only decode — the comparison baseline |
-
-Any other ds4-server flag (`--kv-cache-*`, `--prefill-chunk`, …) rides the free-form extras tail after `--`, e.g. `start <model> -- --prefill-chunk 512`. The loopback/credential denylist still applies, extended for ds4 with `--cors` and `--dist-` — those are stripped/refused.
-
-### Oversized models and below-floor hardware
-
-The DeepSeek-V4 GGUFs are 81–300+ GB; the practical RAM floor is roughly 128 GB on CUDA/ROCm and 96 GB on Metal. On a box below the floor, full residency out-of-memories. LlamaStash handles this for you: when a ds4 launch's resident estimate (~1.25× the weights, covering the expert cache + KV) exceeds free memory, it **auto-enables `ssd_streaming`** before spawn and prints a one-line notice (`ds4 needs ~N GiB resident but only M is free — enabled SSD streaming`). ds4-server then streams weights from disk under a bounded cache instead of OOM-killing mid-load. Set the **`ssd_streaming` native knob** yourself to force streaming on, or `ssd_streaming: false` to force full residency and skip the auto-enable. The knob is also the one launch where the pre-spawn admission gate is skipped (the on-disk size no longer maps to memory demand); this bypass keys on the native knob only — an extras-spelled `--ssd-streaming` still hits the admission gate. DeepSeek-V4's KV cache is modeled from the header (its two-tier compressed cache, ~0.5 GiB at 16k ctx and ~11 GiB at 1M for Flash), so the admission estimate is realistic at long context; the auto-streaming notice above is the memory signal to watch when residency is tight.
-
-Streaming rules out MTP speculation (ds4-server refuses the pair, and only after loading the whole model). When both would apply, llamastash drops whichever it enabled itself and says so; setting `ssd_streaming: true` and an `mtp` head together is refused before the load.
-
-### The ds4 `/v1/models` menu
-
-ds4-server advertises a **static two-entry list** on `/v1/models` — both `deepseek-v4-flash` and `deepseek-v4-pro` — no matter which GGUF is loaded, so a direct `curl` shows two models with one running. It is a fixed menu, not a report of the resident model. `/v1/chat/completions` serves the loaded model and **echoes back the `model` name you send** (no alias rewrite). LlamaStash's proxy publishes your real catalog (by file name) on its own `/v1/models` and forwards your request model verbatim, so through the proxy you request — and get back — the name you used. The right pane marks a ds4-routed model with a ` ds4 ` chip (backend identity only; no model-id remap to disclose).
-
-### kv-disk cache privacy
-
-`--kv-disk-dir` is ds4's own persistent cache, reused across restarts. LlamaStash never subdir-mangles or cleans it — it is entirely ds4-owned state. It durably holds conversation-derived data under ds4's own permissions (umask) at exactly the path you type, without any of LlamaStash's `0600` state-file hygiene. **Point it at a private, user-owned directory.**
-
 ## vLLM backend
 
-**Experimental.** vLLM serves **safetensors HuggingFace repos** — the non-GGUF half of your cache. A GGUF still binds llama.cpp (or ds4); vLLM claims repos the GGUF scanner does not. Setup, the ROCm container recipe, and the full knob table are in **[vLLM setup](vllm-setup.md)**.
+**Experimental.** vLLM serves **safetensors HuggingFace repos** — the non-GGUF half of your cache. A GGUF still binds llama.cpp; vLLM claims repos the GGUF scanner does not. Setup, the ROCm container recipe, and the full knob table are in **[vLLM setup](vllm-setup.md)**.
 
 Enable/disable follows the same tri-state as the other detected backends: unset means on-when-found, `backend.vllm.enabled: false` forces off, and `daemon start --vllm` / `LLAMASTASH_VLLM=1` force on over it.
 
@@ -721,7 +651,7 @@ Three behaviours differ from the GGUF backends and are worth knowing:
 - **Detection never runs the binary.** vLLM builds its argument parser through a device probe and fails with `Failed to infer device type` on a host with no usable accelerator, so LlamaStash checks only that the configured path exists. That is also why a container wrapper script works as the `binary`.
 - **Startup is slow and readiness waits for it.** Engine init (memory profiling plus KV-cache build) ran 10-27 s on a 0.5B and takes longer on real models. Readiness requires `/v1/models` to advertise the model, not just an answering port.
 
-`--ctx` maps to vLLM's own `--max-model-len`, which is the knob's declared name. Nine further vLLM tunables are declared (`kv-cache-memory-bytes`, `gpu-memory-utilization`, `max-num-seqs`, `tensor-parallel-size`, `dtype`, `kv-cache-dtype`, `quantization`, `enforce-eager`, `trust-remote-code`), each reachable from the CLI, the TUI and presets alike; the rest of vLLM's ~240 flags ride the `-- <extras>` tail, minus a denylist that keeps the launch loopback-only and reapable.
+`--ctx` maps to vLLM's own `--max-model-len`, which is the knob's declared name. Nine further vLLM tunables are declared (`kv-cache-memory-bytes`, `gpu-memory-utilization`, `max-num-seqs`, `tensor-parallel-size`, `dtype`, `kv-cache-dtype`, `quantization`, `enforce-eager`, `trust-remote-code`), each reachable from the CLI, the TUI and presets alike. Flags that start extra processes or listeners, like pipeline and data parallelism (`--data-parallel-*`, `-dp`, `-dpm` and the other short aliases), are refused in the extras tail; the full list is in [vLLM setup](vllm-setup.md). The rest of vLLM's ~240 flags ride the `-- <extras>` tail.
 
 **On unified-memory hosts (APUs), the KV cache is capped automatically.** GPU memory is system RAM there, and vLLM sizes its KV cache against the pool rather than the model — the default has exhausted RAM and frozen a 121 GB machine. When neither `kv_cache_memory_bytes` nor `gpu_memory_utilization` is set, the launcher caps the cache from live free memory, keeping a reserve that covers the engine's own footprint as well as the OS, and passes a `--gpu-memory-utilization` sized to the launch so vLLM's startup check lets the capped launch through. See [vLLM setup](vllm-setup.md#notes-and-limitations).
 
@@ -748,6 +678,274 @@ With vLLM installed too, a repo lists both engines in `supported_backends` and a
 
 `resolved_ctx` on a running SGLang row is read from `/get_server_info`, since SGLang's `/v1/models` carries no context field. There is no `cors` key: SGLang allows every origin and exposes no flag to narrow it.
 
+## Generic backend
+
+Runs any OpenAI-compatible server llamastash has no dedicated backend for, declared under `backend.generic.servers` in `config.yaml`. llamastash reserves the port, polls the readiness path, routes the proxy, and stops the process. It knows nothing else about the engine: flags, env and weights live in the entry or in a wrapper script you write. Config-only on purpose, since `binary` runs as you; no CLI flag or IPC method sets one. Entries are read at process start, so run `llamastash daemon restart` (and reopen the TUI) after editing them.
+
+Tested on 2026-09-26 with gufo `d9a84f1`, Halogen `0.14.0` (Docker image) and CIRU `3cf984c` on a Strix Halo host. Full configs are in § Examples below.
+
+Two shapes:
+
+- **With `model`**: the entry runs catalog GGUFs. `model` is a preset-key glob (`*Flash-Next*`), a path, or a model id, and may match several models. The entry becomes the server `generic-<name>` on each matching row: `list` shows `llamacpp|generic`, and the TUI Server row, `start <model> --server generic-<name>` and a preset's `server:` pick it. llama.cpp stays the default; a plain `start` runs the entry only when the last launch of that model did. The model id is the GGUF's own id, and `{model}` carries its path (shard 1 of a split set).
+- **Without `model`**: the entry is its own row, published as `name`. Use this for engines whose weights are not a catalog GGUF (Halogen `.hgn`, CIRU's own package).
+
+| Field | Required | Meaning |
+|---|---|---|
+| `name` | yes | Server id suffix (`generic-<name>`) with `model`; the row's model id without it. No `@`, `/` or spaces. |
+| `binary` | yes | Absolute or `~/` path. |
+| `ready` | yes | HTTP path that returns 200 once the model is loaded (gufo `/ready`, llama-server `/health`, Halogen `/v1/models`). |
+| `model` | no | Catalog GGUF(s) this entry runs, as above. Requires `{model}` in `args` or `env`. |
+| `args` | no | argv after `binary`, with placeholders. |
+| `knobs` | no | Knob declarations, below. |
+| `env` | no | Extra env for the child, with placeholders. |
+| `memory_gib` | no | Admission demand for a row without `model` (a `model` launch is sized from its GGUF). Unset means no memory gating. |
+| `stop_grace_secs` | no | Minimum SIGTERM-to-SIGKILL grace on every stop path: `stop`, `stop --all`, idle eviction, daemon shutdown. A shorter `--grace` is raised to it. |
+| `ready_timeout_secs` | no | Readiness timeout, replacing the default probe budget. |
+| `modes` | no | The endpoints the server answers: any of `chat`, `embedding`, `rerank` (e.g. `[chat]`). The proxy refuses a `/v1/embeddings` or `/v1/rerank` request for an entry that doesn't list that mode with a `400 unsupported_endpoint`, before starting it, and `/v1/models` lists the entry under its first mode. Default: all modes, so the engine answers or refuses each request itself. |
+| `arch`, `params`, `quant`, `ctx` | no | Row info for an entry without `model`, for the Arch, Params, Quant and Ctx columns of `list`, `show` and the TUI (`params: 80B`, `quant: Q4_K_M`, `ctx: 262144`). Strings show as written; the TUI shortens Ctx (`256k`). `arch` also ranks proxy fallback candidates like a GGUF's arch, but picks no `arch_defaults`. `ctx` defaults to the `ctx: true` knob's `default`; Size comes from `memory_gib` and Mode from `modes`. Refused with `model`, since those rows read their GGUF. A `ctx` below a `--ctx` you pass prints the "exceeds native context" warning. |
+| `rewrite_model` | no | `true` makes the proxy replace `body.model` with the launch's `{name}` value. Set it for a server that refuses any other model name (gufo's `--served-model-name`), so a plain id sent to a named launch, or `<model>@<other>` sent to the unnamed one, still reaches it. Default `false`: the body is forwarded unchanged. With it on, the proxy rebuilds each JSON body's top level (keys in their original order, nested values copied byte for byte), so a large body is held twice while it is rewritten. |
+
+**Placeholders** in `args` and `env`: `{port}`, `{host}` (always `127.0.0.1`), `{name}` (the id `/v1/models` publishes for the model, repo-qualified when another model shares its name; `id@launch` for a named launch), `{model}`, and `{<knob id>}`. An unknown placeholder is refused at config load. Braces that don't hold a plain identifier (`{"a": 1}`) stay literal.
+
+**Knobs** are strings passed as `<flag> <value>`, in declaration order, after `args` and before `-- <extras>`. A bare string (`- --seed`) is shorthand for `{flag: --seed}`. Fields: `flag`, `id` (default: the flag without dashes), `default`, `ctx: true` (at most one; makes the knob the context window, so `--ctx`, the TUI Context row and `status` ctx use it), `switch: true` (an on/off knob that sends the bare flag when on and nothing when off; its `default` is `true` or `false`), `label`, `help`. A knob with no value and no default sends nothing. A knob referenced by a placeholder is substituted there instead of emitted; if it has no value the launch is refused. Knob ids may not reuse a built-in knob id or alias (set `id:`). Knobs appear in the TUI editor (an unset knob shows its `default`), presets, `last_params`, `status --json` and `llamastash knobs`, and are set from the CLI with presets or the TUI; `start <model> -- --flag v` passes `--flag v` straight to the engine as an extra; it does not set the knob.
+
+```bash
+llamastash list                                            # entries and matching GGUFs
+llamastash knobs --backend generic                         # each entry's knobs
+llamastash start Qwen3.8-Flash-Next-UD-Q4_K_XL --server generic-gufo --ctx 32768
+llamastash start flash-next-halogen --ctx 65536
+```
+
+### Rules the backend does not enforce
+
+These are documented, not checked. Break one and the launch fails or misbehaves at your own risk:
+
+- **Bind loopback.** Use `{host}` or bind `127.0.0.1` yourself. llamastash can't see what a foreign binary binds.
+- **Stay in the foreground.** The supervised PID must live as long as the server. A wrapper that exits early reads as a crashed launch.
+- **One clean stop.** SIGTERM goes to the whole process group once. Turn it into the engine's own clean stop, and finish inside `stop_grace_secs`. A GPU server killed mid-kernel can hang the device.
+- **Clean up your own leftovers** at start, and name external resources (containers) after `{port}` so two launches don't collide. There is no orphan adoption after a daemon crash.
+- **Multiple launches are your call.** Two launches of one entry get two ports and nothing else: internal ports, GPU memory and disk the engine uses are not checked.
+- **Answer to `{name}`** if the engine checks the request's `model` field (gufo does). A client sending a partial name the proxy accepts will get the engine's 404.
+- **`--server generic-<name>` is not checked against `model`.** Only the TUI Server row filters by it; the CLI and presets run whatever you pick.
+
+### Examples: gufo, Halogen, CIRU
+
+Three Qwen3.8 Flash-Next engines, tested on a Strix Halo box with gufo `d9a84f1`, Halogen `0.14.0` and CIRU `3cf984c`. Replace the `/path/to/...` parts with your own paths. Each takes 80-100 GB, so run one at a time.
+
+**gufo**: a native binary that runs a catalog GGUF directly, so it uses `model` and needs no wrapper. It checks the request's `model` field, hence `--served-model-name "{name}"`. Loads in about 22 s; `/ready` returns 503 until then.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: gufo                                  # server id: generic-gufo
+        model: Qwen3.8-Flash-Next-UD-Q4_K_XL        # a model id; globs work too
+        binary: /path/to/gufo/build/release/gufo
+        args: [serve, --host, "{host}", --port, "{port}", --sessions, "1", llm,
+               --served-model-name, "{name}", --model, "{model}",
+               --mtp-model, /path/to/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf,
+               --top-p, "0.95", --top-k, "20"]
+        knobs:
+          - {flag: --context, ctx: true, default: "131072"}
+          - {flag: --speculative, default: mtp}
+          - {flag: --temperature, default: "1.0"}
+          - --seed
+        ready: /ready
+        stop_grace_secs: 60
+
+presets:
+  Qwen3.8-Flash-Next-*:
+    entries:
+      gufo-128k:
+        server: generic-gufo       # the preset picks the engine
+        knobs:
+          context: 131072
+          speculative: mtp
+          temperature: '1.0'
+```
+
+```bash
+llamastash start Qwen3.8-Flash-Next-UD-Q4_K_XL --preset gufo-128k
+llamastash start Qwen3.8-Flash-Next-UD-Q4_K_XL --server generic-gufo -- --seed 7
+```
+
+**Halogen**: a Docker image configured by `HALOGEN_*` env vars, with its own `.hgn` weights (not a catalog GGUF), so it is its own row. Its knobs feed the container through `env`.
+
+```yaml
+      - name: flash-next-halogen
+        binary: ~/bin/halogen-serve.sh
+        args: ["{port}"]
+        knobs:
+          - {flag: --ctx-window, id: halogen-ctx, ctx: true, default: "131072"}
+          - {flag: --halogen-temperature, id: halogen-temp, default: "1.0"}
+          - {flag: --halogen-mtp-depth, id: halogen-mtp-depth, default: "3"}
+          - {flag: --halogen-reasoning-effort, id: halogen-effort, default: xhigh}
+        env:
+          HALOGEN_MODEL_ID: "{name}"
+          HALOGEN_CTX: "{halogen-ctx}"
+          HALOGEN_KV_POOL_POSITIONS: "{halogen-ctx}"
+          HALOGEN_TEMPERATURE: "{halogen-temp}"
+          HALOGEN_MTP_DEPTH: "{halogen-mtp-depth}"
+          HALOGEN_REASONING_EFFORT: "{halogen-effort}"
+        ready: /v1/models
+        stop_grace_secs: 90
+        ready_timeout_secs: 600
+
+presets:
+  flash-next-halogen:
+    entries:
+      halogen-medium:
+        knobs:
+          halogen-effort: medium   # shorter thinking, faster turns
+```
+
+```bash
+llamastash start flash-next-halogen --preset halogen-medium
+```
+
+`~/bin/halogen-serve.sh`:
+
+```sh
+#!/bin/sh
+# llamastash generic wrapper for Halogen 0.14.0. Bridge network published on
+# loopback only: the image's API binds 0.0.0.0 inside the container.
+# $1 = port; HALOGEN_* come from the entry env.
+port="$1"
+name="llamastash-halogen-$port"          # per port, so two launches don't collide
+docker rm -f "$name" >/dev/null 2>&1      # leftover from a crashed daemon
+hub=/path/to/huggingface/hub
+hg=/hub/models--peonist-ai--halogen-qwen3.8-flash-next/snapshots/<revision>
+docker run -d --rm --name "$name" -p "127.0.0.1:$port:8080" \
+  --device /dev/kfd --device /dev/dri \
+  --group-add "$(getent group video | cut -d: -f3)" --group-add "$(getent group render | cut -d: -f3)" \
+  --ipc=host --ulimit memlock=-1:-1 -v "$hub":/hub:ro \
+  -e HALOGEN_API_PORT=8080 -e HALOGEN_MODEL_ID \
+  -e HALOGEN_CHECKPOINT="$hg/qwen38-flash-next-w4b.hgn" \
+  -e HALOGEN_MTP_HEAD="$hg/qwen38-flash-next-mtp.hgn" -e HALOGEN_TOKENIZER="$hg/tokenizer" \
+  -e HALOGEN_CTX -e HALOGEN_KV_POOL_POSITIONS -e HALOGEN_MTP_DEPTH -e HALOGEN_REASONING_EFFORT \
+  -e HALOGEN_MAX_TOKENS_DEFAULT=16384 -e HALOGEN_TEMPERATURE -e HALOGEN_TOP_P=0.95 -e HALOGEN_TOP_K=20 \
+  ghcr.io/peonist-ai/halogen-flash-server:0.14.0 >/dev/null || exit 1
+# One clean stop: SIGTERM from llamastash becomes `docker stop`, which the
+# image turns into an engine shutdown (its own SIGKILL comes 30 s later).
+trap 'docker stop -t 60 "$name" >/dev/null 2>&1' TERM INT
+docker logs -f "$name" 2>&1 &
+docker wait "$name" >/dev/null &
+wait $!
+```
+
+- `docker run -d` plus `docker wait` keeps the wrapper in the foreground while the container never sees the process-group SIGTERM directly, so the engine gets exactly one signal. Keep `docker stop -t` above the image's 30 s and `stop_grace_secs` above `-t`.
+- Halogen 0.14.0's `all` mode binds its API on `0.0.0.0` whatever `HALOGEN_BIND` says (that variable covers only the internal engine port). Hence the bridge port published on `127.0.0.1` instead of `--network host`, which also keeps two launches' internal engine ports apart.
+- It does not check the request's `model` field. Cold load took 93-105 s here, about 6 s when the weights are still in page cache.
+- `HALOGEN_REASONING_EFFORT` sets the default thinking effort: `minimal`, `low`, `medium`, `high` or `xhigh`, mapped to the template's `low`, `medium` and `xhigh`. Unset, the template's own default applies, which is `xhigh`. A request that sends `reasoning_effort` still wins. The wrapper has to pass the variable through (`-e HALOGEN_REASONING_EFFORT`), or the preset has no effect.
+
+**CIRU**: a `run-server.sh` launcher configured by env vars that `exec`s its own llama-server build and passes extra args through. The wrapper exports the fixed variables; per-launch values go in the entry's `env`.
+
+```yaml
+      - name: flash-next-ciru
+        binary: ~/bin/ciru-serve.sh
+        knobs:
+          - {flag: --ciru-ctx, id: ciru-ctx, ctx: true, default: "65536"}
+          - {flag: --mtp-depth, id: mtp-depth, default: "3"}
+        env:
+          PORT: "{port}"
+          CONTEXT_SIZE: "{ciru-ctx}"
+          MTP_DEPTH: "{mtp-depth}"
+        ready: /health
+        stop_grace_secs: 60
+        ready_timeout_secs: 600
+```
+
+`~/bin/ciru-serve.sh`:
+
+```sh
+#!/bin/sh
+# llamastash generic wrapper for CIRU (3cf984c). Env comes from the entry;
+# extra args pass through to llama-server.
+export ROCM_ROOT=/path/to/ciru/.venv-rocm/lib/python3.12/site-packages/_rocm_sdk_devel
+export CIRU_RUNTIME_ROOT=/path/to/ciru/runtime
+export MODEL_DIR=/path/to/huggingface/hub/models--jcbtc--Qwen3.8-Flash-CIRU-STRIX-IU4/snapshots/<revision>
+export ENABLE_UI=0 HOST=127.0.0.1
+exec /path/to/ciru/scripts/ciru/run-server.sh "$@"
+```
+
+- `exec` hands the PID to llama-server, so llamastash's one SIGTERM reaches the engine directly.
+- CIRU answers under its own alias (`Qwen3.8-Flash-CIRU-STRIX-IU4`) and does not check the request's `model` field. Loads in about 115 s.
+
+### Running ds4 as a generic server
+
+[ds4](https://github.com/antirez/ds4) (antirez's DwarfStar) runs the DeepSeek-V4 Flash/PRO GGUFs from [huggingface.co/antirez/deepseek-v4-gguf](https://huggingface.co/antirez/deepseek-v4-gguf) through its `ds4-server` binary. It was a dedicated backend up to 0.4.0. It's now a generic server entry, which gives the same argv, readiness and speed (tested on 2026-09-28 with ds4 `0aaea5a` and the Flash IQ2_XXS `0731` GGUF: 13.2 t/s either way). You build `ds4-server` yourself (`git clone https://github.com/antirez/ds4 && cd ds4 && make`).
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: ds4                                   # server id: generic-ds4
+        model: "DeepSeek-V4-*"
+        binary: /path/to/ds4/ds4-server
+        args: [-m, "{model}", --host, "{host}", --port, "{port}"]
+        ready: /v1/models            # ds4-server binds its port only after the load
+        knobs:
+          - {flag: --ctx, id: ds4-ctx, ctx: true}
+          - --power
+          - --tokens
+          - {flag: --threads, id: ds4-threads}
+          - --kv-disk-dir
+          - --kv-disk-space-mb
+          - {flag: --ssd-streaming, switch: true}
+          - --ssd-streaming-cache-experts
+          - --ssd-streaming-preload-experts
+          - {flag: --ssd-streaming-cold, switch: true}
+          - {flag: --warm-weights, switch: true}
+          - {flag: --quality, switch: true}
+          - {flag: --mtp, id: mtp-model}
+          - {flag: --mtp-draft, id: ds4-mtp-draft}
+          - --mtp-margin
+          - {flag: --dspark, switch: true}
+          - --dspark-confidence
+          - {flag: --dspark-strict, switch: true}
+
+presets:
+  DeepSeek-V4-Flash-*-0731.gguf:
+    default: ds4-mtp
+    entries:
+      ds4:
+        server: generic-ds4
+      ds4-mtp:
+        server: generic-ds4
+        knobs:
+          mtp-model: /path/to/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
+      ds4-dspark:
+        server: generic-ds4
+        knobs:
+          dspark: true
+          mtp-model: /path/to/DeepSeek-V4-Flash-DSpark-support-0731.gguf
+```
+
+```bash
+llamastash start DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731 --ctx 32768
+llamastash start DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731 --preset ds4-dspark
+```
+
+The knob ids match the old backend's, so presets keep working. The exceptions are `ds4-ctx`, `ds4-threads` and `ds4-mtp-draft`, because `ctx`, `threads` and `mtp-draft-n` are built-in llama.cpp ids. `--ctx` still sets the context window. Any other `ds4-server` flag goes in the extras tail after `--`.
+
+**Migrating from the ds4 backend.** A config that still has `backend.ds4:` is rejected at load, and the error points here.
+
+1. Stop every running ds4 model (`llamastash stop <model>`) **before** you upgrade. The new daemon can't re-adopt a `ds4-server` the old backend started: it keeps running and holds its port and memory, but `status` doesn't list it and `stop` can't reach it. If one is left over, find it with `pgrep -a ds4-server` and `kill` its PID.
+2. Delete the `backend.ds4:` block, and drop `--ds4` / `LLAMASTASH_DS4` from your scripts.
+3. Add the `generic` entry above, with `binary` set to your `ds4-server`.
+4. In your ds4 presets, replace `backend: ds4` with `server: generic-ds4`. llama.cpp is now the default server for these GGUFs, so a preset or `--server generic-ds4` picks ds4. A leftover `backend: ds4` with no `server:` doesn't fail: it runs the model on llama.cpp. The same goes for the remembered last launch of a ds4 model, until you launch it once with `--server generic-ds4`.
+5. Set `mtp-model` in a preset to pair a draft head. The old backend found the MTP or DSpark file next to the model on its own; a generic entry doesn't.
+6. Run `llamastash daemon restart`.
+
+What the dedicated backend did that the generic entry doesn't:
+
+- **No automatic routing or fallback.** A DeepSeek-V4 GGUF defaults to llama.cpp. llama.cpp runs these files from **b9840** on ([ggml-org/llama.cpp#24162](https://github.com/ggml-org/llama.cpp/pull/24162)); an older `llama-server` fails with `unknown model architecture: 'deepseek4'`.
+- **No automatic SSD streaming.** Set `ssd-streaming: true` yourself on a box below the memory floor (about 128 GB on CUDA/ROCm, 96 GB on Metal). The admission check still sizes the launch from the GGUF, so a streaming launch that doesn't fit needs `start --force`.
+- **No MTP and streaming reconciliation.** `ds4-server` refuses `--ssd-streaming` together with `--mtp` after the full model load, so don't set both.
+- **No split-half guard.** The PRO `*-Layers00-30.gguf` / `*-Layers-31-output.gguf` halves are for ds4's distributed mode; launch a single-file GGUF instead.
+
+Two `ds4-server` behaviors to know about. Its `/v1/models` always lists both `deepseek-v4-flash` and `deepseek-v4-pro`, whatever is loaded; chat requests echo back the `model` you send, so no `rewrite_model` is needed. And `--kv-disk-dir` is ds4's own persistent cache: it holds conversation data under ds4's permissions at exactly the path you give, so point it at a private directory. See [DSpark speculative decoding](#dspark-speculative-decoding) for the DSpark caveats.
+
 ## Proxy (OpenAI-compatible listener)
 
 The daemon binds a single OpenAI-compatible HTTP proxy on `127.0.0.1:11435` (default mode) so any agent that speaks the OpenAI REST shape — OpenCode, Pi (pi.dev), the OpenAI SDKs, Cline, llm-cli — can talk to every discovered model through one stable URL. The default port is `11435` (one above Ollama's `11434`) so llamastash co-exists with an installed Ollama daemon without a collision. If the base port is taken the listener walks up to `11440` and binds the first free slot — the actual address is reported via `llamastash status` / the TUI Daemon pane under `proxy.listen`.
@@ -768,13 +966,15 @@ When two models would publish the same plain id, each takes the shortest longer 
 2. **Source-qualified** — the discovery source in front of that: `huggingface/lmstudio-community/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M` vs `lm-studio/lmstudio-community/…`. This is the rung the ordinary duplicate needs — one repo cached by two different tools derives the *same* `owner/repo` from both roots, so step 1 cannot separate them.
 3. **The full canonical path**, when even that collides — the same file name in two subdirectories of one repo, reached through one source.
 
-A **named launch** publishes one more id: the model's published id, an `@`, and the launch name (`Qwen3.8-27B-Q4_K_M@coder`). These come from the live launch registry rather than the disk catalog, so they appear while the launch runs and drop when it stops, and the model half is the same disambiguated id the catalog row publishes. Sending a named id that has no live launch auto-starts one carrying that name, so a client holding a cached id recovers instead of erroring. That auto-start also reads the name as a preset: if the model has a preset called `coder`, `qwen3@coder` launches under it, otherwise under the model's `default:` preset as before. A request body carries nothing but `model`, so this is the only way a client picks a preset — it applies to proxy auto-starts only, never to `start --name` or the TUI, where `--preset` already chooses one. A model file whose own name contains an `@` still resolves whole, and the split is taken at the last `@`.
+A **named launch** publishes one more id: the model's published id, an `@`, and the launch name (`Qwen3.8-27B-Q4_K_M@coder`). These come from the live launch registry rather than the disk catalog, so they appear while the launch runs and drop when it stops, and the model half is the same disambiguated id the catalog row publishes. Sending a named id that has no live launch goes to the model's only launch when that launch is unnamed (running or still loading) and the name is not one of the model's presets, instead of loading a second copy with the same settings. Otherwise it auto-starts one carrying that name, so a client holding a cached id recovers instead of erroring. That auto-start also reads the name as a preset: if the model has a preset called `coder`, `qwen3@coder` launches under it, otherwise under the model's `default:` preset as before. A request body carries nothing but `model`, so this is the only way a client picks a preset — it applies to proxy auto-starts only, never to `start --name` or the TUI, where `--preset` already chooses one. A model file whose own name contains an `@` still resolves whole, and the split is taken at the last `@`.
+
+A request for the plain model id while it runs more than once goes to an unnamed launch before a named one, and among those to the newest (highest `L#`).
 
 The resolver accepts every form for every model, collision or not, and each qualified form in both the published spelling and the `.gguf` filename spelling. It also accepts a partial repo reference (`unsloth/Qwen3.8`), which the raw cache path (`models--unsloth--Qwen3.8-…`) never matched. Sending any form two models share — the bare name, or a repo-qualified form that does not separate them — returns `400 ambiguous_model`, and its `matches` array lists the published id of each candidate, every one of which routes, so resend one verbatim.
 
 ### Anthropic-shape clients (Claude Code)
 
-llama-server speaks the Anthropic Messages API natively, so the proxy forwards `/v1/messages` and `/v1/messages/count_tokens` on the same path as the OpenAI routes — no body translation. Point Claude Code (or anything that drives the Anthropic shape) at the proxy with `ANTHROPIC_BASE_URL` (no `/v1` suffix — the SDK appends `/v1/messages` itself):
+llama-server speaks the Anthropic Messages API natively, so the proxy forwards `/v1/messages` and `/v1/messages/count_tokens` on the same path as the OpenAI routes — no body translation, apart from the one effort field below. Point Claude Code (or anything that drives the Anthropic shape) at the proxy with `ANTHROPIC_BASE_URL` (no `/v1` suffix — the SDK appends `/v1/messages` itself):
 
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:11435 \
@@ -788,6 +988,10 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:11435 \
 - **`llamastash init` writes these for you.** Its **Claude Code** integration drops a sourceable `~/.config/llamastash/claude-code.sh` with the `ANTHROPIC_*` exports (separate from the OpenAI `env.sh`); `source ~/.config/llamastash/claude-code.sh && claude` opts Claude Code into the proxy **for that shell only**. It deliberately does *not* write Claude Code's global `~/.claude/settings.json` (whose `env` block applies to every session) — so bare `claude` keeps using your real Anthropic models.
 - **Auth.** Anthropic clients send the key in the `x-api-key` header; the proxy accepts it alongside `Authorization: Bearer` and browser `Basic`. On the keyless loopback default no key is needed (the token value is ignored, but Claude Code still wants one set). When you set `proxy.api_key` (or `LLAMASTASH_PROXY_API_KEY`), auth is enforced and `init`'s generated `env.sh` / `claude-code.sh` carry that real key (mode `0o600`) — so a client only authenticates once the script is sourced into its environment.
 - **Tool calling** needs the backend launched with `--jinja`, which is on by default (`backend.llamacpp.jinja: true` in `config.yaml`; the reasoning toggle also forces it). Set `backend.llamacpp.jinja: false` only if you don't need tool use. Basic chat / streaming work either way. Some model templates (e.g. certain Qwen GGUFs) fail llama-server's tool-parser generation with `System message must be at the beginning`; override with `start <model> -- --chat-template-file <tool-compatible.jinja>` (or the crude `--chat-template chatml`), or use a GGUF whose template is tool-compatible.
+- **`/effort` reaches a llama.cpp model.** Claude Code sends effort as `output_config.effort`, which llama.cpp's own `/v1/messages` translation drops, so the proxy copies that one value to `chat_template_kwargs.reasoning_effort` before forwarding and leaves every other byte alone. A `chat_template_kwargs.reasoning_effort` the client sends itself wins over it. `count_tokens` gets the same mapping, so its count matches the request that follows.
+- **The mapping overrides a launch-time effort.** A per-request kwarg beats what the server was launched with, so a `-- --reasoning-effort low` (or a chat-template-kwargs extra) no longer applies to a client that sends an effort on every request, which Claude Code does (its own model default when you never pick one). Set `backend.llamacpp.map_anthropic_effort: false` to let the launch and the engine defaults stand.
+- **An effort the model's template rejects fails the request.** The value passes through unclamped and the template decides, so the error names that model's own set: `Unexpected reasoning effort max. Supported types are xhigh (default), medium, and low.` on Qwen3.8 (which also maps `high` onto `xhigh`). llama.cpp answers that with HTTP 500 and the template's own text, so a client can retry it a few times before showing it. With no mapping the field was simply dropped and the request went through on the engine default.
+- Other backends forward the body untouched. Halogen reads `output_config.effort` itself. gufo's `/v1/messages` refuses unknown fields with `400 request field '<x>' is not supported on this endpoint`, so Claude Code can't drive that engine today.
 - Compatibility is best-effort (it's llama-server's translation, not a full Anthropic spec implementation) — verify your client end-to-end.
 
 ### Web UI (`/ui`)
@@ -905,11 +1109,11 @@ Maintaining that `models` map by hand is the tedious part. Two ways to skip it:
 
 **Generate it from `llamastash list --json`.** OpenCode has no native
 `/v1/models` auto-discovery yet, and the proxy's `/v1/models` stays
-OpenAI-standard (`id` / `object` / `created` / `owned_by`) with **no
-capability field**, so nothing downstream can tell a chat model from an
-embedding or reranker off that endpoint alone. `list --json` *does* carry a
-per-model `mode_hint` (under the nested `metadata` block), so generate the block
-from it and filter to just the chat models:
+OpenAI-standard (`id` / `object` / `created` / `owned_by`) plus a `mode`
+field (`chat`, `embedding`, `rerank`) that standard clients ignore. `list --json`
+carries the same as `mode_hint` (under the nested `metadata` block) along with
+the context size, so generate the block from it and filter to just the chat
+models:
 
 ```bash
 BASE="http://$(llamastash status --json | jq -r .proxy.listen)/v1"
@@ -977,7 +1181,7 @@ The proxy speaks HTTP/1.1 only on `127.0.0.1:<port>` (no h2c upgrade, no ALPN-ne
 | Method | Path                   | Behavior                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | ------ | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `GET`  | `/health`              | `{"status":"ok","models_loaded":<N>,"models_discovered":<M>}`. Cheap liveness probe; counts come from the supervisor registry (`models_loaded` = Ready) and the catalog (`models_discovered`). **Always returns 200** — the listener being up is the only signal this endpoint encodes. It does NOT report degraded states (zero Ready models, partial supervisor failures, etc.); poll `/v1/models` or `llamastash status --json` if you need that. |
-| `GET`  | `/v1/models`           | OpenAI-shape `{"object":"list","data":[…]}` listing every discovered model. Each row carries `id` (the published model id — see [Model ids on the proxy](#model-ids-on-the-proxy)), `object: "model"`, `created: 0` (no stable epoch — the catalog has no creation timestamp; documented choice), `owned_by: "llamastash"`. Sorted by `id` so the output is byte-stable across calls.                                                                                                                   |
+| `GET`  | `/v1/models`           | OpenAI-shape `{"object":"list","data":[…]}` listing every discovered model. Each row carries `id` (the published model id — see [Model ids on the proxy](#model-ids-on-the-proxy)), `object: "model"`, `created: 0` (no stable epoch — the catalog has no creation timestamp; documented choice), `owned_by: "llamastash"`, and `mode` (`chat`, `embedding` or `rerank`, from the GGUF header or a generic entry's `modes`; absent when unknown). Sorted by `id` so the output is byte-stable across calls.                                                                                                                   |
 | `POST` | `/v1/chat/completions` | OpenAI chat completions. Streaming (`stream: true`) is byte-piped end-to-end — SSE chunks reach the agent in the same order with the same framing the upstream `llama-server` emitted.                                                                                                                                                                                                                                                               |
 | `POST` | `/v1/completions`      | OpenAI text completions. Same forwarding semantics.                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `POST` | `/v1/embeddings`       | OpenAI embeddings. JSON pass-through.                                                                                                                                                                                                                                                                                                                                                                                                                |
@@ -1113,9 +1317,28 @@ Examples: `llamastash init server --install gh-releases`, `llamastash init model
 | `--offline`              | Refuse outbound network. Useful for `--only config` / `--only server` reruns where the model and snapshot are already cached. `LLAMASTASH_OFFLINE=1` is equivalent.     |
 | `--only <STEPS>`         | Comma-separated list of `server,models,config,integrations` (other names rejected). Only the listed steps run. Or run one step as a subcommand: `init server`.            |
 | `--skip <STEPS>`         | Inverse of `--only`. Mutually exclusive with it (clap refuses both).                                                                                                    |
-| `--install <CHOICE>`     | Pre-answer the install-method prompt. Values: `brew`, `gh-releases`, `existing`, `custom:<PATH>`. Override beats `--recommended`.                                       |
+| `--install <CHOICE>`     | Pre-answer the install-method prompt. Values: `brew`, `gh-releases`, `gh-releases:vulkan`, `existing`, `custom:<PATH>`. Override beats `--recommended`. See [Linux + NVIDIA](#linux--nvidia-cuda-or-vulkan) for `gh-releases:vulkan`. |
 | `--model <CHOICE>`       | Pre-answer the model-pick prompt. Values: `recommended`, `none`, `<owner>/<repo>[:<filename>.gguf]`.                                                                    |
 | `--config-step <CHOICE>` | Pre-answer the config-write confirm. Values: `write`, `skip`. (Named `--config-step` rather than `--config` because the top-level `--config <PATH>` is already global.) |
+
+#### Linux + NVIDIA: CUDA or Vulkan
+
+On Linux with an NVIDIA card, the GitHub Releases install picks llama.cpp's CUDA build when the driver can run it, and the Vulkan build otherwise. A host with both an NVIDIA and an AMD card keeps the Vulkan build, since a CUDA build drives only the NVIDIA card. The CUDA build ships with a `cudart-` bundle (`libcudart`, `libcublas`, `libcublasLt`) that `init` downloads and places next to `llama-server`, so no CUDA toolkit is needed.
+
+| Driver | Card (compute capability) | x86_64 | arm64 |
+| --- | --- | --- | --- |
+| 580 or newer | 7.5 or newer (Turing and later) | CUDA 13 | CUDA 13 |
+| 580 or newer | older than 7.5 (Maxwell, Pascal, Volta) | CUDA 12 | Vulkan |
+| 525 to 579 | any | CUDA 12 | Vulkan |
+| older, or unknown | any | Vulkan | Vulkan |
+
+The driver version and each card's compute capability come from `nvidia-smi` (the driver alone from `/proc/driver/nvidia/version` when `nvidia-smi` fails). Upstream's CUDA 13 build has no kernels for cards older than 7.5, and such a card still shows up in `--list-devices`, so the check below would not catch it. With several cards the oldest one decides. When the compute capability is unknown, x86_64 takes CUDA 12, which covers every card a 525+ driver supports.
+
+The download is larger: about 560 to 730 MiB for build plus runtime (CUDA 13 x86_64 565 MiB, CUDA 13 arm64 667 MiB, CUDA 12 730 MiB at `b11316`), against about 30 MiB for Vulkan. `--recommended`, `--json` and non-interactive runs take the CUDA build too, and `--install gh-releases:vulkan` picks Vulkan instead. The progress line shows the size; under `--json` there is no progress line, so the size is only in the log file (`llamastash.log`), or on stderr with `--verbose`. The interactive picker offers both builds (`GitHub Releases · CUDA 13` and `GitHub Releases · Vulkan`; `· CUDA` on Windows). Downloads stream to disk under the install root and are hashed on the way; the step checks for about three times the download size in free space first. A CUDA build installs to its own directory (`llama-cpp/<tag>-cuda-<ver>-<arch>/`). A re-run reuses a build already in its directory without downloading it again. Temp files an interrupted run left behind (`.download.*`, `*.tmp.*`) are removed by the next run once they are 10 minutes old.
+
+After the install, `init` runs `llama-server --list-devices`. llama.cpp loads its CUDA backend as a plugin and skips it when it cannot load, so a broken CUDA install still starts and passes `--version`, on the CPU. When the list shows no CUDA device, `init` says so, removes the CUDA build, and installs the Vulkan build instead. It records the failed build in `llama-cpp/.cuda-failed` under the state dir. Later runs default to the Vulkan build: the picker still offers CUDA, with a `listed no CUDA device last time` hint, and `--recommended` or a non-interactive run takes Vulkan and says so. Picking CUDA or passing `--install gh-releases` tries it again, and a CUDA build that then lists a device clears the record. When the check itself fails (timeout after 120 s, non-zero exit), it keeps the CUDA build and says how to check by hand.
+
+On Windows with an NVIDIA card the install picks the `win-cuda` zip, which carries no CUDA runtime DLLs, so it needs a CUDA toolkit on `PATH`. The same check runs there: without a toolkit the zip lists no CUDA device and `init` installs the `win-vulkan` build instead. `--install gh-releases:vulkan` picks the Vulkan build directly.
 
 The three per-step flags are **advisory, not authoritative**: supplying `--install brew` for a step that `--skip server` already excludes emits one stderr warning and proceeds. Conflicting axes don't abort.
 
@@ -1123,7 +1346,7 @@ Non-interactive contract: when stdout isn't a terminal and `--recommended` is no
 
 ### `llamastash doctor`
 
-Read-only diagnostic (its one write is the memory-drift baseline refresh). Re-runs hardware detection, diffs against `_init_snapshot.json`, and emits findings with stable ids agents can branch on: `binary_missing`, `binary_digest_drift` (skipped on brew installs — routine `brew upgrade` legitimately rotates the digest), `hardware_drift`, `memory_drift`, `gtt_hint`, `snapshot_stale`, `config_mode_drift`, `remote_snapshot_unreachable`, plus two configured-server advisories — `server_binary_missing` (Warning: a `backend.<id>.servers[].binary` path no longer resolves) and `servers_configured` (Info: a summary of the resolvable servers and their device counts; silent when no `servers:` are configured) — and two info-tier ds4 advisories that both honor the `LLAMASTASH_DS4` force: `ds4_unavailable` (the binary is absent but a compatible model is present — those still run on llama.cpp; the `fix_hint` carries the clone/`make` recipe, the `backend.ds4.servers` key, and a pointer to [ds4 backend](#ds4-backend); this is the only finding that scans discovery) and `ds4_disabled` (the binary is installed but `backend.ds4.enabled: false` and no force — `fix_hint` says re-enable, no scan). All of these ids are additive, so `schema_version` stays `2`; readers refuse only versions above their max. When the local benchmark snapshot looks stale, `doctor` probes the latest remote (the same one the recommender prefers) before judging `snapshot_stale`, so it only fires when no fresher snapshot is actually reachable; `LLAMASTASH_OFFLINE` skips that probe.
+Read-only diagnostic (its one write is the memory-drift baseline refresh). Re-runs hardware detection, diffs against `_init_snapshot.json`, and emits findings with stable ids agents can branch on: `binary_missing`, `binary_digest_drift` (skipped on brew installs — routine `brew upgrade` legitimately rotates the digest), `hardware_drift`, `memory_drift`, `gtt_hint`, `snapshot_stale`, `config_mode_drift`, `remote_snapshot_unreachable`, plus two configured-server advisories — `server_binary_missing` (Warning: a `backend.<id>.servers[].binary` path no longer resolves) and `servers_configured` (Info: a summary of the resolvable servers and their device counts; silent when no `servers:` are configured). All of these ids are additive, so `schema_version` stays `2`; readers refuse only versions above their max. When the local benchmark snapshot looks stale, `doctor` probes the latest remote (the same one the recommender prefers) before judging `snapshot_stale`, so it only fires when no fresher snapshot is actually reachable; `LLAMASTASH_OFFLINE` skips that probe.
 
 ```
 llamastash doctor [--json]
@@ -1160,15 +1383,41 @@ llamastash integrations [TOOLS] [--integrations <TOOLS>] [--json]
 
 | Flag / arg              | Effect                                                                                                                                             |
 | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `[TOOLS]`               | Tool ids to patch, space- or comma-separated: `opencode`, `aider`, `continue`, `zed`, `pi`, `env-sh`, `claude-code`. Omit for the interactive multiselect; `none` runs the step and patches nothing. |
+| `[TOOLS]`               | Tool ids to patch, space- or comma-separated: `opencode`, `aider`, `continue`, `zed`, `pi`, `codex`, `env-sh`, `claude-code`. Omit for the interactive multiselect; `none` runs the step and patches nothing. |
 | `--integrations <TOOLS>` | Same list in flag form, for parity with `init --integrations`.                                                                                     |
 | `--json`                | Same `{"steps_ran": ["detect","integrations"], "integrations": {"applied": [...], "failed": [...]}}` shape as `init --only integrations --json`.    |
 
 Examples: `llamastash integrations pi`, `llamastash integrations opencode,zed`, `llamastash integrations` (pick from the list).
 
+**Which proxy URL gets written.** The address the running daemon's proxy is listening on, read from the daemon (the run starts one if none is up). That covers a proxy that moved past a busy port (`11435` taken, so `11436`) and a daemon started with `--proxy-port` or `--host`, neither of which is saved to `config.yaml`. A wildcard bind (`0.0.0.0`, `::`) is written as loopback. When the daemon can't be reached or its proxy is not listening, the run uses `proxy.host` / `proxy.port` from `config.yaml`, else `127.0.0.1:11435` (`11434` in Ollama-compat mode), and says so on stderr.
+
 **Which models get registered.** The run reads your favorites from the daemon and registers each one, named exactly as `/v1/models` publishes it — a GGUF by its file stem (`Qwen3-Coder-30B-Q4_K_M`), a safetensors repo by its repo id (`Qwen/Qwen3-0.6B`), an Ollama model by `<name>:<tag>`, and a GGUF whose file name is shared by another model under its repo-qualified form ([Model ids on the proxy](#model-ids-on-the-proxy)). So whatever a tool sends back as `body.model` is a name the proxy already answers to. During a full `llamastash init` the model the download step just fetched is registered first, then the favorites. No favorites and nothing downloaded means a provider block with no models: the run says so on stderr, and `llamastash favorites add <model>` then a re-run fills it in.
 
-Per-tool shape: tools whose schema holds a model list (OpenCode, Continue.dev, Zed, pi.dev) register all of them; tools with a single model slot (Aider's `model:`, Claude Code's `ANTHROPIC_MODEL`) take the first non-embedding model. Embedders are routed by kind — Continue.dev gets `roles: [embed]`; Zed and pi.dev leave them out, since both drive chat only and pi has no embeddings API at all.
+**Presets and context size.** A favorite with presets registers one model per preset, as `<id>@<preset>` (`Qwen3-Coder-30B-Q4_K_M@coder`), the default preset first; the plain id is left out. A favorite without presets registers its plain id. Tools that take a context size (pi.dev's `contextWindow`, Zed's `max_tokens`) get the size each one launches with, in this order:
+
+1. the preset's context,
+2. the server entry's configured default (a generic entry's `ctx: true` knob `default:`), for the server the preset picks,
+3. the model's trained context,
+4. 32768.
+
+A context left to `--fit` (`auto`) is not known ahead of time, so the trained context is used. Launches named with `--name` alone have no config record and are not registered; add those by hand.
+
+Per-tool shape: tools whose schema holds a model list (OpenCode, Continue.dev, Zed, pi.dev) register all of them; tools with a single model slot (Aider's `model:`, Codex's `model`, Claude Code's `ANTHROPIC_MODEL`) take the first non-embedding model. OpenCode also gets each model's `limit` (`context` as above, `output` 32000 or half the context, whichever is smaller); without it OpenCode reads the context as `0` and never compacts. pi.dev's `maxTokens` takes the same output figure. pi sends it as `max_completion_tokens` and llama.cpp stops there, and thinking and the answer share it, so a low cap can end a long think before any answer.
+
+**Vision and reasoning flags.** A model with a vision projector is declared as taking images: pi.dev `input: ["text", "image"]`, OpenCode `modalities.input: ["text", "image"]` (without it OpenCode replaces an attached image with an error message), Zed `capabilities.images: true`. Codex already assumes image input. Continue.dev gets nothing, because listing `image_input` in its `capabilities` also turns off its own tool-use detection. A reasoning model gets Zed's `capabilities.interleaved_reasoning: true`, so earlier thinking goes back to the server as `reasoning_content` instead of as plain answer text. Embedders are routed by kind — Continue.dev gets `roles: [embed]`; Zed and pi.dev leave them out, since both drive chat only and pi has no embeddings API at all.
+
+**Reasoning effort.** For a reasoning model whose chat template lists the effort levels it accepts, the patchers wire each tool's effort control to those levels. The list comes from the template, not the model family: Qwen3.8's template accepts `low`, `medium` and `xhigh` (its default), plus `high`, which it turns into `xhigh`, and raises an error on any other value. An alias like `high` is accepted but not offered as a level of its own. `none` turns thinking off where the template reads `enable_thinking`, since llama.cpp maps `reasoning_effort: "none"` to that. Models without such a list (including safetensors repos, whose template is not read yet) get no effort fields.
+
+| Tool | What is written | How to change the level |
+| --- | --- | --- |
+| pi.dev | `reasoning: true` and a `thinkingLevelMap`; levels the template rejects, and aliases like `high`, map to `null`, which hides them | `/thinking <level>` |
+| OpenCode | `reasoning: true` and one `variants` entry per level (plus `none`) | the variant picker |
+| Zed | `reasoning_effort` set to the template's default | the effort picker; Zed's list is fixed to minimal ... max, so for Qwen3.8 `minimal` and `max` get an HTTP 500 whose message ends `Unexpected reasoning effort minimal. Supported types are xhigh (default), medium, and low.` |
+| Codex | `model_reasoning_effort` set to the template's default, with the accepted levels in a comment | edit it in the profile (kept on re-run when the model accepts it), or `-c model_reasoning_effort=<level>` per run |
+| Aider | nothing | `/reasoning-effort <level>` in the chat already works; the `--reasoning-effort` flag would need a model-settings entry that replaces Aider's own defaults for that model |
+| Continue.dev | nothing | Continue sends an effort only for OpenAI `o*` / `gpt-5+` models |
+
+**Codex writes a profile, not `config.toml`.** `codex` writes `$CODEX_HOME/llamastash.config.toml` (`~/.codex/` by default), which Codex loads as a layer over `config.toml` when started with `codex --profile llamastash`. Plain `codex` keeps your own settings. The profile points a `llamastash` provider at the proxy with `wire_api = "responses"` (Codex speaks only the Responses API; llama-server serves `/v1/responses` natively and the proxy forwards it), sets `model` and `model_context_window` for the first chat model, and gets the key by running `llamastash api-key`. For a model with effort levels it also sets `model_reasoning_effort`: without it, the value in your `config.toml` (set for OpenAI models) would be sent to the local model, and Qwen3.8 rejects levels like `minimal`. The file is rewritten on each run, keeping only a `model_reasoning_effort` the model accepts.
 
 **pi.dev patches two files.** `~/.pi/agent/models.json` gets the provider block, and `~/.pi/agent/settings.json` gets `llamastash/**` appended to `enabledModels` — pi's model switcher is bounded by that list, so without the pattern the models are configured but out of scope until you widen it by hand. The pattern is only appended when `enabledModels` is already set: pi reads an absent or empty list as "no scoping", and writing ours there would hide every other provider. Any config that is a symlink (a dotfiles repo, typically) is written *through* the link, not over it.
 
@@ -1177,6 +1426,7 @@ Per-tool shape: tools whose schema holds a model list (OpenCode, Continue.dev, Z
 | Tool | Form | Secret at rest? |
 | --- | --- | --- |
 | pi.dev | `!llamastash api-key` (pi runs it, reads stdout) | No — resolved per pi process |
+| Codex | `auth.command = "llamastash"`, `args = ["api-key"]` (Codex runs it) | No |
 | OpenCode | `{env:LLAMASTASH_API_KEY}` | No — needs the var exported |
 | Zed | nothing written (Zed reads `LLAMASTASH_API_KEY` from env by its own convention) | No |
 | Aider, Continue.dev | literal, file mode `0600` | Yes |
@@ -1192,7 +1442,7 @@ When the run patches a tool that reads the variable **and** the proxy has auth o
 llamastash api-key [--json]
 ```
 
-Prints the proxy's bearer key on stdout, alone on one line, for client configs that resolve a credential by shelling out and for `$(...)` in scripts. Reads the local config only — no daemon contact, so it stays inside a client's shell-out timeout. On the keyless loopback default it prints the `llamastash` stub, since the proxy ignores the value but clients that demand a non-empty key still need one. `--json` emits `{"api_key", "auth", "base_url"}`.
+Prints the proxy's bearer key on stdout, alone on one line, for client configs that resolve a credential by shelling out and for `$(...)` in scripts. Reads the local config only — no daemon contact, so it stays inside a client's shell-out timeout. On the keyless loopback default it prints the `llamastash` stub, since the proxy ignores the value but clients that demand a non-empty key still need one. `--json` emits `{"api_key", "auth", "base_url"}`; `base_url` is the address a running daemon's proxy listens on (asked with a 2 s limit, never starting a daemon), else the configured one.
 
 ### `llamastash pull <repo>`
 
@@ -1297,7 +1547,7 @@ When enabled, left-click moves focus and the wheel replays the `↑`/`↓` actio
 
 Three-stage modal: **Search → File picker → Confirm**. Search runs live against the public `/api/models` endpoint (300 ms debounce); paste an `owner/repo[:filename]` slug + Enter to bypass search. Each search row carries a `fmt` column and two size columns — `params` (model parameter count, e.g. `35B`) and `size` (approximate download size, the representative GGUF file HF parsed, e.g. `5.3G`); the exact per-quant size lands in the File picker.
 
-`fmt` is the repo's weight format: `GGUF` for llama.cpp / ds4, `SFTN` for a safetensors repo (vLLM, SGLang), `-` when the repo publishes both or neither. Both formats are searched — the browser used to be GGUF-only, which left safetensors repos unfindable and so unpullable. The `init` wizard still searches GGUF only, since it is bootstrapping a first model for the default backend.
+`fmt` is the repo's weight format: `GGUF` for llama.cpp, `SFTN` for a safetensors repo (vLLM, SGLang), `-` when the repo publishes both or neither. Both formats are searched — the browser used to be GGUF-only, which left safetensors repos unfindable and so unpullable. The `init` wizard still searches GGUF only, since it is bootstrapping a first model for the default backend.
 
 Drilling into a GGUF repo lists its quants to pick from. A safetensors repo has nothing to pick — one model spread over `*.safetensors` plus `config.json` and the tokenizer files, all of which an engine needs — so the picker offers a single whole-repo row and the pull takes the full set.
 
@@ -1377,7 +1627,8 @@ it; Backspace resets the row. Selectors are passed through verbatim
 (comma-joined for a multi-GPU pick, e.g. `ROCm0,ROCm1`), so only devices
 the server's binary exposes are offered — the list rescopes when you
 cycle the `server` row. On the CLI, `start --device ROCm0,ROCm1` takes
-the same comma-separated list.
+the same comma-separated list, and `start --device none` offloads nothing
+(CPU only), as llama-server's own `--device none` does.
 
 Two gates decide whether any of this is shown, both scoped to the server
 the launch is on (the selected one while editing, the one serving the

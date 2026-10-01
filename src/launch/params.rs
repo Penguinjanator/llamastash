@@ -54,44 +54,70 @@ pub(crate) fn is_forbidden_head(head: &str) -> bool {
 }
 
 /// [`is_forbidden_head`] extended with a backend's own network-affecting
-/// heads (ds4 adds `--cors` / `--dist-`). A prefix ending in `-` matches by
+/// heads (for example `--cors`). A prefix ending in `-` matches by
 /// `starts_with`; everything else matches exactly — same rule as the base set.
 pub(crate) fn is_forbidden_head_ext(head: &str, extra: &[&str]) -> bool {
   is_forbidden_head(head) || head_hits_prefixes(head, extra)
 }
 
+/// How many tokens after a forbidden flag are its values. A denylisted head
+/// takes exactly one unless its backend lists it otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlagValues {
+  None,
+  Exactly(usize),
+  /// One value, then every following token that doesn't start with `-`
+  /// (an argparse `nargs="+"` list).
+  OneOrMore,
+}
+
 /// `extras` with every forbidden head — base denylist plus `extra` — and its
-/// value removed. Both spellings: `--host 0.0.0.0` drops the following token
-/// too, `--host=0.0.0.0` is one token.
+/// values removed. `values` lists the heads whose value count isn't one, taken
+/// from each engine's own parser. A value is dropped even when it starts with
+/// `-`, so `--api-key -secret` doesn't leave `-secret` in argv. The equals form
+/// (`--host=0.0.0.0`) carries its first value inline.
 ///
 /// `compose_and_spawn` already refused a banned head with a clear error; this
 /// strip is the belt-and-suspenders a process-spawning backend applies right
 /// before argv so none reaches the launcher even if some path skipped the
-/// fail-fast. Without the value drop, the space-separated form left `0.0.0.0`
-/// dangling in argv, which a launcher reads as a stray positional and refuses
-/// the launch over.
+/// fail-fast.
 pub(crate) fn strip_forbidden_extras(
   extras: &[std::ffi::OsString],
   extra: &[&str],
+  values: &[(&str, FlagValues)],
   log_tag: &str,
 ) -> Vec<std::ffi::OsString> {
   let mut out = Vec::with_capacity(extras.len());
-  let mut skip_value = false;
-  for e in extras {
+  let mut iter = extras.iter().peekable();
+  while let Some(e) = iter.next() {
     let lossy = e.to_string_lossy();
-    if skip_value {
-      skip_value = false;
-      if !lossy.starts_with('-') {
-        continue;
-      }
-    }
     let head = lossy.split('=').next().unwrap_or(&lossy);
-    if is_forbidden_head_ext(head, extra) {
-      log::warn!("{log_tag}: stripping forbidden extra {head:?}");
-      skip_value = !lossy.contains('=');
+    if !is_forbidden_head_ext(head, extra) {
+      out.push(e.clone());
       continue;
     }
-    out.push(e.clone());
+    log::warn!("{log_tag}: stripping forbidden extra {head:?}");
+    let lower = head.to_ascii_lowercase();
+    let count = values
+      .iter()
+      .find(|(h, _)| *h == lower)
+      .map_or(FlagValues::Exactly(1), |(_, v)| *v);
+    let (fixed, open) = match count {
+      FlagValues::None => (0, false),
+      FlagValues::Exactly(n) => (n, false),
+      FlagValues::OneOrMore => (1, true),
+    };
+    for _ in 0..fixed.saturating_sub(usize::from(lossy.contains('='))) {
+      iter.next();
+    }
+    if open {
+      while iter
+        .peek()
+        .is_some_and(|t| !t.to_string_lossy().starts_with('-'))
+      {
+        iter.next();
+      }
+    }
   }
   out
 }
@@ -170,7 +196,7 @@ pub fn forbidden_in_extras(extras: &[OsString]) -> Vec<String> {
 }
 
 /// [`forbidden_in_extras`] extended with a backend's own network-affecting
-/// heads (ds4 adds `--cors` / `--dist-`), so a ds4 launch that spells one of
+/// heads, so a launch on that backend that spells one of
 /// those in `--` extras is refused with a clear error rather than silently
 /// stripped at spawn.
 pub fn forbidden_in_extras_ext(extras: &[OsString], extra_forbidden: &[&str]) -> Vec<String> {
@@ -250,7 +276,7 @@ pub enum BackendChoice {
 impl BackendChoice {
   /// Stable lowercase label for CLI parsing / JSON projection — `"auto"` or the
   /// backend id. The wire form (the custom [`serde::Serialize`] below) is
-  /// exactly this string, so a persisted `"ds4"` / `"llamacpp"` round-trips
+  /// exactly this string, so a persisted `"lemonade"` / `"llamacpp"` round-trips
   /// byte-for-byte with the old enum encoding.
   /// The pinned backend id, or `None` when this is `Auto`. Callers that need
   /// "which backend's knobs apply" resolve `None` to the default themselves.
@@ -280,7 +306,7 @@ impl BackendChoice {
   }
 }
 
-// Persisted / wired as the bare id string (`"auto"`, `"ds4"`, `"llamacpp"`, …),
+// Persisted / wired as the bare id string (`"auto"`, `"lemonade"`, `"llamacpp"`, …),
 // identical to the old externally-tagged unit-variant encoding, so `state.json`
 // and preset rows stay byte-stable across this refactor.
 impl serde::Serialize for BackendChoice {
@@ -482,7 +508,7 @@ pub struct LaunchParams {
   #[serde(default)]
   pub backend: BackendChoice,
   /// Chosen **server** id — a build/binary of a backend (`llamacpp·vulkan`,
-  /// `ds4·ds4`). Determines which binary the launch spawns; persisted in
+  /// `lemonade`). Determines which binary the launch spawns; persisted in
   /// last-params so a relaunch reuses the build. `None` = no pick (default
   /// binary). `#[serde(default)]` keeps pre-server-abstraction rows loading.
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -625,6 +651,32 @@ pub(crate) fn bench_disable_defaults_from_env() -> bool {
 mod tests {
   use super::*;
 
+  fn os(v: &[&str]) -> Vec<OsString> {
+    v.iter().map(OsString::from).collect()
+  }
+
+  #[test]
+  fn strip_drops_a_value_that_starts_with_a_dash() {
+    let out = strip_forbidden_extras(&os(&["--api-key", "-secret", "--keep"]), &[], &[], "t");
+    assert_eq!(out, os(&["--keep"]));
+  }
+
+  #[test]
+  fn strip_follows_each_flags_value_count() {
+    let values = [
+      ("--switch-x", FlagValues::None),
+      ("--pair-x", FlagValues::Exactly(2)),
+      ("--list-x", FlagValues::OneOrMore),
+    ];
+    let heads = ["--switch-x", "--pair-x", "--list-x"];
+    let strip = |v: &[&str]| strip_forbidden_extras(&os(v), &heads, &values, "t");
+    assert_eq!(strip(&["--switch-x", "kept"]), os(&["kept"]));
+    assert_eq!(strip(&["--pair-x", "h", "-1", "kept"]), os(&["kept"]));
+    assert_eq!(strip(&["--list-x", "-a", "b", "--next"]), os(&["--next"]));
+    assert_eq!(strip(&["--list-x=a", "b", "--next"]), os(&["--next"]));
+    assert_eq!(strip(&["--host=0.0.0.0", "kept"]), os(&["kept"]));
+  }
+
   fn base_params() -> LaunchParams {
     LaunchParams::new(PathBuf::from("/m/model.gguf"), LaunchMode::Chat)
   }
@@ -651,7 +703,7 @@ mod tests {
       BackendChoice::Auto,
       BackendChoice::Explicit("llamacpp".into()),
       BackendChoice::Explicit("lemonade".into()),
-      BackendChoice::Explicit("ds4".into()),
+      BackendChoice::Explicit("enginex".into()),
     ] {
       let s = serde_json::to_string(&c).unwrap();
       let back: BackendChoice = serde_json::from_str(&s).unwrap();
@@ -668,8 +720,8 @@ mod tests {
       "\"llamacpp\""
     );
     assert_eq!(
-      serde_json::from_str::<BackendChoice>("\"ds4\"").unwrap(),
-      BackendChoice::Explicit("ds4".into())
+      serde_json::from_str::<BackendChoice>("\"enginex\"").unwrap(),
+      BackendChoice::Explicit("enginex".into())
     );
   }
 
@@ -968,10 +1020,10 @@ mod tests {
     );
     // Set → the key carries the map, with the same shape the TUI parses back.
     let mut with_knob = base_params();
-    with_knob.knobs.set_by_name("kv-disk-dir", "/tmp/kv");
+    with_knob.knobs.set_by_name("kv-cache-memory-bytes", "8G");
     assert_eq!(
-      with_knob.to_wire()["knobs"]["kv-disk-dir"],
-      serde_json::json!("/tmp/kv"),
+      with_knob.to_wire()["knobs"]["kv-cache-memory-bytes"],
+      serde_json::json!("8G"),
       "a backend's own knob round-trips into the row like any other"
     );
   }

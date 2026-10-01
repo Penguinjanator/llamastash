@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Serialize;
-use sysinfo::{ProcessRefreshKind, RefreshKind, System};
+use sysinfo::{ProcessRefreshKind, System};
 
 use crate::backend::Backend;
 use crate::daemon::state_store::RunningSnapshot;
@@ -195,8 +195,11 @@ pub async fn sweep(inputs: SweepInputs<'_>) -> SweepReport {
       ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always)
     }
   };
-  let mut sys = System::new_with_specifics(RefreshKind::nothing().with_processes(process_refresh));
-  sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+  // `refresh_processes` would also walk every thread (`with_tasks`), ~4x the
+  // /proc reads, and `with_processes` on the constructor would scan once more
+  // before this refresh does.
+  let mut sys = System::new();
+  sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::All, true, process_refresh);
 
   let mut adopted: Vec<RunningSnapshot> = Vec::new();
   let mut stale: Vec<RunningSnapshot> = Vec::new();
@@ -205,9 +208,7 @@ pub async fn sweep(inputs: SweepInputs<'_>) -> SweepReport {
       stale.push(snap);
       continue;
     }
-    let backend = crate::backend::Backends::all()
-      .into_iter()
-      .find(|b| b.id() == snap.resolved_backend)
+    let backend = crate::backend::Backends::from_id(&snap.resolved_backend)
       .unwrap_or_else(crate::backend::default_backend);
     // Orphan re-adoption is process-based, so it needs a path to confirm
     // against. Keyed on **lifecycle**, not identity shape: a managed
@@ -260,11 +261,10 @@ pub async fn sweep(inputs: SweepInputs<'_>) -> SweepReport {
       if adopted_pids.contains(&pid_u32) {
         return None;
       }
-      // Skip threads. `sysinfo` lists each kernel task (thread) under its
-      // own TID alongside the main process; without this filter a
-      // multi-threaded `llama-server` surfaces once per thread (e.g. 36
-      // identical rows for one process). Real processes have
-      // `thread_kind() == None`.
+      // Skip threads. The refresh above leaves `with_tasks` off, so sysinfo
+      // lists none today; if that changes, a multi-threaded `llama-server`
+      // would surface once per thread (e.g. 36 identical rows for one
+      // process). Real processes have `thread_kind() == None`.
       if proc.thread_kind().is_some() {
         return None;
       }
@@ -364,17 +364,6 @@ pub(crate) async fn models_endpoint_serves_id(
   };
   crate::daemon::probe::served_model_ids(&body)
     .is_some_and(|ids| ids.iter().any(|id| id == expected))
-}
-
-/// Compare two model paths for adoption, tolerant of canonicalisation: try a
-/// canonical compare first (resolves symlinks / `..`), fall back to a direct
-/// path compare when either can't be canonicalised (file already gone). Shared
-/// by a backend's `adoption_matches` argv `-m` cross-check.
-pub(crate) fn paths_equal(a: &Path, b: &Path) -> bool {
-  match (a.canonicalize(), b.canonicalize()) {
-    (Ok(ca), Ok(cb)) => ca == cb,
-    _ => a == b,
-  }
 }
 
 /// GET `/v1/models` via `reqwest` — the same client the right-pane
@@ -564,57 +553,6 @@ mod tests {
       }
     });
     (task, port)
-  }
-
-  #[test]
-  fn paths_equal_matches_same_file_and_rejects_different() {
-    // The ds4 adoption argv `-m` cross-check: two spellings of the same file
-    // match; a different basename does not (per-file PID-reuse discrimination).
-    let dir = crate::test_support::unique_temp_dir("orphans-paths", "eq");
-    let a = dir.join("m.gguf");
-    std::fs::write(&a, b"x").unwrap();
-    assert!(paths_equal(&a, &a));
-    // A `./`-prefixed spelling canonicalizes to the same file.
-    let dotted = dir.join(".").join("m.gguf");
-    assert!(paths_equal(&dotted, &a), "canonicalization collapses ./");
-    // A different file in the same dir must not match.
-    let b = dir.join("other.gguf");
-    std::fs::write(&b, b"y").unwrap();
-    assert!(!paths_equal(&a, &b));
-    // A non-existent path falls back to a direct compare (unequal).
-    assert!(!paths_equal(&dir.join("gone.gguf"), &a));
-    std::fs::remove_dir_all(&dir).ok();
-  }
-
-  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-  async fn ds4_tagged_snapshot_dispatches_to_alias_branch() {
-    // A snapshot tagged `resolved_backend: "ds4"` takes the ds4 adoption path
-    // (F8: dispatch keys on the recorded tag, not the process basename). The
-    // test process's argv carries no `-m <recorded path>`, so the ds4 branch's
-    // argv cross-check fails and the row is (correctly) stale — proving the
-    // ds4 branch ran, not the llama.cpp path/basename rule (which would have
-    // adopted on the alias-shaped body alone).
-    let live = std::process::id() as i32;
-    let body = serde_json::json!({
-      "object": "list",
-      "data": [{"id": "deepseek-v4-flash", "object": "model"}],
-    })
-    .to_string();
-    let (_resp, port) = spawn_one_shot(200, body).await;
-    let mut snap = fake_snapshot(live, port, "/m/deepseek-v4-flash.gguf", 1);
-    snap.resolved_backend = "ds4".to_string();
-    let report = sweep(SweepInputs {
-      recorded_running: &[snap],
-      external_markers: vec!["llamastash-sweep-marker-that-matches-nothing-9f3a"],
-      probe_timeout: Duration::from_secs(1),
-    })
-    .await;
-    assert!(
-      report.adopted.is_empty() && report.stale.len() == 1,
-      "ds4 branch must reject when argv `-m` doesn't match (adopted={}, stale={})",
-      report.adopted.len(),
-      report.stale.len()
-    );
   }
 
   #[test]

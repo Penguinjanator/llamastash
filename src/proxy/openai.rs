@@ -16,7 +16,8 @@
 use serde::{Deserialize, Serialize};
 
 /// One row of `/v1/models`. The four documented fields (`id`,
-/// `object`, `created`, `owned_by`) — agents pin against this shape.
+/// `object`, `created`, `owned_by`) — agents pin against this shape — plus
+/// llamastash's `mode`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelObject {
   /// User-visible identifier the client passes in `body.model`. For
@@ -38,6 +39,10 @@ pub struct ModelObject {
   /// Owner label. Hard-coded to `"llamastash"` — there is no
   /// per-model owner concept in v1.
   pub owned_by: &'static str,
+  /// `chat`, `embedding` or `rerank`, so a client can list only the models
+  /// that serve its endpoint. Absent when the model's header gave no signal.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub mode: Option<String>,
 }
 
 impl ModelObject {
@@ -45,12 +50,18 @@ impl ModelObject {
   /// caller's responsibility (derived from `display_label`
   /// → `path.file_stem()`); this constructor just stamps the three
   /// fixed fields so callers stay short.
+  pub fn with_mode(mut self, mode: Option<&str>) -> Self {
+    self.mode = mode.map(str::to_string);
+    self
+  }
+
   pub fn new(id: String) -> Self {
     Self {
       id,
       object: "model",
       created: 0,
       owned_by: "llamastash",
+      mode: None,
     }
   }
 }
@@ -170,6 +181,15 @@ impl ErrorObject {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn mode_is_listed_when_known_and_omitted_otherwise() {
+    let with =
+      serde_json::to_value(ModelObject::new("e".into()).with_mode(Some("embedding"))).unwrap();
+    assert_eq!(with["mode"], "embedding");
+    let without = serde_json::to_value(ModelObject::new("x".into())).unwrap();
+    assert!(without.get("mode").is_none(), "{without}");
+  }
 
   #[test]
   fn model_object_serializes_with_documented_fields() {
