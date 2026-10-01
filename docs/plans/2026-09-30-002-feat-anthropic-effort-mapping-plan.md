@@ -85,9 +85,10 @@ template error names the valid values), request params in presets (dropped
   wins" rule; tests on the rewritten bytes.
 - [x] U3. Check `thinking.type: disabled` on current llama.cpp; map it or
   document why not. **Not mapped**, rationale below.
-- [ ] U4. File the gufo `/v1/messages` 400 upstream (with the four field names
-  and the Claude Code docs link). **Drafted 2026-10-01, not filed** — text in
-  the appendix, tracked in `TODO.md`; filing waits for a go-ahead.
+- [x] U4. File the gufo `/v1/messages` 400 upstream (with the four field names
+  and the Claude Code docs link). **Filed 2026-10-01 as
+  [gufo-org/gufo#370](https://github.com/gufo-org/gufo/issues/370)**; text in
+  the appendix.
 - [x] U5. Docs: `docs/architecture.md` (proxy body rewrites), `docs/usage.md`
   (Claude Code effort), `CHANGELOG.md`.
 
@@ -213,10 +214,13 @@ Nine findings on the first cut, all addressed.
    rewrites nothing; the two rewrites now sit in one helper with that note.
 
 
-## Appendix: gufo upstream issue (drafted 2026-10-01, not filed)
+## Appendix: gufo upstream issue (filed as gufo-org/gufo#370)
 
-Target: [gufo-org/gufo](https://github.com/gufo-org/gufo). Facts measured at
-gufo `fd1710b` (2026-09-30) on this box, not re-measured since.
+Filed at [gufo-org/gufo#370](https://github.com/gufo-org/gufo/issues/370) on
+2026-10-01. Facts measured at gufo `fd1710b` / v0.3.0 (2026-09-30) on this box.
+v0.4.0 (`6aa87fc`, released the day of filing) carries the same rejected-field
+list in `src/cli/serve/http_server.cpp` and does not touch the `/v1/messages`
+handler, which the issue says; no v0.4.0 binary was run.
 
 **Title:** `/v1/messages` 400s on the Anthropic fields Claude Code sends
 
@@ -262,4 +266,4 @@ gufo `fd1710b` (2026-09-30) on this box, not re-measured since.
 >        "messages":[{"role":"user","content":"hi"}]}'
 > ```
 
-Filing it needs a go-ahead; nothing was posted to any tracker from this plan.
+Posted 2026-10-01 as [gufo-org/gufo#370](https://github.com/gufo-org/gufo/issues/370).
