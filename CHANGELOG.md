@@ -4,9 +4,23 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ## [Unreleased]
 
+### Added
+
+- `init` installs llama.cpp's CUDA build with its CUDA runtime on Linux + NVIDIA, and falls back to Vulkan when CUDA does not load (#93).
+- `init` integrations set reasoning effort to the levels the model's chat template accepts in pi, OpenCode, Zed and Codex (#93).
+- `init` integrations: Codex CLI profile, used with `codex --profile llamastash` (#93).
+
 ### Changed
 
 - Faster daemon boot and `stop`: looking up one process no longer scans every process on the host, and the boot sweep no longer reads every thread.
+
+### Fixed
+
+- `init` integrations and `api-key --json` use the port the daemon's proxy actually listens on (#93).
+- pi integration's output cap no longer cuts long thinking short (#93).
+- `init` integrations declare image input for vision models and, in Zed, send earlier thinking back to the model (#93).
+- OpenCode integration declares each model's context and output limits, so it compacts again (#93).
+- `init`'s GitHub Releases install streams downloads to disk and reuses a build it already installed (#93).
 
 ## [0.5.0] — 2026-09-30
 

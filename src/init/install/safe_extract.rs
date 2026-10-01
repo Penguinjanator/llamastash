@@ -56,27 +56,16 @@ pub struct ExtractedBinary {
 /// `dest_root.join(version_dir_name)` and the path of the resolved
 /// `llama-server` entry is returned. Refuses every adversarial shape
 /// listed in the module-level docs.
-pub fn safe_extract_tar_gz(
-  archive_bytes: &[u8],
+pub fn safe_extract_tar_gz<R: Read>(
+  archive: R,
   dest_root: &Path,
   version_dir_name: &str,
 ) -> Result<ExtractedBinary, InstallError> {
   std::fs::create_dir_all(dest_root).map_err(|e| InstallError::Io(e.to_string()))?;
-
-  // Early-return: versioned dir already present from a prior install.
-  // Skip extraction entirely (saves a full archive walk + write on every
-  // re-run of `init --only server`).
-  let final_dir = dest_root.join(version_dir_name);
-  if final_dir.exists() {
-    // Locate the actual `llama-server` inside `final_dir` rather than
-    // computing a path from the archive's layout — the two may not
-    // match (partial prior install, different release tarball schema).
-    let existing = find_llama_server(&final_dir).ok_or_else(|| InstallError::UnsafeArchive {
-      path: final_dir.display().to_string(),
-      reason: "pre-existing versioned dir does not contain a `llama-server` binary".into(),
-    })?;
-    return Ok(ExtractedBinary { path: existing });
+  if let Some(existing) = existing_install(dest_root, version_dir_name)? {
+    return Ok(existing);
   }
+  let final_dir = dest_root.join(version_dir_name);
 
   let tmp = tempfile::Builder::new()
     .prefix(&format!("{version_dir_name}.tmp."))
@@ -87,10 +76,9 @@ pub fn safe_extract_tar_gz(
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700));
   }
-  let mut total_uncompressed: u64 = 0;
-  let mut entry_count: usize = 0;
+  let mut caps = Caps::default();
 
-  let gz = GzDecoder::new(archive_bytes);
+  let gz = GzDecoder::new(archive);
   let mut tar = tar::Archive::new(gz);
   // Disable libtar's default permission setting (we override mode
   // explicitly) and disable symlink/hardlink restoration (refused).
@@ -104,49 +92,29 @@ pub fn safe_extract_tar_gz(
     .entries()
     .map_err(|e| InstallError::Io(format!("tar read: {e}")))?
   {
-    entry_count += 1;
-    if entry_count > MAX_ENTRIES {
-      return Err(InstallError::UnsafeArchive {
-        path: String::new(),
-        reason: format!("entry count exceeded the {MAX_ENTRIES} cap"),
-      });
-    }
+    caps.count()?;
     let mut entry = entry.map_err(|e| InstallError::Io(format!("tar entry: {e}")))?;
-    let entry_path =
-      entry
-        .path()
-        .map(|p| p.to_path_buf())
-        .map_err(|e| InstallError::UnsafeArchive {
-          path: String::new(),
-          reason: format!("bad path: {e}"),
-        })?;
-    let entry_path_str = entry_path.display().to_string();
+    let (entry_path, entry_path_str) = entry_path(&entry)?;
     let entry_type = entry.header().entry_type();
 
     // Hardlinks remain refused — release tarballs don't use them and
     // they're harder to bound safely (a hardlink to an already-extracted
     // SUID binary would inherit its mode).
     if entry_type == EntryType::Link {
-      return Err(InstallError::UnsafeArchive {
-        path: entry_path_str,
-        reason: "hardlink entries refused".into(),
-      });
+      return Err(unsafe_entry(&entry_path_str, "hardlink entries refused"));
     }
     // Refuse anything that isn't a regular file, directory, or symlink.
     if !matches!(
       entry_type,
       EntryType::Regular | EntryType::Directory | EntryType::Symlink
     ) {
-      return Err(InstallError::UnsafeArchive {
-        path: entry_path_str,
-        reason: format!("unsupported entry type {entry_type:?}"),
-      });
+      return Err(unsafe_entry(
+        &entry_path_str,
+        format!("unsupported entry type {entry_type:?}"),
+      ));
     }
     let safe_rel =
-      safe_relative_path(&entry_path).map_err(|reason| InstallError::UnsafeArchive {
-        path: entry_path_str.clone(),
-        reason,
-      })?;
+      safe_relative_path(&entry_path).map_err(|reason| unsafe_entry(&entry_path_str, reason))?;
     let target = tmp.path().join(&safe_rel);
 
     if entry_type == EntryType::Directory {
@@ -157,20 +125,10 @@ pub fn safe_extract_tar_gz(
     if entry_type == EntryType::Symlink {
       let link_name = entry
         .link_name()
-        .map_err(|e| InstallError::UnsafeArchive {
-          path: entry_path_str.clone(),
-          reason: format!("symlink target unreadable: {e}"),
-        })?
-        .ok_or_else(|| InstallError::UnsafeArchive {
-          path: entry_path_str.clone(),
-          reason: "symlink with no target".into(),
-        })?;
-      let safe_link = safe_symlink_target(&safe_rel, &link_name).map_err(|reason| {
-        InstallError::UnsafeArchive {
-          path: entry_path_str.clone(),
-          reason,
-        }
-      })?;
+        .map_err(|e| unsafe_entry(&entry_path_str, format!("symlink target unreadable: {e}")))?
+        .ok_or_else(|| unsafe_entry(&entry_path_str, "symlink with no target"))?;
+      let safe_link = safe_symlink_target(&safe_rel, &link_name)
+        .map_err(|reason| unsafe_entry(&entry_path_str, reason))?;
       if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(|e| InstallError::Io(e.to_string()))?;
       }
@@ -189,36 +147,13 @@ pub fn safe_extract_tar_gz(
       continue;
     }
 
-    // Per-entry size check: refuse before allocating buffers.
-    let entry_size = entry.header().size().unwrap_or(0);
-    if entry_size > MAX_PER_ENTRY_UNCOMPRESSED_BYTES {
-      return Err(InstallError::UnsafeArchive {
-        path: entry_path_str,
-        reason: format!(
-          "entry size {entry_size} exceeds per-entry cap of \
-           {MAX_PER_ENTRY_UNCOMPRESSED_BYTES} bytes"
-        ),
-      });
-    }
-    total_uncompressed = total_uncompressed.saturating_add(entry_size);
-    if total_uncompressed > MAX_TOTAL_UNCOMPRESSED_BYTES {
-      return Err(InstallError::UnsafeArchive {
-        path: entry_path_str,
-        reason: format!(
-          "total uncompressed size exceeded the {MAX_TOTAL_UNCOMPRESSED_BYTES}-byte cap"
-        ),
-      });
-    }
+    caps.charge(&entry_path_str, entry.header().size().unwrap_or(0))?;
     // Ensure parent dir exists; we already validated path safety.
     if let Some(parent) = target.parent() {
       std::fs::create_dir_all(parent).map_err(|e| InstallError::Io(e.to_string()))?;
     }
     let mut out = std::fs::File::create(&target).map_err(|e| InstallError::Io(e.to_string()))?;
-    // Per-entry cap on the actual byte stream, not just the declared
-    // header size — an attacker who passes the line 178 header check
-    // by declaring < MAX_PER_ENTRY can still attempt to stream more.
-    let mut limited = entry.by_ref().take(MAX_PER_ENTRY_UNCOMPRESSED_BYTES);
-    std::io::copy(&mut limited, &mut out).map_err(|e| InstallError::Io(e.to_string()))?;
+    copy_capped(&mut entry, &mut out)?;
     drop(out);
     #[cfg(unix)]
     {
@@ -265,25 +200,168 @@ pub fn safe_extract_tar_gz(
   })
 }
 
+/// Extract a runtime-library bundle (the Linux `cudart-` tarball) flat
+/// into `dest_dir`, the directory holding the installed binary.
+///
+/// Stricter than [`safe_extract_tar_gz`]: only directories and regular
+/// files named `lib*.so*` are accepted, each written under its own file
+/// name directly in `dest_dir`, since the binaries resolve them through
+/// an `$ORIGIN` rpath. Same size and entry caps. Each file lands through
+/// a temp file and a rename, so an interrupted run leaves no partial
+/// library behind; an existing file of the same name is replaced.
+pub fn safe_extract_libs_tar_gz<R: Read>(archive: R, dest_dir: &Path) -> Result<(), InstallError> {
+  let mut tar = tar::Archive::new(GzDecoder::new(archive));
+  let mut caps = Caps::default();
+  let mut written = 0usize;
+  for entry in tar
+    .entries()
+    .map_err(|e| InstallError::Io(format!("tar read: {e}")))?
+  {
+    caps.count()?;
+    let mut entry = entry.map_err(|e| InstallError::Io(format!("tar entry: {e}")))?;
+    let (entry_path, entry_path_str) = entry_path(&entry)?;
+    let refuse = |reason: &str| unsafe_entry(&entry_path_str, reason);
+    let safe_rel = safe_relative_path(&entry_path).map_err(|r| refuse(&r))?;
+    match entry.header().entry_type() {
+      EntryType::Directory => continue,
+      EntryType::Regular => {}
+      other => return Err(refuse(&format!("unsupported entry type {other:?}"))),
+    }
+    let name = safe_rel
+      .file_name()
+      .and_then(|n| n.to_str())
+      .ok_or_else(|| refuse("entry has no file name"))?;
+    if !(name.starts_with("lib") && name.contains(".so")) {
+      return Err(refuse("not a shared library"));
+    }
+    caps.charge(&entry_path_str, entry.header().size().unwrap_or(0))?;
+    let mut tmp = tempfile::Builder::new()
+      .prefix(&format!(".{name}.tmp."))
+      .tempfile_in(dest_dir)
+      .map_err(|e| InstallError::Io(e.to_string()))?;
+    copy_capped(&mut entry, tmp.as_file_mut())?;
+    tmp
+      .persist(dest_dir.join(name))
+      .map_err(|e| InstallError::Io(format!("persist {name}: {e}")))?;
+    written += 1;
+  }
+  if written == 0 {
+    return Err(InstallError::UnsafeArchive {
+      path: String::new(),
+      reason: "runtime bundle held no shared libraries".into(),
+    });
+  }
+  Ok(())
+}
+
+/// The `llama-server` an earlier run extracted to
+/// `dest_root/version_dir_name`, when that dir exists. Extraction lands
+/// through a rename, so an existing dir holds a finished install.
+pub fn existing_install(
+  dest_root: &Path,
+  version_dir_name: &str,
+) -> Result<Option<ExtractedBinary>, InstallError> {
+  let final_dir = dest_root.join(version_dir_name);
+  if !final_dir.exists() {
+    return Ok(None);
+  }
+  // Locate the actual `llama-server` inside `final_dir` rather than
+  // computing a path from the archive's layout — the two may not
+  // match (partial prior install, different release tarball schema).
+  let path = find_llama_server(&final_dir).ok_or_else(|| InstallError::UnsafeArchive {
+    path: final_dir.display().to_string(),
+    reason: "pre-existing versioned dir does not contain a `llama-server` binary".into(),
+  })?;
+  Ok(Some(ExtractedBinary { path }))
+}
+
+fn unsafe_entry(path: &str, reason: impl Into<String>) -> InstallError {
+  InstallError::UnsafeArchive {
+    path: path.to_string(),
+    reason: reason.into(),
+  }
+}
+
+/// A tar entry's raw path, and its display form for refusals.
+fn entry_path<R: Read>(entry: &tar::Entry<'_, R>) -> Result<(PathBuf, String), InstallError> {
+  let path = entry
+    .path()
+    .map(|p| p.to_path_buf())
+    .map_err(|e| unsafe_entry("", format!("bad path: {e}")))?;
+  let shown = path.display().to_string();
+  Ok((path, shown))
+}
+
+/// Running entry count and uncompressed total, checked against the caps.
+#[derive(Default)]
+struct Caps {
+  entries: usize,
+  total: u64,
+}
+
+impl Caps {
+  fn count(&mut self) -> Result<(), InstallError> {
+    self.entries += 1;
+    if self.entries > MAX_ENTRIES {
+      return Err(unsafe_entry(
+        "",
+        format!("entry count exceeded the {MAX_ENTRIES} cap"),
+      ));
+    }
+    Ok(())
+  }
+
+  /// Charge a file entry's declared size, before anything is written.
+  fn charge(&mut self, path: &str, size: u64) -> Result<(), InstallError> {
+    if size > MAX_PER_ENTRY_UNCOMPRESSED_BYTES {
+      return Err(unsafe_entry(
+        path,
+        format!(
+          "entry size {size} exceeds per-entry cap of \
+           {MAX_PER_ENTRY_UNCOMPRESSED_BYTES} bytes"
+        ),
+      ));
+    }
+    self.total = self.total.saturating_add(size);
+    if self.total > MAX_TOTAL_UNCOMPRESSED_BYTES {
+      return Err(unsafe_entry(
+        path,
+        format!("total uncompressed size exceeded the {MAX_TOTAL_UNCOMPRESSED_BYTES}-byte cap"),
+      ));
+    }
+    Ok(())
+  }
+}
+
+/// Copy at most the per-entry cap, whatever size the header declared.
+fn copy_capped(entry: &mut impl Read, out: &mut impl std::io::Write) -> Result<(), InstallError> {
+  let mut limited = entry.take(MAX_PER_ENTRY_UNCOMPRESSED_BYTES);
+  std::io::copy(&mut limited, out).map_err(|e| InstallError::Io(e.to_string()))?;
+  Ok(())
+}
+
 /// Dispatch on `archive_name`'s extension to either the tar.gz or
-/// (Windows-only) zip extraction codepath. The picked filename's
-/// trailing extension drives the choice — `.zip` routes through the
-/// Windows backend, `.tar.gz` / `.tgz` routes through the tar reader.
-/// Anything else surfaces an `UnsafeArchive` refusal so the caller
-/// can fall back to the manual-path install flow.
+/// (Windows-only) zip extraction codepath, reading the archive from
+/// `archive_path`. The picked filename's trailing extension drives the
+/// choice — `.zip` routes through the Windows backend, `.tar.gz` / `.tgz`
+/// routes through the tar reader. Anything else surfaces an
+/// `UnsafeArchive` refusal so the caller can fall back to the
+/// manual-path install flow.
 pub fn safe_extract(
   archive_name: &str,
-  archive_bytes: &[u8],
+  archive_path: &Path,
   dest_root: &Path,
   version_dir_name: &str,
 ) -> Result<ExtractedBinary, InstallError> {
   let lower = archive_name.to_ascii_lowercase();
   if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
-    return safe_extract_tar_gz(archive_bytes, dest_root, version_dir_name);
+    let file = std::fs::File::open(archive_path).map_err(|e| InstallError::Io(e.to_string()))?;
+    return safe_extract_tar_gz(std::io::BufReader::new(file), dest_root, version_dir_name);
   }
   #[cfg(windows)]
   if lower.ends_with(".zip") {
-    return safe_extract_zip(archive_bytes, dest_root, version_dir_name);
+    let file = std::fs::File::open(archive_path).map_err(|e| InstallError::Io(e.to_string()))?;
+    return safe_extract_zip(std::io::BufReader::new(file), dest_root, version_dir_name);
   }
   #[cfg(not(windows))]
   if lower.ends_with(".zip") {
@@ -301,7 +379,7 @@ pub fn safe_extract(
   })
 }
 
-/// Stream the `.zip` body in `archive_bytes` into a unique tmp dir
+/// Stream the `.zip` in `archive` into a unique tmp dir
 /// under `dest_root`. Same safety contract as
 /// [`safe_extract_tar_gz`]: entry path validation rejects `..` /
 /// absolute / Windows-drive-prefix entries, per-entry and total-size
@@ -310,32 +388,24 @@ pub fn safe_extract(
 /// bits is ignored — Windows llama.cpp releases don't ship SONAME
 /// chains the way Linux .tar.gz does).
 #[cfg(windows)]
-pub fn safe_extract_zip(
-  archive_bytes: &[u8],
+pub fn safe_extract_zip<R: Read + std::io::Seek>(
+  archive: R,
   dest_root: &Path,
   version_dir_name: &str,
 ) -> Result<ExtractedBinary, InstallError> {
-  use std::io::Cursor;
-
   std::fs::create_dir_all(dest_root).map_err(|e| InstallError::Io(e.to_string()))?;
-
-  let final_dir = dest_root.join(version_dir_name);
-  if final_dir.exists() {
-    let existing = find_llama_server(&final_dir).ok_or_else(|| InstallError::UnsafeArchive {
-      path: final_dir.display().to_string(),
-      reason: "pre-existing versioned dir does not contain a `llama-server` binary".into(),
-    })?;
-    return Ok(ExtractedBinary { path: existing });
+  if let Some(existing) = existing_install(dest_root, version_dir_name)? {
+    return Ok(existing);
   }
+  let final_dir = dest_root.join(version_dir_name);
 
   let tmp = tempfile::Builder::new()
     .prefix(&format!("{version_dir_name}.tmp."))
     .tempdir_in(dest_root)
     .map_err(|e| InstallError::Io(e.to_string()))?;
 
-  let cursor = Cursor::new(archive_bytes);
   let mut archive =
-    zip::ZipArchive::new(cursor).map_err(|e| InstallError::Io(format!("zip open: {e}")))?;
+    zip::ZipArchive::new(archive).map_err(|e| InstallError::Io(format!("zip open: {e}")))?;
 
   let entry_count = archive.len();
   if entry_count > MAX_ENTRIES {
@@ -582,6 +652,14 @@ mod tests {
     crate::util::test_temp::unique_temp_dir(&format!("extract-{label}"))
   }
 
+  /// Write `bytes` to a fresh file, the way the installer hands
+  /// [`safe_extract`] a downloaded archive.
+  fn on_disk(label: &str, bytes: &[u8]) -> PathBuf {
+    let path = temp_dir(&format!("{label}-src")).join("archive");
+    std::fs::write(&path, bytes).unwrap();
+    path
+  }
+
   fn build_archive<F: FnOnce(&mut Builder<GzEncoder<Vec<u8>>>)>(f: F) -> Vec<u8> {
     let buf: Vec<u8> = Vec::new();
     let enc = GzEncoder::new(buf, Compression::fast());
@@ -606,7 +684,7 @@ mod tests {
       write_file_entry(tar, "build/bin/README.md", b"docs");
     });
     let dest = temp_dir("happy");
-    let out = safe_extract_tar_gz(&archive, &dest, "b9999").expect("extract");
+    let out = safe_extract_tar_gz(archive.as_slice(), &dest, "b9999").expect("extract");
     assert!(out.path.is_file());
     assert!(out.path.ends_with("build/bin/llama-server"));
     #[cfg(unix)]
@@ -615,6 +693,52 @@ mod tests {
       let mode = std::fs::metadata(&out.path).unwrap().permissions().mode() & 0o777;
       assert_eq!(mode, 0o700, "llama-server must be chmod 0700");
     }
+    std::fs::remove_dir_all(&dest).ok();
+  }
+
+  #[test]
+  fn runtime_libs_land_flat_beside_the_binary() {
+    // Upstream's layout: one wrapping dir holding the three libraries.
+    let top = "cudart-llama-b11302-bin-ubuntu-cuda-13.4-x64";
+    let archive = build_archive(|tar| {
+      for lib in ["libcudart.so.13", "libcublas.so.13", "libcublasLt.so.13"] {
+        write_file_entry(tar, &format!("{top}/{lib}"), lib.as_bytes());
+      }
+    });
+    let dest = temp_dir("libs-flat");
+    std::fs::write(dest.join("llama-server"), b"bin").unwrap();
+    safe_extract_libs_tar_gz(archive.as_slice(), &dest).expect("extract");
+    assert_eq!(
+      std::fs::read(dest.join("libcudart.so.13")).unwrap(),
+      b"libcudart.so.13"
+    );
+    assert!(dest.join("libcublasLt.so.13").is_file());
+    assert!(!dest.join(top).exists(), "no wrapping dir");
+    std::fs::remove_dir_all(&dest).ok();
+  }
+
+  #[test]
+  fn runtime_bundle_refuses_anything_but_shared_libraries() {
+    let dest = temp_dir("libs-refuse");
+    let exe = build_archive(|tar| write_file_entry(tar, "top/llama-server", b"swap"));
+    assert!(matches!(
+      safe_extract_libs_tar_gz(exe.as_slice(), &dest),
+      Err(InstallError::UnsafeArchive { .. })
+    ));
+    assert!(!dest.join("llama-server").exists());
+    let link = build_archive(|tar| {
+      let mut header = Header::new_gnu();
+      header.set_size(0);
+      header.set_entry_type(EntryType::Symlink);
+      header.set_link_name("/usr/lib/libc.so.6").unwrap();
+      header.set_cksum();
+      tar
+        .append_data(&mut header, "top/libcudart.so.13", &[][..])
+        .unwrap();
+    });
+    assert!(safe_extract_libs_tar_gz(link.as_slice(), &dest).is_err());
+    let empty = build_archive(|_| {});
+    assert!(safe_extract_libs_tar_gz(empty.as_slice(), &dest).is_err());
     std::fs::remove_dir_all(&dest).ok();
   }
 
@@ -656,7 +780,7 @@ mod tests {
         .unwrap();
     });
     let dest = temp_dir("hardlink");
-    let err = safe_extract_tar_gz(&archive, &dest, "b9999").unwrap_err();
+    let err = safe_extract_tar_gz(archive.as_slice(), &dest, "b9999").unwrap_err();
     assert!(
       matches!(err, InstallError::UnsafeArchive { ref reason, .. } if reason.contains("hardlink")),
       "expected hardlink refusal, got {err:?}"
@@ -678,7 +802,7 @@ mod tests {
         .unwrap();
     });
     let dest = temp_dir("symlink-abs");
-    let err = safe_extract_tar_gz(&archive, &dest, "b9999").unwrap_err();
+    let err = safe_extract_tar_gz(archive.as_slice(), &dest, "b9999").unwrap_err();
     assert!(
       matches!(err, InstallError::UnsafeArchive { ref reason, .. } if reason.contains("absolute")),
       "expected absolute-target refusal, got {err:?}"
@@ -703,7 +827,7 @@ mod tests {
         .unwrap();
     });
     let dest = temp_dir("fifo-entry");
-    let err = safe_extract_tar_gz(&archive, &dest, "b9999").unwrap_err();
+    let err = safe_extract_tar_gz(archive.as_slice(), &dest, "b9999").unwrap_err();
     assert!(
       matches!(err, InstallError::UnsafeArchive { ref reason, .. } if reason.contains("unsupported entry type")),
       "expected unsupported-entry-type refusal, got {err:?}"
@@ -730,7 +854,7 @@ mod tests {
         .unwrap();
     });
     let dest = temp_dir("symlink-no-target");
-    let err = safe_extract_tar_gz(&archive, &dest, "b9999").unwrap_err();
+    let err = safe_extract_tar_gz(archive.as_slice(), &dest, "b9999").unwrap_err();
     assert!(
       matches!(err, InstallError::UnsafeArchive { ref reason, .. } if reason.contains("no target") || reason.contains("empty")),
       "expected no-target or empty-target refusal, got {err:?}"
@@ -755,7 +879,7 @@ mod tests {
       tar.append_data(&mut header, "loop", &[][..]).unwrap();
     });
     let dest = temp_dir("self-loop-symlink");
-    let err = safe_extract_tar_gz(&archive, &dest, "b9999").unwrap_err();
+    let err = safe_extract_tar_gz(archive.as_slice(), &dest, "b9999").unwrap_err();
     assert!(
       matches!(err, InstallError::UnsafeArchive { ref reason, .. } if reason.contains("strict subpath") || reason.contains("empty")),
       "expected self-loop refusal, got {err:?}"
@@ -775,7 +899,7 @@ mod tests {
       tar.append_data(&mut header, "evil-link", &[][..]).unwrap();
     });
     let dest = temp_dir("symlink-escape");
-    let err = safe_extract_tar_gz(&archive, &dest, "b9999").unwrap_err();
+    let err = safe_extract_tar_gz(archive.as_slice(), &dest, "b9999").unwrap_err();
     assert!(
       matches!(err, InstallError::UnsafeArchive { ref reason, .. } if reason.contains("escapes")),
       "expected dotdot-escape refusal, got {err:?}"
@@ -809,7 +933,7 @@ mod tests {
         .unwrap();
     });
     let dest = temp_dir("soname-chain");
-    let out = safe_extract_tar_gz(&archive, &dest, "b9999").expect("extract");
+    let out = safe_extract_tar_gz(archive.as_slice(), &dest, "b9999").expect("extract");
     let dir = out.path.parent().unwrap();
     let unversioned = dir.join("libllama.so");
     let soname = dir.join("libllama.so.0");
@@ -842,7 +966,7 @@ mod tests {
       write_file_entry(tar, "build/bin/some-other-binary", b"surprise");
     });
     let dest = temp_dir("no-binary");
-    let err = safe_extract_tar_gz(&archive, &dest, "b9999").unwrap_err();
+    let err = safe_extract_tar_gz(archive.as_slice(), &dest, "b9999").unwrap_err();
     assert!(
       matches!(err, InstallError::UnsafeArchive { ref reason, .. } if reason.contains("llama-server")),
       "expected llama-server-missing refusal, got {err:?}"
@@ -883,7 +1007,7 @@ mod tests {
       }
     });
     let dest = temp_dir("entry-count");
-    let err = safe_extract_tar_gz(&archive, &dest, "b9999").unwrap_err();
+    let err = safe_extract_tar_gz(archive.as_slice(), &dest, "b9999").unwrap_err();
     assert!(
       matches!(err, InstallError::UnsafeArchive { ref reason, .. } if reason.contains("entry count")),
       "expected entry-count cap refusal, got {err:?}"
@@ -904,7 +1028,7 @@ mod tests {
       );
     });
     let dest = temp_dir("per-entry-cap");
-    let err = safe_extract_tar_gz(&archive, &dest, "b9999").unwrap_err();
+    let err = safe_extract_tar_gz(archive.as_slice(), &dest, "b9999").unwrap_err();
     assert!(
       matches!(err, InstallError::UnsafeArchive { ref reason, .. } if reason.contains("per-entry cap")),
       "expected per-entry cap refusal, got {err:?}"
@@ -936,7 +1060,7 @@ mod tests {
       write_file_entry(tar, "build/bin/llama-server", b"v1");
     });
     let dest = temp_dir("existing");
-    let out_a = safe_extract_tar_gz(&archive_a, &dest, "b9999").expect("first extract");
+    let out_a = safe_extract_tar_gz(archive_a.as_slice(), &dest, "b9999").expect("first extract");
     assert!(out_a.path.is_file());
     // Second archive places the binary at a different relative
     // path. If the early-return code naively joined the new
@@ -945,7 +1069,7 @@ mod tests {
     let archive_b = build_archive(|tar| {
       write_file_entry(tar, "binaries/llama-server", b"v1");
     });
-    let out_b = safe_extract_tar_gz(&archive_b, &dest, "b9999").expect("second extract");
+    let out_b = safe_extract_tar_gz(archive_b.as_slice(), &dest, "b9999").expect("second extract");
     assert!(
       out_b.path.is_file(),
       "early-return must locate the binary actually on disk, got {}",
@@ -962,7 +1086,8 @@ mod tests {
     // Anything that isn't a known archive extension surfaces an
     // actionable refusal — callers should not silently pass through.
     let dest = temp_dir("dispatch-bad-ext");
-    let err = safe_extract("artifact.exe", b"not an archive", &dest, "b9999").unwrap_err();
+    let src = on_disk("dispatch-bad-ext", b"not an archive");
+    let err = safe_extract("artifact.exe", &src, &dest, "b9999").unwrap_err();
     assert!(
       matches!(err, InstallError::UnsafeArchive { ref reason, .. } if reason.contains("unsupported archive extension")),
       "expected unsupported-extension refusal, got {err:?}"
@@ -976,13 +1101,9 @@ mod tests {
       write_file_entry(tar, "build/bin/llama-server", b"#!/bin/sh\necho ok\n");
     });
     let dest = temp_dir("dispatch-targz");
-    let out = safe_extract(
-      "llama-b9999-bin-ubuntu-x64.tar.gz",
-      &archive,
-      &dest,
-      "b9999",
-    )
-    .expect("tar.gz route");
+    let src = on_disk("dispatch-targz", &archive);
+    let out = safe_extract("llama-b9999-bin-ubuntu-x64.tar.gz", &src, &dest, "b9999")
+      .expect("tar.gz route");
     assert!(out.path.ends_with("build/bin/llama-server"));
     std::fs::remove_dir_all(&dest).ok();
   }
@@ -991,13 +1112,8 @@ mod tests {
   #[test]
   fn safe_extract_refuses_zip_on_non_windows() {
     let dest = temp_dir("dispatch-zip-not-windows");
-    let err = safe_extract(
-      "llama-b9999-bin-win-cpu-x64.zip",
-      b"PK\x03\x04",
-      &dest,
-      "b9999",
-    )
-    .unwrap_err();
+    let src = on_disk("dispatch-zip-not-windows", b"PK\x03\x04");
+    let err = safe_extract("llama-b9999-bin-win-cpu-x64.zip", &src, &dest, "b9999").unwrap_err();
     assert!(
       matches!(err, InstallError::UnsafeArchive { ref reason, .. } if reason.contains("only supported on Windows")),
       "expected non-Windows zip refusal, got {err:?}"
@@ -1037,7 +1153,7 @@ mod tests {
         write_zip_file(w, "README.txt", b"docs");
       });
       let dest = temp_dir("zip-happy");
-      let out = safe_extract_zip(&archive, &dest, "b9999").expect("zip extract");
+      let out = safe_extract_zip(Cursor::new(archive), &dest, "b9999").expect("zip extract");
       assert!(out.path.is_file(), "binary not extracted");
       assert!(out.path.ends_with("llama-server.exe"));
       std::fs::remove_dir_all(&dest).ok();
@@ -1049,7 +1165,7 @@ mod tests {
         write_zip_file(w, "other.exe", b"MZ");
       });
       let dest = temp_dir("zip-no-binary");
-      let err = safe_extract_zip(&archive, &dest, "b9999").unwrap_err();
+      let err = safe_extract_zip(Cursor::new(archive), &dest, "b9999").unwrap_err();
       assert!(
         matches!(err, InstallError::UnsafeArchive { ref reason, .. } if reason.contains("llama-server.exe")),
         "expected missing-binary refusal, got {err:?}"
@@ -1066,7 +1182,7 @@ mod tests {
         write_zip_file(w, "../escape.exe", b"evil");
       });
       let dest = temp_dir("zip-traversal");
-      let err = safe_extract_zip(&archive, &dest, "b9999").unwrap_err();
+      let err = safe_extract_zip(Cursor::new(archive), &dest, "b9999").unwrap_err();
       assert!(
         matches!(err, InstallError::UnsafeArchive { .. }),
         "expected traversal refusal, got {err:?}"
@@ -1080,8 +1196,9 @@ mod tests {
         write_zip_file(w, "llama-server.exe", b"MZ");
       });
       let dest = temp_dir("dispatch-zip");
-      let out = safe_extract("llama-b9999-bin-win-cpu-x64.zip", &archive, &dest, "b9999")
-        .expect("zip route");
+      let src = on_disk("dispatch-zip", &archive);
+      let out =
+        safe_extract("llama-b9999-bin-win-cpu-x64.zip", &src, &dest, "b9999").expect("zip route");
       assert!(out.path.ends_with("llama-server.exe"));
       std::fs::remove_dir_all(&dest).ok();
     }
@@ -1100,7 +1217,7 @@ mod tests {
     let archive = build_archive(|tar| {
       write_file_entry(tar, "build/bin/llama-server", b"new binary");
     });
-    let err = safe_extract_tar_gz(&archive, &dest, "b9999").unwrap_err();
+    let err = safe_extract_tar_gz(archive.as_slice(), &dest, "b9999").unwrap_err();
     assert!(
       matches!(err, InstallError::UnsafeArchive { ref reason, .. } if reason.contains("llama-server")),
       "expected actionable missing-binary error, got {err:?}"

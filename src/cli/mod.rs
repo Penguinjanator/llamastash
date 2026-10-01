@@ -136,7 +136,7 @@ pub async fn dispatch(mut cli: Cli, config: LoadedConfig) -> Result<i32> {
       )
       .await
     }
-    Some(Command::ApiKey(args)) => api_key::handle(args, &cli, resolved_config),
+    Some(Command::ApiKey(args)) => api_key::handle(args, &cli, resolved_config).await,
     Some(Command::Doctor(args)) => doctor::handle(args, &cli, resolved_config).await,
     #[cfg(feature = "uat")]
     Some(Command::Uat(args)) => uat::handle(args, &cli, resolved_config).await,

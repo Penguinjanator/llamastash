@@ -177,6 +177,44 @@ impl FetchClient {
     url: &str,
     max_bytes: u64,
   ) -> Result<(Vec<u8>, reqwest::header::HeaderMap), FetchError> {
+    let response = self.send_checked(url, max_bytes).await?;
+    let headers = response.headers().clone();
+    let mut total = 0_u64;
+    let mut buf: Vec<u8> = Vec::with_capacity(
+      response
+        .content_length()
+        .map(|n| n.min(max_bytes) as usize)
+        .unwrap_or(0),
+    );
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+      let chunk = chunk.map_err(|e| FetchError::Transport(e.to_string()))?;
+      total = total.saturating_add(chunk.len() as u64);
+      if total > max_bytes {
+        return Err(FetchError::BodyOverflow { cap: max_bytes });
+      }
+      buf.extend_from_slice(&chunk);
+    }
+    Ok((buf, headers))
+  }
+
+  /// Same contract as [`Self::get_bytes`], but the body is streamed into
+  /// `out` and hashed on the way instead of held in memory. Returns the
+  /// body's SHA-256 as lowercase hex. For release assets in the hundreds
+  /// of MB.
+  pub async fn download_to(
+    &self,
+    url: &str,
+    max_bytes: u64,
+    out: &mut std::fs::File,
+  ) -> Result<String, FetchError> {
+    let response = self.send_checked(url, max_bytes).await?;
+    write_hashed(response.bytes_stream(), max_bytes, out).await
+  }
+
+  /// Send the GET and turn rate limits, non-success statuses and an
+  /// over-cap `Content-Length` into errors before any body is read.
+  async fn send_checked(&self, url: &str, max_bytes: u64) -> Result<reqwest::Response, FetchError> {
     let (client, allowlist) = match &self.inner {
       Mode::Online { client, allowlist } => (client, allowlist),
       Mode::Offline => return Err(FetchError::Offline),
@@ -212,24 +250,7 @@ impl FetchClient {
         return Err(FetchError::BodyOverflow { cap: max_bytes });
       }
     }
-    let headers = response.headers().clone();
-    let mut total = 0_u64;
-    let mut buf: Vec<u8> = Vec::with_capacity(
-      response
-        .content_length()
-        .map(|n| n.min(max_bytes) as usize)
-        .unwrap_or(0),
-    );
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-      let chunk = chunk.map_err(|e| FetchError::Transport(e.to_string()))?;
-      total = total.saturating_add(chunk.len() as u64);
-      if total > max_bytes {
-        return Err(FetchError::BodyOverflow { cap: max_bytes });
-      }
-      buf.extend_from_slice(&chunk);
-    }
-    Ok((buf, headers))
+    Ok(response)
   }
 
   /// GET `url`, parse the body as JSON into `T`. Body capped at
@@ -321,6 +342,40 @@ pub fn build_with_offline_check(
   FetchClient::new(cfg)
 }
 
+/// Copy a body stream into `out`, hashing it on the way. Stops with
+/// `BodyOverflow` before writing the chunk that passes `max_bytes`.
+/// Returns the SHA-256 as lowercase hex.
+async fn write_hashed<S, B, E>(
+  mut stream: S,
+  max_bytes: u64,
+  out: &mut impl std::io::Write,
+) -> Result<String, FetchError>
+where
+  S: futures::Stream<Item = Result<B, E>> + Unpin,
+  B: AsRef<[u8]>,
+  E: std::fmt::Display,
+{
+  use sha2::{Digest, Sha256};
+  let mut hasher = Sha256::new();
+  let mut total = 0_u64;
+  while let Some(chunk) = stream.next().await {
+    let chunk = chunk.map_err(|e| FetchError::Transport(e.to_string()))?;
+    let chunk = chunk.as_ref();
+    total = total.saturating_add(chunk.len() as u64);
+    if total > max_bytes {
+      return Err(FetchError::BodyOverflow { cap: max_bytes });
+    }
+    hasher.update(chunk);
+    out
+      .write_all(chunk)
+      .map_err(|e| FetchError::Transport(format!("write: {e}")))?;
+  }
+  out
+    .flush()
+    .map_err(|e| FetchError::Transport(format!("write: {e}")))?;
+  Ok(crate::util::hex::encode(hasher.finalize().as_slice()))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -334,6 +389,51 @@ mod tests {
     let json_result: Result<serde_json::Value, _> =
       c.get_json("https://api.github.com/", 1024).await;
     assert!(matches!(json_result, Err(FetchError::Offline)));
+    let mut file = tempfile::tempfile().expect("tempfile");
+    let download = c
+      .download_to("https://api.github.com/", 1024, &mut file)
+      .await;
+    assert!(matches!(download, Err(FetchError::Offline)));
+  }
+
+  fn chunks(parts: &[&'static [u8]]) -> impl futures::Stream<Item = Result<&'static [u8], String>> {
+    futures::stream::iter(parts.iter().map(|p| Ok(*p)).collect::<Vec<_>>())
+  }
+
+  #[tokio::test]
+  async fn a_streamed_body_is_written_whole_and_hashed() {
+    let mut out = Vec::new();
+    let digest = write_hashed(chunks(&[b"hello ", b"world"]), 11, &mut out)
+      .await
+      .expect("fits the cap exactly");
+    assert_eq!(out, b"hello world");
+    // `printf 'hello world' | sha256sum`
+    assert_eq!(
+      digest,
+      "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+    );
+  }
+
+  #[tokio::test]
+  async fn a_body_past_the_cap_stops_before_the_overflowing_chunk() {
+    let mut out = Vec::new();
+    let err = write_hashed(chunks(&[b"hello ", b"world"]), 10, &mut out)
+      .await
+      .unwrap_err();
+    assert!(matches!(err, FetchError::BodyOverflow { cap: 10 }));
+    assert_eq!(
+      out, b"hello ",
+      "the chunk that passed the cap was not written"
+    );
+  }
+
+  #[tokio::test]
+  async fn a_stream_error_is_a_transport_error() {
+    let stream = futures::stream::iter(vec![Ok(&b"a"[..]), Err("reset".to_string())]);
+    let err = write_hashed(stream, 100, &mut Vec::new())
+      .await
+      .unwrap_err();
+    assert!(matches!(err, FetchError::Transport(ref m) if m == "reset"));
   }
 
   #[tokio::test]
