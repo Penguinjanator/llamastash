@@ -371,13 +371,9 @@ places.
 
 ## R12 (v0.6.0 checklist)
 
-### Tests
+Order: batch 1 → batch 2; batch 3 runs alongside. Dropped 2026-09-30: request params in presets (every engine already takes `reasoning_effort` per request) and a proxy clamp for unsupported effort values (the template error names the valid values); reasons in the batch 2 and 3 plans.
 
-- [x] ~~**`the_entry_grace_is_a_floor_under_every_stop` is flaky.**~~ Failed once on 2026-10-01 at [`tests/generic_backend_test.rs`](tests/generic_backend_test.rs) line 380: the stop returned after 1.5 ms instead of after the fixture's 2 s SIGTERM drain. Fixed: [`fake_llama_server`](tests/fixtures/fake_llama_server.rs) installed its SIGTERM handlers inside a spawned task, which could run after `/health` answered, so an early SIGTERM killed it with the default action. Both handlers (`--sigterm-exit-delay-ms`, `--trap-sigterm`) are now installed before the spawn.
-- [x] ~~**Daemon-spawning tests time out on a busy host.**~~ On 2026-10-01 a pre-push `nextest` run failed 15 tests with `detached daemon did not bind control plane within 20s` or `daemon never came up` while a model server was running. `generic_backend_test`, `preset_config_ipc_test`, `sglang_backend_test` and `vllm_backend_test` boot a daemon but ran outside the `daemon-bound` group. Fixed: they are in the group in [`.config/nextest.toml`](.config/nextest.toml), and the cap went from 4 to 8, because at 4 their sleep-bound tests queued and added ~10 s to a ~16 s run. Old vs new, 3 alternating local runs: 19.6 / 18.1 / 20.1 s vs 15.7 / 16.9 / 17.3 s, all passing.
-  - [ ] 4 of the 15 failures were `cli_integration_test` tests already in the group (`daemon_restart_*`, `agent_script_round_trip_*`). If they time out again on a busy host, raise their 20 s control-plane deadline.
-
-### Model residency — [plan](docs/plans/2026-09-30-001-feat-model-residency-plan.md)
+### Batch 1: which models stay loaded — [plan](docs/plans/2026-09-30-001-feat-model-residency-plan.md)
 
 - [x] ~~**Per-preset idle TTL.** A preset overrides `proxy.idle_ttl_secs`; `0` = never unload.~~ — done: `idle_ttl_secs` on the preset body, read off the live preset store on every sweep pass (so `presets save --idle-ttl` moves a running launch's deadline without a relaunch; a hand edit still needs a restart), `presets save --idle-ttl` / `--no-idle-ttl`, `presets list` `TTL` column.
 - [x] ~~**Unload idle models to make room instead of refusing a proxy auto-start.** Stop idle auto-started launches, least recently used first, until the new one fits. Manual launches stay exempt.~~ — done: `eviction::make_room`, driven by the auto-start path's admission refusal (the refusal's own numbers ride the IPC error `data`), all-or-nothing, waits for the sampled free memory before retrying once. Each admitted launch keeps its projection on its running row (`projected_demand_bytes`), which is what a candidate is credited for.
@@ -386,7 +382,24 @@ places.
 - [x] ~~**Preload models at daemon boot.** `daemon.preload: [<ref> | <launch file>]` or preset `preload: true`, each through admission.~~ — done: `daemon::preload`, sequential in list order, `LaunchOrigin::Manual` so the sweep cannot touch it, refusals logged and skipped.
   - [ ] **TUI has no residency editor.** `Ctrl+P` captures a running launch's params, and residency is not part of a launch's params, so `idle_ttl_secs` / `preload` stay CLI/config-authored (`presets save --idle-ttl` / `--preload`, hand-edited like `default:`). Surfacing them in the preset cycle or the save dialog needs a decision on whether a captured preset should carry a running launch's residency over. See [`src/tui/save_preset_dialog.rs`](src/tui/save_preset_dialog.rs).
 
-Dropped 2026-09-30: request params in presets (every engine already takes `reasoning_effort` per request) and a proxy clamp for unsupported effort values (the template error names the valid values); reasons in plans [`2026-09-30-002`](docs/plans/2026-09-30-002-feat-anthropic-effort-mapping-plan.md) and [`2026-09-30-003`](docs/plans/2026-09-30-003-feat-init-effort-cuda-codex-plan.md).
+### Batch 2: Anthropic effort on llama.cpp — [plan](docs/plans/2026-09-30-002-feat-anthropic-effort-mapping-plan.md)
+
+- [ ] **Map `output_config.effort` to `chat_template_kwargs.reasoning_effort` on `/v1/messages` for llama.cpp.** Claude Code's `/effort` does nothing on a local model today; upstream [llama.cpp #20479](https://github.com/ggml-org/llama.cpp/pull/20479) is unmerged.
+  - [ ] File upstream with gufo: its `/v1/messages` returns `400` for `thinking`, `output_config`, `reasoning_effort` and `chat_template_kwargs`.
+
+### Batch 3: `init` / installer — [plan](docs/plans/2026-09-30-003-feat-init-effort-cuda-codex-plan.md)
+
+Validate each client at its source and test it live where possible before changing its patcher.
+
+- [ ] **Patchers: wire effort controls for reasoning models** (pi, opencode incl. `limit.context`, Zed, Continue, Aider). No patcher writes a reasoning field today, so client effort pickers do nothing.
+- [ ] **Route Linux + NVIDIA to the upstream CUDA prebuilt** instead of Vulkan.
+- [ ] **Ship the Codex CLI entry in the `init` picker** once `/v1/responses` is confirmed on the fetched llama.cpp build.
+
+### Tests
+
+- [x] ~~**`the_entry_grace_is_a_floor_under_every_stop` is flaky.**~~ Failed once on 2026-10-01 at [`tests/generic_backend_test.rs`](tests/generic_backend_test.rs) line 380: the stop returned after 1.5 ms instead of after the fixture's 2 s SIGTERM drain. Fixed: [`fake_llama_server`](tests/fixtures/fake_llama_server.rs) installed its SIGTERM handlers inside a spawned task, which could run after `/health` answered, so an early SIGTERM killed it with the default action. Both handlers (`--sigterm-exit-delay-ms`, `--trap-sigterm`) are now installed before the spawn.
+- [x] ~~**Daemon-spawning tests time out on a busy host.**~~ On 2026-10-01 a pre-push `nextest` run failed 15 tests with `detached daemon did not bind control plane within 20s` or `daemon never came up` while a model server was running. `generic_backend_test`, `preset_config_ipc_test`, `sglang_backend_test` and `vllm_backend_test` boot a daemon but ran outside the `daemon-bound` group. Fixed: they are in the group in [`.config/nextest.toml`](.config/nextest.toml), and the cap went from 4 to 8, because at 4 their sleep-bound tests queued and added ~10 s to a ~16 s run. Old vs new, 3 alternating local runs: 19.6 / 18.1 / 20.1 s vs 15.7 / 16.9 / 17.3 s, all passing.
+  - [ ] 4 of the 15 failures were `cli_integration_test` tests already in the group (`daemon_restart_*`, `agent_script_round_trip_*`). If they time out again on a busy host, raise their 20 s control-plane deadline.
 
 ### Done
 
