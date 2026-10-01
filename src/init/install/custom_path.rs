@@ -61,6 +61,7 @@ pub fn preflight_integrity(path: &Path) -> Result<(), InstallError> {
   }
   #[cfg(unix)]
   {
+    use crate::util::file_security::dir_swap_surface;
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
     // Owner must be ourselves or root. Root-owned binaries are the
@@ -82,21 +83,19 @@ pub fn preflight_integrity(path: &Path) -> Result<(), InstallError> {
       )));
     }
     // Both the symlink's own directory and the target's directory are
-    // swap surfaces: a group/world-writable parent lets another user
-    // repoint the link or replace the file. Check each that applies.
+    // swap surfaces: a permissive parent lets another user repoint the
+    // link or replace the file. Check each that applies.
     let mut dirs = vec![path.parent()];
     if is_symlink {
       dirs.push(target.parent());
     }
     for parent in dirs.into_iter().flatten() {
-      if let Ok(parent_meta) = std::fs::metadata(parent) {
-        let pmode = parent_meta.permissions().mode() & 0o777;
-        if pmode & 0o022 != 0 {
-          return Err(InstallError::Integrity(format!(
-            "parent dir `{}` is group/world-writable (mode {pmode:#o})",
-            parent.display()
-          )));
-        }
+      if let Some(surface) = dir_swap_surface(parent, our_uid) {
+        return Err(InstallError::Integrity(format!(
+          "parent dir `{}` {}",
+          parent.display(),
+          surface.describe(our_uid)
+        )));
       }
     }
   }
@@ -205,7 +204,7 @@ mod tests {
     fs::set_permissions(&target_dir, fs::Permissions::from_mode(0o777)).unwrap();
     let err = install_from_custom_path(&link).unwrap_err();
     assert!(
-      matches!(err, InstallError::Integrity(ref msg) if msg.contains("group/world-writable")),
+      matches!(err, InstallError::Integrity(ref msg) if msg.contains("world-writable")),
       "expected world-writable target-dir refusal, got {err:?}"
     );
     fs::set_permissions(&target_dir, fs::Permissions::from_mode(0o700)).unwrap();
@@ -234,9 +233,38 @@ mod tests {
     write_exec(&bin, b"#!/bin/sh\n");
     let err = install_from_custom_path(&bin).unwrap_err();
     assert!(
-      matches!(err, InstallError::Integrity(ref msg) if msg.contains("group/world-writable")),
+      matches!(err, InstallError::Integrity(ref msg) if msg.contains("world-writable")),
       "expected world-writable-parent refusal, got {err:?}"
     );
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::remove_dir_all(&dir).ok();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn accepts_binary_in_self_owned_group_writable_dir_on_a_private_group() {
+    // A group-writable directory *we* own is safe only when its group is a
+    // user-private one (the home-dir default, e.g. a `mise` installs tree):
+    // no other user can write into it. That premise fails on macOS, where
+    // every local user's primary group is `staff`, so the answer here
+    // follows the host's actual primary group.
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("perm-own-gw");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
+    let bin = dir.join("llama-server");
+    write_exec(&bin, b"#!/bin/sh\n");
+    let our_uid = unsafe { libc::geteuid() };
+    let gid = fs::metadata(&dir).unwrap().gid();
+    if crate::util::file_security::is_user_private_group(gid, our_uid) {
+      install_from_custom_path(&bin).expect("accept a binary in a self-owned 0775 dir");
+    } else {
+      let err = install_from_custom_path(&bin).unwrap_err();
+      assert!(
+        matches!(err, InstallError::Integrity(ref msg) if msg.contains("group-writable")),
+        "a 0775 dir on a shared group must refuse: {err:?}"
+      );
+    }
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
     fs::remove_dir_all(&dir).ok();
   }
