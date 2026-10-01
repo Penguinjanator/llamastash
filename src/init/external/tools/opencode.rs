@@ -36,19 +36,17 @@ use crate::init::external::{Format, PatchContext, PatchModel, ToolPatcher};
 
 pub struct OpenCode;
 
-/// opencode's own output cap (`OUTPUT_TOKEN_MAX` in
-/// `provider/transform.ts`), what it uses when `output` is `0`.
-const OUTPUT_TOKEN_MAX: u64 = 32_000;
-
 fn model_entry(m: &PatchModel) -> serde_json::Value {
-  let context = m.declared_context();
-  // opencode compacts at `context - output`; half the window keeps a
-  // small-context model usable.
-  let output = OUTPUT_TOKEN_MAX.min(context / 2);
+  // opencode compacts at `context - output`.
   let mut entry = json!({
     "name": m.id,
-    "limit": { "context": context, "output": output },
+    "limit": { "context": m.declared_context(), "output": m.declared_output() },
   });
+  // opencode replaces an image part with an error text unless the model
+  // lists `image` input (`provider/transform.ts`).
+  if m.vision {
+    entry["modalities"] = json!({ "input": ["text", "image"], "output": ["text"] });
+  }
   if let Some(effort) = &m.effort {
     let mut variants: serde_json::Map<String, serde_json::Value> = effort
       .levels
@@ -152,6 +150,19 @@ mod tests {
       models["small"]["limit"],
       json!({"context": 8192, "output": 4096})
     );
+  }
+
+  #[test]
+  fn a_vision_model_lists_image_input() {
+    let mut ctx = PatchContext::fixture(&["small-vl", "plain"]);
+    ctx.models[0].vision = true;
+    let v = OpenCode.build_additions(&ctx);
+    let models = &v["provider"]["llamastash"]["models"];
+    assert_eq!(
+      models["small-vl"]["modalities"],
+      json!({"input": ["text", "image"], "output": ["text"]})
+    );
+    assert!(models["plain"].get("modalities").is_none());
   }
 
   #[test]

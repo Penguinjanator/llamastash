@@ -72,6 +72,10 @@ pub struct PatchContext {
 /// enough to be safe with any model rather than a guess that overflows.
 const DEFAULT_CONTEXT_WINDOW: u64 = 32768;
 
+/// Output cap for tools that send one: opencode's own default
+/// (`OUTPUT_TOKEN_MAX` in its `provider/transform.ts`).
+const OUTPUT_TOKEN_MAX: u64 = 32_000;
+
 /// One model to register, named the way the proxy publishes it.
 ///
 /// `is_embed`: an embedding model (nomic-embed, snowflake-arctic-embed,
@@ -91,10 +95,14 @@ pub struct PatchModel {
   /// window. Clients size their own history against this, so too high makes
   /// them overflow the server and too low makes them compact early.
   pub context_window: Option<u64>,
+  /// The model emits reasoning (a `<think>` token in its GGUF).
+  pub reasoning: bool,
   /// Reasoning-effort levels the chat template accepts, for a reasoning
   /// model whose template lists them. Patchers write effort controls
   /// only when this is set.
   pub effort: Option<effort::EffortLevels>,
+  /// The model has a vision projector, so it takes images.
+  pub vision: bool,
 }
 
 impl PatchModel {
@@ -108,7 +116,9 @@ impl PatchModel {
       id,
       is_embed,
       context_window: None,
+      reasoning: false,
       effort: None,
+      vision: false,
     }
   }
 
@@ -116,6 +126,13 @@ impl PatchModel {
   /// the catalog has no figure (a parse failure, a registry row).
   pub fn declared_context(&self) -> u64 {
     self.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW)
+  }
+
+  /// Output token cap to declare. Thinking and the answer share it, so a
+  /// low cap can end a long think before any answer; half the context
+  /// keeps room for the prompt on a small-context model.
+  pub fn declared_output(&self) -> u64 {
+    OUTPUT_TOKEN_MAX.min(self.declared_context() / 2)
   }
 
   /// Project a catalog row under the id the proxy publishes it as. Prefers
@@ -135,7 +152,9 @@ impl PatchModel {
       id,
       is_embed,
       context_window: row.native_ctx,
+      reasoning: row.has_reasoning_hint,
       effort: None,
+      vision: row.multimodal.is_some_and(|m| m.vision),
     }
   }
 }

@@ -119,7 +119,7 @@ impl Catalog {
   ) -> Vec<PatchModel> {
     let mut base = PatchModel::from_catalog_row(row, id.to_string());
     if row.has_reasoning_hint {
-      base.effort = crate::init::external::effort::from_gguf(Path::new(&row.path));
+      base.effort = crate::init::external::effort::from_gguf(Path::new(&row.path)).1;
     }
     let path = Path::new(&row.path);
     let context = |preset_ctx: Option<u32>, server: Option<&str>| {
@@ -181,8 +181,14 @@ fn from_download(summary: &ModelSummary, catalog: Option<&Catalog>) -> Option<Pa
   });
   match gguf {
     Some(path) => {
-      let mut m = PatchModel::from_id(downloaded_id(path, catalog));
-      m.effort = crate::init::external::effort::from_gguf(path);
+      let (id, row) = downloaded_id(path, catalog);
+      let mut m = PatchModel::from_id(id);
+      let (reasoning, effort) = crate::init::external::effort::from_gguf(path);
+      m.reasoning = reasoning;
+      m.effort = effort;
+      // Vision comes from the scan pairing a projector with the file, so
+      // only a row the catalog already has can say.
+      m.vision = row.and_then(|r| r.multimodal).is_some_and(|mm| mm.vision);
       Some(m)
     }
     // No GGUF but files landed: a safetensors repo, pulled whole.
@@ -197,17 +203,25 @@ fn from_download(summary: &ModelSummary, catalog: Option<&Catalog>) -> Option<Pa
 /// stem then answers `400 ambiguous_model` forever. Falls back to that stem
 /// when there is no catalog (daemon unreachable) or no row for the file yet
 /// (the scan has not caught up) — which is still the right answer whenever
-/// the name is unique, and the best guess available otherwise.
-fn downloaded_id(path: &std::path::Path, catalog: Option<&Catalog>) -> String {
+/// the name is unique, and the best guess available otherwise. The row is
+/// returned too, when there is one.
+fn downloaded_id<'a>(
+  path: &std::path::Path,
+  catalog: Option<&'a Catalog>,
+) -> (String, Option<&'a CatalogRow>) {
   let stem = || crate::util::paths::model_public_id(path, None);
   let Some(catalog) = catalog else {
-    return stem();
+    return (stem(), None);
   };
   let reference = path.to_string_lossy();
   crate::launch::resolve::resolve_model_with_candidates(&catalog.rows, &reference)
     .ok()
-    .and_then(|row| catalog.published_id(&row.path).map(ToOwned::to_owned))
-    .unwrap_or_else(stem)
+    .and_then(|row| {
+      let id = catalog.published_id(&row.path)?.to_owned();
+      let row = catalog.rows.iter().find(|r| r.path == row.path)?;
+      Some((id, Some(row)))
+    })
+    .unwrap_or_else(|| (stem(), None))
 }
 
 /// The daemon's catalog and favorites in one read.

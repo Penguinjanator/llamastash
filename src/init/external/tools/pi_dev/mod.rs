@@ -97,12 +97,17 @@ impl ToolPatcher for PiDev {
       .iter()
       .filter(|m| !m.is_embed)
       .map(|m| {
+        // `maxTokens` goes out as `max_completion_tokens`, and llama.cpp
+        // stops there, so it must leave room for a long think.
         let mut entry = json!({
           "id": m.id,
           "name": m.id,
           "contextWindow": m.declared_context(),
-          "maxTokens": 8192,
+          "maxTokens": m.declared_output(),
         });
+        if m.vision {
+          entry["input"] = json!(["text", "image"]);
+        }
         if let Some(effort) = &m.effort {
           entry["reasoning"] = json!(true);
           entry["thinkingLevelMap"] = thinking_level_map(effort);
@@ -248,6 +253,20 @@ mod tests {
     // No levels, no fields: pi's defaults stay as they were.
     assert!(models[1].get("reasoning").is_none());
     assert!(models[1].get("thinkingLevelMap").is_none());
+  }
+
+  #[test]
+  fn the_output_cap_leaves_room_to_think_and_vision_models_take_images() {
+    let mut ctx = PatchContext::fixture(&["Qwen3.8-27B-UD-Q6_K", "small-vl"]);
+    ctx.models[0].context_window = Some(262_144);
+    ctx.models[1].context_window = Some(8192);
+    ctx.models[1].vision = true;
+    let v = PiDev.build_additions(&ctx);
+    let models = &v["providers"]["llamastash"]["models"];
+    assert_eq!(models[0]["maxTokens"], 32_000);
+    assert!(models[0].get("input").is_none(), "pi's default is text");
+    assert_eq!(models[1]["maxTokens"], 4096);
+    assert_eq!(models[1]["input"], json!(["text", "image"]));
   }
 
   #[test]

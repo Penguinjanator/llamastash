@@ -18,6 +18,12 @@
 //! max) with no per-model override. So only the default is written, set
 //! to the template's own default so nothing changes until the user picks
 //! a level; a level the template rejects comes back as the server's error.
+//!
+//! **Reasoning history.** With `capabilities.interleaved_reasoning` off
+//! (Zed's default), earlier thinking goes back as plain assistant text
+//! (`crates/open_ai/src/completion.rs`). On, it goes back as
+//! `reasoning_content`, which a template like Qwen3.8's wraps back in
+//! `<think>`. So it is on for every reasoning model.
 
 use std::path::PathBuf;
 
@@ -74,9 +80,10 @@ impl ToolPatcher for Zed {
           "max_tokens": m.declared_context(),
           "capabilities": {
             "tools": true,
-            "images": false,
+            "images": m.vision,
             "parallel_tool_calls": false,
             "prompt_cache_key": false,
+            "interleaved_reasoning": m.reasoning,
           }
         });
         if let Some(level) = m.effort.as_ref().and_then(default_effort) {
@@ -132,6 +139,19 @@ mod tests {
     let models = &v["language_models"]["openai_compatible"]["LlamaStash"]["available_models"];
     assert_eq!(models[0]["reasoning_effort"], "xhigh");
     assert!(models[1].get("reasoning_effort").is_none());
+  }
+
+  #[test]
+  fn reasoning_and_vision_set_their_capabilities() {
+    let mut ctx = PatchContext::fixture(&["thinker", "small-vl"]);
+    ctx.models[0].reasoning = true;
+    ctx.models[1].vision = true;
+    let v = Zed.build_additions(&ctx);
+    let models = &v["language_models"]["openai_compatible"]["LlamaStash"]["available_models"];
+    assert_eq!(models[0]["capabilities"]["interleaved_reasoning"], true);
+    assert_eq!(models[0]["capabilities"]["images"], false);
+    assert_eq!(models[1]["capabilities"]["interleaved_reasoning"], false);
+    assert_eq!(models[1]["capabilities"]["images"], true);
   }
 
   #[test]

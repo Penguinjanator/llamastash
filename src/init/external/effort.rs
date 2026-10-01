@@ -94,23 +94,27 @@ fn validated_list(rest: &str) -> Option<Vec<String>> {
   (!levels.is_empty()).then_some(levels)
 }
 
-/// The levels of a local GGUF, or `None` for anything else (a
-/// safetensors repo, a registry entry) or a template without a list.
-pub fn from_gguf(path: &Path) -> Option<EffortLevels> {
+/// Whether a local GGUF carries a reasoning token, and the effort levels
+/// its template lists. `(false, None)` for anything else (a safetensors
+/// repo, a registry entry, an unreadable file).
+pub fn from_gguf(path: &Path) -> (bool, Option<EffortLevels>) {
   let is_gguf = path
     .extension()
     .and_then(|e| e.to_str())
     .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
   if !is_gguf {
-    return None;
+    return (false, None);
   }
-  let read =
-    crate::gguf::header::read_path(path, crate::gguf::header::HeaderReadOptions::default()).ok()?;
+  let Ok(read) =
+    crate::gguf::header::read_path(path, crate::gguf::header::HeaderReadOptions::default())
+  else {
+    return (false, None);
+  };
   let md = crate::gguf::metadata::summarise(&read.header);
   if !md.reasoning_hint {
-    return None;
+    return (false, None);
   }
-  md.chat_template.as_deref().and_then(from_template)
+  (true, md.chat_template.as_deref().and_then(from_template))
 }
 
 #[cfg(test)]
@@ -172,16 +176,21 @@ mod tests {
         .build();
       std::fs::write(dir.join(name), bytes).unwrap();
     }
+    let (reasoning, effort) = from_gguf(&dir.join("think.gguf"));
+    assert!(reasoning);
     assert_eq!(
-      from_gguf(&dir.join("think.gguf")).expect("levels").levels,
+      effort.expect("levels").levels,
       vec!["low", "medium", "xhigh"]
     );
-    assert!(from_gguf(&dir.join("plain.gguf")).is_none());
+    assert_eq!(from_gguf(&dir.join("plain.gguf")), (false, None));
     std::fs::remove_dir_all(&dir).ok();
   }
 
   #[test]
   fn non_gguf_paths_are_not_read() {
-    assert!(from_gguf(Path::new("/hub/models--Qwen--Qwen3-0.6B/snapshots/abc")).is_none());
+    assert_eq!(
+      from_gguf(Path::new("/hub/models--Qwen--Qwen3-0.6B/snapshots/abc")),
+      (false, None)
+    );
   }
 }

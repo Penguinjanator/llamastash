@@ -190,6 +190,30 @@ order is: the daemon's `status.proxy.listen` when `status` is `listening`
 and to `41536` (`--proxy-port 41535` held by another listener); pi,
 OpenCode, Zed and Codex configs got the moved port.
 
+## Follow-up: other request fields
+
+Checked what pi, opencode and Codex send (capture listener) and Zed's
+source, for fields that matter as much as effort:
+
+- **Output cap.** pi sent `max_completion_tokens: 8192` from the patched
+  `maxTokens`; llama.cpp enforces it (`n_predict` alias). Now
+  `min(32000, context / 2)`, the same figure as opencode's `limit.output`.
+- **Images.** No patcher declared image input. pi defaults custom models to
+  `["text"]` (`provider-composer.ts`), opencode replaces image parts unless
+  `modalities.input` lists `image` (`transform.ts`), Zed was hard-coded
+  `images: false`. Now declared from the catalog's `multimodal.vision`.
+  Codex defaults to text + image. Continue is left alone: a `capabilities`
+  list also sets `tool_use` off, which it otherwise detects.
+- **Zed reasoning history.** `interleaved_reasoning` off sends earlier
+  thinking back as assistant text; Qwen3.8's template reads
+  `reasoning_content` and re-wraps it in `<think>`. Now on for reasoning
+  models.
+- **Sampling.** Not missing: pi, opencode and Codex send no temperature;
+  Zed sends 1.0, which matches the Qwen3.8 GGUF's `general.sampling.temp`.
+
+Checked live with Qwen3.8-27B (it has a vision projector): pi and opencode
+both answered "Red" for a solid red PNG through the proxy.
+
 ## Verification
 
 - `make test`, `make lint`; patcher golden tests per client.
