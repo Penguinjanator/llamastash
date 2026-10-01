@@ -20,7 +20,7 @@
 //!   default path, `OLLAMA_HOST` env probes, IDE plugins) recognise
 //!   llamastash as Ollama-compatible and fall through to the OpenAI
 //!   compat endpoints for actual inference. Tier 2 (`/api/chat`,
-//!   `/api/generate`, `/api/embed`) is tracked under TODO §R2.
+//!   `/api/generate`, `/api/embed`) is tracked under TODO §Low priority.
 
 use std::collections::HashMap;
 use std::error::Error as StdError;
