@@ -407,12 +407,9 @@ pub async fn make_room(
     crate::launch::admission::human_gib(freed),
     crate::launch::admission::human_gib(refusal.demand_bytes),
   );
-  // Selection is up to the stop grace old by the time the stops start, so every
-  // pick is re-checked before any of them is stopped, and all-or-nothing is
+  // Every pick is re-checked before any stop starts, and all-or-nothing is
   // decided again on what survives: giving up the whole plan is better than
-  // unloading half of it for a launch that still will not fit. A request that
-  // arrives in the window between here and an individual stop is still honoured
-  // by the per-candidate check below — that launch is left running.
+  // unloading half of it for a launch that still will not fit.
   let mut go: Vec<RoomCandidate> = Vec::new();
   let mut freed_now = 0u64;
   for candidate in picked {
@@ -437,24 +434,14 @@ pub async fn make_room(
     return false;
   }
   let ctx = state.ctx.clone();
-  let mut freed_bytes = 0u64;
-  let mut unloaded = 0usize;
-  for candidate in go {
-    if !matches!(candidate.guard.state().await, ManagedState::Ready)
-      || candidate.guard.inflight() > 0
-    {
-      log::info!(
-        "proxy make-room: {} took a request during the stops — left it running",
-        candidate.targets[0].as_str(),
-      );
-      continue;
-    }
-    for target in &candidate.targets {
-      stop_launch(&ctx, target).await;
-      unloaded += 1;
-    }
-    freed_bytes = freed_bytes.saturating_add(candidate.bytes);
-  }
+  let freed_bytes: u64 = go.iter().map(|c| c.bytes).sum();
+  let targets: Vec<LaunchId> = go.iter().flat_map(|c| c.targets.clone()).collect();
+  let unloaded = targets.len();
+  // Stopped together, the way the sweep unloads: the re-check above is only
+  // honest if nothing else runs before the stops, and stopping one after another
+  // would both stretch the request's wait to N x the stop grace and reopen the
+  // window for a launch to take a request mid-sequence.
+  futures::future::join_all(targets.iter().map(|target| stop_launch(&ctx, target))).await;
   if unloaded == 0 {
     log::info!("proxy make-room: nothing was free after all — not retrying");
     return false;

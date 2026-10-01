@@ -145,7 +145,7 @@ async fn collect_with_rows(
 /// in it — an arch preset could fill the host one sequential launch at a time,
 /// each waiting on its own load, until admission refuses. One `preload: true`,
 /// one model; name the model (or a glob that matches exactly one).
-fn preload_target(key: &str, rows: &[CatalogRow]) -> Result<PathBuf, String> {
+pub(crate) fn preload_target(key: &str, rows: &[CatalogRow]) -> Result<PathBuf, String> {
   match preset_models(key, rows).as_slice() {
     [] => Err("no discovered model matches this preset key".to_string()),
     [one] => Ok(one.clone()),
@@ -221,12 +221,10 @@ async fn resolve_entry(
 /// A launch-file preload entry: the same file `llamastash run <file>` takes,
 /// parsed by the same code so the two cannot disagree about what the file runs.
 fn parse_launch_file(entry: &str, rows: &[CatalogRow]) -> Result<Option<PreloadLaunch>, String> {
-  // Expand first: `is_launch_file` needs the extension *and* an existing file,
-  // and neither is true of a literal `~/launches/big.yaml`.
-  let path = crate::util::paths::expand_user_path(Path::new(entry));
-  if !crate::cli::launch_file::is_launch_file(&path.to_string_lossy()) {
-    return Ok(None);
-  }
+  let path = match launch_file_path(entry, None) {
+    Some(path) => path,
+    None => return Ok(None),
+  };
   let sel = crate::cli::launch_file::load(&path, None).map_err(|e| {
     e.message
       .unwrap_or_else(|| format!("cannot read launch file `{}`", path.display()))
@@ -241,6 +239,16 @@ fn parse_launch_file(entry: &str, rows: &[CatalogRow]) -> Result<Option<PreloadL
     )),
     model_path,
   }))
+}
+
+/// The launch file an entry names, once a leading `~` has been expanded to
+/// `home` (the process home when that is `None`).
+///
+/// Expansion comes first because `is_launch_file` wants the extension *and* an
+/// existing file, and neither is true of a literal `~/launches/big.yaml`.
+fn launch_file_path(entry: &str, home: Option<&Path>) -> Option<PathBuf> {
+  let path = crate::util::paths::expand_user_path_in(Path::new(entry), home);
+  crate::cli::launch_file::is_launch_file(&path.to_string_lossy()).then_some(path)
 }
 
 /// Resolve a preload reference to a catalog path.
@@ -417,12 +425,12 @@ mod tests {
   /// name an existing directory would otherwise launch the directory.
   #[test]
   fn resolve_path_does_not_let_a_relative_name_beat_the_catalog() {
-    let cwd = std::env::current_dir().expect("cwd");
-    let lookalike = cwd.join("m");
-    std::fs::create_dir_all(&lookalike).expect("mkdir");
-    let rows = vec![row("/m/m.gguf", Some("llama"))];
-    let got = resolve_path("m", &rows).expect("catalog wins over the cwd entry");
-    assert_eq!(got, PathBuf::from("/m/m.gguf"));
+    // `Cargo.toml` is a real file next to every test's working directory, so
+    // this proves the order without leaving anything behind: the catalog is
+    // consulted first, and the relative path is only a fallback after a miss.
+    let rows = vec![row("/m/Cargo.toml", Some("llama"))];
+    let got = resolve_path("Cargo.toml", &rows).expect("catalog wins over the cwd entry");
+    assert_eq!(got, PathBuf::from("/m/Cargo.toml"));
   }
 
   /// An absolute path that does not exist is a bad path, not a fuzzy model name.
@@ -469,27 +477,14 @@ mod tests {
   #[test]
   fn tilde_launch_file_entry_is_a_launch_file() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let model = dir.path().join("demo.gguf");
-    std::fs::write(&model, "not a gguf, path is all the launcher needs here").expect("model");
     let file = dir.path().join("lf.yaml");
-    std::fs::write(
-      &file,
-      "presets:\n  ~/demo.gguf:\n    default: p\n    entries:\n      p:\n        knobs: {}\n",
-    )
-    .expect("launch file");
-
-    let home = std::env::var("HOME").ok();
-    std::env::set_var("HOME", dir.path());
-    let parsed = parse_launch_file("~/lf.yaml", &[]);
-    match home {
-      Some(home) => std::env::set_var("HOME", &home),
-      None => std::env::remove_var("HOME"),
-    }
-    let launch = parsed
-      .expect("parses")
-      .expect("recognised as a launch file, not a model reference");
-    assert_eq!(launch.model_path, model);
-    assert_eq!(launch.preset.as_ref().map(|p| p.name.as_str()), Some("p"));
+    std::fs::write(&file, "presets:\n  x:\n    entries: {}\n").expect("launch file");
+    assert_eq!(
+      launch_file_path("~/lf.yaml", Some(dir.path())).as_deref(),
+      Some(file.as_path()),
+      "`~` has to be expanded before the file check"
+    );
+    assert_eq!(launch_file_path("~/missing.yaml", Some(dir.path())), None);
   }
 
   /// One `preload: true` starts one model. A key that scopes a family is refused

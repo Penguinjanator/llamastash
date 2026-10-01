@@ -752,6 +752,43 @@ mod clearable_u64 {
   }
 }
 
+/// Which config key the entry a `presets_save` inherits from actually lives
+/// under, using the precedence `effective_presets` merges with: the arch layer,
+/// then a wildcard that matches this model, then an exact per-model key.
+fn residency_source_key(
+  store: &std::collections::BTreeMap<String, crate::config::ConfigPresetBlock>,
+  name: &str,
+  model_name: &str,
+  model_path: &str,
+  model_arch: Option<&str>,
+  rows: &[CatalogRow],
+) -> Option<String> {
+  use crate::launch::presets::{classify_preset_key, preset_key_matches, KeyClass};
+  let holds = |block: &crate::config::ConfigPresetBlock| block.entries.contains_key(name);
+  let mut winner: Option<String> = None;
+  if let Some(arch) = model_arch {
+    for (k, block) in store {
+      if k.eq_ignore_ascii_case(arch)
+        && classify_preset_key(k, rows) == KeyClass::Arch
+        && holds(block)
+      {
+        winner = Some(k.to_string());
+      }
+    }
+  }
+  for pass in [true, false] {
+    for (k, block) in store {
+      if crate::util::glob::is_pattern(k) == pass
+        && preset_key_matches(k, model_name, model_path)
+        && holds(block)
+      {
+        winner = Some(k.to_string());
+      }
+    }
+  }
+  winner
+}
+
 async fn presets_save_handler(
   ctx: &MethodContext,
   params: Option<Value>,
@@ -796,6 +833,14 @@ async fn presets_save_handler(
   // silently drop the pin being shadowed.
   let before = ctx.presets.snapshot().await;
   let path_str = parsed.model_path.display().to_string();
+  let source = residency_source_key(
+    &before,
+    &parsed.name,
+    &key,
+    &path_str,
+    arch.as_deref(),
+    &rows,
+  );
   let inherited = effective_presets(&key, &path_str, arch.as_deref(), &before, &rows)
     .named(&parsed.name)
     .cloned();
@@ -803,9 +848,17 @@ async fn presets_save_handler(
     Some(pin) => pin,
     None => inherited.as_ref().and_then(|e| e.idle_ttl_secs),
   };
-  let preload = parsed
-    .preload
-    .unwrap_or_else(|| inherited.as_ref().is_some_and(|e| e.preload));
+  // `preload` inherits only from a key that names this one model, the same test
+  // boot applies: `preload: true` on an arch or family key is skipped at boot, so
+  // copying it onto this model's own key would start it at boot from a save that
+  // never asked, and a preloaded launch can never be unloaded again.
+  let preload = parsed.preload.unwrap_or_else(|| {
+    source.as_deref().is_some_and(|source| {
+      inherited.as_ref().is_some_and(|e| e.preload)
+        && matches!(crate::daemon::preload::preload_target(source, &rows),
+                    Ok(path) if path == std::path::Path::new(&path_str))
+    })
+  });
   let body = crate::config::PresetBody {
     idle_ttl_secs,
     preload,
@@ -1340,7 +1393,9 @@ mod tests {
   /// number or `true` pins it.
   #[tokio::test]
   async fn presets_save_inherits_residency_unless_told_otherwise() {
-    let c = ctx();
+    // A discovered model, because a preload pin is only inheritable from a key
+    // that names this model, and that is a catalog question.
+    let c = arch_key_ctx(&["/m/a.gguf"]).await;
     let save = |params: Value, id: i64| {
       let c = &c;
       async move {
@@ -1378,10 +1433,50 @@ mod tests {
     assert_eq!(cleared, (None, false));
   }
 
-  /// The save writes under the model's own key, but the pin it must inherit may
-  /// live on the arch entry of the same name that this save shadows.
+  /// A re-save inherits the TTL pin from the entry the name resolves to, which
+  /// may be an arch entry the save is about to shadow. It does *not* inherit a
+  /// family key's `preload: true`: boot refuses to act on that pin, and copying
+  /// it onto one model's own key would boot-load a model nobody asked to preload,
+  /// permanently.
   #[tokio::test]
-  async fn presets_save_inherits_a_pin_from_the_entry_it_shadows() {
+  async fn presets_save_inherits_a_ttl_from_the_entry_it_shadows() {
+    let c = arch_key_ctx(&["/m/a.gguf", "/m/b.gguf"]).await;
+    save_preset(
+      &c,
+      json!({"model_path": "/m/a.gguf", "name": "p", "ctx": 2048}),
+    )
+    .await;
+
+    let saved = per_model_entry(&c).await;
+    assert_eq!(
+      saved.idle_ttl_secs,
+      Some(60),
+      "the arch entry's TTL pin was dropped by the shadowing save"
+    );
+    assert!(
+      !saved.preload,
+      "a family key's preload pin leaked onto a single-model key"
+    );
+  }
+
+  /// The same arch key that scopes exactly one model is a per-model decision in
+  /// all but spelling, so its preload pin does carry over.
+  #[tokio::test]
+  async fn presets_save_inherits_preload_when_the_key_names_one_model() {
+    let c = arch_key_ctx(&["/m/a.gguf"]).await;
+    save_preset(
+      &c,
+      json!({"model_path": "/m/a.gguf", "name": "p", "ctx": 2048}),
+    )
+    .await;
+    assert!(
+      per_model_entry(&c).await.preload,
+      "a key naming only this model should pass its preload pin on"
+    );
+  }
+
+  /// A catalog of qwen3 models plus an arch-keyed preset `p` pinning residency.
+  async fn arch_key_ctx(paths: &[&str]) -> MethodContext {
     use crate::config::{ConfigPresetBlock, PresetBody};
     use crate::daemon::preset_store::ConfigPresetStore;
     use crate::discovery::{DiscoveredModel, ModelSource};
@@ -1390,76 +1485,69 @@ mod tests {
     use std::path::PathBuf;
 
     let catalog = ModelCatalog::new();
-    catalog
-      .upsert(DiscoveredModel {
-        path: PathBuf::from("/m/a.gguf"),
-        parent: PathBuf::from("/m"),
-        source: ModelSource::UserPath,
-        metadata: Some(ModelMetadata {
-          arch: Some("qwen3".to_string()),
-          total_parameters: Some(7_000_000_000),
-          parameter_label: Some("7B".to_string()),
-          quant: Quant::Q4_K,
-          quant_label: None,
-          native_ctx: Some(8192),
-          chat_template: None,
-          tokenizer_kind: Some("llama".to_string()),
-          reasoning_hint: false,
-          mode_hint: ModeHint::Chat,
-          weights_bytes: Some(4_000_000_000),
-          lazy_tensor_bytes: Vec::new(),
-          mtp: None,
-        }),
-        parse_error: None,
-        split_siblings: Vec::new(),
-        display_label: None,
-        multimodal: None,
-        supported_backends: Vec::new(),
-        mtp_head: None,
-      })
-      .await;
-    let c = MethodContext::with_catalog(ShutdownToken::new(), catalog).with_presets(
-      ConfigPresetStore::new(
-        BTreeMap::from([(
-          "qwen3".to_string(),
-          ConfigPresetBlock {
-            default: None,
-            entries: BTreeMap::from([(
-              "p".to_string(),
-              PresetBody {
-                idle_ttl_secs: Some(60),
-                preload: true,
-                ..Default::default()
-              },
-            )]),
-          },
-        )]),
-        None,
-      ),
-    );
+    for path in paths {
+      catalog
+        .upsert(DiscoveredModel {
+          path: PathBuf::from(path),
+          parent: PathBuf::from("/m"),
+          source: ModelSource::UserPath,
+          metadata: Some(ModelMetadata {
+            arch: Some("qwen3".to_string()),
+            total_parameters: Some(7_000_000_000),
+            parameter_label: Some("7B".to_string()),
+            quant: Quant::Q4_K,
+            quant_label: None,
+            native_ctx: Some(8192),
+            chat_template: None,
+            tokenizer_kind: Some("llama".to_string()),
+            reasoning_hint: false,
+            mode_hint: ModeHint::Chat,
+            weights_bytes: Some(4_000_000_000),
+            lazy_tensor_bytes: Vec::new(),
+            mtp: None,
+          }),
+          parse_error: None,
+          split_siblings: Vec::new(),
+          display_label: None,
+          multimodal: None,
+          supported_backends: Vec::new(),
+          mtp_head: None,
+        })
+        .await;
+    }
+    MethodContext::with_catalog(ShutdownToken::new(), catalog).with_presets(ConfigPresetStore::new(
+      BTreeMap::from([(
+        "qwen3".to_string(),
+        ConfigPresetBlock {
+          default: None,
+          entries: BTreeMap::from([(
+            "p".to_string(),
+            PresetBody {
+              idle_ttl_secs: Some(60),
+              preload: true,
+              ..Default::default()
+            },
+          )]),
+        },
+      )]),
+      None,
+    ))
+  }
 
-    dispatch_request(
-      &c,
-      Request::new(
-        1,
-        "presets_save",
-        Some(json!({"model_path": "/m/a.gguf", "name": "p", "ctx": 2048})),
-      ),
-    )
-    .await;
+  async fn save_preset(c: &MethodContext, params: Value) {
+    dispatch_request(c, Request::new(1, "presets_save", Some(params))).await;
+  }
 
-    let store = c.presets.snapshot().await;
-    let saved = store
+  /// The `p` entry written under the model's own key, not the arch one.
+  async fn per_model_entry(c: &MethodContext) -> crate::config::PresetBody {
+    c.presets
+      .snapshot()
+      .await
       .iter()
       .filter(|(key, _)| key.as_str() != "qwen3")
       .find_map(|(_, block)| block.entries.get("p"))
-      .expect("a per-model entry was written");
-    assert_eq!(
-      saved.idle_ttl_secs,
-      Some(60),
-      "the arch entry's TTL pin was dropped by the shadowing save"
-    );
-    assert!(saved.preload, "the arch entry's preload pin was dropped");
+      .cloned()
+      .expect("a per-model entry was written")
   }
 
   #[tokio::test]
