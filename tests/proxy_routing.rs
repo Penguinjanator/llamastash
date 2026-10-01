@@ -36,7 +36,7 @@ use llamastash::gguf::metadata::{ModeHint, ModelMetadata, Quant};
 use llamastash::launch::mode::LaunchMode;
 use llamastash::launch::params::LaunchParams;
 use llamastash::proxy::server::{
-  loopback_addr, new_status_cell, serve, serve_with_options, ProxyStatus, ServeOptions, StatusCell,
+  loopback_addr, new_status_cell, serve_with_options, ProxyStatus, ServeOptions, StatusCell,
 };
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
@@ -162,13 +162,20 @@ async fn spawn_fake_supervisor(
 async fn spawn_listener_with_state(
   state: Arc<ProxyState>,
 ) -> (SocketAddr, ShutdownToken, tokio::task::JoinHandle<()>) {
+  spawn_listener_with_options(state, ServeOptions::default()).await
+}
+
+async fn spawn_listener_with_options(
+  state: Arc<ProxyState>,
+  options: ServeOptions,
+) -> (SocketAddr, ShutdownToken, tokio::task::JoinHandle<()>) {
   let token = ShutdownToken::new();
   let status: StatusCell = new_status_cell();
   let bind_addr = loopback_addr(0);
   let token_for_task = token.clone();
   let status_for_task = Arc::clone(&status);
   let handle = tokio::spawn(async move {
-    serve(state, bind_addr, token_for_task, status_for_task)
+    serve_with_options(state, bind_addr, token_for_task, status_for_task, options)
       .await
       .expect("proxy serve returns Ok");
   });
@@ -945,23 +952,11 @@ async fn partial_request_closes_within_header_read_timeout() {
   let dir = unique_temp("partial");
   let registry = SupervisorRegistry::new();
   let state = proxy_state_with(Vec::new(), registry).await;
-  let shutdown = ShutdownToken::new();
-  let status: StatusCell = new_status_cell();
-  let listener_handle = {
-    let (state, shutdown, status) = (state, shutdown.clone(), Arc::clone(&status));
-    tokio::spawn(async move {
-      let options = ServeOptions {
-        header_read_timeout: TIMEOUT,
-        ..ServeOptions::default()
-      };
-      serve_with_options(state, loopback_addr(0), shutdown, status, options)
-        .await
-        .expect("proxy serve returns Ok");
-    })
+  let options = ServeOptions {
+    header_read_timeout: TIMEOUT,
+    ..ServeOptions::default()
   };
-  let addr = wait_for_listening(&status, Duration::from_secs(2))
-    .await
-    .expect("listener reaches Listening");
+  let (addr, shutdown, listener_handle) = spawn_listener_with_options(state, options).await;
 
   let mut sock = TcpStream::connect(addr).await.expect("connect");
   // Partial request line, no newline, no Host header. Server waits

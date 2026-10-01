@@ -263,11 +263,10 @@ pub async fn sweep(inputs: SweepInputs<'_>) -> SweepReport {
       if adopted_pids.contains(&pid_u32) {
         return None;
       }
-      // Skip threads. `sysinfo` lists each kernel task (thread) under its
-      // own TID alongside the main process; without this filter a
-      // multi-threaded `llama-server` surfaces once per thread (e.g. 36
-      // identical rows for one process). Real processes have
-      // `thread_kind() == None`.
+      // Skip threads. The refresh above leaves `with_tasks` off, so sysinfo
+      // lists none today; if that changes, a multi-threaded `llama-server`
+      // would surface once per thread (e.g. 36 identical rows for one
+      // process). Real processes have `thread_kind() == None`.
       if proc.thread_kind().is_some() {
         return None;
       }

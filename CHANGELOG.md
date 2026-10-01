@@ -6,7 +6,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ### Changed
 
-- Single-process lookups (stop grace loop, adopted-row argv, resource sampling) and the boot orphan sweep no longer scan every process and thread on the host first. Cuts the full test suite from ~90 s to ~19 s and speeds up `stop`.
+- Faster daemon boot and `stop`: looking up one process no longer scans every process on the host, and the boot sweep no longer reads every thread.
 
 ## [0.5.0] — 2026-09-30
 
