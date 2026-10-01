@@ -292,6 +292,8 @@ pub struct EffectivePresets {
   /// `None`). Drives both the TUI cycle's opening stop and the server-side
   /// `PresetDefault` resolver layer.
   pub default: Option<String>,
+  /// The config key each preset name was taken from, keyed like `presets`.
+  sources: BTreeMap<String, String>,
 }
 
 impl EffectivePresets {
@@ -317,6 +319,13 @@ impl EffectivePresets {
       .presets
       .iter()
       .find(|p| crate::launch::resolve::name_matches(Some(&p.name), name))
+  }
+
+  /// The config key the preset `name` resolves from: the arch, wildcard or
+  /// per-model key whose entry won the merge.
+  pub fn source_key(&self, name: &str) -> Option<&str> {
+    let preset = self.named(name)?;
+    self.sources.get(&preset.name).map(String::as_str)
   }
 }
 
@@ -345,7 +354,7 @@ pub fn effective_presets(
 ) -> EffectivePresets {
   // BTreeMap keeps the merged set name-sorted (config entries are an
   // unordered map, so a deterministic order is the right surface).
-  let mut merged: BTreeMap<String, NamedPreset> = BTreeMap::new();
+  let mut merged: BTreeMap<String, (String, NamedPreset)> = BTreeMap::new();
   let mut arch_default = None;
   let mut pattern_default = None;
   let mut model_default = None;
@@ -355,7 +364,7 @@ pub fn effective_presets(
   if let Some(arch) = model_arch {
     for (key, block) in store {
       if key.eq_ignore_ascii_case(arch) && classify_preset_key(key, catalog) == KeyClass::Arch {
-        merge_block(&mut merged, block, model_path);
+        merge_block(&mut merged, key, block, model_path);
         arch_default = arch_default.or_else(|| block.default.clone());
       }
     }
@@ -373,19 +382,21 @@ pub fn effective_presets(
   // key order.
   for (key, block) in store {
     if crate::util::glob::is_pattern(key) && preset_key_matches(key, model_name, model_path) {
-      merge_block(&mut merged, block, model_path);
+      merge_block(&mut merged, key, block, model_path);
       pattern_default = pattern_default.or_else(|| block.default.clone());
     }
   }
   for (key, block) in store {
     if !crate::util::glob::is_pattern(key) && preset_key_matches(key, model_name, model_path) {
-      merge_block(&mut merged, block, model_path);
+      merge_block(&mut merged, key, block, model_path);
       model_default = model_default.or_else(|| block.default.clone());
     }
   }
 
   let mut presets = Presets::new();
-  for np in merged.into_values() {
+  let mut sources = BTreeMap::new();
+  for (name, (key, np)) in merged {
+    sources.insert(name, key);
     presets.upsert(np);
   }
   // `auto` is the reserved "pure-fit default" sentinel and is kept verbatim;
@@ -394,18 +405,26 @@ pub fn effective_presets(
     .or(pattern_default)
     .or(arch_default)
     .filter(|d| d.eq_ignore_ascii_case(AUTO_DEFAULT) || presets.get(d).is_some());
-  EffectivePresets { presets, default }
+  EffectivePresets {
+    presets,
+    default,
+    sources,
+  }
 }
 
 fn merge_block(
-  merged: &mut BTreeMap<String, NamedPreset>,
+  merged: &mut BTreeMap<String, (String, NamedPreset)>,
+  key: &str,
   block: &ConfigPresetBlock,
   model_path: &str,
 ) {
   for (name, body) in &block.entries {
     merged.insert(
       name.clone(),
-      materialize_preset(name, body, PathBuf::from(model_path)),
+      (
+        key.to_string(),
+        materialize_preset(name, body, PathBuf::from(model_path)),
+      ),
     );
   }
 }
@@ -896,6 +915,52 @@ mod tests {
       other.presets.iter().next().is_none(),
       "wildcard is anchored"
     );
+  }
+
+  #[test]
+  fn source_key_names_the_key_that_won_the_merge() {
+    let catalog = vec![
+      catalog_row("/m/Qwen3.8-27B-Q4_K_M.gguf", "qwen3"),
+      catalog_row("/m/Qwen3.8-27B-Q8_0.gguf", "qwen3"),
+    ];
+    let mut store = BTreeMap::new();
+    store.insert(
+      "qwen3".to_string(),
+      block(&[("arch", body_ctx(1)), ("p", body_ctx(1))], None),
+    );
+    store.insert(
+      "Qwen3.8-27B-*".to_string(),
+      block(&[("glob", body_ctx(2)), ("p", body_ctx(2))], None),
+    );
+    store.insert(
+      "Qwen3.8-27B-Q8_0.gguf".to_string(),
+      block(&[("p", body_ctx(3))], None),
+    );
+
+    let q8 = effective_presets(
+      "Qwen3.8-27B-Q8_0.gguf",
+      "/m/Qwen3.8-27B-Q8_0.gguf",
+      Some("qwen3"),
+      &store,
+      &catalog,
+    );
+    assert_eq!(q8.source_key("arch"), Some("qwen3"));
+    assert_eq!(q8.source_key("glob"), Some("Qwen3.8-27B-*"));
+    assert_eq!(
+      q8.source_key("P"),
+      Some("Qwen3.8-27B-Q8_0.gguf"),
+      "matches names the way `named` does"
+    );
+    assert_eq!(q8.source_key("missing"), None);
+
+    let q4 = effective_presets(
+      "Qwen3.8-27B-Q4_K_M.gguf",
+      "/m/Qwen3.8-27B-Q4_K_M.gguf",
+      Some("qwen3"),
+      &store,
+      &catalog,
+    );
+    assert_eq!(q4.source_key("p"), Some("Qwen3.8-27B-*"));
   }
 
   #[test]

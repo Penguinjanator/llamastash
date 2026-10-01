@@ -752,43 +752,6 @@ mod clearable_u64 {
   }
 }
 
-/// Which config key the entry a `presets_save` inherits from actually lives
-/// under, using the precedence `effective_presets` merges with: the arch layer,
-/// then a wildcard that matches this model, then an exact per-model key.
-fn residency_source_key(
-  store: &std::collections::BTreeMap<String, crate::config::ConfigPresetBlock>,
-  name: &str,
-  model_name: &str,
-  model_path: &str,
-  model_arch: Option<&str>,
-  rows: &[CatalogRow],
-) -> Option<String> {
-  use crate::launch::presets::{classify_preset_key, preset_key_matches, KeyClass};
-  let holds = |block: &crate::config::ConfigPresetBlock| block.entries.contains_key(name);
-  let mut winner: Option<String> = None;
-  if let Some(arch) = model_arch {
-    for (k, block) in store {
-      if k.eq_ignore_ascii_case(arch)
-        && classify_preset_key(k, rows) == KeyClass::Arch
-        && holds(block)
-      {
-        winner = Some(k.to_string());
-      }
-    }
-  }
-  for pass in [true, false] {
-    for (k, block) in store {
-      if crate::util::glob::is_pattern(k) == pass
-        && preset_key_matches(k, model_name, model_path)
-        && holds(block)
-      {
-        winner = Some(k.to_string());
-      }
-    }
-  }
-  winner
-}
-
 async fn presets_save_handler(
   ctx: &MethodContext,
   params: Option<Value>,
@@ -833,28 +796,20 @@ async fn presets_save_handler(
   // silently drop the pin being shadowed.
   let before = ctx.presets.snapshot().await;
   let path_str = parsed.model_path.display().to_string();
-  let source = residency_source_key(
-    &before,
-    &parsed.name,
-    &key,
-    &path_str,
-    arch.as_deref(),
-    &rows,
-  );
-  let inherited = effective_presets(&key, &path_str, arch.as_deref(), &before, &rows)
-    .named(&parsed.name)
-    .cloned();
+  let before_eff = effective_presets(&key, &path_str, arch.as_deref(), &before, &rows);
+  let inherited = before_eff.named(&parsed.name);
+  let source = before_eff.source_key(&parsed.name);
   let idle_ttl_secs = match parsed.idle_ttl_secs {
     Some(pin) => pin,
-    None => inherited.as_ref().and_then(|e| e.idle_ttl_secs),
+    None => inherited.and_then(|e| e.idle_ttl_secs),
   };
   // `preload` inherits only from a key that names this one model, the same test
   // boot applies: `preload: true` on an arch or family key is skipped at boot, so
   // copying it onto this model's own key would start it at boot from a save that
   // never asked, and a preloaded launch can never be unloaded again.
   let preload = parsed.preload.unwrap_or_else(|| {
-    source.as_deref().is_some_and(|source| {
-      inherited.as_ref().is_some_and(|e| e.preload)
+    source.is_some_and(|source| {
+      inherited.is_some_and(|e| e.preload)
         && matches!(crate::daemon::preload::preload_target(source, &rows),
                     Ok(path) if path == std::path::Path::new(&path_str))
     })

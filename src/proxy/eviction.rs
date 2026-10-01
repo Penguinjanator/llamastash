@@ -433,23 +433,22 @@ pub async fn make_room(
     );
     return false;
   }
-  let ctx = state.ctx.clone();
-  let freed_bytes: u64 = go.iter().map(|c| c.bytes).sum();
-  let targets: Vec<LaunchId> = go.iter().flat_map(|c| c.targets.clone()).collect();
-  let unloaded = targets.len();
-  // Stopped together, the way the sweep unloads: the re-check above is only
-  // honest if nothing else runs before the stops, and stopping one after another
-  // would both stretch the request's wait to N x the stop grace and reopen the
-  // window for a launch to take a request mid-sequence.
-  futures::future::join_all(targets.iter().map(|target| stop_launch(&ctx, target))).await;
-  if unloaded == 0 {
-    log::info!("proxy make-room: nothing was free after all — not retrying");
-    return false;
-  }
+  let ctx = &state.ctx;
+  let unloaded: usize = go.iter().map(|c| c.targets.len()).sum();
+  // Candidates stop together, the way the sweep unloads: the re-check above is
+  // only honest if nothing else runs before the stops, and stopping one after
+  // another would stretch the request's wait to N x the stop grace. The models
+  // inside one multiplexer still go one at a time, as the sweep sends them.
+  futures::future::join_all(go.iter().map(|candidate| async move {
+    for target in &candidate.targets {
+      stop_launch(ctx, target).await;
+    }
+  }))
+  .await;
   log::info!(
     "proxy make-room: unloaded {} launch(es) ({}), waiting for the memory to land",
     unloaded,
-    crate::launch::admission::human_gib(freed_bytes),
+    crate::launch::admission::human_gib(freed_now),
   );
   wait_for_room(state, refusal.demand_bytes).await;
   true
