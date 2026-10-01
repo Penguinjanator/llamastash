@@ -68,8 +68,10 @@ struct AssetRow {
   browser_download_url: String,
   /// `sha256:<hex>`. Optional in the schema; required at use time.
   digest: Option<String>,
-  #[serde(default)]
-  size: u64,
+  /// Bytes. Required at use time like `digest`: the free-space check
+  /// sizes itself from it, and a missing size would pass a check the
+  /// extract then fails mid-way.
+  size: Option<u64>,
 }
 
 /// Pick the (platform, variant, arch) suffix the host wants. Returns
@@ -310,6 +312,15 @@ fn runtime_libs_name(asset_name: &str) -> Option<String> {
   (asset_name.contains("-bin-ubuntu-cuda-")).then(|| format!("cudart-{asset_name}"))
 }
 
+fn size_of(asset: &AssetRow) -> Result<u64, InstallError> {
+  asset.size.ok_or_else(|| {
+    InstallError::Integrity(format!(
+      "asset `{}` has no size field on the GH API response",
+      asset.name
+    ))
+  })
+}
+
 fn sha256_of(asset: &AssetRow) -> Result<String, InstallError> {
   let digest = asset.digest.as_deref().ok_or_else(|| {
     InstallError::Integrity(format!(
@@ -382,7 +393,7 @@ pub async fn fetch_latest_asset(
   let runtime_libs = match runtime {
     Some(r) => Some(Download {
       sha256: sha256_of(&r)?,
-      size: r.size,
+      size: size_of(&r)?,
       asset_name: r.name,
       url: r.browser_download_url,
     }),
@@ -391,7 +402,7 @@ pub async fn fetch_latest_asset(
   Ok(AssetPick {
     tag,
     sha256: sha256_of(&matched)?,
-    size: matched.size,
+    size: size_of(&matched)?,
     asset_name: matched.name,
     url: matched.browser_download_url,
     runtime_libs,
@@ -851,6 +862,20 @@ mod tests {
   }
 
   #[test]
+  fn an_asset_without_a_size_is_refused_not_sized_zero() {
+    let mut a = asset("llama-b1-bin-ubuntu-x64.tar.gz");
+    assert_eq!(size_of(&a).unwrap(), 1);
+    a.size = None;
+    assert!(matches!(size_of(&a), Err(InstallError::Integrity(_))));
+    // The API row deserialises without it rather than defaulting to 0.
+    let row: AssetRow = serde_json::from_str(
+      r#"{"name":"llama-b1-bin-ubuntu-x64.tar.gz","browser_download_url":"https://x","digest":"sha256:0"}"#,
+    )
+    .unwrap();
+    assert_eq!(row.size, None);
+  }
+
+  #[test]
   fn non_cuda_builds_take_no_runtime_bundle() {
     let releases = vec![release("b1", &["llama-b1-bin-ubuntu-vulkan-x64.tar.gz"])];
     let (_, _, runtime) = pick_release_with_asset(releases, "ubuntu-vulkan-x64.tar.gz").unwrap();
@@ -1003,7 +1028,7 @@ mod tests {
       name: name.into(),
       browser_download_url: format!("https://example.test/{name}"),
       digest: Some("sha256:0".into()),
-      size: 0,
+      size: Some(1),
     }
   }
 
