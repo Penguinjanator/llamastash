@@ -178,6 +178,18 @@ pi,opencode,zed,codex,aider`:
   Supported types are xhigh (default), medium, and low.` Zed itself was not
   driven (GUI), so how it renders that is not checked.
 
+## Follow-up: proxy URL in tool configs
+
+Found during E2E: the integrations wrote `config.proxy.effective_port()`
+(config, else `11435`), so a proxy that moved past a busy port or a daemon
+started with `--proxy-port` got configs pointing at the wrong port. With
+another daemon on `11435`, that is a different daemon's proxy. Now the
+order is: the daemon's `status.proxy.listen` when `status` is `listening`
+(wildcard host mapped to loopback), then config, then the default
+(`src/init/external/proxy_url.rs`). Checked live: daemon moved to `11436`
+and to `41536` (`--proxy-port 41535` held by another listener); pi,
+OpenCode, Zed and Codex configs got the moved port.
+
 ## Verification
 
 - `make test`, `make lint`; patcher golden tests per client.

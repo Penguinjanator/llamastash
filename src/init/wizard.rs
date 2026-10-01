@@ -1290,8 +1290,13 @@ async fn run_integrations_step(
   config: &Config,
   model_summary: Option<&ModelSummary>,
 ) -> Result<Option<IntegrationsSummary>, CliExit> {
-  let proxy_port = config.proxy.effective_port();
-  let proxy_base_url = format!("http://127.0.0.1:{proxy_port}/v1");
+  let proxy_url = crate::init::external::proxy_url::resolve(cli, config).await;
+  if let Some(note) = &proxy_url.note {
+    if !args.json {
+      eprintln!("{}", colors::warning(note));
+    }
+    log::warn!("init: integrations proxy url: {note}");
+  }
   // External tool configs must carry the proxy's real bearer token when
   // auth is enforced, or every request 401s. Fall back to the
   // `llamastash` stub on the keyless loopback default — clients that
@@ -1307,7 +1312,7 @@ async fn run_integrations_step(
     log::debug!("init: integrations model list: {note}");
   }
   let ctx = crate::init::external::PatchContext {
-    proxy_base_url,
+    proxy_base_url: proxy_url.base_url,
     api_key,
     models: resolved.models,
   };

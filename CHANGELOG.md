@@ -16,6 +16,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ### Fixed
 
+- `init` integrations write the proxy address the running daemon is actually listening on, instead of the config or default port. A proxy that moved past a busy `11435`, or a daemon started with `--proxy-port` / `--host`, no longer leaves tool configs pointing at the wrong port (or at another daemon's proxy).
 - OpenCode integration now declares each model's context and output `limit`; without it OpenCode read the context as `0` and never compacted.
 
 ## [0.5.0] — 2026-09-30
