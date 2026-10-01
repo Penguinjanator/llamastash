@@ -355,6 +355,29 @@ pub trait Backend {
     false
   }
 
+  /// Rewrite a forwarded request body for `endpoint` (the client-facing path,
+  /// e.g. `/v1/messages`) before it reaches the engine, or `None` to forward
+  /// `body` unchanged.
+  ///
+  /// Default `None`. A client sends a field the engine's own translator drops,
+  /// and only the engine knows the spelling it does read — so the remap lives
+  /// with the backend instead of naming an engine or a client in the generic
+  /// proxy. Callers must treat the body as opaque bytes; a rewrite that leaves
+  /// bytes untouched is a bug the client sees as a corrupt request.
+  ///
+  /// Whatever a rewrite does has to be switchable off: it overrides what the
+  /// launch itself configured, and a user who wants the engine's own default
+  /// needs a way back. Read the setting from `ctx` (see
+  /// [`crate::daemon::context::MethodContext::backend`]).
+  fn rewrite_request_body(
+    &self,
+    _ctx: &MethodContext,
+    _endpoint: &str,
+    _body: &[u8],
+  ) -> Option<Vec<u8>> {
+    None
+  }
+
   /// Seed daemon-config-derived launch knobs into `params.backend_knobs`, fresh
   /// each launch (config projection, not user intent). Default: no-op. llama.cpp
   /// projects its `jinja` / `strict_fit` / `fit_ctx_floor` config here so the
@@ -1043,6 +1066,12 @@ impl Backends {
       Backends::Generic(GenericBackend::new()),
     ]
   }
+
+  /// The backend whose [`Backend::id`] is `id`, or `None` for an unknown id.
+  /// For a recorded id string (a launch's `resolved_backend`, a status row).
+  pub fn from_id(id: &str) -> Option<Backends> {
+    Self::all().into_iter().find(|b| b.id() == id)
+  }
 }
 
 /// The id of the backend that **auto-claims** `header` (the first registry
@@ -1094,6 +1123,15 @@ impl Backend for Backends {
 
   fn serves_web_ui(&self) -> bool {
     for_each_backend!(self, b => b.serves_web_ui())
+  }
+
+  fn rewrite_request_body(
+    &self,
+    ctx: &MethodContext,
+    endpoint: &str,
+    body: &[u8],
+  ) -> Option<Vec<u8>> {
+    for_each_backend!(self, b => b.rewrite_request_body(ctx, endpoint, body))
   }
 
   fn seed_launch_knobs(&self, ctx: &MethodContext, params: &mut LaunchParams) {
@@ -1387,10 +1425,7 @@ pub fn knob_scope_for(backend: &Backends, path: &Path, server: Option<&str>) -> 
 /// [`knob_scope_for`] from a backend id, for surfaces that hold the id rather
 /// than a [`Backends`]. An unknown id scopes to the default backend.
 pub fn knob_scope_by_id(backend_id: &str, path: &Path, server: Option<&str>) -> &'static str {
-  let backend = Backends::all()
-    .into_iter()
-    .find(|b| b.id() == backend_id)
-    .unwrap_or_else(default_backend);
+  let backend = Backends::from_id(backend_id).unwrap_or_else(default_backend);
   knob_scope_for(&backend, path, server)
 }
 
@@ -1443,10 +1478,9 @@ pub fn config_declares_models(config: &BackendConfig) -> bool {
 pub fn backend_for_identity(identity: &ModelIdentity) -> Backends {
   match identity {
     ModelIdentity::Gguf(_) => Backends::LlamaCpp(LlamaCppBackend::new()),
-    ModelIdentity::Backend(id) => Backends::all()
-      .into_iter()
-      .find(|b| b.id() == id.backend)
-      .unwrap_or_else(|| Backends::LlamaCpp(LlamaCppBackend::new())),
+    ModelIdentity::Backend(id) => {
+      Backends::from_id(&id.backend).unwrap_or_else(|| Backends::LlamaCpp(LlamaCppBackend::new()))
+    }
   }
 }
 
@@ -1460,10 +1494,9 @@ pub fn resolve_backend(identity: &ModelIdentity, choice: BackendChoice) -> Backe
     BackendChoice::Auto => backend_for_identity(identity),
     // Force the named backend from the registry; an unknown id (shouldn't reach
     // here — the CLI/IPC boundary validates) falls back to the identity rule.
-    BackendChoice::Explicit(id) => Backends::all()
-      .into_iter()
-      .find(|b| b.id() == id)
-      .unwrap_or_else(|| backend_for_identity(identity)),
+    BackendChoice::Explicit(id) => {
+      Backends::from_id(&id).unwrap_or_else(|| backend_for_identity(identity))
+    }
   }
 }
 
@@ -1798,9 +1831,7 @@ pub fn is_managed_multiplexer(id: &str) -> bool {
 /// re-adopted process's real argv when the OS still has it, and reaches for this
 /// only once the process is gone or unreadable.
 pub fn adopted_process_name(backend_id: &str) -> &'static str {
-  Backends::all()
-    .iter()
-    .find(|b| b.id() == backend_id)
+  Backends::from_id(backend_id)
     .and_then(|b| b.process_markers().first().copied())
     // Unknown / marker-less id falls back to the default backend's own marker.
     .or_else(|| default_backend().process_markers().first().copied())
@@ -1832,7 +1863,7 @@ pub fn resolve_backend_for_launch(
       // is available and serves this mode (so a model falls back to llama.cpp
       // when its preferred engine is absent, or on an embedding/rerank launch).
       for id in supported_backends {
-        if let Some(b) = Backends::all().into_iter().find(|b| b.id() == id.as_str()) {
+        if let Some(b) = Backends::from_id(id) {
           if b.available(ctx) && b.serves_mode(path, server, mode) {
             return b;
           }
@@ -2148,9 +2179,7 @@ mod tests {
     let top = claimants
       .iter()
       .max_by_key(|id| {
-        Backends::all()
-          .iter()
-          .find(|b| b.id() == **id)
+        Backends::from_id(id)
           .map(|b| b.launch_priority())
           .unwrap_or(i32::MIN)
       })

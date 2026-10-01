@@ -14,6 +14,7 @@
 mod actuals;
 pub mod caps;
 mod compose;
+mod effort;
 pub mod knobs;
 pub mod list_devices;
 mod telemetry;
@@ -148,6 +149,17 @@ pub struct LlamaCppConfig {
   /// size. Factory [`crate::config::DEFAULT_FIT_CTX_FLOOR`].
   #[serde(default = "default_fit_ctx_floor")]
   pub fit_ctx_floor: u32,
+  /// Map the Anthropic `output_config.effort` field onto
+  /// `chat_template_kwargs.reasoning_effort` when the proxy forwards
+  /// `/v1/messages` (factory `true`). llama.cpp's own Anthropic translation
+  /// drops that field, so without the mapping a client's effort control does
+  /// nothing on a local model.
+  ///
+  /// Set `false` when the effort should come from the launch or the engine
+  /// default instead: a per-request kwarg overrides both, and a client that
+  /// sends an effort value on every request would otherwise always win.
+  #[serde(default = "default_true")]
+  pub map_anthropic_effort: bool,
 }
 
 fn default_true() -> bool {
@@ -165,6 +177,7 @@ impl Default for LlamaCppConfig {
       jinja: true,
       strict_fit: false,
       fit_ctx_floor: crate::config::DEFAULT_FIT_CTX_FLOOR,
+      map_anthropic_effort: true,
     }
   }
 }
@@ -247,6 +260,18 @@ impl Backend for LlamaCppBackend {
   }
   fn id(&self) -> &'static str {
     "llamacpp"
+  }
+
+  fn rewrite_request_body(
+    &self,
+    ctx: &MethodContext,
+    endpoint: &str,
+    body: &[u8],
+  ) -> Option<Vec<u8>> {
+    if !ctx.backend.llamacpp.map_anthropic_effort {
+      return None;
+    }
+    effort::rewrite_request_body(endpoint, body)
   }
 
   fn lifecycle(&self) -> Lifecycle {
@@ -545,6 +570,32 @@ mod tests {
   use super::*;
   use crate::launch::mode::LaunchMode;
   use std::ffi::OsString;
+
+  #[test]
+  fn anthropic_effort_mapping_is_switchable_off() {
+    // The mapping overrides whatever effort the launch itself set, so a user
+    // who wants the engine default has to be able to turn it off.
+    let mut ctx =
+      crate::daemon::context::MethodContext::new(crate::daemon::shutdown::ShutdownToken::new());
+    let body = r#"{"output_config":{"effort":"xhigh"}}"#;
+    let backend = LlamaCppBackend::new();
+
+    ctx.backend.llamacpp.map_anthropic_effort = true;
+    let rewritten = backend
+      .rewrite_request_body(&ctx, "/v1/messages", body.as_bytes())
+      .expect("mapped by default");
+    assert_eq!(
+      String::from_utf8(rewritten).expect("utf-8 json"),
+      r#"{"output_config":{"effort":"xhigh"},"chat_template_kwargs":{"reasoning_effort":"xhigh"}}"#,
+    );
+
+    ctx.backend.llamacpp.map_anthropic_effort = false;
+    assert_eq!(
+      backend.rewrite_request_body(&ctx, "/v1/messages", body.as_bytes()),
+      None,
+      "off means the client's bytes go through untouched"
+    );
+  }
 
   #[test]
   fn speculation_set_in_extras_defers_to_a_hand_passed_spec_type() {

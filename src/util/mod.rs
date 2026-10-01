@@ -6,6 +6,7 @@ pub mod file_security;
 pub mod glob;
 pub mod hex;
 pub mod http_auth;
+pub mod json_body;
 pub mod logging;
 pub mod model_caches;
 pub mod paths;

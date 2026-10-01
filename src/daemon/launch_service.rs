@@ -1242,10 +1242,7 @@ pub(crate) async fn spawn_supervised(
   // outside the scan roots) back outside the gate, which is the one case
   // that most needs it.
   let gate_applies = identity.as_gguf().is_some()
-    || crate::backend::Backends::all()
-      .into_iter()
-      .find(|b| crate::backend::Backend::id(b) == resolved_backend_id)
-      .map(|b| crate::backend::Backend::lifecycle(&b))
+    || crate::backend::Backends::from_id(&resolved_backend_id).map(|b| b.lifecycle())
       == Some(crate::backend::Lifecycle::ProcessPerModel);
   if gate_applies {
     if let Some(host_slot) = ctx.host_metrics.as_ref() {
@@ -1257,9 +1254,7 @@ pub(crate) async fn spawn_supervised(
           .ctx
           .or(admission_floor)
           .unwrap_or(crate::config::DEFAULT_FIT_CTX_FLOOR);
-        let backend = crate::backend::Backends::all()
-          .into_iter()
-          .find(|b| crate::backend::Backend::id(b) == resolved_backend_id);
+        let backend = crate::backend::Backends::from_id(&resolved_backend_id);
         // Free and pool total must come from the same pool, so both take one flag.
         let budget = |layer_count: Option<u64>| {
           let gpu_resident = backend
@@ -1565,10 +1560,9 @@ pub(crate) async fn backend_for_launch(
     .find(|r| r.launch_id.as_ref() == Some(launch_id))
     .map(|r| r.resolved_backend);
   match backend_id {
-    Some(id) => crate::backend::Backends::all()
-      .into_iter()
-      .find(|b| b.id() == id)
-      .unwrap_or_else(crate::backend::default_backend),
+    Some(id) => {
+      crate::backend::Backends::from_id(&id).unwrap_or_else(crate::backend::default_backend)
+    }
     None => crate::backend::default_backend(),
   }
 }
@@ -1748,9 +1742,7 @@ fn spawn_last_params_recorder(
           if let Some(port) = params.port {
             let mut actuals = model.actuals().await;
             if actuals.is_empty() {
-              let backend = crate::backend::Backends::all()
-                .into_iter()
-                .find(|b| b.id() == resolved_backend)
+              let backend = crate::backend::Backends::from_id(&resolved_backend)
                 .unwrap_or_else(crate::backend::default_backend);
               actuals = backend.fetch_actuals(port, Duration::from_secs(5)).await;
             }

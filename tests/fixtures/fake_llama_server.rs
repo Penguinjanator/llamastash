@@ -468,7 +468,9 @@ async fn handle(
       // Anthropic Messages API. Real llama-server (b6961+) answers this
       // natively. Echo `body.model` into the response so a proxy forward
       // test can assert model resolution + byte-pure pass-through, same
-      // contract as the chat-completions arm above.
+      // contract as the chat-completions arm above. `received_body` carries
+      // the request bytes verbatim, so a test can also assert what a backend
+      // body rewrite actually put on the wire.
       let body_text = std::str::from_utf8(&body).unwrap_or("");
       let echoed_model = extract_body_model(body_text).unwrap_or_else(|| args.model_path.clone());
       let body = serde_json::json!({
@@ -476,6 +478,7 @@ async fn handle(
         "type": "message",
         "role": "assistant",
         "model": echoed_model,
+        "received_body": body_text,
         "content": [{"type": "text", "text": "hi"}],
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 1, "output_tokens": 1},

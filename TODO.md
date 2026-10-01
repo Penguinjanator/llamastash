@@ -441,6 +441,9 @@ places.
 
 ### Low priority
 
+- [ ] **Anthropic effort mapping: retire it, and file the gufo gap** (origin: PR #95, plan [`2026-09-30-002`](docs/plans/2026-09-30-002-feat-anthropic-effort-mapping-plan.md)).
+  - [ ] **Delete `src/backend/llama_cpp/effort.rs`** once llama.cpp maps the Anthropic effort fields itself — [ggml-org/llama.cpp#20479](https://github.com/ggml-org/llama.cpp/pull/20479), open since 2026-03-13 and quiet since 2026-06-26 as of 2026-10-01. Run `scripts/effort-live-check.sh <proxy> <model> <upstream>` to confirm: the `proxy-effort-*` rows move on their own once upstream handles it.
+  - [ ] **File at gufo**: its `/v1/messages` answers `400 request field '<x>' is not supported on this endpoint` for `thinking`, `output_config`, `reasoning_effort` and `chat_template_kwargs`, so Claude Code cannot reach that engine at all. Draft in the plan's appendix, measured at gufo `fd1710b` (2026-09-30).
 - [ ] **Need brainstorm/plan**: **SSE for `logs_tail` streaming.** Today the CLI polls `logs_tail` every 250 ms over HTTP and de-dupes (works correctly; not a regression). SSE would collapse N polls/sec into one long-lived connection. Unit 3 of the 0.0.2 plan was explicitly deferred — needs its own brainstorm + plan.
 - [ ] **Follow-ups (deferred from PR #28):**
   - [ ] lemonade preload errors carry only `lemond returned HTTP 500` — include the response body's `detail` (e.g. the FLM memlock message) in `LemonadeError` so the status row's cause is actionable; llama.cpp supervisor `Error` rows can carry an empty cause when `llama-server` exits during Loading (status `state_cause` plumbing exists, the watcher just doesn't fill it on that path);

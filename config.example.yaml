@@ -461,6 +461,19 @@ backend:
     # Sources — CLI: (none) · Env: (none, config-only).
     jinja: true
 
+    # Map the Anthropic `output_config.effort` field that Claude Code sends on
+    # `/v1/messages` onto `chat_template_kwargs.reasoning_effort`, the spelling
+    # llama.cpp actually reads (default: true). llama.cpp's own Anthropic
+    # translation drops the field, so without this a client's effort control
+    # does nothing on a local model.
+    #
+    # A per-request kwarg overrides what the launch was given, so set false to
+    # keep an effort you pinned at launch time (e.g. with `-- --reasoning-effort`)
+    # or to let the model's own template default stand.
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    map_anthropic_effort: true
+
   # ── Lemonade (NPU / multi-engine backend) [EXPERIMENTAL] ──
   #
   # EXPERIMENTAL: behaviour and these keys may change. A second backend

@@ -208,9 +208,7 @@ pub async fn sweep(inputs: SweepInputs<'_>) -> SweepReport {
       stale.push(snap);
       continue;
     }
-    let backend = crate::backend::Backends::all()
-      .into_iter()
-      .find(|b| b.id() == snap.resolved_backend)
+    let backend = crate::backend::Backends::from_id(&snap.resolved_backend)
       .unwrap_or_else(crate::backend::default_backend);
     // Orphan re-adoption is process-based, so it needs a path to confirm
     // against. Keyed on **lifecycle**, not identity shape: a managed
