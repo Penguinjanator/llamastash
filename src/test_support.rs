@@ -138,6 +138,7 @@ pub fn running_row(path: &str) -> RunningRow {
     actuals: Default::default(),
     resolved_backend: crate::backend::DEFAULT_BACKEND_ID.to_string(),
     projected_demand_bytes: None,
+    origin: None,
   })
 }
 
@@ -201,6 +202,13 @@ impl RunningRow {
   /// credits it for when it is unloaded.
   pub fn projected_demand(mut self, bytes: u64) -> Self {
     self.0.projected_demand_bytes = Some(bytes);
+    self
+  }
+
+  /// How the launch came to be running — the sweep and make-room only ever
+  /// consider an `AutoStart` row.
+  pub fn origin(mut self, origin: crate::daemon::supervisor::LaunchOrigin) -> Self {
+    self.0.origin = Some(origin);
     self
   }
 

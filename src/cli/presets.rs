@@ -114,7 +114,9 @@ pub async fn handle(args: PresetsArgs, cli: &Cli, config: &Config) -> CliResult 
       backend,
       server,
       idle_ttl,
+      no_idle_ttl,
       preload,
+      no_preload,
       mtp,
       mtp_draft_n,
       from_last,
@@ -184,11 +186,18 @@ pub async fn handle(args: PresetsArgs, cli: &Cli, config: &Config) -> CliResult 
         payload.insert("server".into(), json!(sv));
       }
       // Residency policy, beside the params rather than inside them.
+      // Absent means "leave the pin alone" (the daemon inherits it); an explicit
+      // `--no-idle-ttl` / `--no-preload` clears it, which is the `null` /
+      // `false` the handler reads as a deliberate unpin.
       if let Some(ttl) = idle_ttl {
         payload.insert("idle_ttl_secs".into(), json!(ttl));
+      } else if no_idle_ttl {
+        payload.insert("idle_ttl_secs".into(), Value::Null);
       }
       if preload {
         payload.insert("preload".into(), json!(true));
+      } else if no_preload {
+        payload.insert("preload".into(), json!(false));
       }
       if !extras_os.is_empty() {
         let extras_str: Vec<String> = extras_os

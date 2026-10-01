@@ -642,6 +642,7 @@ impl Backend for LemonadeBackend {
     let snapshot_launch_id = launch_id.clone();
     let snapshot_name = exec.name.clone();
     let snapshot_preset = exec.preset.clone();
+    let snapshot_origin = exec.origin;
     let echoed_name = snapshot_name.clone();
     ctx
       .state
@@ -663,6 +664,7 @@ impl Backend for LemonadeBackend {
           // admission gate never budgeted per launch, so there is no projection
           // to carry. Make-room falls back to the model's own size.
           projected_demand_bytes: None,
+          origin: Some(snapshot_origin),
         });
       })
       .await;

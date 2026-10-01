@@ -1448,6 +1448,7 @@ pub(crate) async fn spawn_supervised(
         actuals: Default::default(),
         resolved_backend: resolved_backend_id.clone(),
         projected_demand_bytes,
+        origin: Some(origin),
       });
     })
     .await;
@@ -1900,7 +1901,7 @@ fn extras_lazy_mode(extras: &[OsString]) -> Option<String> {
 /// [`extras_lazy_mode`].
 ///
 /// Off the runtime — a stat per shard, following the HF cache's symlinks.
-async fn launch_resident_bytes(
+pub(crate) async fn launch_resident_bytes(
   ctx: &MethodContext,
   model_path: &std::path::Path,
   extras: &[OsString],

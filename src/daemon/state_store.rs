@@ -182,6 +182,13 @@ pub struct RunningSnapshot {
   /// priced in — so the two cannot disagree.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub projected_demand_bytes: Option<u64>,
+  /// Where this launch came from, read by the eviction gates. A delegated
+  /// (managed-multiplexer) row has no supervisor of its own, so the snapshot is
+  /// the only home its origin can have; process rows carry it too so one rule
+  /// covers both. Not persisted: `state.running` is cleared on every boot, so an
+  /// adopted row never needs it and a stale one must not outlive its daemon.
+  #[serde(skip)]
+  pub origin: Option<crate::daemon::supervisor::LaunchOrigin>,
 }
 
 impl RunningSnapshot {

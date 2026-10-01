@@ -303,6 +303,9 @@ async fn idle_lemonade_model_is_unloaded_but_umbrella_stays_up() {
       s.running.push(
         llamastash::test_support::running_row("lemonade://Qwen2.5-0.5B-Instruct")
           .identity(identity)
+          // The sweep may only give up a model the proxy brought up; a manual
+          // Lemonade launch is left alone whatever its preset says.
+          .origin(llamastash::daemon::supervisor::LaunchOrigin::AutoStart)
           .pid(0)
           .port(port)
           .launch_id("evict-L1")

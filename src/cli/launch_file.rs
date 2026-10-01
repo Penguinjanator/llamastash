@@ -156,6 +156,17 @@ pub fn select_launch(
 /// such pass: it has no `presets show` to reveal what survived.
 const BLOCK_FIELDS: [&str; 2] = ["default", "entries"];
 const ENTRY_FIELDS: [&str; 4] = ["knobs", "extras", "backend", "server"];
+/// Keys a `config.yaml` preset entry may carry that a launch file may not, with
+/// the reason the error has to say: a launch file is an input for one launch, so
+/// there is no residency to pin — the launch it describes is manual intent, never
+/// swept, and nothing preloads it.
+const PRESET_ONLY_FIELDS: [(&str, &str); 2] = [
+  (
+    "idle_ttl_secs",
+    "how long a preset's launches stay loaded is preset policy",
+  ),
+  ("preload", "only a preset starts a model at daemon boot"),
+];
 
 /// Error on anything in the *selected* entry that would not reach the launch.
 ///
@@ -257,6 +268,11 @@ fn reject_unknown_fields(
     .any(|k| crate::launch::knobs::resolve_id(k).is_some())
   {
     "\nknobs go under `knobs:`, not beside it"
+  } else if let Some((key, why)) = PRESET_ONLY_FIELDS
+    .iter()
+    .find(|(key, _)| unknown.iter().any(|k| k == key))
+  {
+    &format!("\n`{key}` is preset-only: {why}. A launch file describes one launch, and that launch is manual intent.")
   } else {
     ""
   };

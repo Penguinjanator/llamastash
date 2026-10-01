@@ -594,3 +594,48 @@ async fn make_room_never_picks_a_manual_or_never_unload_launch() {
     std::fs::remove_dir_all(&dir).ok();
   }
 }
+
+/// A candidate that takes a request between selection and the stop is skipped,
+/// not unloaded under the request. The shortfall here needs one launch; the
+/// least-recently-used one is the busy one, so make-room must move on to the
+/// next candidate rather than giving up or evicting the active launch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn make_room_skips_a_candidate_that_took_a_request() {
+  let dir = unique_temp("make-room-busy");
+  let log_dir = dir.join("logs");
+  std::fs::create_dir_all(&log_dir).unwrap();
+  let registry = SupervisorRegistry::new();
+  let busy = pre_launch(&log_dir, &registry, LaunchOrigin::AutoStart).await;
+  let idle = pre_launch(&log_dir, &registry, LaunchOrigin::AutoStart).await;
+  let persisted = PersistedState::new(DaemonState::default(), None);
+  stamp_row(&persisted, &registry, &busy, None, 500).await;
+  stamp_row(&persisted, &registry, &idle, None, 500).await;
+  let state =
+    build_state_with_presets(registry, &log_dir, persisted, ConfigPresetStore::empty()).await;
+  // `busy` is the least recently used, so it is picked first — then it takes a
+  // request before the stop lands.
+  state.touch_mru(busy.id()).await;
+  state.touch_mru(idle.id()).await;
+  let _guard = busy.inflight_guard();
+  assert_eq!(busy.inflight(), 1);
+
+  let fits = eviction::make_room(
+    &state,
+    &Refusal {
+      demand_bytes: 550,
+      effective_free_bytes: 100,
+      reserved_bytes: 0,
+    },
+  )
+  .await;
+  assert!(fits, "450 needed, the idle launch alone covers 500");
+  assert!(
+    matches!(busy.state().await, ManagedState::Ready),
+    "a launch with a request in flight was unloaded"
+  );
+  wait_until_not_ready(&idle, "the idle candidate after the busy one").await;
+  drop(_guard);
+  assert_eq!(busy.inflight(), 0);
+  let _ = busy.stop(Duration::from_secs(2)).await;
+  std::fs::remove_dir_all(&dir).ok();
+}

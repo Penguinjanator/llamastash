@@ -19,8 +19,9 @@ pub use crate::backend::sglang::SglangConfig;
 pub use crate::backend::vllm::VllmConfig;
 pub use crate::backend::BackendConfig;
 pub use loader::{
-  config_path, config_path_from, load_config, load_config_from_path, validate_port_range,
-  validate_scan_settings, CachePathsConfig, Config, ConfigPresetBlock, DaemonConfig,
-  DefaultLaunchMode, GpuConfig, KnobValue, KnobValueOpt, LoadedConfig, PortRange, PortRangeError,
-  PresetBody, ProxyConfig, ScanSettingsError, DEFAULT_FIT_CTX_FLOOR, MAX_CTX_TOKENS,
+  config_path, config_path_from, load_config, load_config_from_path, preset_entries,
+  validate_port_range, validate_scan_settings, CachePathsConfig, Config, ConfigPresetBlock,
+  DaemonConfig, DefaultLaunchMode, GpuConfig, KnobValue, KnobValueOpt, LoadedConfig, PortRange,
+  PortRangeError, PresetBody, ProxyConfig, ScanSettingsError, DEFAULT_FIT_CTX_FLOOR,
+  MAX_CTX_TOKENS,
 };

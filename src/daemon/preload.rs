@@ -33,6 +33,7 @@ use crate::daemon::launch_service::{
 use crate::daemon::shutdown::ShutdownToken;
 use crate::daemon::supervisor::{LaunchOrigin, ManagedModel, ManagedState};
 use crate::launch::mode::LaunchMode;
+use crate::launch::presets::KeyClass;
 use crate::launch::presets::{materialize_preset, NamedPreset};
 use crate::launch::resolve::{parse_named_reference, CatalogRow};
 
@@ -94,11 +95,18 @@ pub async fn run(ctx: MethodContext, entries: Vec<String>, shutdown: ShutdownTok
 /// on their own. Unresolvable entries are logged and dropped here, so the caller
 /// only ever sees work it can do.
 async fn collect(ctx: &MethodContext, entries: &[String]) -> Vec<PreloadLaunch> {
-  let rows = wait_for_catalog(ctx).await;
+  collect_with_rows(ctx, entries, &wait_for_catalog(ctx).await).await
+}
+
+async fn collect_with_rows(
+  ctx: &MethodContext,
+  entries: &[String],
+  rows: &[CatalogRow],
+) -> Vec<PreloadLaunch> {
   let store = ctx.presets.snapshot().await;
   let mut out: Vec<PreloadLaunch> = Vec::new();
   for entry in entries {
-    match resolve_entry(entry, &rows, ctx).await {
+    match resolve_entry(entry, rows, ctx).await {
       Ok(launch) => out.push(launch),
       Err(why) => log::warn!("preload: skipping `{entry}` — {why}"),
     }
@@ -108,26 +116,52 @@ async fn collect(ctx: &MethodContext, entries: &[String]) -> Vec<PreloadLaunch> 
       if !body.preload {
         continue;
       }
-      let path = match resolve_path(key, &rows) {
-        Ok(path) => path,
-        Err(why) => {
-          log::warn!("preload: preset `{name}` under `{key}` is not preloadable — {why}");
-          continue;
-        }
-      };
-      // The explicit list already covers this model (that entry picks its
-      // preset, `default:` or none); don't start it twice.
-      if out.iter().any(|l| l.model_path == path) {
+      // A preset key is scoped exactly the way the read side scopes it: one
+      // model, a wildcard family, or a whole architecture. Preloading an arch
+      // preset therefore warms every model that arch has, which is what
+      // attaching `preload: true` to it says.
+      let models = preset_models(key, rows);
+      if models.is_empty() {
+        log::warn!("preload: preset `{name}` under `{key}` names no discovered model");
         continue;
       }
-      out.push(PreloadLaunch {
-        label: format!("{key}@{name}"),
-        preset: Some(materialize_preset(name, body, path.clone())),
-        model_path: path,
-      });
+      for path in models {
+        // The explicit list already covers this model (that entry picks its
+        // preset, `default:` or none); don't start it twice.
+        if out.iter().any(|l| l.model_path == path) {
+          continue;
+        }
+        out.push(PreloadLaunch {
+          label: format!("{key}@{name}"),
+          preset: Some(materialize_preset(name, body, path.clone())),
+          model_path: path,
+        });
+      }
     }
   }
   out
+}
+
+/// The models a preset key applies to, using the same classification
+/// [`effective_presets`] uses: an arch key takes every row of that arch, a
+/// wildcard or exact per-model key takes the rows it matches.
+fn preset_models(key: &str, rows: &[CatalogRow]) -> Vec<PathBuf> {
+  if crate::launch::presets::classify_preset_key(key, rows) == KeyClass::Arch {
+    return rows
+      .iter()
+      .filter(|r| {
+        r.arch
+          .as_deref()
+          .is_some_and(|arch| arch.eq_ignore_ascii_case(key))
+      })
+      .map(|r| PathBuf::from(&r.path))
+      .collect();
+  }
+  rows
+    .iter()
+    .filter(|r| crate::launch::presets::preset_key_matches(key, &r.name(), &r.path))
+    .map(|r| PathBuf::from(&r.path))
+    .collect()
 }
 
 /// One `daemon.preload:` entry: a launch file, a `<model>@<preset>` address, or
@@ -176,9 +210,10 @@ fn parse_launch_file(entry: &str, rows: &[CatalogRow]) -> Result<Option<PreloadL
   if !crate::cli::launch_file::is_launch_file(entry) {
     return Ok(None);
   }
-  let sel = crate::cli::launch_file::load(Path::new(entry), None).map_err(|e| {
+  let path = crate::util::paths::expand_user_path(Path::new(entry));
+  let sel = crate::cli::launch_file::load(&path, None).map_err(|e| {
     e.message
-      .unwrap_or_else(|| "cannot read launch file".into())
+      .unwrap_or_else(|| format!("cannot read launch file `{}`", path.display()))
   })?;
   let model_path = resolve_path(&sel.model_key, rows)?;
   Ok(Some(PreloadLaunch {
@@ -192,17 +227,34 @@ fn parse_launch_file(entry: &str, rows: &[CatalogRow]) -> Result<Option<PreloadL
   }))
 }
 
-/// Resolve a preload reference to a catalog path. A path that exists on disk is
-/// taken as-is, so a model outside every scan root still preloads.
+/// Resolve a preload reference to a catalog path.
+///
+/// An absolute or `~`-rooted reference is a path by declaration, so it is read
+/// from disk (a model outside every scan root still preloads) and never offered
+/// to the fuzzy matcher. A bare name goes to the catalog first: a relative name
+/// resolves against the *daemon's* working directory, which is not the
+/// operator's, so letting it win over the catalog turns a model name that
+/// happens to match a directory into the wrong launch. A catalog miss then falls
+/// back to the relative path, so a file next to the daemon's cwd still works.
 fn resolve_path(reference: &str, rows: &[CatalogRow]) -> Result<PathBuf, String> {
-  let path = std::path::Path::new(reference);
-  if path.is_file() || path.is_dir() {
-    return crate::util::paths::canonicalize(path)
-      .map_err(|e| format!("cannot resolve `{reference}`: {e}"));
+  let declared = crate::util::paths::expand_user_path(Path::new(reference));
+  if declared.is_absolute() {
+    if declared.is_file() || declared.is_dir() {
+      return crate::util::paths::canonicalize(&declared)
+        .map_err(|e| format!("cannot resolve `{reference}`: {e}"));
+    }
+    return Err(format!("`{reference}` is not a readable path"));
   }
-  crate::launch::resolve::resolve_model_with_candidates(rows, reference)
-    .map(|row| PathBuf::from(row.path))
-    .map_err(|_| format!("`{reference}` does not name exactly one discovered model"))
+  match crate::launch::resolve::resolve_model_with_candidates(rows, reference) {
+    Ok(row) => Ok(PathBuf::from(row.path)),
+    Err(_) if declared.is_file() || declared.is_dir() => {
+      crate::util::paths::canonicalize(&declared)
+        .map_err(|e| format!("cannot resolve `{reference}`: {e}"))
+    }
+    Err(_) => Err(format!(
+      "`{reference}` does not name exactly one discovered model"
+    )),
+  }
 }
 
 /// The `general.architecture` of a catalog path, for preset arch keys.
@@ -344,6 +396,58 @@ mod tests {
     assert!(resolve_path("nothing-like-this", &rows).is_err());
   }
 
+  /// A bare name must not be read as a filesystem path first: the daemon's
+  /// working directory is not the operator's, so a model name that happens to
+  /// name an existing directory would otherwise launch the directory.
+  #[test]
+  fn resolve_path_does_not_let_a_relative_name_beat_the_catalog() {
+    let cwd = std::env::current_dir().expect("cwd");
+    let lookalike = cwd.join("m");
+    std::fs::create_dir_all(&lookalike).expect("mkdir");
+    let rows = vec![row("/m/m.gguf", Some("llama"))];
+    let got = resolve_path("m", &rows).expect("catalog wins over the cwd entry");
+    assert_eq!(got, PathBuf::from("/m/m.gguf"));
+  }
+
+  /// An absolute path that does not exist is a bad path, not a fuzzy model name.
+  #[test]
+  fn resolve_path_rejects_a_missing_absolute_path() {
+    let rows = vec![row("/m/demo.gguf", Some("llama"))];
+    let err = resolve_path("/no/such/model.gguf", &rows).unwrap_err();
+    assert!(err.contains("not a readable path"), "{err}");
+  }
+
+  /// A preset key preloads exactly the models the read side scopes it to: an
+  /// arch key warms every model of that arch, a glob every model it matches, and
+  /// an exact key just its own.
+  #[test]
+  fn preset_models_scopes_arch_glob_and_exact_keys() {
+    let rows = vec![
+      row("/repos/unsloth/a-Q4_K_M.gguf", Some("qwen3")),
+      row("/repos/unsloth/b-Q4_K_M.gguf", Some("qwen3")),
+      row("/repos/other/c-Q4_K_M.gguf", Some("llama")),
+    ];
+    let mut arch = preset_models("qwen3", &rows);
+    arch.sort();
+    assert_eq!(
+      arch,
+      vec![
+        PathBuf::from("/repos/unsloth/a-Q4_K_M.gguf"),
+        PathBuf::from("/repos/unsloth/b-Q4_K_M.gguf"),
+      ]
+    );
+
+    let mut glob = preset_models("unsloth/*", &rows);
+    glob.sort();
+    assert_eq!(glob, arch, "the same two rows the arch key found");
+
+    assert_eq!(
+      preset_models("c-Q4_K_M.gguf", &rows),
+      vec![PathBuf::from("/repos/other/c-Q4_K_M.gguf")]
+    );
+    assert!(preset_models("no-such-model.gguf", &rows).is_empty());
+  }
+
   #[test]
   fn plain_reference_sends_a_default_selection_and_no_preset() {
     let launch = PreloadLaunch {
@@ -376,12 +480,36 @@ mod tests {
     assert_eq!(params.mode, None, "a Chat mode stays off the wire");
   }
 
+  /// An entry that names nothing is logged and dropped; the entries around it
+  /// still launch, in order. Rows are passed in so the test does not sit out the
+  /// catalog grace wait on an empty catalog.
   #[tokio::test]
-  async fn collect_skips_an_unresolvable_entry_and_keeps_the_rest() {
+  async fn collect_skips_unresolvable_entries_and_keeps_the_rest_in_order() {
     let ctx = MethodContext::new(ShutdownToken::new());
-    let launches = collect(&ctx, &["definitely-not-a-model".into()]).await;
-    // No catalog rows in a bare context, and no CATALOG_GRACE wait is asserted
-    // here: the entry is logged and dropped rather than failing the boot.
-    assert!(launches.is_empty());
+    let rows = vec![
+      row("/m/first-Q4_K_M.gguf", Some("llama")),
+      row("/m/last-Q4_K_M.gguf", Some("llama")),
+    ];
+    let launches = collect_with_rows(
+      &ctx,
+      &[
+        "first-Q4_K_M".into(),
+        "definitely-not-a-model".into(),
+        "last-Q4_K_M".into(),
+      ],
+      &rows,
+    )
+    .await;
+    assert_eq!(
+      launches
+        .iter()
+        .map(|l| l.model_path.clone())
+        .collect::<Vec<_>>(),
+      vec![
+        PathBuf::from("/m/first-Q4_K_M.gguf"),
+        PathBuf::from("/m/last-Q4_K_M.gguf"),
+      ],
+      "the bad entry is skipped, the good two keep their order"
+    );
   }
 }

@@ -198,7 +198,36 @@ async fn preload_starts_listed_models_in_order() {
   let presets = preset_block(vec![(b.clone(), "warm".to_string(), PresetBody::default())]);
   let ctx = build_ctx(vec![discovered(&a), discovered(&b)], presets).await;
 
+  // Preload launches one model at a time, in list order, and does not move on
+  // until the current one is Ready. Watch the running rows from another task:
+  // the order the two paths first appear in is the order they were launched.
+  let watcher = {
+    let ctx = ctx.clone();
+    let want = [a.clone(), b.clone()];
+    tokio::spawn(async move {
+      let mut seen: Vec<PathBuf> = Vec::new();
+      for _ in 0..1500 {
+        for row in ctx.state.snapshot().await.running {
+          let path = row.params.model_path.clone();
+          if want.contains(&path) && !seen.contains(&path) {
+            seen.push(path);
+          }
+        }
+        if seen.len() == want.len() {
+          break;
+        }
+        sleep(Duration::from_millis(2)).await;
+      }
+      seen
+    })
+  };
   run_preload(&ctx, vec!["alpha".to_string(), "beta@warm".to_string()]).await;
+  let order = watcher.await.expect("watcher task");
+  assert_eq!(
+    order,
+    vec![a.clone(), b.clone()],
+    "preload launched out of list order (or in parallel)"
+  );
 
   let ready = wait_for_supervisors(&ctx, 2).await;
   assert!(

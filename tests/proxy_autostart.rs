@@ -20,8 +20,11 @@ use std::time::Duration;
 
 use llamastash::config::loader::PortRange;
 use llamastash::daemon::context::{LaunchEnv, MethodContext};
+use llamastash::daemon::host_metrics::{HostMetricsSnapshot, SamplerHandles};
 use llamastash::daemon::probe::ProbeOptions;
 use llamastash::daemon::registry::SupervisorRegistry;
+
+const GIB: u64 = 1024 * 1024 * 1024;
 use llamastash::daemon::shutdown::ShutdownToken;
 use llamastash::discovery::{DiscoveredModel, ModelCatalog, ModelSource};
 use llamastash::gguf::metadata::{ModeHint, ModelMetadata, Quant};
@@ -150,9 +153,34 @@ async fn build_state(
     servers: Default::default(),
     default_launch_mode: Default::default(),
   };
+  // A sampled host-metrics slot with a generous free pool: the memory admission
+  // gate only runs when it sees one, so without this the auto-start path under
+  // test never touches it. A test that needs a refusal clamps the figure
+  // through `ctx.host_metrics`.
+  let metrics = Arc::new(tokio::sync::RwLock::new(HostMetricsSnapshot {
+    cpu_pct: 0.0,
+    cpu_temp_c: None,
+    ram_used_bytes: GIB,
+    ram_total_bytes: 512 * GIB,
+    gpu_util_pct: None,
+    gpu_mem_used_bytes: None,
+    gpu_mem_total_bytes: None,
+    gpu_temp_c: None,
+    gpu_backend: "cpu_only".to_string(),
+    gpu_device_count: 0,
+    unified: false,
+    uma_shared_total_bytes: None,
+    uma_shared_used_bytes: None,
+    uma_class_source: None,
+    gpu_devices: None,
+  }));
   let ctx = MethodContext::with_catalog(token, catalog)
     .with_supervisors(SupervisorRegistry::new())
-    .with_launch_env(env);
+    .with_launch_env(env)
+    .with_sampler(SamplerHandles {
+      snapshot: Arc::clone(&metrics),
+      gpu: Arc::new(tokio::sync::RwLock::new(llamastash::gpu::GpuInfo::CpuOnly)),
+    });
   let state = ProxyState::from_context(&ctx, false, true, DEFAULT_BODY_LIMIT_BYTES);
   (state, ctx)
 }
@@ -745,4 +773,84 @@ async fn auto_start_failure_with_no_ready_models_returns_launch_failed() {
   stop_all(&ctx).await;
   shutdown_listener(shutdown, listener_handle).await;
   std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- Scenario: an admission refusal makes room, then retries once ----
+
+/// Set the sampled free memory the admission gate reads, so a test can price a
+/// launch in or out without touching the real host.
+async fn set_free_bytes(metrics: &Arc<tokio::sync::RwLock<HostMetricsSnapshot>>, free: u64) {
+  let mut snap = metrics.write().await;
+  snap.ram_used_bytes = snap.ram_total_bytes.saturating_sub(free);
+}
+
+/// The full make-room round trip on one request: the gate refuses the second
+/// model, the daemon unloads the first idle auto-start to fit it, the retry is
+/// admitted, and the client sees `200` — never a `503`. The unload is what the
+/// test asserts at the end: A's supervisor is gone and B is the resident launch.
+#[tokio::test]
+async fn auto_start_refusal_unloads_the_idle_model_and_retries_once() {
+  let dir = unique_temp("make-room");
+  let log_dir = dir.join("logs");
+  std::fs::create_dir_all(&log_dir).expect("mkdir logs");
+  let first = write_gguf(&dir, "first-Q4_K_M.gguf", "qwen2");
+  let second = write_gguf(&dir, "second-Q4_K_M.gguf", "qwen2");
+  let (state, ctx) = build_state(
+    vec![
+      discovered(&first, None, "qwen2"),
+      discovered(&second, None, "qwen2"),
+    ],
+    &log_dir,
+    allocate_wide_port_range(),
+  )
+  .await;
+  let metrics = ctx.host_metrics.clone().expect("test sampler attached");
+  let (addr, token, handle) = spawn_listener(state).await;
+
+  let body = |model: &str| format!(r#"{{"model":"{model}","messages":[]}}"#);
+  let (status, _, resp) = http_post(addr, "/v1/chat/completions", &body("first-Q4_K_M.gguf")).await;
+  assert_eq!(
+    status,
+    200,
+    "first auto-start: {}",
+    String::from_utf8_lossy(&resp)
+  );
+
+  // Clamp the sampled pool below one launch's demand. The gate must refuse the
+  // second model, and make-room has to give the first back to fit it.
+  set_free_bytes(&metrics, GIB).await;
+  // A stop's memory is not something this test can measure, so lift the clamp a
+  // moment after the unloads start; `wait_for_room` polls this same slot.
+  {
+    let metrics = metrics.clone();
+    tokio::spawn(async move {
+      sleep(Duration::from_millis(300)).await;
+      set_free_bytes(&metrics, 511 * GIB).await;
+    });
+  }
+
+  let (status, _, resp) =
+    http_post(addr, "/v1/chat/completions", &body("second-Q4_K_M.gguf")).await;
+  assert_eq!(
+    status,
+    200,
+    "make-room should have unloaded the first model and the retry served: {}",
+    String::from_utf8_lossy(&resp)
+  );
+
+  let resident: Vec<PathBuf> = ctx
+    .supervisors
+    .snapshot()
+    .await
+    .into_iter()
+    .map(|(_, m)| m.params().model_path.clone())
+    .collect();
+  assert_eq!(
+    resident,
+    vec![second.clone()],
+    "the idle first launch is gone and the refused one is resident"
+  );
+
+  stop_all(&ctx).await;
+  shutdown_listener(token, handle).await;
 }

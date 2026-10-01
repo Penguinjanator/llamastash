@@ -230,16 +230,18 @@ async fn drive_launch_as_leader(
       // The memory admission gate refused it. Before answering 503, try to make
       // room by unloading the idle auto-started models that hold the memory —
       // least-recently-used first, all-or-nothing. Any other failure, or a retry
-      // that still does not fit, fails exactly as before.
+      // that still does not fit, fails exactly as before. A failed retry costs the
+      // family-MRU fallback its idle candidates, which is the honest price of
+      // having unloaded them: `start --force` or a smaller request is the way
+      // back, and TODO tracks tightening the estimate that let this happen.
+      let failed = |err: crate::ipc::protocol::ErrorObject| LaunchOutcome::Failed {
+        cause: format!("compose_and_spawn: {}", err.message),
+      };
       let Some(refusal) = admission_refusal(&e) else {
-        return LaunchOutcome::Failed {
-          cause: format!("compose_and_spawn: {}", e.message),
-        };
+        return failed(e);
       };
       if !super::eviction::make_room(state, &refusal).await {
-        return LaunchOutcome::Failed {
-          cause: format!("compose_and_spawn: {}", e.message),
-        };
+        return failed(e);
       }
       match compose_and_spawn(
         &state.ctx,
@@ -249,11 +251,7 @@ async fn drive_launch_as_leader(
       .await
       {
         Ok(s) => s,
-        Err(retry) => {
-          return LaunchOutcome::Failed {
-            cause: format!("compose_and_spawn: {}", retry.message),
-          };
-        }
+        Err(retry) => return failed(retry),
       }
     }
   };

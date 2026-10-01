@@ -710,14 +710,46 @@ struct PresetsSaveParams {
   /// Server (build/binary) this preset pins. Identity, like `backend`.
   #[serde(default)]
   server: Option<String>,
-  /// Idle-TTL override in seconds for launches this preset starts (`Some(0)` =
-  /// never unload). Residency policy, not a launch knob, so it never rides in
-  /// `knobs`.
+  /// Idle-TTL override in seconds for launches this preset starts (`0` = never
+  /// unload). Residency policy, not a launch knob, so it never rides in `knobs`.
+  /// Tri-state on purpose: absent = leave whatever the entry already pins,
+  /// `null` = clear the pin, a number = set it. A caller that captures launch
+  /// params (the TUI's `Ctrl+P`, `presets save --from-last`) sends nothing here,
+  /// and must not silently delete a residency pin it never looked at.
+  #[serde(default, deserialize_with = "clearable_u64::deserialize")]
+  idle_ttl_secs: Option<Option<u64>>,
+  /// Start this preset when the daemon boots. Same tri-state: absent = leave the
+  /// entry's pin, `true` / `false` set or clear it.
   #[serde(default)]
-  idle_ttl_secs: Option<u64>,
-  /// Start this preset when the daemon boots.
-  #[serde(default)]
-  preload: bool,
+  preload: Option<bool>,
+}
+
+/// Reads a present `idle_ttl_secs` while keeping "absent" distinguishable from
+/// "sent as null". Plain `Option<Option<u64>>` will not do it: serde maps a JSON
+/// `null` to the *outer* `None`, so an explicit clear would look exactly like a
+/// caller that said nothing — which is the data loss this tri-state exists to
+/// avoid.
+mod clearable_u64 {
+  use serde::de::{Deserialize, Deserializer};
+
+  fn bad<D: serde::de::Error>() -> D {
+    serde::de::Error::custom("idle_ttl_secs must be a non-negative integer or null")
+  }
+
+  pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Option<u64>>, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+      serde_json::Value::Null => Ok(Some(None)),
+      serde_json::Value::Number(n) => match n.as_u64() {
+        Some(secs) => Ok(Some(Some(secs))),
+        None => Err(bad()),
+      },
+      _ => Err(bad()),
+    }
+  }
 }
 
 async fn presets_save_handler(
@@ -752,16 +784,32 @@ async fn presets_save_handler(
     .unwrap_or_default();
   lp.server = parsed.server.clone();
   lp.extras = parsed.extras.into_iter().map(OsString::from).collect();
+  let (key, arch, rows) = model_key_arch_rows(ctx, &parsed.model_path).await;
   // Residency policy sits beside the launch params rather than inside them: it
-  // decides how long the launch *stays* up, not how it is launched. A save that
-  // carries neither pins nothing, the same rule every other field here follows.
+  // decides how long the launch *stays* up, not how it is launched. Because a
+  // params capture knows nothing about it, an absent field inherits what the
+  // entry already pins instead of dropping it; only an explicit `null` /
+  // `false` clears.
+  let existing = ctx
+    .presets
+    .snapshot()
+    .await
+    .get(&key)
+    .and_then(|block| block.entries.get(&parsed.name))
+    .cloned();
+  let idle_ttl_secs = match parsed.idle_ttl_secs {
+    Some(pin) => pin,
+    None => existing.as_ref().and_then(|e| e.idle_ttl_secs),
+  };
+  let preload = parsed
+    .preload
+    .unwrap_or_else(|| existing.as_ref().is_some_and(|e| e.preload));
   let body = crate::config::PresetBody {
-    idle_ttl_secs: parsed.idle_ttl_secs,
-    preload: parsed.preload,
+    idle_ttl_secs,
+    preload,
     ..preset_body_from_launch_params(&lp)
   };
 
-  let (key, arch, rows) = model_key_arch_rows(ctx, &parsed.model_path).await;
   let saved_np = materialize_preset(&parsed.name, &body, parsed.model_path.clone());
   let prev = ctx
     .presets
@@ -1283,6 +1331,50 @@ mod tests {
     let err = second.error.expect("double-stop must error");
     assert_eq!(err.code, ErrorCode::InvalidParams.as_i32());
     assert!(err.message.contains("L1"));
+  }
+
+  /// The residency fields are tri-state on the wire, because `Ctrl+P` re-saves a
+  /// preset from a launch capture that knows nothing about them: absent inherits
+  /// what the entry already pins, an explicit `null` / `false` clears it, a
+  /// number or `true` pins it.
+  #[tokio::test]
+  async fn presets_save_inherits_residency_unless_told_otherwise() {
+    let c = ctx();
+    let save = |params: Value, id: i64| {
+      let c = &c;
+      async move {
+        dispatch_request(c, Request::new(id, "presets_save", Some(params))).await;
+        let block = c.presets.snapshot().await;
+        let entry = block
+          .values()
+          .filter_map(|b| b.entries.get("p"))
+          .next()
+          .cloned()
+          .expect("saved entry");
+        (entry.idle_ttl_secs, entry.preload)
+      }
+    };
+
+    let pinned = save(
+      json!({"model_path": "/m/a.gguf", "name": "p", "idle_ttl_secs": 60, "preload": true}),
+      1,
+    )
+    .await;
+    assert_eq!(pinned, (Some(60), true));
+
+    let inherited = save(json!({"model_path": "/m/a.gguf", "name": "p"}), 2).await;
+    assert_eq!(
+      inherited,
+      (Some(60), true),
+      "a params-only re-save dropped the residency policy"
+    );
+
+    let cleared = save(
+      json!({"model_path": "/m/a.gguf", "name": "p", "idle_ttl_secs": null, "preload": false}),
+      3,
+    )
+    .await;
+    assert_eq!(cleared, (None, false));
   }
 
   #[tokio::test]

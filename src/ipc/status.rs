@@ -370,12 +370,7 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
   // entries pin `preload: true`. Reported so a caller can tell a daemon that was
   // asked to warm models from one that was not; whether a given entry started is
   // visible in `models`, since a preloaded launch is a normal running row.
-  let preload_presets = ctx
-    .presets
-    .snapshot()
-    .await
-    .values()
-    .flat_map(|block| block.entries.values())
+  let preload_presets = crate::config::preset_entries(&ctx.presets.snapshot().await)
     .filter(|entry| entry.preload)
     .count();
   let mut body = json!({

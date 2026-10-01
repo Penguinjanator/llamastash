@@ -269,27 +269,12 @@ fn must_refuse_insecure_proxy(host: IpAddr, has_api_key: bool, insecure_no_auth:
   !host.is_loopback() && !has_api_key && !insecure_no_auth
 }
 
-/// Whether any preset pins its own `idle_ttl_secs`. A per-preset TTL needs the
-/// eviction sweep even when the global `proxy.idle_ttl_secs` is 0, so it keeps
-/// the sweeper armed on its own.
-fn presets_pin_idle_ttl(
-  presets: &std::collections::BTreeMap<String, crate::config::ConfigPresetBlock>,
-) -> bool {
-  presets
-    .values()
-    .flat_map(|block| block.entries.values())
-    .any(|entry| entry.idle_ttl_secs.is_some())
-}
-
 /// Whether any preset opts into boot preload on its own, which arms the preload
 /// task even when `daemon.preload` lists nothing.
 fn presets_pin_preload(
   presets: &std::collections::BTreeMap<String, crate::config::ConfigPresetBlock>,
 ) -> bool {
-  presets
-    .values()
-    .flat_map(|block| block.entries.values())
-    .any(|entry| entry.preload)
+  crate::config::preset_entries(presets).any(|entry| entry.preload)
 }
 
 /// A configured proxy key counts as "present" for the backstop only when it is
@@ -585,12 +570,13 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
         header_read_timeout: std::time::Duration::from_secs(opts.proxy.header_read_timeout_secs),
         ..proxy::server::ServeOptions::default()
       };
-      // Idle-TTL eviction sweeper. Skipped when `idle_ttl_secs = 0`
-      // (operator disabled the global deadline) *and* no preset pins its own
-      // `idle_ttl_secs` — a per-preset TTL still needs a sweep to run in.
-      // Runs in parallel with the listener; uses the same shutdown token so
-      // daemon stop tears both down at once.
-      if opts.proxy.idle_ttl_secs > 0 || presets_pin_idle_ttl(&opts.presets) {
+      // Idle-TTL eviction sweeper. Always armed while the proxy is, even at
+      // `idle_ttl_secs = 0`: a per-preset TTL needs a sweep to run in, and a
+      // preset saved later (`presets save --idle-ttl 600`) has to find one
+      // waiting rather than needing a daemon restart. Rows the sweep must not
+      // touch are skipped individually. Runs in parallel with the listener on
+      // the same shutdown token, so daemon stop tears both down at once.
+      {
         let state_for_evict = std::sync::Arc::clone(&state);
         let token_for_evict = token.clone();
         let ttl = std::time::Duration::from_secs(opts.proxy.idle_ttl_secs);

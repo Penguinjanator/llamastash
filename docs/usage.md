@@ -544,10 +544,10 @@ An entry knob set to `auto` delegates that knob to llama-server's `--fit` (e.g. 
 Beside its launch settings an entry can pin how long it stays loaded and whether it starts on its own. These are residency policy, not knobs, so they sit next to `knobs:` (`--idle-ttl` / `--preload` on `presets save`, and both show in `presets list` under `TTL` / `PRELOAD` and in `--json` as `idle_ttl_secs` / `preload`):
 
 - `idle_ttl_secs: N` — this preset's launches are unloaded after `N` idle seconds instead of the global `proxy.idle_ttl_secs`. Useful when load times differ a lot: a model that takes 80 s to read off disk should not expire on the same clock as one that takes 4 s.
-- `idle_ttl_secs: 0` — never unload this preset's launches. Only presets (and proxy auto-starts) are ever swept; a `llamastash start` launch is already exempt.
+- `idle_ttl_secs: 0` — never unload this preset's launches. Note the sweep only ever considers **proxy auto-started** launches: anything you `llamastash start` (or the TUI launches) is exempt from eviction whatever its preset says, so a TTL is about models the proxy brought up on a request.
 - `preload: true` — start this preset when the daemon boots. Same as naming it in `daemon.preload`, and the same exemption applies: a preloaded launch is manual intent, so it stays up until you stop it.
 
-The sweep reads these from `config.yaml` on every pass, so editing a preset moves a running launch's deadline without a relaunch. When a request cannot be admitted because the host is full, the daemon first tries to make room by unloading idle auto-started launches, least-recently-used first (see §Proxy); launches pinned to `idle_ttl_secs: 0`, launches with a request in flight, and manual or preloaded launches are never picked.
+The sweep reads the TTL from the daemon's live preset store on every pass, so `presets save --idle-ttl` moves a running launch's deadline without a relaunch; a hand edit to `config.yaml` needs `daemon restart`, like any other hand edit. When a request cannot be admitted because the host is full, the daemon first tries to make room by unloading idle auto-started launches, least-recently-used first (see §Proxy); launches pinned to `idle_ttl_secs: 0`, launches with a request in flight, and manual or preloaded launches are never picked.
 
 ### `llamastash favorites`
 

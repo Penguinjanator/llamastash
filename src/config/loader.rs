@@ -613,6 +613,15 @@ pub struct ConfigPresetBlock {
   pub entries: BTreeMap<String, PresetBody>,
 }
 
+/// Every preset entry in a `presets:` map, whatever key it is filed under
+/// (per-model, wildcard, or arch). Readers that ask a question about *any* entry
+/// — is one pinned to a TTL, does one preload — share this one walk.
+pub fn preset_entries(
+  presets: &BTreeMap<String, ConfigPresetBlock>,
+) -> impl Iterator<Item = &PresetBody> {
+  presets.values().flat_map(|block| block.entries.values())
+}
+
 /// A single named preset's launch settings, as authored in `config.yaml`.
 ///
 /// The typed knobs are flattened so `ctx: 65536` / `flash_attn: true` read

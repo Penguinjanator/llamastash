@@ -692,14 +692,22 @@ pub enum PresetsAction {
     #[arg(long)]
     server: Option<String>,
     /// Idle TTL in seconds for launches this preset starts. Overrides
-    /// `proxy.idle_ttl_secs` for them; `0` never unloads them. Unset keeps the
-    /// global TTL.
-    #[arg(long, value_name = "SECONDS")]
+    /// `proxy.idle_ttl_secs` for them; `0` never unloads them. Absent leaves
+    /// whatever the preset already pins.
+    #[arg(long, value_name = "SECONDS", conflicts_with = "no_idle_ttl")]
     idle_ttl: Option<u64>,
-    /// Start this preset when the daemon boots. A preloaded launch is manual
-    /// intent, so the idle sweep never unloads it.
+    /// Drop an idle-TTL pin, so the preset's launches follow the global
+    /// `proxy.idle_ttl_secs` again.
     #[arg(long)]
+    no_idle_ttl: bool,
+    /// Start this preset when the daemon boots. A preloaded launch is manual
+    /// intent, so the idle sweep never unloads it. Absent leaves whatever the
+    /// preset already pins.
+    #[arg(long, conflicts_with = "no_preload")]
     preload: bool,
+    /// Drop a boot-preload pin.
+    #[arg(long)]
+    no_preload: bool,
     /// MTP speculative decoding: `auto` (default), `on`, or `off`.
     #[arg(long, value_name = "auto|on|off", value_parser = parse_mtp_enable)]
     mtp: Option<crate::launch::params::MtpEnable>,
