@@ -991,6 +991,7 @@ mod tests {
       extras: Some(vec!["--rope-freq-base".into(), "1000000".into()]),
       backend: Some(crate::backend::DEFAULT_BACKEND_ID.to_string()),
       server: Some("llamacpp-vulkan".into()),
+      ..PresetBody::default()
     };
     let named =
       crate::launch::presets::materialize_preset("fast", &body, PathBuf::from("/m/a.gguf"));

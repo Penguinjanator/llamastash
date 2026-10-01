@@ -314,6 +314,9 @@ pub struct DaemonHealth {
   /// (e.g. `http://127.0.0.1:48134`). `None` when talking to a
   /// pre-Phase-A daemon that doesn't surface the field.
   pub ipc_url: Option<String>,
+  /// Boot preload as configured: `{entries, presets}`. `None` against a daemon
+  /// that predates the field.
+  pub preload: Option<Value>,
 }
 
 fn parse_daemon_health(v: &Value) -> Option<DaemonHealth> {
@@ -337,6 +340,7 @@ fn parse_daemon_health(v: &Value) -> Option<DaemonHealth> {
       .get("ipc_url")
       .and_then(Value::as_str)
       .map(str::to_string),
+    preload: obj.get("preload").cloned(),
   })
 }
 

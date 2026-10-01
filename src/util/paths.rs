@@ -241,6 +241,32 @@ pub fn resolve_symlinks(path: &Path) -> PathBuf {
 /// a config path nested deeper than this is a loop, not a setup.
 const SYMLINK_HOPS: usize = 8;
 
+/// Expand a leading `~` (alone or as `~/…`) to the current user's home. Config
+/// entries and preload references are hand-authored with `~/…` paths; the
+/// filesystem has no idea what that means, so anything that opens one of those
+/// paths goes through here first. Anything else is returned unchanged.
+pub fn expand_user_path(path: &Path) -> PathBuf {
+  expand_user_path_in(path, None)
+}
+
+/// [`expand_user_path`] with `~` standing for `home` instead of the process
+/// home, so a caller can resolve a hand-authored path against a directory it
+/// chose rather than repointing `$HOME` for the whole process.
+pub(crate) fn expand_user_path_in(path: &Path, home: Option<&Path>) -> PathBuf {
+  let raw = path.to_string_lossy();
+  let rest = match raw.as_ref() {
+    "~" => "",
+    other => match other.strip_prefix("~/") {
+      Some(rest) => rest,
+      None => return path.to_path_buf(),
+    },
+  };
+  match home.or(home_dir().as_deref()) {
+    Some(home) => home.join(rest),
+    None => path.to_path_buf(),
+  }
+}
+
 /// Best-effort home directory resolution. Returns `None` only when the
 /// platform can't supply one (i.e. broken `$HOME` and no equivalent in
 /// the password database) — every realistic developer machine has one.

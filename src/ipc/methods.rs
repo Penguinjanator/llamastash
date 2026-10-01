@@ -710,6 +710,46 @@ struct PresetsSaveParams {
   /// Server (build/binary) this preset pins. Identity, like `backend`.
   #[serde(default)]
   server: Option<String>,
+  /// Idle-TTL override in seconds for launches this preset starts (`0` = never
+  /// unload). Residency policy, not a launch knob, so it never rides in `knobs`.
+  /// Tri-state on purpose: absent = leave whatever the entry already pins,
+  /// `null` = clear the pin, a number = set it. A caller that captures launch
+  /// params (the TUI's `Ctrl+P`, `presets save --from-last`) sends nothing here,
+  /// and must not silently delete a residency pin it never looked at.
+  #[serde(default, deserialize_with = "clearable_u64::deserialize")]
+  idle_ttl_secs: Option<Option<u64>>,
+  /// Start this preset when the daemon boots. Same tri-state: absent = leave the
+  /// entry's pin, `true` / `false` set or clear it.
+  #[serde(default)]
+  preload: Option<bool>,
+}
+
+/// Reads a present `idle_ttl_secs` while keeping "absent" distinguishable from
+/// "sent as null". Plain `Option<Option<u64>>` will not do it: serde maps a JSON
+/// `null` to the *outer* `None`, so an explicit clear would look exactly like a
+/// caller that said nothing — which is the data loss this tri-state exists to
+/// avoid.
+mod clearable_u64 {
+  use serde::de::{Deserialize, Deserializer};
+
+  fn bad<D: serde::de::Error>() -> D {
+    serde::de::Error::custom("idle_ttl_secs must be a non-negative integer or null")
+  }
+
+  pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Option<u64>>, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+      serde_json::Value::Null => Ok(Some(None)),
+      serde_json::Value::Number(n) => match n.as_u64() {
+        Some(secs) => Ok(Some(Some(secs))),
+        None => Err(bad()),
+      },
+      _ => Err(bad()),
+    }
+  }
 }
 
 async fn presets_save_handler(
@@ -744,9 +784,42 @@ async fn presets_save_handler(
     .unwrap_or_default();
   lp.server = parsed.server.clone();
   lp.extras = parsed.extras.into_iter().map(OsString::from).collect();
-  let body = preset_body_from_launch_params(&lp);
-
   let (key, arch, rows) = model_key_arch_rows(ctx, &parsed.model_path).await;
+  // Residency policy sits beside the launch params rather than inside them: it
+  // decides how long the launch *stays* up, not how it is launched. Because a
+  // params capture knows nothing about it, an absent field inherits what the
+  // entry already pins instead of dropping it; only an explicit `null` /
+  // `false` clears.
+  // Inherit from the entry the *name* actually resolves to, which may sit under
+  // an arch or wildcard key the save is about to shadow with a per-model entry of
+  // the same name; looking only under this model's own key would find nothing and
+  // silently drop the pin being shadowed.
+  let before = ctx.presets.snapshot().await;
+  let path_str = parsed.model_path.display().to_string();
+  let before_eff = effective_presets(&key, &path_str, arch.as_deref(), &before, &rows);
+  let inherited = before_eff.named(&parsed.name);
+  let source = before_eff.source_key(&parsed.name);
+  let idle_ttl_secs = match parsed.idle_ttl_secs {
+    Some(pin) => pin,
+    None => inherited.and_then(|e| e.idle_ttl_secs),
+  };
+  // `preload` inherits only from a key that names this one model, the same test
+  // boot applies: `preload: true` on an arch or family key is skipped at boot, so
+  // copying it onto this model's own key would start it at boot from a save that
+  // never asked, and a preloaded launch can never be unloaded again.
+  let preload = parsed.preload.unwrap_or_else(|| {
+    source.is_some_and(|source| {
+      inherited.is_some_and(|e| e.preload)
+        && matches!(crate::daemon::preload::preload_target(source, &rows),
+                    Ok(path) if path == std::path::Path::new(&path_str))
+    })
+  });
+  let body = crate::config::PresetBody {
+    idle_ttl_secs,
+    preload,
+    ..preset_body_from_launch_params(&lp)
+  };
+
   let saved_np = materialize_preset(&parsed.name, &body, parsed.model_path.clone());
   let prev = ctx
     .presets
@@ -758,7 +831,6 @@ async fn presets_save_handler(
   // the key/arch/rows resolved above — the catalog can't change across the
   // save, so re-deriving the key (a second catalog snapshot) is wasted work.
   let store = ctx.presets.snapshot().await;
-  let path_str = parsed.model_path.display().to_string();
   let eff = effective_presets(&key, &path_str, arch.as_deref(), &store, &rows);
   let default = is_default(&eff, &parsed.name);
   let replaced = prev
@@ -858,6 +930,10 @@ fn preset_row(p: &NamedPreset, is_default: bool) -> Value {
     // source without re-deriving it.
     "source": "config",
     "is_default": is_default,
+    // Residency policy: this preset's idle-TTL override (`0` = never unload,
+    // null = the global `proxy.idle_ttl_secs`) and whether it preloads at boot.
+    "idle_ttl_secs": p.idle_ttl_secs,
+    "preload": p.preload,
   })
 }
 
@@ -1264,6 +1340,169 @@ mod tests {
     let err = second.error.expect("double-stop must error");
     assert_eq!(err.code, ErrorCode::InvalidParams.as_i32());
     assert!(err.message.contains("L1"));
+  }
+
+  /// The residency fields are tri-state on the wire, because `Ctrl+P` re-saves a
+  /// preset from a launch capture that knows nothing about them: absent inherits
+  /// what the entry already pins, an explicit `null` / `false` clears it, a
+  /// number or `true` pins it.
+  #[tokio::test]
+  async fn presets_save_inherits_residency_unless_told_otherwise() {
+    // A discovered model, because a preload pin is only inheritable from a key
+    // that names this model, and that is a catalog question.
+    let c = arch_key_ctx(&["/m/a.gguf"]).await;
+    let save = |params: Value, id: i64| {
+      let c = &c;
+      async move {
+        dispatch_request(c, Request::new(id, "presets_save", Some(params))).await;
+        let block = c.presets.snapshot().await;
+        let entry = block
+          .values()
+          .filter_map(|b| b.entries.get("p"))
+          .next()
+          .cloned()
+          .expect("saved entry");
+        (entry.idle_ttl_secs, entry.preload)
+      }
+    };
+
+    let pinned = save(
+      json!({"model_path": "/m/a.gguf", "name": "p", "idle_ttl_secs": 60, "preload": true}),
+      1,
+    )
+    .await;
+    assert_eq!(pinned, (Some(60), true));
+
+    let inherited = save(json!({"model_path": "/m/a.gguf", "name": "p"}), 2).await;
+    assert_eq!(
+      inherited,
+      (Some(60), true),
+      "a params-only re-save dropped the residency policy"
+    );
+
+    let cleared = save(
+      json!({"model_path": "/m/a.gguf", "name": "p", "idle_ttl_secs": null, "preload": false}),
+      3,
+    )
+    .await;
+    assert_eq!(cleared, (None, false));
+  }
+
+  /// A re-save inherits the TTL pin from the entry the name resolves to, which
+  /// may be an arch entry the save is about to shadow. It does *not* inherit a
+  /// family key's `preload: true`: boot refuses to act on that pin, and copying
+  /// it onto one model's own key would boot-load a model nobody asked to preload,
+  /// permanently.
+  #[tokio::test]
+  async fn presets_save_inherits_a_ttl_from_the_entry_it_shadows() {
+    let c = arch_key_ctx(&["/m/a.gguf", "/m/b.gguf"]).await;
+    save_preset(
+      &c,
+      json!({"model_path": "/m/a.gguf", "name": "p", "ctx": 2048}),
+    )
+    .await;
+
+    let saved = per_model_entry(&c).await;
+    assert_eq!(
+      saved.idle_ttl_secs,
+      Some(60),
+      "the arch entry's TTL pin was dropped by the shadowing save"
+    );
+    assert!(
+      !saved.preload,
+      "a family key's preload pin leaked onto a single-model key"
+    );
+  }
+
+  /// The same arch key that scopes exactly one model is a per-model decision in
+  /// all but spelling, so its preload pin does carry over.
+  #[tokio::test]
+  async fn presets_save_inherits_preload_when_the_key_names_one_model() {
+    let c = arch_key_ctx(&["/m/a.gguf"]).await;
+    save_preset(
+      &c,
+      json!({"model_path": "/m/a.gguf", "name": "p", "ctx": 2048}),
+    )
+    .await;
+    assert!(
+      per_model_entry(&c).await.preload,
+      "a key naming only this model should pass its preload pin on"
+    );
+  }
+
+  /// A catalog of qwen3 models plus an arch-keyed preset `p` pinning residency.
+  async fn arch_key_ctx(paths: &[&str]) -> MethodContext {
+    use crate::config::{ConfigPresetBlock, PresetBody};
+    use crate::daemon::preset_store::ConfigPresetStore;
+    use crate::discovery::{DiscoveredModel, ModelSource};
+    use crate::gguf::metadata::{ModeHint, ModelMetadata, Quant};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    let catalog = ModelCatalog::new();
+    for path in paths {
+      catalog
+        .upsert(DiscoveredModel {
+          path: PathBuf::from(path),
+          parent: PathBuf::from("/m"),
+          source: ModelSource::UserPath,
+          metadata: Some(ModelMetadata {
+            arch: Some("qwen3".to_string()),
+            total_parameters: Some(7_000_000_000),
+            parameter_label: Some("7B".to_string()),
+            quant: Quant::Q4_K,
+            quant_label: None,
+            native_ctx: Some(8192),
+            chat_template: None,
+            tokenizer_kind: Some("llama".to_string()),
+            reasoning_hint: false,
+            mode_hint: ModeHint::Chat,
+            weights_bytes: Some(4_000_000_000),
+            lazy_tensor_bytes: Vec::new(),
+            mtp: None,
+          }),
+          parse_error: None,
+          split_siblings: Vec::new(),
+          display_label: None,
+          multimodal: None,
+          supported_backends: Vec::new(),
+          mtp_head: None,
+        })
+        .await;
+    }
+    MethodContext::with_catalog(ShutdownToken::new(), catalog).with_presets(ConfigPresetStore::new(
+      BTreeMap::from([(
+        "qwen3".to_string(),
+        ConfigPresetBlock {
+          default: None,
+          entries: BTreeMap::from([(
+            "p".to_string(),
+            PresetBody {
+              idle_ttl_secs: Some(60),
+              preload: true,
+              ..Default::default()
+            },
+          )]),
+        },
+      )]),
+      None,
+    ))
+  }
+
+  async fn save_preset(c: &MethodContext, params: Value) {
+    dispatch_request(c, Request::new(1, "presets_save", Some(params))).await;
+  }
+
+  /// The `p` entry written under the model's own key, not the arch one.
+  async fn per_model_entry(c: &MethodContext) -> crate::config::PresetBody {
+    c.presets
+      .snapshot()
+      .await
+      .iter()
+      .filter(|(key, _)| key.as_str() != "qwen3")
+      .find_map(|(_, block)| block.entries.get("p"))
+      .cloned()
+      .expect("a per-model entry was written")
   }
 
   #[tokio::test]

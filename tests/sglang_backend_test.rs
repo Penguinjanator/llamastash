@@ -625,6 +625,8 @@ mod lifecycle {
       params: LaunchParams::new(snapshot.clone(), LaunchMode::Chat),
       actuals: Default::default(),
       resolved_backend: "sglang".to_string(),
+      projected_demand_bytes: None,
+      origin: None,
     }];
 
     let report = sweep(SweepInputs {

@@ -56,8 +56,18 @@ const ENTRIES_KEY: &str = "entries";
 const KNOBS_KEY: &str = "knobs";
 
 /// Keys inside a preset entry that are *not* knobs and stay where they are.
-/// `port` is absent by design (D7): presets have never carried one.
-const RESERVED: &[&str] = &["extras", "backend", "server", KNOBS_KEY];
+/// `port` is absent by design (D7): presets have never carried one. The two
+/// residency keys are here for the same reason as `backend` / `server`: they are
+/// entry policy, and dropping them from a migrated entry would silently unload
+/// a model's never-expire or boot-warm pin.
+const RESERVED: &[&str] = &[
+  "extras",
+  "backend",
+  "server",
+  "idle_ttl_secs",
+  "preload",
+  KNOBS_KEY,
+];
 
 /// What a migration did, for the log line the daemon prints.
 #[derive(Debug, Clone, PartialEq)]
@@ -463,6 +473,52 @@ mod tests {
       "a migrated config is left alone"
     );
     assert_eq!(read(&p), after_first, "and byte-identical");
+  }
+
+  /// An entry's residency pins are policy, not knobs: an entry that has to be
+  /// rewritten for its flat knobs must come out still carrying them, or the
+  /// migration silently un-pins a model the user marked never-unload / warm.
+  #[test]
+  fn residency_keys_survive_a_migrated_entry() {
+    let p = write(
+      "residency",
+      concat!(
+        "presets:\n",
+        "  m.gguf:\n",
+        "    entries:\n",
+        "      warm:\n",
+        "        ctx: 4096\n",
+        "        idle_ttl_secs: 0\n",
+        "        preload: true\n",
+      ),
+    );
+    migrate(&p).unwrap().expect("the flat ctx migrates");
+    let after = read(&p);
+    assert!(after.contains("ctx-size: 4096"), "{after}");
+    assert!(after.contains("idle_ttl_secs: 0"), "{after}");
+    assert!(after.contains("preload: true"), "{after}");
+  }
+
+  /// The other half: residency keys alone must not read as the old shape, or
+  /// every daemon start re-migrates an entry that has nothing to migrate.
+  #[test]
+  fn residency_keys_alone_are_not_the_legacy_shape() {
+    let p = write(
+      "residency-only",
+      concat!(
+        "presets:\n",
+        "  m.gguf:\n",
+        "    entries:\n",
+        "      warm:\n",
+        "        knobs:\n",
+        "          ctx-size: 4096\n",
+        "        idle_ttl_secs: 300\n",
+      ),
+    );
+    assert!(
+      migrate(&p).unwrap().is_none(),
+      "a current-shape entry with a residency pin must be left alone"
+    );
   }
 
   #[test]

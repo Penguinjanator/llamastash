@@ -174,6 +174,21 @@ pub struct RunningSnapshot {
     skip_serializing_if = "is_default_backend"
   )]
   pub resolved_backend: String,
+  /// The demand floor the memory admission gate priced this launch at, in
+  /// bytes (weights + cache at the projected ctx + overhead band). Stamped only
+  /// when the gate actually budgeted the launch, so a disk-streaming or
+  /// orphan-adopted row leaves it unset. Make-room reads it as the figure a
+  /// launch gives back when unloaded — the same unit the refused launch is
+  /// priced in — so the two cannot disagree.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub projected_demand_bytes: Option<u64>,
+  /// Where this launch came from, read by the eviction gates. A delegated
+  /// (managed-multiplexer) row has no supervisor of its own, so the snapshot is
+  /// the only home its origin can have; process rows carry it too so one rule
+  /// covers both. Not persisted: `state.running` is cleared on every boot, so an
+  /// adopted row never needs it and a stale one must not outlive its daemon.
+  #[serde(skip)]
+  pub origin: Option<crate::daemon::supervisor::LaunchOrigin>,
 }
 
 impl RunningSnapshot {

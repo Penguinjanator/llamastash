@@ -211,21 +211,28 @@ async fn main() {
     // the test process cleanly. Windows has no SIGTERM — supervisor
     // tests that exercise force-kill use CTRL+BREAK + TerminateJobObject,
     // so the trap flag is a no-op on Windows.
+    //
+    // The handler is installed here, not inside the spawned task: the task
+    // may not run before `/health` answers, and a SIGTERM landing in that
+    // window would kill the process with the default action.
     #[cfg(unix)]
-    tokio::spawn(async {
+    {
       let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("install sigterm handler");
-      while sig.recv().await.is_some() {
-        eprintln!("fake-llama-server: ignoring SIGTERM (test mode)");
-      }
-    });
+      tokio::spawn(async move {
+        while sig.recv().await.is_some() {
+          eprintln!("fake-llama-server: ignoring SIGTERM (test mode)");
+        }
+      });
+    }
   }
 
   #[cfg(unix)]
   if let Some(ms) = args.sigterm_exit_delay_ms {
+    // Installed before the spawn for the same reason as the trap above.
+    let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+      .expect("install sigterm handler");
     tokio::spawn(async move {
-      let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("install sigterm handler");
       if sig.recv().await.is_some() {
         eprintln!("fake-llama-server: SIGTERM, exiting in {ms} ms");
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;

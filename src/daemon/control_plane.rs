@@ -9,10 +9,11 @@
 //!    bearer token; the token plus URL get written to `runtime.json`
 //!    at startup so clients can attach. See [`super::auth`] for the
 //!    token shape and [`super::runtime_file`] for the on-disk handoff.
-//! 2. **Routes.** Only three: `POST /rpc` (the JSON-RPC dispatcher),
-//!    `GET /logs/tail` (Server-Sent Events), `GET /health`
-//!    (unauthenticated liveness probe used by the daemon-attach
-//!    handshake).
+//! 2. **Routes.** Only two: `POST /rpc` (the JSON-RPC dispatcher) and
+//!    `GET /health` (unauthenticated liveness probe used by the
+//!    daemon-attach handshake). Log following goes through the
+//!    `logs_tail` RPC method, which `llamastash logs --follow` polls;
+//!    an SSE route is tracked in TODO §Low priority.
 
 use std::{
   net::{IpAddr, Ipv4Addr, SocketAddr},

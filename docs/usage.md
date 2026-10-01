@@ -106,6 +106,9 @@ daemon: # Launch ports, health probing, lifecycle. Config-only.
   probe_timeout_secs: 120 # Per-launch health-probe deadline.
   idle_timeout_secs: 0 # Shut down after N idle seconds (0 = never).
   metrics_interval_secs: 1 # Host-metrics tick (1..=60; 0 resets to 1).
+  # preload:                       # Models to start at daemon boot, in order.
+  #   - model.gguf                 # list name, path, <model>@<preset>, or a launch file
+  #   - other.gguf@long-ctx
 
 mouse_focus: false # Opt into mouse capture for click-to-focus / click-to-tab. Default off keeps native terminal text selection.
 
@@ -514,6 +517,7 @@ LlamaStash logs <target> [-n N] [-f]
 llamastash presets <ref> list [--json]
 llamastash presets <ref> save <NAME> [--ctx N]
                                    [--reasoning on|off] [--mode <m>]
+                                   [--idle-ttl SECONDS] [--preload]
                                    [-- <flags>...]
 llamastash presets <ref> delete <NAME>
 llamastash presets <ref> show <NAME>
@@ -533,7 +537,17 @@ Picking a preset explicitly (`start --preset <name>`, or the TUI cycle) override
 
 Alongside its knobs an entry may pin launch **identity**: `mode:` (`chat` / `embedding` / `rerank`), `backend:`, and `server:` (a build id, as shown on the TUI's Server row). These say *what runs* rather than how it is tuned, and they apply on every surface: `start --preset`, a `default:` preset on plain `start` and on proxy auto-start, and the TUI preset cycle. An explicit `--mode` / `--backend` / `--server` still wins over the pin, and a pinned or last-used `server:` of another backend is dropped when `--backend` names a different one. A `mode:` pin also answers a model whose GGUF hint is `unknown`, which `start` would otherwise refuse with "pass `--mode`". Only a pinned preset carries a mode forward; a one-off `start --mode embedding` is not remembered for the next plain launch, so an embedding request can never lock a chat model out of chat.
 
-An entry knob set to `auto` delegates that knob to llama-server's `--fit` (e.g. `n_gpu_layers: auto`); `auto` is a reserved token, so to pin a knob to the *literal* string value `auto`, use the escape `{ value: auto }`. The app writes entries in block style (flow `{ ctx: 8192 }` is also accepted when you hand-author). Presets carry no `port` (it is per-launch, auto-assigned). Changes the CLI/TUI make are live immediately; hand-edits to `config.yaml` need a `llamastash daemon restart` to be picked up. See `config.example.yaml` for the full shape. On the first `daemon start` after upgrading, an older `config.yaml` is rewritten in place into the `knobs:` shape with a `.pre-knobs.bak` copy beside it; the daemon logs what it migrated. Comments above a key survive that rewrite, comments *between* two knobs inside a migrated entry do not (the entry body is regenerated), which is what the backup is for. Until that first start, a read that does not reach the daemon (`--no-spawn`) sees an unmigrated entry's knobs as empty.
+An entry knob set to `auto` delegates that knob to llama-server's `--fit` (e.g. `n_gpu_layers: auto`); `auto` is a reserved token, so to pin a knob to the *literal* string value `auto`, use the escape `{ value: auto }`. The app writes entries in block style (flow `{ ctx: 8192 }` is also accepted when you hand-author). Presets carry no `port` (it is per-launch, auto-assigned). Changes the CLI/TUI make are live immediately; hand-edits to `config.yaml` need a `llamastash daemon restart` to be picked up. See `config.example.yaml` for the full shape. On the first `daemon start` after upgrading, an older `config.yaml` is rewritten in place into the `knobs:` shape with a `.pre-knobs.bak` copy beside it; the daemon logs what it migrated. Comments above a key survive that rewrite, comments *between* two knobs inside a migrated entry do not (the entry body is regenerated), which is what the backup is for. Residency keys (`idle_ttl_secs`, `preload`) are entry policy like `backend:` / `server:`, so they are carried through a migration verbatim and never read as the old shape on their own. Until that first start, a read that does not reach the daemon (`--no-spawn`) sees an unmigrated entry's knobs as empty.
+
+#### Preset residency
+
+Beside its launch settings an entry can pin how long it stays loaded and whether it starts on its own. These are residency policy, not knobs, so they sit next to `knobs:` (`--idle-ttl` / `--preload` on `presets save`, and both show in `presets list` under `TTL` / `PRELOAD` and in `--json` as `idle_ttl_secs` / `preload`):
+
+- `idle_ttl_secs: N` — this preset's launches are unloaded after `N` idle seconds instead of the global `proxy.idle_ttl_secs`. Useful when load times differ a lot: a model that takes 80 s to read off disk should not expire on the same clock as one that takes 4 s.
+- `idle_ttl_secs: 0` — never unload this preset's launches. Note the sweep only ever considers **proxy auto-started** launches: anything you `llamastash start` (or the TUI launches) is exempt from eviction whatever its preset says, so a TTL is about models the proxy brought up on a request.
+- `preload: true` — start this preset when the daemon boots. Same as naming it in `daemon.preload`, and the same exemption applies: a preloaded launch is manual intent, so it stays up until you stop it. The preset's key has to name **one** model: a preloaded launch can never be unloaded, so an arch or wide-glob key (which would pin every model it matches) is skipped at boot with a line in the daemon log — name the model, or list them under `daemon.preload` in the order you want them.
+
+A re-save that says nothing about residency keeps whatever the name already pins, even when the save lands under the model's own key and shadows an arch or glob entry of the same name; `--no-idle-ttl` / `--no-preload` are the only way to drop a pin. The one exception is `preload`: a family key's `preload: true` is not carried onto a single-model key, because boot refuses to preload a family and a preloaded launch can never be unloaded — so a `Ctrl+P` recapture cannot start loading your model at boot behind your back. The sweep reads the TTL from the daemon's live preset store on every pass, so `presets save --idle-ttl` moves a running launch's deadline without a relaunch; a hand edit to `config.yaml` needs `daemon restart`, like any other hand edit. When a request cannot be admitted because the host is full, the daemon first tries to make room by unloading idle auto-started launches, least-recently-used first (see §Proxy); launches pinned to `idle_ttl_secs: 0`, launches with a request in flight, and manual or preloaded launches are never picked.
 
 ### `llamastash favorites`
 
@@ -1197,11 +1211,11 @@ Request body cap: **`proxy.max_body_size` bytes, default 16 MiB**, enforced via 
 
 The four `/api/*` endpoints above let Ollama-shape discovery libraries — `ollama-python`'s default code path, IDE plugins that probe `GET /api/tags` to detect Ollama, `OLLAMA_HOST`-based env discovery in agent frameworks — recognise llamastash as Ollama-compatible. Once recognised, clients fall through to the OpenAI-compat surface (`/v1/chat/completions` etc.) for actual inference, which already works against llamastash without further changes. This unlocks OOB compatibility with anything that "speaks Ollama" for discovery but uses OpenAI shape for completions — the most common pattern in the agent ecosystem.
 
-The Ollama **inference** endpoints (`POST /api/chat`, `POST /api/generate`, `POST /api/embed`) are **not** implemented in v1. They emit a different request/response shape than OpenAI compat (newline-delimited JSON streaming, different field names) and would require request/response body translation — incompatible with the proxy's current byte-pure forward path. Tracked in TODO §R2 as a brainstorm/plan item. For now, point Ollama-shape _inference_ clients at `OLLAMA_HOST=http://127.0.0.1:11434` and they will discover models via `/api/tags`, then fall through to the OpenAI-compat completion endpoints on those same client libraries that support both shapes (most do).
+The Ollama **inference** endpoints (`POST /api/chat`, `POST /api/generate`, `POST /api/embed`) are **not** implemented in v1. They emit a different request/response shape than OpenAI compat (newline-delimited JSON streaming, different field names) and would require request/response body translation — incompatible with the proxy's current byte-pure forward path. Tracked in TODO §Low priority as a brainstorm/plan item. For now, point Ollama-shape _inference_ clients at `OLLAMA_HOST=http://127.0.0.1:11434` and they will discover models via `/api/tags`, then fall through to the OpenAI-compat completion endpoints on those same client libraries that support both shapes (most do).
 
 A few field-level details where llamastash's projection diverges from Ollama's:
 
-- **`digest`** — Ollama uses `sha256:<hex>`; llamastash uses `blake3:<hex>` derived from the canonical path string of the discovered file. The value is stable across `/api/tags` and `/api/ps` for the same model — both endpoints hash the same path — so clients can join the two endpoints by digest. It is **not** the GGUF header BLAKE3 that `ModelId` carries internally; re-reading the header on every `/api/tags` row would brick discovery, and the catalog doesn't cache the header hash today. Lifting the digest to the truthful header BLAKE3 is tracked in [TODO §R2](https://github.com/llamastash/llamastash/blob/main/TODO.md) ("Ollama-compat digest from cached header BLAKE3"). Clients that round-trip the digest opaquely keep working; clients that _validate_ the algorithm see the truthful `blake3:` tag rather than a misleading `sha256:` prefix on a non-SHA-256 hash.
+- **`digest`** — Ollama uses `sha256:<hex>`; llamastash uses `blake3:<hex>` derived from the canonical path string of the discovered file. The value is stable across `/api/tags` and `/api/ps` for the same model — both endpoints hash the same path — so clients can join the two endpoints by digest. It is **not** the GGUF header BLAKE3 that `ModelId` carries internally; re-reading the header on every `/api/tags` row would brick discovery, and the catalog doesn't cache the header hash today. Lifting the digest to the truthful header BLAKE3 is tracked in [TODO §Low priority](https://github.com/llamastash/llamastash/blob/main/TODO.md) ("Ollama-compat digest from cached header BLAKE3"). Clients that round-trip the digest opaquely keep working; clients that _validate_ the algorithm see the truthful `blake3:` tag rather than a misleading `sha256:` prefix on a non-SHA-256 hash.
 - **`size`** — Ollama returns the on-disk file size; llamastash returns `weights_bytes` (the GGUF tensor footprint), typically within a few KiB of the full file size. `0` when discovery couldn't parse the header.
 - **`modified_at`** — llamastash doesn't track file mtime in the catalog. Emits `"1970-01-01T00:00:00Z"` (Unix epoch) as a placeholder so clients displaying this see a clearly-not-now sentinel.
 - **`/api/ps` `expires_at`** — far-future placeholder (`"9999-12-31T23:59:59Z"`) while idle-TTL eviction is deferred (R34).
@@ -1271,7 +1285,7 @@ proxy:
   # api_key: "..."       # Bearer token enforced whenever set.
   # fallback_enabled: true   # Family-MRU fallback on auto-start failure.
   # header_read_timeout_secs: 30
-  # idle_ttl_secs: 1800      # 0 disables idle eviction.
+  # idle_ttl_secs: 1800      # 0 disables the global deadline; a preset can still pin its own.
   # max_body_size: 16777216  # Bytes; cap on every request body (default 16 MiB; 0 disables the check).
 ```
 

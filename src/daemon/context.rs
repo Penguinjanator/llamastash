@@ -120,6 +120,11 @@ pub struct MethodContext {
   /// launches; settled (released) when each child reaches Ready / Error
   /// / Stopped. In-memory by design.
   pub admission: Arc<crate::launch::admission::Ledger>,
+  /// The `daemon.preload:` list as configured, empty when nothing was set.
+  /// Reported on `status.daemon.preload` so a caller can tell "preload
+  /// configured" from "preload has nothing to start"; the entries themselves are
+  /// what [`crate::daemon::preload`] resolved against the catalog at boot.
+  pub preload: Arc<Vec<String>>,
 }
 
 /// Wrapper around the in-memory `DaemonState` plus the directory
@@ -287,7 +292,15 @@ impl MethodContext {
       backend: crate::backend::BackendConfig::default(),
       backend_force: std::collections::BTreeMap::new(),
       admission: Arc::new(crate::launch::admission::Ledger::default()),
+      preload: Arc::new(Vec::new()),
     }
+  }
+
+  /// Builder helper: record the `daemon.preload:` list the daemon was started
+  /// with, so `status` can report it.
+  pub fn with_preload(mut self, entries: Vec<String>) -> Self {
+    self.preload = Arc::new(entries);
+    self
   }
 
   /// Builder helper: seed the external (unmanaged `llama-server`)

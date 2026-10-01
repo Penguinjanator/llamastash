@@ -7,7 +7,7 @@
 //! Ollama-compatible and fall through to the OpenAI compat endpoints
 //! for inference. The Tier 2 inference surface (`/api/chat`,
 //! `/api/generate`, `/api/embed`) is deferred to a future plan — see
-//! TODO §R2.
+//! TODO §Low priority.
 //!
 //! Coverage shape mirrors `tests/proxy_models.rs`: hand-built
 //! [`ProxyState`] with a seeded [`ModelCatalog`], proxy listener on an

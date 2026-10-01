@@ -184,6 +184,29 @@ daemon:
   # tick would spin the sampler.
   metrics_interval_secs: 1
 
+  # Models to start when the daemon comes up — the always-warm list (an
+  # embedder a script hits every minute, the one coding model you open
+  # first). Each entry is a `list` name or path, a `<model>@<preset>`
+  # address, or the path to a launch file (`.yaml` / `.yml`, the same
+  # file `llamastash run` takes). A preset can opt itself in instead
+  # with `preload: true` (see `presets:` below).
+  #
+  # Launches run in list order, each waited for before the next, so the
+  # list is also a priority order and the memory admission gate prices
+  # them one at a time. Each is a manual launch, so the idle sweep never
+  # unloads it. Anything that cannot start — unknown model, an admission
+  # refusal because something else is already loaded — logs one line and
+  # is skipped: preload never blocks or fails the boot.
+  #
+  # Read at daemon start; `daemon restart` after editing.
+  #
+  # Default: empty (nothing preloaded).
+  #
+  # Sources — CLI: (none) · Env: (none). Config-only.
+  # preload:
+  #   - Qwen3-Embedding-0.6B-Q4_K_M.gguf
+  #   - Qwen3-Coder-30B-Q4_K_M.gguf@long-ctx
+
 # ─── Auto-fit launch behaviour ────────────────────────────────────
 #
 # How a knob you never touched (and that no preset / arch-default
@@ -336,10 +359,13 @@ proxy:
   # the daemon's eviction sweeper stops the launch like `stop_model`
   # (5s grace) so a long-running daemon doesn't pin VRAM on models
   # nobody is using.
-  # `0` disables eviction entirely; supervisors stay resident until
-  # an explicit `stop_model`. Only auto-start supervisors are
-  # evictable — explicit `llamastash start` / TUI launches are
-  # treated as durable user intent and stay resident regardless.
+  # `0` disables the global deadline; supervisors stay resident until
+  # an explicit `stop_model` or a preset's own `idle_ttl_secs`. Only
+  # auto-start supervisors are evictable — explicit `llamastash start`
+  # / TUI launches and anything `daemon.preload` started are treated as
+  # durable user intent and stay resident regardless. A preset overrides
+  # this per launch with `idle_ttl_secs` (see `presets:` below), and `0`
+  # there means that one model is never unloaded.
   #
   # Default: 1800 (30 min).
   #
@@ -903,6 +929,18 @@ presets:
         server: llamacpp-vulkan
         knobs:
           ctx-size: 8192
+      # Residency, beside the launch settings: how long a launch this preset
+      # started stays loaded, and whether it starts at all. `idle_ttl_secs`
+      # overrides `proxy.idle_ttl_secs` for this preset's launches — `0` never
+      # unloads it, which is how a slow-loading model (tens of seconds to read
+      # from disk) earns its keep. `preload: true` starts it at daemon boot,
+      # the same as naming it in `daemon.preload`.
+      # CLI: `presets save <model> <name> --idle-ttl 0` / `--preload`.
+      always-warm:
+        idle_ttl_secs: 0
+        preload: true
+        knobs:
+          ctx-size: 4096
   # wildcard per-model preset: `*` spans any run of characters (`/`
   # included), `?` exactly one. Matched case-insensitively against the
   # file name, its stem, the full path, and both prefixed with the REPO

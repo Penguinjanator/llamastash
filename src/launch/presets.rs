@@ -22,6 +22,12 @@ use crate::launch::resolve::CatalogRow;
 pub struct NamedPreset {
   pub name: String,
   pub params: LaunchParams,
+  /// Residency policy carried from the config body: this preset's idle-TTL
+  /// override (`Some(0)` = never unload) and whether it starts at daemon boot.
+  #[serde(default)]
+  pub idle_ttl_secs: Option<u64>,
+  #[serde(default)]
+  pub preload: bool,
 }
 
 /// Per-model preset list. Wrapper around `Vec<NamedPreset>` so the
@@ -113,6 +119,9 @@ pub fn preset_body_from_launch_params(params: &LaunchParams) -> PresetBody {
     extras: (!extras.is_empty()).then_some(extras),
     backend: params.backend.explicit_id().map(str::to_string),
     server: params.server.clone(),
+    // Residency policy is not part of a launch's params, so a fold from params
+    // alone pins none of it; callers set it beside this call.
+    ..Default::default()
   }
 }
 
@@ -175,6 +184,8 @@ pub fn materialize_preset(name: &str, body: &PresetBody, model_path: PathBuf) ->
   NamedPreset {
     name: name.to_string(),
     params,
+    idle_ttl_secs: body.idle_ttl_secs,
+    preload: body.preload,
   }
 }
 
@@ -281,6 +292,8 @@ pub struct EffectivePresets {
   /// `None`). Drives both the TUI cycle's opening stop and the server-side
   /// `PresetDefault` resolver layer.
   pub default: Option<String>,
+  /// The config key each preset name was taken from, keyed like `presets`.
+  sources: BTreeMap<String, String>,
 }
 
 impl EffectivePresets {
@@ -306,6 +319,13 @@ impl EffectivePresets {
       .presets
       .iter()
       .find(|p| crate::launch::resolve::name_matches(Some(&p.name), name))
+  }
+
+  /// The config key the preset `name` resolves from: the arch, wildcard or
+  /// per-model key whose entry won the merge.
+  pub fn source_key(&self, name: &str) -> Option<&str> {
+    let preset = self.named(name)?;
+    self.sources.get(&preset.name).map(String::as_str)
   }
 }
 
@@ -334,7 +354,7 @@ pub fn effective_presets(
 ) -> EffectivePresets {
   // BTreeMap keeps the merged set name-sorted (config entries are an
   // unordered map, so a deterministic order is the right surface).
-  let mut merged: BTreeMap<String, NamedPreset> = BTreeMap::new();
+  let mut merged: BTreeMap<String, (String, NamedPreset)> = BTreeMap::new();
   let mut arch_default = None;
   let mut pattern_default = None;
   let mut model_default = None;
@@ -344,7 +364,7 @@ pub fn effective_presets(
   if let Some(arch) = model_arch {
     for (key, block) in store {
       if key.eq_ignore_ascii_case(arch) && classify_preset_key(key, catalog) == KeyClass::Arch {
-        merge_block(&mut merged, block, model_path);
+        merge_block(&mut merged, key, block, model_path);
         arch_default = arch_default.or_else(|| block.default.clone());
       }
     }
@@ -362,19 +382,21 @@ pub fn effective_presets(
   // key order.
   for (key, block) in store {
     if crate::util::glob::is_pattern(key) && preset_key_matches(key, model_name, model_path) {
-      merge_block(&mut merged, block, model_path);
+      merge_block(&mut merged, key, block, model_path);
       pattern_default = pattern_default.or_else(|| block.default.clone());
     }
   }
   for (key, block) in store {
     if !crate::util::glob::is_pattern(key) && preset_key_matches(key, model_name, model_path) {
-      merge_block(&mut merged, block, model_path);
+      merge_block(&mut merged, key, block, model_path);
       model_default = model_default.or_else(|| block.default.clone());
     }
   }
 
   let mut presets = Presets::new();
-  for np in merged.into_values() {
+  let mut sources = BTreeMap::new();
+  for (name, (key, np)) in merged {
+    sources.insert(name, key);
     presets.upsert(np);
   }
   // `auto` is the reserved "pure-fit default" sentinel and is kept verbatim;
@@ -383,18 +405,26 @@ pub fn effective_presets(
     .or(pattern_default)
     .or(arch_default)
     .filter(|d| d.eq_ignore_ascii_case(AUTO_DEFAULT) || presets.get(d).is_some());
-  EffectivePresets { presets, default }
+  EffectivePresets {
+    presets,
+    default,
+    sources,
+  }
 }
 
 fn merge_block(
-  merged: &mut BTreeMap<String, NamedPreset>,
+  merged: &mut BTreeMap<String, (String, NamedPreset)>,
+  key: &str,
   block: &ConfigPresetBlock,
   model_path: &str,
 ) {
   for (name, body) in &block.entries {
     merged.insert(
       name.clone(),
-      materialize_preset(name, body, PathBuf::from(model_path)),
+      (
+        key.to_string(),
+        materialize_preset(name, body, PathBuf::from(model_path)),
+      ),
     );
   }
 }
@@ -444,6 +474,8 @@ mod tests {
     NamedPreset {
       name: name.to_string(),
       params: LaunchParams::new(PathBuf::from("/m/a.gguf"), LaunchMode::Chat),
+      idle_ttl_secs: None,
+      preload: false,
     }
   }
 
@@ -886,6 +918,52 @@ mod tests {
   }
 
   #[test]
+  fn source_key_names_the_key_that_won_the_merge() {
+    let catalog = vec![
+      catalog_row("/m/Qwen3.8-27B-Q4_K_M.gguf", "qwen3"),
+      catalog_row("/m/Qwen3.8-27B-Q8_0.gguf", "qwen3"),
+    ];
+    let mut store = BTreeMap::new();
+    store.insert(
+      "qwen3".to_string(),
+      block(&[("arch", body_ctx(1)), ("p", body_ctx(1))], None),
+    );
+    store.insert(
+      "Qwen3.8-27B-*".to_string(),
+      block(&[("glob", body_ctx(2)), ("p", body_ctx(2))], None),
+    );
+    store.insert(
+      "Qwen3.8-27B-Q8_0.gguf".to_string(),
+      block(&[("p", body_ctx(3))], None),
+    );
+
+    let q8 = effective_presets(
+      "Qwen3.8-27B-Q8_0.gguf",
+      "/m/Qwen3.8-27B-Q8_0.gguf",
+      Some("qwen3"),
+      &store,
+      &catalog,
+    );
+    assert_eq!(q8.source_key("arch"), Some("qwen3"));
+    assert_eq!(q8.source_key("glob"), Some("Qwen3.8-27B-*"));
+    assert_eq!(
+      q8.source_key("P"),
+      Some("Qwen3.8-27B-Q8_0.gguf"),
+      "matches names the way `named` does"
+    );
+    assert_eq!(q8.source_key("missing"), None);
+
+    let q4 = effective_presets(
+      "Qwen3.8-27B-Q4_K_M.gguf",
+      "/m/Qwen3.8-27B-Q4_K_M.gguf",
+      Some("qwen3"),
+      &store,
+      &catalog,
+    );
+    assert_eq!(q4.source_key("p"), Some("Qwen3.8-27B-*"));
+  }
+
+  #[test]
   fn a_wildcard_key_can_name_a_whole_repo() {
     let path =
       "/c/hub/models--unsloth--Qwen3.8-27B-GGUF/snapshots/1/UD-Q4_K_XL/Qwen3.8-27B-Q4_K_M.gguf";
@@ -1019,6 +1097,30 @@ mod tests {
     assert!(
       eff.presets.is_empty(),
       "no presets apply to this model/arch"
+    );
+  }
+
+  /// The residency fields are read off the config body by the eviction sweep and
+  /// the boot preload, so they have to survive materialisation — and the flat
+  /// YAML shape the writer produces — rather than live only on the raw body.
+  #[test]
+  fn residency_fields_survive_materialisation_and_yaml() {
+    let body: PresetBody =
+      yaml_serde::from_str("idle_ttl_secs: 0\npreload: true\n").expect("residency keys parse");
+    assert_eq!(body.idle_ttl_secs, Some(0));
+    assert!(body.preload);
+
+    let named = materialize_preset("warm", &body, PathBuf::from("/m/a.gguf"));
+    assert_eq!(named.idle_ttl_secs, Some(0));
+    assert!(named.preload);
+
+    // An entry that pins nothing writes neither key, so a plain preset stays
+    // byte-stable on disk.
+    let plain = PresetBody::default();
+    let yaml = yaml_serde::to_string(&plain).expect("plain body serialises");
+    assert!(
+      !yaml.contains("idle_ttl_secs") && !yaml.contains("preload"),
+      "unset residency fields are omitted: {yaml}"
     );
   }
 }

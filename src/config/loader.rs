@@ -171,6 +171,13 @@ pub struct DaemonConfig {
   /// `nvidia-smi` / `rocm-smi` are spawned, at the cost of a less
   /// responsive host pane.
   pub metrics_interval_secs: u64,
+  /// Models to start when the daemon comes up, in list order. Each entry is a
+  /// model reference (`list` name, path, or `<model>@<preset>`), or the path to
+  /// a launch file (`.yaml`/`.yml`). A preset can also opt in on its own with
+  /// `preload: true`. Preloaded launches are `Manual`, so the idle sweep never
+  /// unloads them. A refused entry (admission, unknown model) logs and is
+  /// skipped — preload never blocks boot.
+  pub preload: Vec<String>,
 }
 
 impl DaemonConfig {
@@ -197,6 +204,7 @@ impl Default for DaemonConfig {
       probe_timeout_secs: 120,
       idle_timeout_secs: 0,
       metrics_interval_secs: 1,
+      preload: Vec::new(),
     }
   }
 }
@@ -605,6 +613,15 @@ pub struct ConfigPresetBlock {
   pub entries: BTreeMap<String, PresetBody>,
 }
 
+/// Every preset entry in a `presets:` map, whatever key it is filed under
+/// (per-model, wildcard, or arch). Readers that ask a question about *any* entry
+/// — is one pinned to a TTL, does one preload — share this one walk.
+pub fn preset_entries(
+  presets: &BTreeMap<String, ConfigPresetBlock>,
+) -> impl Iterator<Item = &PresetBody> {
+  presets.values().flat_map(|block| block.entries.values())
+}
+
 /// A single named preset's launch settings, as authored in `config.yaml`.
 ///
 /// The typed knobs are flattened so `ctx: 65536` / `flash_attn: true` read
@@ -639,6 +656,15 @@ pub struct PresetBody {
   /// Server (build/binary) this preset pins. Identity, like `backend`.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub server: Option<String>,
+  /// Idle-TTL override for launches this preset started, in seconds. Overrides
+  /// `proxy.idle_ttl_secs` for those launches; `0` never unloads them. Unset
+  /// keeps the global TTL.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub idle_ttl_secs: Option<u64>,
+  /// Start this preset when the daemon boots. Same as naming it in
+  /// `daemon.preload`; preloaded launches are exempt from idle eviction.
+  #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+  pub preload: bool,
 }
 
 /// How a knob *no layer supplied a value for* is seeded at launch

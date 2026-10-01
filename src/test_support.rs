@@ -137,6 +137,8 @@ pub fn running_row(path: &str) -> RunningRow {
     params: LaunchParams::new(PathBuf::from(path), LaunchMode::Chat),
     actuals: Default::default(),
     resolved_backend: crate::backend::DEFAULT_BACKEND_ID.to_string(),
+    projected_demand_bytes: None,
+    origin: None,
   })
 }
 
@@ -193,6 +195,20 @@ impl RunningRow {
 
   pub fn params(mut self, params: crate::launch::params::LaunchParams) -> Self {
     self.0.params = params;
+    self
+  }
+
+  /// The demand the admission gate priced this launch at — what make-room
+  /// credits it for when it is unloaded.
+  pub fn projected_demand(mut self, bytes: u64) -> Self {
+    self.0.projected_demand_bytes = Some(bytes);
+    self
+  }
+
+  /// How the launch came to be running — the sweep and make-room only ever
+  /// consider an `AutoStart` row.
+  pub fn origin(mut self, origin: crate::daemon::supervisor::LaunchOrigin) -> Self {
+    self.0.origin = Some(origin);
     self
   }
 

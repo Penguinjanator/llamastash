@@ -7,7 +7,7 @@
 //! environment detection) recognise llamastash as an Ollama-compatible
 //! endpoint and fall through to the existing OpenAI-compat surface for
 //! inference. The Tier 2 inference surface (`/api/chat`,
-//! `/api/generate`, `/api/embed`) is tracked under TODO §R2 as a
+//! `/api/generate`, `/api/embed`) is tracked under TODO §Low priority as a
 //! separate brainstorm — those need request/response body translation
 //! and NDJSON-vs-SSE streaming-format handling, which doesn't fit the
 //! proxy's current byte-pure forward path.
@@ -31,7 +31,7 @@
 //!   ~16 MiB of header on every `/api/tags` request would brick
 //!   discovery, and the catalog doesn't cache the header hash
 //!   alongside [`ModelMetadata`] today. Lifting the digest to the
-//!   truthful header BLAKE3 is tracked in TODO §R2 ("Ollama-compat
+//!   truthful header BLAKE3 is tracked in TODO §Low priority ("Ollama-compat
 //!   digest from cached header BLAKE3").
 //! - `size`: Ollama returns the on-disk file size; we don't currently
 //!   stat the file at discovery time. `weights_bytes` from
@@ -44,12 +44,12 @@
 //!   that display this see a sentinel "unknown" value rather than a
 //!   misleading current-time stamp.
 //! - `expires_at` (on `/api/ps`): Ollama emits the keep-alive
-//!   deadline. llamastash has no idle-TTL eviction in v1 (R34
-//!   deferred — see TODO §R2 "Proxy idle-TTL eviction"). Emit a
-//!   far-future timestamp so clients reading the field see "no
-//!   expiry" rather than "expires immediately."
+//!   deadline. llamastash unloads on the proxy-wide
+//!   `proxy.idle_ttl_secs` sweep instead of a per-launch keep-alive, and
+//!   no per-launch deadline is surfaced here, so emit a far-future
+//!   timestamp — "no expiry" rather than "expires immediately."
 //! - `size_vram` (on `/api/ps`): per-PID VRAM attribution is a TODO
-//!   item (R2 brainstorm). Emit `0`.
+//!   item (TODO §Low priority brainstorm). Emit `0`.
 //!
 //! These types stay private to the proxy module.
 
@@ -67,8 +67,8 @@ use serde::{Deserialize, Serialize};
 /// timestamp rather than something misleading.
 pub const UNKNOWN_MTIME: &str = "1970-01-01T00:00:00Z";
 
-/// Placeholder `expires_at` value emitted on `/api/ps` while idle-TTL
-/// eviction is deferred. Far-future = "no expiry."
+/// Placeholder `expires_at` value emitted on `/api/ps`: no per-launch
+/// keep-alive deadline is exposed. Far-future = "no expiry."
 pub const FAR_FUTURE_EXPIRY: &str = "9999-12-31T23:59:59Z";
 
 /// Format 32 BLAKE3 bytes as the `blake3:<hex>` string used by
@@ -94,7 +94,7 @@ pub fn digest_blake3_hex(bytes: &[u8; 32]) -> String {
 /// GGUF header BLAKE3 today and re-reading the header on every
 /// `/api/tags` row would brick discovery, so we use the canonical
 /// path as a stable stand-in. Lifting this to the truthful header
-/// digest is tracked in TODO §R2.
+/// digest is tracked in TODO §Low priority.
 pub fn digest_for_path(path: &std::path::Path) -> String {
   let hashed = blake3::hash(path.to_string_lossy().as_bytes());
   digest_blake3_hex(hashed.as_bytes())

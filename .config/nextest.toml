@@ -9,13 +9,16 @@
 # global scheduler + a test-group can.
 
 # Bound how many daemon-spawning tests run at once across the WHOLE run
-# (not per-binary), so several daemons never boot together on a few-core
-# runner. Assigned to the matching binaries via the override below.
+# (not per-binary). Assigned to the matching binaries via the override
+# below; every test binary that boots a daemon belongs in that filter.
+# 8, not 4: several of these tests mostly sleep (SIGTERM drains, ready
+# timeouts), and at 4 they queued behind each other, adding ~10 s to a
+# ~16 s local run. A 3-4 core CI runner never reaches 8 anyway.
 [test-groups]
-daemon-bound = { max-threads = 4 }
+daemon-bound = { max-threads = 8 }
 
 [[profile.default.overrides]]
-filter = 'binary(/^(proxy_|daemon_|control_plane|supervisor_|start_model|lemonade_|tui_|init_orchestration|list_models|cli_integration|uat_lifecycle)/)'
+filter = 'binary(/^(proxy_|daemon_|control_plane|supervisor_|start_model|lemonade_|tui_|init_orchestration|list_models|cli_integration|uat_lifecycle|generic_backend|preset_config_ipc|sglang_backend|vllm_backend)/)'
 test-group = 'daemon-bound'
 
 [profile.ci]
@@ -30,5 +33,5 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 # Profile overrides don't inherit the default profile's, so repeat the
 # daemon-bound assignment here for the CI profile.
 [[profile.ci.overrides]]
-filter = 'binary(/^(proxy_|daemon_|control_plane|supervisor_|start_model|lemonade_|tui_|init_orchestration|list_models|cli_integration|uat_lifecycle)/)'
+filter = 'binary(/^(proxy_|daemon_|control_plane|supervisor_|start_model|lemonade_|tui_|init_orchestration|list_models|cli_integration|uat_lifecycle|generic_backend|preset_config_ipc|sglang_backend|vllm_backend)/)'
 test-group = 'daemon-bound'

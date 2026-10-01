@@ -654,6 +654,7 @@ pub(crate) fn build_options(args: BuildOptionsArgs<'_>) -> Result<DaemonOptions>
   opts.probe_timeout_secs = Some(config.daemon.probe_timeout_secs);
   opts.idle_timeout = config.daemon.idle_timeout();
   opts.metrics_interval = config.daemon.metrics_interval();
+  opts.preload = config.daemon.preload.clone();
   opts.gpu_reprobe_interval = config.gpu.reprobe_interval();
   opts.arch_defaults = config.arch_defaults.clone();
   // Config presets seed the daemon's in-memory store; `config_path` is where
@@ -1251,6 +1252,7 @@ mod tests {
         probe_timeout_secs: 600,
         idle_timeout_secs: 900,
         metrics_interval_secs: 5,
+        preload: vec!["demo-model".into()],
       },
       gpu: crate::config::GpuConfig {
         enable_vulkan_probe: false,
@@ -1263,6 +1265,7 @@ mod tests {
     assert_eq!(opts.probe_timeout_secs, Some(600));
     assert_eq!(opts.idle_timeout, Some(Duration::from_secs(900)));
     assert_eq!(opts.metrics_interval, Duration::from_secs(5));
+    assert_eq!(opts.preload, vec!["demo-model".to_string()]);
     assert_eq!(opts.gpu_reprobe_interval, Some(Duration::from_secs(120)));
   }
 
