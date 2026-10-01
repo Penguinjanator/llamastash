@@ -648,22 +648,18 @@ impl LaunchPickerState {
   /// set; an unset pick falls through to the model's own backend.
   /// Registry-driven — names no backend.
   fn resolved_backend(&self) -> crate::backend::Backends {
-    use crate::backend::{Backend, Backends};
+    use crate::backend::Backends;
     if let Some(id) = &self.selected_server {
       if let Some(srv) = self.servers.iter().find(|s| &s.id == id) {
-        if let Some(b) = Backends::all()
-          .into_iter()
-          .find(|b| b.id() == srv.backend_id.as_str())
-        {
+        if let Some(b) = Backends::from_id(&srv.backend_id) {
           return b;
         }
       }
     }
     match &self.model_backend {
-      BackendChoice::Explicit(id) => Backends::all()
-        .into_iter()
-        .find(|b| b.id() == id.as_str())
-        .unwrap_or_else(crate::backend::default_backend),
+      BackendChoice::Explicit(id) => {
+        Backends::from_id(id).unwrap_or_else(crate::backend::default_backend)
+      }
       BackendChoice::Auto => crate::backend::default_backend(),
     }
   }

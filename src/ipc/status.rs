@@ -73,9 +73,7 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
       .find(|b| b.umbrella_launch_id().as_ref() == Some(&launch_id))
       .or_else(|| {
         let id = running_snap.map(|r| r.resolved_backend.as_str())?;
-        crate::backend::Backends::all()
-          .into_iter()
-          .find(|b| b.id() == id)
+        crate::backend::Backends::from_id(id)
       })
       .unwrap_or_else(crate::backend::default_backend);
     let resolved_backend = owner.id().to_string();
@@ -228,9 +226,7 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
       // shape-identical. `active` comes from the owning backend; acceptance is
       // null for a delegated model (it shares the umbrella's log, so per-model
       // draft figures aren't separable). Owner resolved via the registry.
-      let owner = crate::backend::Backends::all()
-        .into_iter()
-        .find(|b| b.id() == running_snap.resolved_backend)
+      let owner = crate::backend::Backends::from_id(&running_snap.resolved_backend)
         .unwrap_or_else(crate::backend::default_backend);
       let params_json = json!({
         "model_path": running_snap.params.model_path,
