@@ -586,7 +586,7 @@ fn check_config_mode_drift() -> Option<Finding> {
           FindingId::ConfigModeDrift,
           Severity::Warning,
           format!(
-            "parent dir `{}` {} — `chmod 700` recommended",
+            "parent dir `{}` {}",
             parent.display(),
             surface.describe(our_uid)
           ),

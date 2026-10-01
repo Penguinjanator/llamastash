@@ -22,7 +22,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 - `init` integrations declare image input for vision models and, in Zed, send earlier thinking back to the model (#93).
 - OpenCode integration declares each model's context and output limits, so it compacts again (#93).
 - `init`'s GitHub Releases install streams downloads to disk and reuses a build it already installed (#93).
-- `init` and config writes accept a group-writable directory in your own user-private group; the refusal message now names the real reason.
+- `init`, config writes and `doctor` accept a group-writable directory you own when its group is your own user-private group (`user:user`), and refuse a directory owned by another non-root user. Thanks [@gzsombor](https://github.com/gzsombor) ([#86](https://github.com/llamastash/llamastash/pull/86)).
 
 ## [0.5.0] — 2026-09-30
 

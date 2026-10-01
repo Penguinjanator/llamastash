@@ -118,7 +118,10 @@ pub fn dir_swap_surface(path: &Path, our_uid: u32) -> Option<SwapSurface> {
   let meta = std::fs::metadata(path).ok()?;
   let owner = meta.uid();
   let mode = meta.permissions().mode() & 0o777;
-  let private_group = is_user_private_group(meta.gid(), our_uid);
+  // Only this case reads the answer; skipping the lookup otherwise saves an
+  // NSS round trip (LDAP/SSSD) per call.
+  let private_group =
+    owner == our_uid && mode & 0o020 != 0 && is_user_private_group(meta.gid(), our_uid);
   SwapSurface::for_perm(owner, mode, our_uid, private_group)
 }
 
@@ -217,12 +220,13 @@ impl SwapSurface {
       SwapSurface::ForeignOwner { owner, .. } => format!(
         "is owned by UID {owner} (neither you, UID {our_uid}, nor root); that account controls it"
       ),
-      SwapSurface::WorldWritable { mode } => {
-        format!("is world-writable (mode {mode:#o}); any user could replace a file inside it")
-      }
+      SwapSurface::WorldWritable { mode } => format!(
+        "is world-writable (mode {mode:#o}), so any user could replace a file inside it; \
+         run `chmod go-w` on it"
+      ),
       SwapSurface::GroupWritable { mode, .. } => format!(
-        "is group-writable (mode {mode:#o}) on a group that is not your user-private group; \
-         other members of that group could replace a file inside it — `chmod g-w` the directory"
+        "is group-writable (mode {mode:#o}) and its group is not your user-private group, \
+         so other members of that group could replace a file inside it; run `chmod g-w` on it"
       ),
     }
   }
@@ -232,7 +236,7 @@ impl SwapSurface {
 mod tests_unix {
   use super::*;
   use std::fs;
-  use std::os::unix::fs::PermissionsExt;
+  use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
   #[test]
   fn for_perm_accepts_self_owned_group_writable_dir() {
@@ -317,16 +321,15 @@ mod tests_unix {
   fn real_dir_matches_the_predicate() {
     let dir = crate::util::test_temp::unique_temp_dir("swap-surface");
     let our_uid = unsafe { libc::geteuid() };
-    let our_gid = unsafe { libc::getegid() };
+    // A new dir takes its parent's group on macOS/BSD, not the egid.
+    let dir_gid = fs::metadata(&dir).unwrap().gid();
 
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(dir_swap_surface(&dir, our_uid), None);
 
-    // Which way 0775 goes depends on the host's primary group — a private
-    // `user:user` accepts it, a shared `staff`/`users` refuses it. What
-    // matters here is that `dir_swap_surface` threads the dir's real gid
-    // into that test instead of assuming it.
-    let private = is_user_private_group(our_gid, our_uid);
+    // Which way 0775 goes depends on the dir's group: a private
+    // `user:user` accepts it, a shared `staff`/`users` refuses it.
+    let private = is_user_private_group(dir_gid, our_uid);
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
     assert_eq!(
       dir_swap_surface(&dir, our_uid),
