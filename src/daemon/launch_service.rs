@@ -132,7 +132,7 @@ pub(crate) enum LaunchSelection {
   Auto,
 }
 
-#[derive(Deserialize, Clone, Copy)]
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum LaunchModeWire {
   Chat,
@@ -1232,6 +1232,9 @@ pub(crate) async fn spawn_supervised(
   // knob (that path already warned, in memory terms).
   let bypass_note_suppressed = !auto_set_knobs.is_empty();
   let mut admitted = false;
+  // What the gate priced this launch at, kept for the running row so make-room
+  // can later credit it for exactly that much when it is unloaded.
+  let mut projected_demand_bytes = None;
   // A non-GGUF identity used to skip the gate entirely, so a
   // process-per-model backend serving a directory could OOM the host with no
   // pre-spawn refusal at all. It has no header to project from, but the
@@ -1364,11 +1367,19 @@ pub(crate) async fn spawn_supervised(
               return Err(ErrorObject::with_data(
                 ErrorCode::ResourceExhausted,
                 format_admission_refusal(&refusal),
-                serde_json::json!({ "cause": "launch_refused" }),
+                serde_json::json!({
+                  "cause": "launch_refused",
+                  "demand_bytes": refusal.demand_bytes,
+                  "effective_free_bytes": refusal.effective_free_bytes,
+                  "reserved_bytes": refusal.reserved_bytes,
+                }),
               ));
             }
           } else {
             admitted = true;
+          }
+          if admitted {
+            projected_demand_bytes = Some(demand);
           }
         }
       }
@@ -1436,6 +1447,7 @@ pub(crate) async fn spawn_supervised(
         params: launch_params.clone(),
         actuals: Default::default(),
         resolved_backend: resolved_backend_id.clone(),
+        projected_demand_bytes,
       });
     })
     .await;

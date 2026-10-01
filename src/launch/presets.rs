@@ -22,6 +22,12 @@ use crate::launch::resolve::CatalogRow;
 pub struct NamedPreset {
   pub name: String,
   pub params: LaunchParams,
+  /// Residency policy carried from the config body: this preset's idle-TTL
+  /// override (`Some(0)` = never unload) and whether it starts at daemon boot.
+  #[serde(default)]
+  pub idle_ttl_secs: Option<u64>,
+  #[serde(default)]
+  pub preload: bool,
 }
 
 /// Per-model preset list. Wrapper around `Vec<NamedPreset>` so the
@@ -113,6 +119,9 @@ pub fn preset_body_from_launch_params(params: &LaunchParams) -> PresetBody {
     extras: (!extras.is_empty()).then_some(extras),
     backend: params.backend.explicit_id().map(str::to_string),
     server: params.server.clone(),
+    // Residency policy is not part of a launch's params, so a fold from params
+    // alone pins none of it; callers set it beside this call.
+    ..Default::default()
   }
 }
 
@@ -175,6 +184,8 @@ pub fn materialize_preset(name: &str, body: &PresetBody, model_path: PathBuf) ->
   NamedPreset {
     name: name.to_string(),
     params,
+    idle_ttl_secs: body.idle_ttl_secs,
+    preload: body.preload,
   }
 }
 
@@ -444,6 +455,8 @@ mod tests {
     NamedPreset {
       name: name.to_string(),
       params: LaunchParams::new(PathBuf::from("/m/a.gguf"), LaunchMode::Chat),
+      idle_ttl_secs: None,
+      preload: false,
     }
   }
 
@@ -1019,6 +1032,30 @@ mod tests {
     assert!(
       eff.presets.is_empty(),
       "no presets apply to this model/arch"
+    );
+  }
+
+  /// The residency fields are read off the config body by the eviction sweep and
+  /// the boot preload, so they have to survive materialisation — and the flat
+  /// YAML shape the writer produces — rather than live only on the raw body.
+  #[test]
+  fn residency_fields_survive_materialisation_and_yaml() {
+    let body: PresetBody =
+      yaml_serde::from_str("idle_ttl_secs: 0\npreload: true\n").expect("residency keys parse");
+    assert_eq!(body.idle_ttl_secs, Some(0));
+    assert!(body.preload);
+
+    let named = materialize_preset("warm", &body, PathBuf::from("/m/a.gguf"));
+    assert_eq!(named.idle_ttl_secs, Some(0));
+    assert!(named.preload);
+
+    // An entry that pins nothing writes neither key, so a plain preset stays
+    // byte-stable on disk.
+    let plain = PresetBody::default();
+    let yaml = yaml_serde::to_string(&plain).expect("plain body serialises");
+    assert!(
+      !yaml.contains("idle_ttl_secs") && !yaml.contains("preload"),
+      "unset residency fields are omitted: {yaml}"
     );
   }
 }

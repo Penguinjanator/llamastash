@@ -829,6 +829,9 @@ pub fn status_json(snap: &StatusSnapshot) -> Value {
       "build": d.build,
       "server_path": d.server_path,
       "ipc_url": d.ipc_url,
+      // Boot preload as configured, mirrored verbatim; omitted against an
+      // older daemon that doesn't surface it.
+      "preload": d.preload,
     })
   });
   let mut body = serde_json::json!({
@@ -1422,6 +1425,7 @@ mod tests {
         build: None,
         server_path: None,
         ipc_url: None,
+        preload: None,
       }),
       proxy: Value::Null,
       backends: Value::Null,
@@ -1449,6 +1453,7 @@ mod tests {
         build: None,
         server_path: None,
         ipc_url: None,
+        preload: None,
       }),
       proxy: Value::Null,
       backends: Value::Null,
@@ -1476,6 +1481,7 @@ mod tests {
       build: None,
       server_path: None,
       ipc_url: None,
+      preload: None,
     };
     let listening = StatusSnapshot {
       models: vec![],
@@ -1623,6 +1629,7 @@ mod tests {
         build: Some("0.1.0".into()),
         server_path: Some("/usr/bin/llama-server".into()),
         ipc_url: Some("http://127.0.0.1:48134".into()),
+        preload: Some(serde_json::json!({"entries": ["warm.gguf"], "presets": 1})),
       }),
       proxy: Value::Null,
       backends: Value::Null,
@@ -1636,6 +1643,12 @@ mod tests {
     assert_eq!(
       v["daemon"]["server_path"],
       serde_json::json!("/usr/bin/llama-server")
+    );
+    // Boot preload mirrors the daemon block so a CLI agent sees what an IPC
+    // client sees, and stays distinguishable from an older daemon that omits it.
+    assert_eq!(
+      v["daemon"]["preload"],
+      serde_json::json!({"entries": ["warm.gguf"], "presets": 1})
     );
   }
 
@@ -2029,6 +2042,7 @@ mod tests {
         build: None,
         server_path: None,
         ipc_url: None,
+        preload: None,
       }),
       proxy: proxy_value("disabled", None, None),
       backends: Value::Null,
@@ -2057,6 +2071,7 @@ mod tests {
         build: None,
         server_path: None,
         ipc_url: None,
+        preload: None,
       }),
       proxy: proxy_value("listening", Some("127.0.0.1:11434"), None),
       backends: Value::Null,
@@ -2085,6 +2100,7 @@ mod tests {
         build: None,
         server_path: None,
         ipc_url: None,
+        preload: None,
       }),
       proxy: proxy_value("port_in_use", Some("127.0.0.1:11434"), None),
       backends: Value::Null,
@@ -2219,6 +2235,7 @@ mod tests {
         build: None,
         server_path: None,
         ipc_url: None,
+        preload: None,
       }),
       proxy: proxy_value("unbound", Some("127.0.0.1:80"), Some("permission denied")),
       backends: Value::Null,

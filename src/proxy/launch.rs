@@ -161,6 +161,28 @@ pub(crate) async fn auto_start(
   }
 }
 
+/// The admission numbers behind a launch refusal, or `None` for any other
+/// failure. `compose_and_spawn` refuses before spawn with `ResourceExhausted`
+/// and carries the projection in its `data`; make-room needs the same figures
+/// the gate used, not a re-derivation of them.
+fn admission_refusal(
+  e: &crate::ipc::protocol::ErrorObject,
+) -> Option<crate::launch::admission::Refusal> {
+  if e.code != crate::ipc::protocol::ErrorCode::ResourceExhausted.as_i32() {
+    return None;
+  }
+  let data = e.data.as_ref()?;
+  if data.get("cause").and_then(|c| c.as_str()) != Some("launch_refused") {
+    return None;
+  }
+  let field = |key: &str| data.get(key).and_then(|v| v.as_u64());
+  Some(crate::launch::admission::Refusal {
+    demand_bytes: field("demand_bytes")?,
+    effective_free_bytes: field("effective_free_bytes")?,
+    reserved_bytes: field("reserved_bytes").unwrap_or(0),
+  })
+}
+
 /// Attach to an in-flight launch when one exists, else run
 /// [`compose_and_spawn`]; either way wait for `Ready` via
 /// [`await_ready`]. Pulled out so the leader arm of [`auto_start`]
@@ -183,28 +205,56 @@ async fn drive_launch_as_leader(
     return await_ready(state, &existing).await;
   }
 
-  let params = StartParams {
+  let mode = resolve_auto_start_mode(
+    resolved.mode_hint.as_deref(),
+    endpoint_mode,
+    last_used_mode(state, model_id).await,
+  );
+  // Built by a closure so the make-room retry below sends the same request a
+  // second time rather than a partially consumed copy.
+  let start_params = || StartParams {
     model_path: std::path::PathBuf::from(&resolved.path),
-    name,
-    mode: resolve_auto_start_mode(
-      resolved.mode_hint.as_deref(),
-      endpoint_mode,
-      last_used_mode(state, model_id).await,
-    ),
+    name: name.clone(),
+    mode,
     ..StartParams::default()
   };
   let started = match compose_and_spawn(
     &state.ctx,
-    params,
+    start_params(),
     crate::daemon::supervisor::LaunchOrigin::AutoStart,
   )
   .await
   {
     Ok(s) => s,
     Err(e) => {
-      return LaunchOutcome::Failed {
-        cause: format!("compose_and_spawn: {}", e.message),
+      // The memory admission gate refused it. Before answering 503, try to make
+      // room by unloading the idle auto-started models that hold the memory —
+      // least-recently-used first, all-or-nothing. Any other failure, or a retry
+      // that still does not fit, fails exactly as before.
+      let Some(refusal) = admission_refusal(&e) else {
+        return LaunchOutcome::Failed {
+          cause: format!("compose_and_spawn: {}", e.message),
+        };
       };
+      if !super::eviction::make_room(state, &refusal).await {
+        return LaunchOutcome::Failed {
+          cause: format!("compose_and_spawn: {}", e.message),
+        };
+      }
+      match compose_and_spawn(
+        &state.ctx,
+        start_params(),
+        crate::daemon::supervisor::LaunchOrigin::AutoStart,
+      )
+      .await
+      {
+        Ok(s) => s,
+        Err(retry) => {
+          return LaunchOutcome::Failed {
+            cause: format!("compose_and_spawn: {}", retry.message),
+          };
+        }
+      }
     }
   };
   // No human watches an auto-start; log any advisories (dropped knobs,
@@ -503,6 +553,45 @@ mod tests {
       resolve_auto_start_mode(None, Some(LaunchMode::Embedding), None),
       Some(LaunchModeWire::Embedding)
     ));
+  }
+
+  /// The auto-start retry is gated on reading the gate's own numbers back out of
+  /// the refusal, so the `data` contract is asserted here: a refusal that loses
+  /// its figures must not be retried with made-up ones.
+  #[test]
+  fn admission_refusal_reads_the_gate_projection_back() {
+    use crate::ipc::protocol::{ErrorCode, ErrorObject};
+    let refusal = crate::launch::admission::Refusal {
+      demand_bytes: 900,
+      effective_free_bytes: 400,
+      reserved_bytes: 100,
+    };
+    let err = ErrorObject::with_data(
+      ErrorCode::ResourceExhausted,
+      "refused",
+      serde_json::json!({
+        "cause": "launch_refused",
+        "demand_bytes": refusal.demand_bytes,
+        "effective_free_bytes": refusal.effective_free_bytes,
+        "reserved_bytes": refusal.reserved_bytes,
+      }),
+    );
+    let read = admission_refusal(&err).expect("the gate's own figures come back");
+    assert_eq!(read, refusal);
+    assert_eq!(read.available_bytes(), 300);
+
+    // Any other failure — a different code, a different cause, no data — is not
+    // an admission refusal, so the auto-start fails without unloading anything.
+    assert!(admission_refusal(&ErrorObject::new(ErrorCode::InvalidParams, "bad")).is_none());
+    assert!(admission_refusal(&ErrorObject::with_data(
+      ErrorCode::ResourceExhausted,
+      "refused",
+      serde_json::json!({ "cause": "other" }),
+    ))
+    .is_none());
+    assert!(
+      admission_refusal(&ErrorObject::new(ErrorCode::ResourceExhausted, "no data")).is_none()
+    );
   }
 
   #[test]

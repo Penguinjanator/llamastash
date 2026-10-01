@@ -10,6 +10,9 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 - `init` integrations set reasoning effort to the levels the model's chat template accepts in pi, OpenCode, Zed and Codex (#93).
 - `init` integrations: Codex CLI profile, used with `codex --profile llamastash` (#93).
 - Claude Code's `/effort` now reaches a llama.cpp model: the proxy maps the Anthropic `output_config.effort` field onto `chat_template_kwargs.reasoning_effort` when forwarding `/v1/messages`, so switching effort changes thinking length instead of doing nothing. `backend.llamacpp.map_anthropic_effort: false` leaves the effort the launch was given in charge. ([#95](https://github.com/llamastash/llamastash/pull/95))
+- **Per-preset idle TTL.** A preset can pin `idle_ttl_secs`, overriding `proxy.idle_ttl_secs` for the launches it starts; `0` never unloads them. A model that takes 80 s to read off disk no longer expires on the same clock as one that takes 4 s. `presets save --idle-ttl`, and `presets list` gains `TTL` / `PRELOAD` columns.
+- **Unload-to-make-room.** When a request for a dormant model does not fit the memory gate, the daemon now unloads the least recently used idle auto-started models to fit it instead of answering `503`. Manual, in-flight and never-unload launches are never picked, and nothing is unloaded if the idle set cannot cover the shortfall.
+- **Boot preload.** `daemon.preload:` in `config.yaml` (or a preset pinning `preload: true`) starts the models you want warm as soon as the daemon is up, in list order, through the same admission gate as any other launch. A preloaded launch stays up until you stop it.
 
 ### Changed
 

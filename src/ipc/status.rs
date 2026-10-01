@@ -366,6 +366,18 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
     None => Value::Array(Vec::new()),
   };
   let backends = backends_status(ctx).await;
+  // Boot preload, as configured: the `daemon.preload:` list and how many preset
+  // entries pin `preload: true`. Reported so a caller can tell a daemon that was
+  // asked to warm models from one that was not; whether a given entry started is
+  // visible in `models`, since a preloaded launch is a normal running row.
+  let preload_presets = ctx
+    .presets
+    .snapshot()
+    .await
+    .values()
+    .flat_map(|block| block.entries.values())
+    .filter(|entry| entry.preload)
+    .count();
   let mut body = json!({
     "models": models,
     "external": external,
@@ -384,6 +396,10 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
         .and_then(|env| env.binary.as_ref())
         .map(|b| b.display().to_string()),
       "ipc_url": ctx.ipc_url,
+      "preload": {
+        "entries": ctx.preload.iter().cloned().collect::<Vec<_>>(),
+        "presets": preload_presets,
+      },
     },
   });
   if let Some(proxy) = proxy {
@@ -601,6 +617,26 @@ mod tests {
     assert!(daemon["pid"].is_number());
     assert!(daemon["uptime_seconds"].is_number());
     assert_eq!(daemon["active_connections"], json!(0));
+    // Preload is always reported, empty included, so "not configured" and
+    // "unread" stay distinguishable.
+    assert_eq!(daemon["preload"]["entries"], json!([]));
+    assert_eq!(daemon["preload"]["presets"], json!(0));
+  }
+
+  /// A configured preload list and preset pins both reach `status.daemon`, so an
+  /// operator can tell a daemon that was asked to warm models from one that was
+  /// not even when every entry failed to start.
+  #[tokio::test]
+  async fn status_reports_configured_preload() {
+    let mut c = ctx();
+    c.preload = std::sync::Arc::new(vec!["ghost.gguf".into(), "warm.gguf@long-ctx".into()]);
+    let resp = dispatch_request(&c, Request::new(1, "status", None)).await;
+    let daemon = resp.result.expect("status result")["daemon"].clone();
+    assert_eq!(
+      daemon["preload"]["entries"],
+      json!(["ghost.gguf", "warm.gguf@long-ctx"])
+    );
+    assert_eq!(daemon["preload"]["presets"], json!(0));
   }
 
   /// Agent-facing contract guard: pins the exact top-level key set of a

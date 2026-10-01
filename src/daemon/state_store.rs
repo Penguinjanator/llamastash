@@ -174,6 +174,14 @@ pub struct RunningSnapshot {
     skip_serializing_if = "is_default_backend"
   )]
   pub resolved_backend: String,
+  /// The demand floor the memory admission gate priced this launch at, in
+  /// bytes (weights + cache at the projected ctx + overhead band). Stamped only
+  /// when the gate actually budgeted the launch, so a disk-streaming or
+  /// orphan-adopted row leaves it unset. Make-room reads it as the figure a
+  /// launch gives back when unloaded — the same unit the refused launch is
+  /// priced in — so the two cannot disagree.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub projected_demand_bytes: Option<u64>,
 }
 
 impl RunningSnapshot {

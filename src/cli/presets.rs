@@ -113,6 +113,8 @@ pub async fn handle(args: PresetsArgs, cli: &Cli, config: &Config) -> CliResult 
       mode,
       backend,
       server,
+      idle_ttl,
+      preload,
       mtp,
       mtp_draft_n,
       from_last,
@@ -180,6 +182,13 @@ pub async fn handle(args: PresetsArgs, cli: &Cli, config: &Config) -> CliResult 
       }
       if let Some(sv) = server {
         payload.insert("server".into(), json!(sv));
+      }
+      // Residency policy, beside the params rather than inside them.
+      if let Some(ttl) = idle_ttl {
+        payload.insert("idle_ttl_secs".into(), json!(ttl));
+      }
+      if preload {
+        payload.insert("preload".into(), json!(true));
       }
       if !extras_os.is_empty() {
         let extras_str: Vec<String> = extras_os
@@ -268,7 +277,15 @@ fn render_presets_human(arr: &[Value], model_name: &str) -> String {
     );
   }
   let tty = console::colors_enabled();
-  let header = ["NAME", "CTX", "REASONING", "KNOBS", "EXTRAS"];
+  let header = [
+    "NAME",
+    "CTX",
+    "REASONING",
+    "KNOBS",
+    "EXTRAS",
+    "TTL",
+    "PRELOAD",
+  ];
   let table_rows: Vec<Vec<String>> = arr
     .iter()
     .map(|preset| {
@@ -306,7 +323,31 @@ fn render_presets_human(arr: &[Value], model_name: &str) -> String {
             .join(" ")
         })
         .unwrap_or_default();
-      vec![name.to_string(), ctx, reasoning, knobs, extras]
+      // `idle_ttl_secs: null` means the global TTL applies, `0` means the
+      // preset is never unloaded; both read differently from a number.
+      let ttl = match preset.get("idle_ttl_secs") {
+        Some(Value::Number(n)) if n.as_u64() == Some(0) => "never".to_string(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => "-".to_string(),
+      };
+      let preload = if preset
+        .get("preload")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+      {
+        "yes"
+      } else {
+        "-"
+      };
+      vec![
+        name.to_string(),
+        ctx,
+        reasoning,
+        knobs,
+        extras,
+        ttl,
+        preload.to_string(),
+      ]
     })
     .collect();
   let mut out = format::table(&header, &table_rows);
@@ -398,10 +439,35 @@ mod tests {
     let out = render_presets_human(&arr, "qwen-coder");
     assert_eq!(
       out,
-      "NAME\tCTX\tREASONING\tKNOBS\tEXTRAS\n\
-       coding\t32768\ton\tthreads=8\t--foo bar\n\
-       default\t-\toff\t\t\n"
+      "NAME\tCTX\tREASONING\tKNOBS\tEXTRAS\tTTL\tPRELOAD\n\
+       coding\t32768\ton\tthreads=8\t--foo bar\t-\t-\n\
+       default\t-\toff\t\t\t-\t-\n"
     );
+  }
+
+  /// The residency columns read as policy, not as raw numbers: `idle_ttl_secs`
+  /// null is "the global TTL", `0` is "never unload", and preload is a yes/no.
+  #[test]
+  fn render_presets_human_shows_residency_columns() {
+    let _g = ColorGuard::set(false);
+    let row = |ttl: Value, preload: bool| json!({ "name": "p", "params": {}, "idle_ttl_secs": ttl, "preload": preload });
+    let out = render_presets_human(
+      &[
+        row(Value::Null, false),
+        row(serde_json::json!(0), true),
+        row(serde_json::json!(60), false),
+      ],
+      "m",
+    );
+    let lines: Vec<&str> = out.trim_end().split('\n').collect();
+    assert_eq!(
+      lines[0],
+      "NAME\tCTX\tREASONING\tKNOBS\tEXTRAS\tTTL\tPRELOAD"
+    );
+    let (unset, never, secs) = (lines[1], lines[2], lines[3]);
+    assert!(unset.ends_with("\t-\t-"), "unset: {unset}\n{out}");
+    assert!(never.ends_with("\tnever\tyes"), "ttl 0: {never}\n{out}");
+    assert!(secs.ends_with("\t60\t-"), "ttl 60: {secs}\n{out}");
   }
 
   #[test]

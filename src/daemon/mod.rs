@@ -18,6 +18,7 @@ pub mod launch_service;
 pub mod lockfile;
 pub mod orphans;
 pub mod ports;
+pub mod preload;
 pub mod preset_store;
 pub mod probe;
 pub mod registry;
@@ -151,6 +152,9 @@ pub struct DaemonOptions {
   /// Idle-shutdown deadline, or `None` when the timer is off. From
   /// [`crate::config::DaemonConfig::idle_timeout`].
   pub idle_timeout: Option<Duration>,
+  /// Models to start at boot (`daemon.preload`). Resolved against the catalog by
+  /// [`preload`], which logs and skips anything it cannot start. Default empty.
+  pub preload: Vec<String>,
   /// Host-metrics sampler cadence. From
   /// [`crate::config::DaemonConfig::metrics_interval`].
   pub metrics_interval: Duration,
@@ -201,6 +205,7 @@ impl DaemonOptions {
       gpu_reprobe_interval: crate::config::GpuConfig::default().reprobe_interval(),
       idle_timeout: crate::config::DaemonConfig::default().idle_timeout(),
       metrics_interval: crate::config::DaemonConfig::default().metrics_interval(),
+      preload: crate::config::DaemonConfig::default().preload,
     }
   }
 
@@ -236,6 +241,7 @@ impl DaemonOptions {
       gpu_reprobe_interval: crate::config::GpuConfig::default().reprobe_interval(),
       idle_timeout: crate::config::DaemonConfig::default().idle_timeout(),
       metrics_interval: crate::config::DaemonConfig::default().metrics_interval(),
+      preload: crate::config::DaemonConfig::default().preload,
     })
   }
 }
@@ -261,6 +267,29 @@ pub enum StartOutcome {
 /// or dropped `!` here would silently expose an unauthenticated proxy.
 fn must_refuse_insecure_proxy(host: IpAddr, has_api_key: bool, insecure_no_auth: bool) -> bool {
   !host.is_loopback() && !has_api_key && !insecure_no_auth
+}
+
+/// Whether any preset pins its own `idle_ttl_secs`. A per-preset TTL needs the
+/// eviction sweep even when the global `proxy.idle_ttl_secs` is 0, so it keeps
+/// the sweeper armed on its own.
+fn presets_pin_idle_ttl(
+  presets: &std::collections::BTreeMap<String, crate::config::ConfigPresetBlock>,
+) -> bool {
+  presets
+    .values()
+    .flat_map(|block| block.entries.values())
+    .any(|entry| entry.idle_ttl_secs.is_some())
+}
+
+/// Whether any preset opts into boot preload on its own, which arms the preload
+/// task even when `daemon.preload` lists nothing.
+fn presets_pin_preload(
+  presets: &std::collections::BTreeMap<String, crate::config::ConfigPresetBlock>,
+) -> bool {
+  presets
+    .values()
+    .flat_map(|block| block.entries.values())
+    .any(|entry| entry.preload)
 }
 
 /// A configured proxy key counts as "present" for the backstop only when it is
@@ -414,6 +443,7 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
     .with_presets(preset_store)
     .with_external(external_combined)
     .with_proxy_status(std::sync::Arc::clone(&proxy_status_cell))
+    .with_preload(opts.preload.clone())
     .with_backend(opts.backend.clone(), opts.backend_force.clone());
   if opts.binary.is_none() {
     log::info!(
@@ -555,11 +585,12 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
         header_read_timeout: std::time::Duration::from_secs(opts.proxy.header_read_timeout_secs),
         ..proxy::server::ServeOptions::default()
       };
-      // Idle-TTL eviction sweeper. Skipped entirely when
-      // `idle_ttl_secs = 0` (operator disabled it). Runs in parallel
-      // with the listener; uses the same shutdown token so daemon stop
-      // tears both down at once.
-      if opts.proxy.idle_ttl_secs > 0 {
+      // Idle-TTL eviction sweeper. Skipped when `idle_ttl_secs = 0`
+      // (operator disabled the global deadline) *and* no preset pins its own
+      // `idle_ttl_secs` — a per-preset TTL still needs a sweep to run in.
+      // Runs in parallel with the listener; uses the same shutdown token so
+      // daemon stop tears both down at once.
+      if opts.proxy.idle_ttl_secs > 0 || presets_pin_idle_ttl(&opts.presets) {
         let state_for_evict = std::sync::Arc::clone(&state);
         let token_for_evict = token.clone();
         let ttl = std::time::Duration::from_secs(opts.proxy.idle_ttl_secs);
@@ -650,6 +681,21 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
       log::warn!("control plane listener task ended with error: {e}");
     }
   });
+
+  // 8d. Boot preload: `daemon.preload:` entries plus any preset pinning
+  // `preload: true`. Spawned last so the catalog, the proxy and the control
+  // plane all exist before the first launch — entries resolve against the
+  // catalog, and a preloaded model should be routable the moment it is Ready.
+  // Best-effort by design: anything that cannot start logs and is skipped, and a
+  // preload never blocks boot.
+  if !opts.preload.is_empty() || presets_pin_preload(&opts.presets) {
+    let preload_ctx = ctx.clone();
+    let preload_entries = opts.preload.clone();
+    let preload_token = token.clone();
+    supervisor::spawn_supervised("daemon_preload", async move {
+      preload::run(preload_ctx, preload_entries, preload_token).await;
+    });
+  }
 
   // 9. Wait for shutdown. The control plane runs as a supervised
   // background task; the foreground future parks on the shutdown

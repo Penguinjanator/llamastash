@@ -659,6 +659,10 @@ impl Backend for LemonadeBackend {
           params: snapshot_params,
           actuals: Default::default(),
           resolved_backend: snapshot_backend,
+          // A delegated model lives inside the umbrella process, which the
+          // admission gate never budgeted per launch, so there is no projection
+          // to carry. Make-room falls back to the model's own size.
+          projected_demand_bytes: None,
         });
       })
       .await;

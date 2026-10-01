@@ -710,6 +710,14 @@ struct PresetsSaveParams {
   /// Server (build/binary) this preset pins. Identity, like `backend`.
   #[serde(default)]
   server: Option<String>,
+  /// Idle-TTL override in seconds for launches this preset starts (`Some(0)` =
+  /// never unload). Residency policy, not a launch knob, so it never rides in
+  /// `knobs`.
+  #[serde(default)]
+  idle_ttl_secs: Option<u64>,
+  /// Start this preset when the daemon boots.
+  #[serde(default)]
+  preload: bool,
 }
 
 async fn presets_save_handler(
@@ -744,7 +752,14 @@ async fn presets_save_handler(
     .unwrap_or_default();
   lp.server = parsed.server.clone();
   lp.extras = parsed.extras.into_iter().map(OsString::from).collect();
-  let body = preset_body_from_launch_params(&lp);
+  // Residency policy sits beside the launch params rather than inside them: it
+  // decides how long the launch *stays* up, not how it is launched. A save that
+  // carries neither pins nothing, the same rule every other field here follows.
+  let body = crate::config::PresetBody {
+    idle_ttl_secs: parsed.idle_ttl_secs,
+    preload: parsed.preload,
+    ..preset_body_from_launch_params(&lp)
+  };
 
   let (key, arch, rows) = model_key_arch_rows(ctx, &parsed.model_path).await;
   let saved_np = materialize_preset(&parsed.name, &body, parsed.model_path.clone());
@@ -858,6 +873,10 @@ fn preset_row(p: &NamedPreset, is_default: bool) -> Value {
     // source without re-deriving it.
     "source": "config",
     "is_default": is_default,
+    // Residency policy: this preset's idle-TTL override (`0` = never unload,
+    // null = the global `proxy.idle_ttl_secs`) and whether it preloads at boot.
+    "idle_ttl_secs": p.idle_ttl_secs,
+    "preload": p.preload,
   })
 }
 

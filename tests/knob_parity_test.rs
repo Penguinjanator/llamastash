@@ -110,6 +110,7 @@ fn every_declared_knob_reaches_every_surface() {
       extras: None,
       backend: Some(backend_id.to_string()),
       server: None,
+      ..llamastash::config::PresetBody::default()
     };
     let yaml = yaml_serde::to_string(&body).expect("preset serialises");
     let back: llamastash::config::PresetBody =
@@ -187,6 +188,7 @@ fn every_config_declared_knob_reaches_every_surface() {
       extras: None,
       backend: None,
       server: None,
+      ..llamastash::config::PresetBody::default()
     };
     let yaml = yaml_serde::to_string(&body).unwrap();
     let back: llamastash::config::PresetBody = yaml_serde::from_str(&yaml).unwrap();
@@ -293,6 +295,7 @@ fn every_identity_field_reaches_its_declared_surfaces() {
       extras: Some(vec!["--x".into()]),
       backend: Some("b".into()),
       server: Some("s".into()),
+      ..llamastash::config::PresetBody::default()
     };
     let v: yaml_serde::Value = yaml_serde::to_value(&body).expect("preset serialises");
     v.as_mapping()
