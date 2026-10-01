@@ -4,9 +4,9 @@ IMAGE    := ${IMG_NAME}:${VERSION}
 
 default: run
 
-## Run all tests (matches AGENTS.md CI parity — needs the test-fixtures feature)
+## Run lint, the test suite and doctests the way CI does (needs `cargo install cargo-nextest`)
 test:
-	@make lint && cargo test --features test-fixtures
+	@make lint && cargo nextest run --features test-fixtures --workspace && cargo test --doc --features test-fixtures --workspace
 
 ## Regenerate golden test fixtures
 test-golden:

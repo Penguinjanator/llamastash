@@ -42,7 +42,7 @@ Read the relevant doc before non-trivial work in that area; don't re-derive from
 
 ```bash
 make build                                                 # release: cargo build --release
-make test                                                  # cargo test --features test-fixtures — required for CI parity
+make test                                                  # lint + nextest + doctests with test-fixtures, as CI runs them
 cargo test --features test-fixtures --test <name>          # one integration binary
 make lint                                                  # fmt --check + clippy -D warnings
 make audit                                                 # maintainer bundle → target/audit; make audit-summary for the headline
