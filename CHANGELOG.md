@@ -4,15 +4,19 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-10-01
+
+This release is about which models stay loaded. A preset can pin its own idle TTL, so a model that takes 80 s to read off disk no longer expires on the same clock as one that takes 4 s. A request that does not fit in memory now unloads the least recently used idle models instead of failing with `503`. And `daemon.preload` starts the models you want warm as soon as the daemon is up. Claude Code's `/effort` also reaches llama.cpp models now, and `init` installs llama.cpp's CUDA build on Linux with an NVIDIA card.
+
 ### Added
 
-- `init` installs llama.cpp's CUDA build with its CUDA runtime on Linux + NVIDIA, and falls back to Vulkan when CUDA does not load (#93).
-- `init` integrations set reasoning effort to the levels the model's chat template accepts in pi, OpenCode, Zed and Codex (#93).
-- `init` integrations: Codex CLI profile, used with `codex --profile llamastash` (#93).
-- Claude Code's `/effort` now reaches a llama.cpp model: the proxy maps the Anthropic `output_config.effort` field onto `chat_template_kwargs.reasoning_effort` when forwarding `/v1/messages`, so switching effort changes thinking length instead of doing nothing. `backend.llamacpp.map_anthropic_effort: false` leaves the effort the launch was given in charge. ([#95](https://github.com/llamastash/llamastash/pull/95))
-- **Per-preset idle TTL.** A preset can pin `idle_ttl_secs`, overriding `proxy.idle_ttl_secs` for the launches it starts; `0` never unloads them. A model that takes 80 s to read off disk no longer expires on the same clock as one that takes 4 s. `presets save --idle-ttl` pins it and `--no-idle-ttl` drops the pin, and `presets list` gains `TTL` / `PRELOAD` columns.
-- **Unload-to-make-room.** When a request for a dormant model does not fit the memory gate, the daemon now unloads the least recently used idle auto-started models to fit it instead of answering `503`. Manual, in-flight and never-unload launches are never picked, and nothing is unloaded if the idle set cannot cover the shortfall.
-- **Boot preload.** `daemon.preload:` in `config.yaml` (or a preset pinning `preload: true`, cleared by `presets save --no-preload`) starts the models you want warm as soon as the daemon is up, in list order, through the same admission gate as any other launch. A preloaded launch stays up until you stop it.
+- **Per-preset idle TTL.** A preset can pin `idle_ttl_secs`, overriding `proxy.idle_ttl_secs` for the launches it starts; `0` never unloads them. A model that takes 80 s to read off disk no longer expires on the same clock as one that takes 4 s. `presets save --idle-ttl` pins it and `--no-idle-ttl` drops the pin, and `presets list` gains `TTL` / `PRELOAD` columns. ([#94](https://github.com/llamastash/llamastash/pull/94))
+- **Unload-to-make-room.** When a request for a dormant model does not fit the memory gate, the daemon now unloads the least recently used idle auto-started models to fit it instead of answering `503`. Manual, in-flight and never-unload launches are never picked, and nothing is unloaded if the idle set cannot cover the shortfall. ([#94](https://github.com/llamastash/llamastash/pull/94))
+- **Boot preload.** `daemon.preload:` in `config.yaml` (or a preset pinning `preload: true`, cleared by `presets save --no-preload`) starts the models you want warm as soon as the daemon is up, in list order, through the same admission gate as any other launch. A preloaded launch stays up until you stop it. ([#94](https://github.com/llamastash/llamastash/pull/94))
+- Claude Code's `/effort` now reaches a llama.cpp model: the proxy maps the Anthropic `output_config.effort` field onto `chat_template_kwargs.reasoning_effort` when forwarding `/v1/messages`, so switching effort changes thinking length instead of doing nothing. `backend.llamacpp.map_anthropic_effort: false` leaves the effort the launch was given in charge. ([#95](https://github.com/llamastash/llamastash/pull/95), [#96](https://github.com/llamastash/llamastash/pull/96))
+- `init` installs llama.cpp's CUDA build with its CUDA runtime on Linux + NVIDIA, and falls back to Vulkan when CUDA does not load ([#93](https://github.com/llamastash/llamastash/pull/93)).
+- `init` integrations set reasoning effort to the levels the model's chat template accepts in pi, OpenCode, Zed and Codex ([#93](https://github.com/llamastash/llamastash/pull/93)).
+- `init` integrations: Codex CLI profile, used with `codex --profile llamastash` ([#93](https://github.com/llamastash/llamastash/pull/93)).
 
 ### Changed
 
@@ -20,12 +24,19 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ### Fixed
 
-- `init` integrations and `api-key --json` use the port the daemon's proxy actually listens on (#93).
-- pi integration's output cap no longer cuts long thinking short (#93).
-- `init` integrations declare image input for vision models and, in Zed, send earlier thinking back to the model (#93).
-- OpenCode integration declares each model's context and output limits, so it compacts again (#93).
-- `init`'s GitHub Releases install streams downloads to disk and reuses a build it already installed (#93).
+- `init` integrations and `api-key --json` use the port the daemon's proxy actually listens on ([#93](https://github.com/llamastash/llamastash/pull/93)).
+- pi integration's output cap no longer cuts long thinking short ([#93](https://github.com/llamastash/llamastash/pull/93)).
+- `init` integrations declare image input for vision models and, in Zed, send earlier thinking back to the model ([#93](https://github.com/llamastash/llamastash/pull/93)).
+- OpenCode integration declares each model's context and output limits, so it compacts again ([#93](https://github.com/llamastash/llamastash/pull/93)).
+- `init`'s GitHub Releases install streams downloads to disk and reuses a build it already installed ([#93](https://github.com/llamastash/llamastash/pull/93)).
 - `init`, config writes and `doctor` accept a group-writable directory you own when its group is your own user-private group (`user:user`), and refuse a directory owned by another non-root user. Thanks [@gzsombor](https://github.com/gzsombor) ([#86](https://github.com/llamastash/llamastash/pull/86)).
+
+### Contributors
+
+Thanks to everyone who shipped code in this release:
+
+- [@gzsombor](https://github.com/gzsombor): user-private group check for group-writable directories ([#86](https://github.com/llamastash/llamastash/pull/86))
+- [@deepu105](https://github.com/deepu105): everything else
 
 ## [0.5.0] — 2026-09-30
 
