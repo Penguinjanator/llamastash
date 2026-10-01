@@ -139,6 +139,15 @@ Done 2026-10-01.
 - The check needs a model whose template defines `reasoning_effort`. On
   Qwen3.5-4B (no such branch in its template) every row answers 600 / 1640
   regardless, which exercises the plumbing and nothing else.
+- Cheapest model that does have the branch: `LFM2.5-2.6B-Q3.8-TBrilliance-NEO-IQ4_XS.gguf`
+  from `DavidAU/LFM2.5-2.6B-Qwen3.8-Turbo-...-GGUF` (1.5 GB, ready in seconds,
+  unlike the 27B's ~3 min). Its template names its efforts `low` /
+  `medium-low` / `medium` / `high` / `ultra` and raises on `xhigh`, so the
+  script takes the row values from `EFFORT_LOW` / `EFFORT_HIGH` / `EFFORT_BAD`.
+  With `EFFORT_HIGH=ultra EFFORT_BAD=nonsense`: nothing 501 / 885, `low`
+  416 / 877, `ultra` 598 / 1136, `low` + client kwarg `low` 416 / 877,
+  `nonsense` and `xhigh` a 500 with the template's raise text, and the direct
+  kwarg rows land on 416 / 877 and 600 / 1356.
 - What the real client sends, captured from Claude Code 2.1.286 against a
   logging listener on `/v1/messages?beta=true` for an unrecognized model id:
   `thinking: {"type":"adaptive","display":"omitted"}` plus

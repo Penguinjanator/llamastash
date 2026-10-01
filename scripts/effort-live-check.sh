@@ -12,10 +12,20 @@
 #
 # Usage: effort-live-check.sh <proxy-origin> <model> [direct-upstream-origin]
 #   e.g. effort-live-check.sh http://127.0.0.1:11535 Qwen3.8-27B-UD-Q6_K http://127.0.0.1:41101
+#   cheap variant (1.5 GB, loads in seconds):
+#     EFFORT_HIGH=ultra EFFORT_BAD=xhigh effort-live-check.sh \
+#       http://127.0.0.1:11535 LFM2.5-2.6B-Q3.8-TBrilliance-NEO-IQ4_XS \
+#       http://127.0.0.1:41101
+#   pulled with:
+#     llamastash pull DavidAU/LFM2.5-2.6B-Qwen3.8-Turbo-Brilliance-Power-X12-NEO-MAX-GGUF:LFM2.5-2.6B-Q3.8-TBrilliance-NEO-IQ4_XS.gguf
 #
-# The model needs a chat template that defines `reasoning_effort` (the Qwen3.8
-# GGUFs do). A model whose template has no effort branch — Qwen3.5-4B, e.g. —
-# answers every row identically and proves nothing beyond the plumbing.
+# The model needs a chat template that defines `reasoning_effort`. A model
+# whose template has no effort branch (Qwen3.5-4B, e.g.) answers every row
+# identically and proves nothing beyond the plumbing. The accepted names are
+# per-template: Qwen3.8 takes `xhigh` / `medium` / `low` and raises on anything
+# else, DAU's fusion templates take `low` ... `ultra` and fall back to their own
+# default instead of raising. Override the row values with `EFFORT_LOW`,
+# `EFFORT_HIGH` and `EFFORT_BAD` when the defaults do not fit the model.
 #
 # The proxy bearer key comes from $LS_PROXY_KEY. A keyless loopback proxy needs
 # none, and the header is sent either way and ignored.
@@ -40,11 +50,14 @@ run() { # $1=label  $2=url  $3=extra json fragment (may be empty)
 
 printf 'LABEL\tOUTPUT_TOKENS\tTHINKING_CHARS\n'
 run "proxy-no-effort" "$PROXY/v1/messages" ""
-run "proxy-effort-low" "$PROXY/v1/messages" ',"output_config":{"effort":"low"}'
-run "proxy-effort-xhigh" "$PROXY/v1/messages" ',"output_config":{"effort":"xhigh"}'
-run "proxy-effort-unsupported" "$PROXY/v1/messages" ',"output_config":{"effort":"max"}'
-run "proxy-client-kwarg-wins" "$PROXY/v1/messages" ',"output_config":{"effort":"xhigh"},"chat_template_kwargs":{"reasoning_effort":"low"}'
+ELLOW=${EFFORT_LOW:-low}
+EHIGH=${EFFORT_HIGH:-xhigh}
+EBAD=${EFFORT_BAD:-max}
+run "proxy-effort-low" "$PROXY/v1/messages" ",\"output_config\":{\"effort\":\"$ELLOW\"}"
+run "proxy-effort-xhigh" "$PROXY/v1/messages" ",\"output_config\":{\"effort\":\"$EHIGH\"}"
+run "proxy-effort-unsupported" "$PROXY/v1/messages" ",\"output_config\":{\"effort\":\"$EBAD\"}"
+run "proxy-client-kwarg-wins" "$PROXY/v1/messages" ",\"output_config\":{\"effort\":\"$EHIGH\"},\"chat_template_kwargs\":{\"reasoning_effort\":\"$ELLOW\"}" 
 if [ -n "$DIRECT" ]; then
-  run "direct-kwarg-low" "$DIRECT/v1/messages" ',"chat_template_kwargs":{"reasoning_effort":"low"}'
-  run "direct-kwarg-xhigh" "$DIRECT/v1/messages" ',"chat_template_kwargs":{"reasoning_effort":"xhigh"}'
+  run "direct-kwarg-low" "$DIRECT/v1/messages" ",\"chat_template_kwargs\":{\"reasoning_effort\":\"$ELLOW\"}"
+  run "direct-kwarg-xhigh" "$DIRECT/v1/messages" ",\"chat_template_kwargs\":{\"reasoning_effort\":\"$EHIGH\"}" 
 fi
