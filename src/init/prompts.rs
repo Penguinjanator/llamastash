@@ -1025,7 +1025,7 @@ fn build_install_items(
       (
         InstallPick::Resolved(InstallChoice::GhReleases(GhBuild::Best)),
         format!("GitHub Releases · {label}"),
-        "native NVIDIA build plus its CUDA runtime (~560-730 MB download)".into(),
+        "native NVIDIA build plus its CUDA runtime (~560-730 MiB download)".into(),
       ),
       (
         InstallPick::Resolved(InstallChoice::GhReleases(GhBuild::Vulkan)),

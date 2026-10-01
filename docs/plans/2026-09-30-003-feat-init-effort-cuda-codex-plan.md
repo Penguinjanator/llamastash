@@ -214,6 +214,36 @@ source, for fields that matter as much as effort:
 Checked live with Qwen3.8-27B (it has a vision projector): pi and opencode
 both answered "Red" for a solid red PNG through the proxy.
 
+## Follow-up: PR review
+
+- **CUDA check.** `--list-devices` failing (timeout, non-zero exit, spawn
+  error) used to read as "no CUDA device" and threw a working install
+  away. Now three outcomes: a `CUDA<n>:` line keeps it, a clean `(none)`
+  falls back, a failed probe keeps it with a warning. 120 s budget for
+  the first, cold load. The real `b11302` CUDA build on this AMD host
+  exits 0 with `(none)`.
+- **Fallback cleanup.** The CUDA install dir is removed when it falls back.
+- **Downloads** stream to a temp file under the install root, hashed on
+  the way (`FetchClient::download_to`), after a free-space check of 3x the
+  download. Peak memory no longer holds a 594 MB bundle.
+- **Runtime bundle** completion is a marker written after extraction, not
+  the presence of `libcudart`.
+- **Feed names** used as path components (tag, CUDA variant, bundle name)
+  must be `[A-Za-z0-9._-]` and not `.`/`..`.
+- **Driver read** only on Linux with an NVIDIA card and no AMD card; a
+  mixed host keeps Vulkan.
+- **Sizes** were MiB labelled MB.
+- **Effort names:** a `<name> not in (...)` check counts only for
+  `reasoning_effort` or a variable `set` straight from it. A plain
+  word-boundary check would miss Qwen3.8, which validates
+  `resolved_reasoning_effort`.
+- **Codex effort leak:** the profile is a layer over `config.toml`, so its
+  `model_reasoning_effort` applied to the local model (captured
+  `"effort": "minimal"` with codex 0.150.1). The profile now pins the
+  template's default and keeps a user-set level the model accepts.
+- Declined: re-reading the GGUF header in `from_gguf` is the only source
+  of the chat template in `init` (the catalog doesn't carry it).
+
 ## Verification
 
 - `make test`, `make lint`; patcher golden tests per client.

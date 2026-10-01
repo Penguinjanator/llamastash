@@ -35,25 +35,80 @@ impl EffortLevels {
   }
 }
 
+/// The kwarg llama.cpp passes `reasoning_effort` through as.
+const KWARG: &str = "reasoning_effort";
+
 /// Parse the accepted levels out of a chat template. Recognises the
-/// validated form, `<...>reasoning_effort not in ('a', 'b')` or
-/// `<...>reasoning_effort in ['a', 'b']`. A template that uses
-/// `reasoning_effort` without validating it (any string goes into the
-/// prompt) returns `None`: there is no list to offer.
+/// validated form, `<name> not in ('a', 'b')` or `<name> in ['a', 'b']`,
+/// where `<name>` is the kwarg itself or a variable set straight from it
+/// (Qwen3.8 validates `resolved_reasoning_effort`, set from
+/// `reasoning_effort|default('xhigh')`). A template that uses the kwarg
+/// without validating it (any string goes into the prompt) returns
+/// `None`: there is no list to offer.
 pub fn from_template(template: &str) -> Option<EffortLevels> {
-  let mut levels = template
-    .match_indices("reasoning_effort")
-    .find_map(|(i, m)| validated_list(&template[i + m.len()..]))?;
+  let names = effort_names(template);
+  let mut uses: Vec<(usize, usize)> = names
+    .iter()
+    .flat_map(|n| whole_word_matches(template, n))
+    .collect();
+  uses.sort_unstable();
+  let mut levels = uses
+    .iter()
+    .find_map(|&(i, len)| validated_list(&template[i + len..]))?;
   levels.sort_by_key(|l| RANK.iter().position(|r| r == l).unwrap_or(RANK.len()));
-  let default = template
-    .match_indices("reasoning_effort")
-    .find_map(|(i, m)| default_value(&template[i + m.len()..]))
+  let default = whole_word_matches(template, KWARG)
+    .find_map(|(i, len)| default_value(&template[i + len..]))
     .filter(|d| levels.contains(d));
   Some(EffortLevels {
     levels,
     default,
     can_disable: template.contains("enable_thinking"),
   })
+}
+
+fn is_ident(b: u8) -> bool {
+  b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// `(start, len)` of each occurrence of `name` as a whole identifier.
+fn whole_word_matches<'a>(
+  template: &'a str,
+  name: &'a str,
+) -> impl Iterator<Item = (usize, usize)> + 'a {
+  let bytes = template.as_bytes();
+  template.match_indices(name).filter_map(move |(i, m)| {
+    let end = i + m.len();
+    let left_ok = i == 0 || !is_ident(bytes[i - 1]);
+    let right_ok = end == bytes.len() || !is_ident(bytes[end]);
+    (left_ok && right_ok).then_some((i, m.len()))
+  })
+}
+
+/// The kwarg plus every variable a `set <name> = reasoning_effort...`
+/// assigns straight from it.
+fn effort_names(template: &str) -> Vec<String> {
+  let mut names = vec![KWARG.to_string()];
+  for (i, len) in whole_word_matches(template, "set") {
+    let rest = template[i + len..].trim_start();
+    let ident_len = rest.bytes().take_while(|b| is_ident(*b)).count();
+    if ident_len == 0 {
+      continue;
+    }
+    let (ident, after) = rest.split_at(ident_len);
+    let Some(value) = after.trim_start().strip_prefix('=') else {
+      continue;
+    };
+    let value = value.trim_start();
+    let assigns_kwarg = value.starts_with(KWARG)
+      && value
+        .as_bytes()
+        .get(KWARG.len())
+        .is_none_or(|b| !is_ident(*b));
+    if assigns_kwarg && !names.iter().any(|n| n == ident) {
+      names.push(ident.to_string());
+    }
+  }
+  names
 }
 
 /// `rest` starts right after a `reasoning_effort` token. Returns `x` of
@@ -139,6 +194,20 @@ mod tests {
     assert_eq!(e.default.as_deref(), Some("xhigh"));
     assert!(e.can_disable);
     assert!(!e.accepts("high"));
+  }
+
+  #[test]
+  fn an_unrelated_variable_ending_in_the_kwarg_name_is_ignored() {
+    // `tool_reasoning_effort` is not set from the kwarg, so its list is
+    // not the model's; the real check comes later.
+    let t = "{% if tool_reasoning_effort not in ('fast', 'slow') %}{% endif %}\
+             {% set effort = reasoning_effort|default('high') %}\
+             {% if effort not in ('low', 'high') %}{{ raise_exception('x') }}{% endif %}";
+    let e = from_template(t).expect("levels");
+    assert_eq!(e.levels, vec!["low", "high"]);
+    assert_eq!(e.default.as_deref(), Some("high"));
+    // With only the unrelated check, there is no list.
+    assert!(from_template("{% if tool_reasoning_effort not in ('a') %}{% endif %}").is_none());
   }
 
   #[test]

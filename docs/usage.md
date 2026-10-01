@@ -1318,7 +1318,7 @@ Examples: `llamastash init server --install gh-releases`, `llamastash init model
 
 #### Linux + NVIDIA: CUDA or Vulkan
 
-On Linux with an NVIDIA card, the GitHub Releases install picks llama.cpp's CUDA build when the driver can run it, and the Vulkan build otherwise. The CUDA build ships with a `cudart-` bundle (`libcudart`, `libcublas`, `libcublasLt`) that `init` downloads and places next to `llama-server`, so no CUDA toolkit is needed.
+On Linux with an NVIDIA card, the GitHub Releases install picks llama.cpp's CUDA build when the driver can run it, and the Vulkan build otherwise. A host with both an NVIDIA and an AMD card keeps the Vulkan build, since a CUDA build drives only the NVIDIA card. The CUDA build ships with a `cudart-` bundle (`libcudart`, `libcublas`, `libcublasLt`) that `init` downloads and places next to `llama-server`, so no CUDA toolkit is needed.
 
 | Driver (from `/proc/driver/nvidia/version`, else `nvidia-smi`) | x86_64 | arm64 |
 | --- | --- | --- |
@@ -1326,9 +1326,9 @@ On Linux with an NVIDIA card, the GitHub Releases install picks llama.cpp's CUDA
 | 525 to 579 | CUDA 12 | Vulkan |
 | older, or unknown | Vulkan | Vulkan |
 
-The download is larger: about 560 to 730 MB for build plus runtime, against about 30 MB for Vulkan. The interactive picker offers both builds (`GitHub Releases · CUDA 13` and `GitHub Releases · Vulkan`); `--install gh-releases:vulkan` picks Vulkan without a prompt. A CUDA build installs to its own directory (`llama-cpp/<tag>-cuda-<ver>-<arch>/`).
+The download is larger: about 560 to 730 MiB for build plus runtime (CUDA 13 x86_64 565 MiB, CUDA 13 arm64 667 MiB, CUDA 12 730 MiB at `b11316`), against about 30 MiB for Vulkan. `--recommended`, `--json` and non-interactive runs take the CUDA build too; the progress line shows the size, and `--install gh-releases:vulkan` picks Vulkan instead. The interactive picker offers both builds (`GitHub Releases · CUDA 13` and `GitHub Releases · Vulkan`). Downloads stream to disk under the install root and are hashed on the way; the step checks for about three times the download size in free space first. A CUDA build installs to its own directory (`llama-cpp/<tag>-cuda-<ver>-<arch>/`).
 
-After the install, `init` runs `llama-server --list-devices`. llama.cpp loads its CUDA backend as a plugin and skips it when it cannot load, so a broken CUDA install still starts and passes `--version`, on the CPU. When the list shows no CUDA device, `init` says so and installs the Vulkan build instead.
+After the install, `init` runs `llama-server --list-devices`. llama.cpp loads its CUDA backend as a plugin and skips it when it cannot load, so a broken CUDA install still starts and passes `--version`, on the CPU. When the list shows no CUDA device, `init` says so, removes the CUDA build, and installs the Vulkan build instead. When the check itself fails (timeout after 120 s, non-zero exit), it keeps the CUDA build and says how to check by hand.
 
 The three per-step flags are **advisory, not authoritative**: supplying `--install brew` for a step that `--skip server` already excludes emits one stderr warning and proceeds. Conflicting axes don't abort.
 
@@ -1403,11 +1403,11 @@ Per-tool shape: tools whose schema holds a model list (OpenCode, Continue.dev, Z
 | pi.dev | `reasoning: true` and a `thinkingLevelMap`; levels the template rejects map to `null`, which hides them | `/thinking <level>` |
 | OpenCode | `reasoning: true` and one `variants` entry per level (plus `none`) | the variant picker |
 | Zed | `reasoning_effort` set to the template's default | the effort picker; Zed's list is fixed to minimal ... max, so for Qwen3.8 `minimal` and `max` get an HTTP 500 whose message ends `Unexpected reasoning effort minimal. Supported types are xhigh (default), medium, and low.` |
-| Codex | a comment listing the levels; no default, so the template's default applies | `model_reasoning_effort = "<level>"` in the profile, or `-c model_reasoning_effort=<level>` |
+| Codex | `model_reasoning_effort` set to the template's default, with the accepted levels in a comment | edit it in the profile (kept on re-run when the model accepts it), or `-c model_reasoning_effort=<level>` per run |
 | Aider | nothing | `/reasoning-effort <level>` in the chat already works; the `--reasoning-effort` flag would need a model-settings entry that replaces Aider's own defaults for that model |
 | Continue.dev | nothing | Continue sends an effort only for OpenAI `o*` / `gpt-5+` models |
 
-**Codex writes a profile, not `config.toml`.** `codex` writes `$CODEX_HOME/llamastash.config.toml` (`~/.codex/` by default), which Codex loads as a layer over `config.toml` when started with `codex --profile llamastash`. Plain `codex` keeps your own settings. The profile points a `llamastash` provider at the proxy with `wire_api = "responses"` (Codex speaks only the Responses API; llama-server serves `/v1/responses` natively and the proxy forwards it), sets `model` and `model_context_window` for the first chat model, and gets the key by running `llamastash api-key`. The file is rewritten on each run.
+**Codex writes a profile, not `config.toml`.** `codex` writes `$CODEX_HOME/llamastash.config.toml` (`~/.codex/` by default), which Codex loads as a layer over `config.toml` when started with `codex --profile llamastash`. Plain `codex` keeps your own settings. The profile points a `llamastash` provider at the proxy with `wire_api = "responses"` (Codex speaks only the Responses API; llama-server serves `/v1/responses` natively and the proxy forwards it), sets `model` and `model_context_window` for the first chat model, and gets the key by running `llamastash api-key`. For a model with effort levels it also sets `model_reasoning_effort`: without it, the value in your `config.toml` (set for OpenAI models) would be sent to the local model, and Qwen3.8 rejects levels like `minimal`. The file is rewritten on each run, keeping only a `model_reasoning_effort` the model accepts.
 
 **pi.dev patches two files.** `~/.pi/agent/models.json` gets the provider block, and `~/.pi/agent/settings.json` gets `llamastash/**` appended to `enabledModels` — pi's model switcher is bounded by that list, so without the pattern the models are configured but out of scope until you widen it by hand. The pattern is only appended when `enabledModels` is already set: pi reads an absent or empty list as "no scoping", and writing ours there would hide every other provider. Any config that is a symlink (a dotfiles repo, typically) is written *through* the link, not over it.
 

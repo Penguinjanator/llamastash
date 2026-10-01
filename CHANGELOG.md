@@ -6,9 +6,9 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ### Added
 
-- `init` installs llama.cpp's CUDA build on Linux + NVIDIA (CUDA 13 on driver 580+, CUDA 12 on 525+), with its CUDA runtime libraries, and falls back to Vulkan when the build lists no CUDA device. `--install gh-releases:vulkan` keeps Vulkan.
+- `init` installs llama.cpp's CUDA build on Linux + NVIDIA (CUDA 13 on driver 580+, CUDA 12 on 525+), with its CUDA runtime libraries, and falls back to Vulkan when the build lists no CUDA device. Mixed NVIDIA + AMD hosts keep Vulkan, and `--install gh-releases:vulkan` keeps Vulkan anywhere. GitHub Releases downloads now stream to disk instead of memory.
 - `init` integrations wire reasoning effort for models whose chat template lists levels (Qwen3.8: `low`, `medium`, `xhigh`, plus `none`): pi gets `reasoning` + `thinkingLevelMap`, OpenCode gets `variants`, Zed gets a `reasoning_effort` default.
-- `init` integrations: Codex CLI entry, written as a `~/.codex/llamastash.config.toml` profile (`codex --profile llamastash`) on the Responses API.
+- `init` integrations: Codex CLI entry, written as a `~/.codex/llamastash.config.toml` profile (`codex --profile llamastash`) on the Responses API, with the model's effort pinned so `config.toml`'s doesn't leak in.
 
 ### Changed
 

@@ -177,6 +177,63 @@ impl FetchClient {
     url: &str,
     max_bytes: u64,
   ) -> Result<(Vec<u8>, reqwest::header::HeaderMap), FetchError> {
+    let response = self.send_checked(url, max_bytes).await?;
+    let headers = response.headers().clone();
+    let mut total = 0_u64;
+    let mut buf: Vec<u8> = Vec::with_capacity(
+      response
+        .content_length()
+        .map(|n| n.min(max_bytes) as usize)
+        .unwrap_or(0),
+    );
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+      let chunk = chunk.map_err(|e| FetchError::Transport(e.to_string()))?;
+      total = total.saturating_add(chunk.len() as u64);
+      if total > max_bytes {
+        return Err(FetchError::BodyOverflow { cap: max_bytes });
+      }
+      buf.extend_from_slice(&chunk);
+    }
+    Ok((buf, headers))
+  }
+
+  /// Same contract as [`Self::get_bytes`], but the body is streamed into
+  /// `out` and hashed on the way instead of held in memory. Returns the
+  /// body's SHA-256 as lowercase hex. For release assets in the hundreds
+  /// of MB.
+  pub async fn download_to(
+    &self,
+    url: &str,
+    max_bytes: u64,
+    out: &mut std::fs::File,
+  ) -> Result<String, FetchError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    let response = self.send_checked(url, max_bytes).await?;
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+      let chunk = chunk.map_err(|e| FetchError::Transport(e.to_string()))?;
+      total = total.saturating_add(chunk.len() as u64);
+      if total > max_bytes {
+        return Err(FetchError::BodyOverflow { cap: max_bytes });
+      }
+      hasher.update(&chunk);
+      out
+        .write_all(&chunk)
+        .map_err(|e| FetchError::Transport(format!("write: {e}")))?;
+    }
+    out
+      .flush()
+      .map_err(|e| FetchError::Transport(format!("write: {e}")))?;
+    Ok(crate::util::hex::encode(hasher.finalize().as_slice()))
+  }
+
+  /// Send the GET and turn rate limits, non-success statuses and an
+  /// over-cap `Content-Length` into errors before any body is read.
+  async fn send_checked(&self, url: &str, max_bytes: u64) -> Result<reqwest::Response, FetchError> {
     let (client, allowlist) = match &self.inner {
       Mode::Online { client, allowlist } => (client, allowlist),
       Mode::Offline => return Err(FetchError::Offline),
@@ -212,24 +269,7 @@ impl FetchClient {
         return Err(FetchError::BodyOverflow { cap: max_bytes });
       }
     }
-    let headers = response.headers().clone();
-    let mut total = 0_u64;
-    let mut buf: Vec<u8> = Vec::with_capacity(
-      response
-        .content_length()
-        .map(|n| n.min(max_bytes) as usize)
-        .unwrap_or(0),
-    );
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-      let chunk = chunk.map_err(|e| FetchError::Transport(e.to_string()))?;
-      total = total.saturating_add(chunk.len() as u64);
-      if total > max_bytes {
-        return Err(FetchError::BodyOverflow { cap: max_bytes });
-      }
-      buf.extend_from_slice(&chunk);
-    }
-    Ok((buf, headers))
+    Ok(response)
   }
 
   /// GET `url`, parse the body as JSON into `T`. Body capped at

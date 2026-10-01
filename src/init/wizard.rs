@@ -664,7 +664,7 @@ async fn run_install_step(
     }
   }
   let default = default_install_method(hardware);
-  let driver_major = gh_releases::nvidia_driver_major();
+  let driver_major = gh_releases::nvidia_driver_major(hardware);
   let cuda_label = gh_releases::cuda_asset_suffix(hardware, driver_major)
     .and_then(|s| gh_releases::cuda_label(&s));
   log::debug!(
@@ -708,19 +708,38 @@ async fn run_install_step(
         emit_progress,
       )
       .await?;
-      if !cuda || cuda_device_loaded(&install.path) {
+      if !cuda {
         return Ok(install);
+      }
+      let warn = |msg: &str| {
+        log::warn!("init server: {msg}");
+        if emit_progress {
+          eprintln!("{}", colors::warning(msg));
+        }
+      };
+      match gh_releases::check_cuda_device(&install.path) {
+        gh_releases::CudaCheck::Loaded => return Ok(install),
+        // A failed probe says nothing about CUDA; dropping a working
+        // install over it would waste the download.
+        gh_releases::CudaCheck::Unknown(why) => {
+          warn(&format!(
+            "could not check the CUDA build for a CUDA device ({why}); keeping it. \
+             Run `{} --list-devices` to check, or rerun with `--install gh-releases:vulkan`",
+            install.path.display()
+          ));
+          return Ok(install);
+        }
+        gh_releases::CudaCheck::NotLoaded => {}
       }
       // The CUDA backend is a plugin llama.cpp skips when it cannot
       // load, so a broken CUDA install still runs, on the CPU. Fall
       // back to the Vulkan build instead of keeping it.
-      let msg = format!(
+      warn(&format!(
         "{} lists no CUDA device; installing the Vulkan build instead",
         install.path.display()
-      );
-      log::warn!("init server: {msg}");
-      if emit_progress {
-        eprintln!("{}", colors::warning(&msg));
+      ));
+      if let Err(e) = gh_releases::remove_install(&install_root, &install.path) {
+        warn(&format!("could not remove the CUDA build: {e}"));
       }
       install_gh_release(
         fetch,
@@ -784,10 +803,19 @@ async fn install_gh_release(
       return Err(install_err_to_exit(e));
     }
   };
+  let size = crate::init::detection::fmt_bytes(pick.download_bytes());
   let what = match &pick.runtime_libs {
-    Some(libs) => format!("`{}` + `{}`", pick.asset_name, libs.asset_name),
-    None => format!("`{}`", pick.asset_name),
+    Some(libs) => format!("`{}` + `{}`, {size}", pick.asset_name, libs.asset_name),
+    None => format!("`{}`, {size}", pick.asset_name),
   };
+  // The non-interactive paths take the CUDA build without showing the
+  // picker's size hint, so the size and the way out go to the log too.
+  if pick.is_cuda() {
+    log::info!(
+      "init server: downloading the CUDA build ({size}); \
+       `--install gh-releases:vulkan` takes the smaller Vulkan build"
+    );
+  }
   let sp_install = prompts::StepProgress::start_if(
     emit_progress,
     format!("Downloading + verifying + extracting {what}"),
@@ -805,15 +833,6 @@ async fn install_gh_release(
       Err(install_err_to_exit(e))
     }
   }
-}
-
-/// Whether `binary --list-devices` shows a CUDA device.
-fn cuda_device_loaded(binary: &std::path::Path) -> bool {
-  use crate::backend::Backend;
-  crate::backend::default_backend()
-    .probe_devices(binary)
-    .iter()
-    .any(|d| d.gpu_backend.eq_ignore_ascii_case("cuda"))
 }
 
 fn install_err_to_exit(e: InstallError) -> CliExit {

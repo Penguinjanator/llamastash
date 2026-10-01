@@ -245,6 +245,12 @@ pub trait ToolPatcher: Send + Sync {
   fn raw_body(&self, _ctx: &PatchContext) -> Option<String> {
     None
   }
+  /// For [`Format::Raw`] patchers that keep something from the file they
+  /// replace: the body, given the current file's text (`None` when there
+  /// is no file). Defaults to [`Self::raw_body`].
+  fn raw_body_from(&self, ctx: &PatchContext, _current: Option<&str>) -> Option<String> {
+    self.raw_body(ctx)
+  }
   /// Unix mode for the on-disk file. Defaults to `0o600` — these
   /// files may carry the proxy's real bearer token (embedded literally,
   /// or exported into a sourceable shell var by the `env.sh` /
