@@ -37,7 +37,7 @@ fi
 PROXY=$1
 MODEL=$2
 DIRECT=${3:-}
-KEY=${LS_PROXY_KEY:-$(grep -m1 'api_key:' ~/.config/llamastash/config.yaml 2>/dev/null | awk '{print $2}' || true)}
+KEY=${LS_PROXY_KEY:-}
 PROMPT='A farmer has 17 sheep. All but 9 die. He then buys 3 dozen eggs and sells them at a 20% discount off $2.50 each. How many sheep are left and what does he earn? Reason carefully.'
 
 run() { # $1=label  $2=url  $3=extra json fragment (may be empty)
@@ -53,11 +53,11 @@ run "proxy-no-effort" "$PROXY/v1/messages" ""
 ELLOW=${EFFORT_LOW:-low}
 EHIGH=${EFFORT_HIGH:-xhigh}
 EBAD=${EFFORT_BAD:-max}
-run "proxy-effort-low" "$PROXY/v1/messages" ",\"output_config\":{\"effort\":\"$ELLOW\"}"
-run "proxy-effort-xhigh" "$PROXY/v1/messages" ",\"output_config\":{\"effort\":\"$EHIGH\"}"
-run "proxy-effort-unsupported" "$PROXY/v1/messages" ",\"output_config\":{\"effort\":\"$EBAD\"}"
-run "proxy-client-kwarg-wins" "$PROXY/v1/messages" ",\"output_config\":{\"effort\":\"$EHIGH\"},\"chat_template_kwargs\":{\"reasoning_effort\":\"$ELLOW\"}" 
+run "proxy-effort-$ELLOW" "$PROXY/v1/messages" ",\"output_config\":{\"effort\":\"$ELLOW\"}"
+run "proxy-effort-$EHIGH" "$PROXY/v1/messages" ",\"output_config\":{\"effort\":\"$EHIGH\"}"
+run "proxy-effort-$EBAD" "$PROXY/v1/messages" ",\"output_config\":{\"effort\":\"$EBAD\"}"
+run "proxy-client-kwarg-wins" "$PROXY/v1/messages" ",\"output_config\":{\"effort\":\"$EHIGH\"},\"chat_template_kwargs\":{\"reasoning_effort\":\"$ELLOW\"}"
 if [ -n "$DIRECT" ]; then
-  run "direct-kwarg-low" "$DIRECT/v1/messages" ",\"chat_template_kwargs\":{\"reasoning_effort\":\"$ELLOW\"}"
-  run "direct-kwarg-xhigh" "$DIRECT/v1/messages" ",\"chat_template_kwargs\":{\"reasoning_effort\":\"$EHIGH\"}" 
+  run "direct-kwarg-$ELLOW" "$DIRECT/v1/messages" ",\"chat_template_kwargs\":{\"reasoning_effort\":\"$ELLOW\"}"
+  run "direct-kwarg-$EHIGH" "$DIRECT/v1/messages" ",\"chat_template_kwargs\":{\"reasoning_effort\":\"$EHIGH\"}"
 fi

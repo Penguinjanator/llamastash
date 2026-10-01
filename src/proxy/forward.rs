@@ -13,7 +13,7 @@
 //!   ([`crate::backend::Backend::rewrite_request_body`]). Both copy every
 //!   untouched entry as the client's own bytes — the body is never re-encoded.
 //!   The plan's Risks row "rewrites body.model" makes the case for this; the
-//!   echo-verification test in `tests/proxy_echo_verification.rs` keeps it
+//!   `received_body` echo assertions in `tests/proxy_routing.rs` keep it
 //!   honest.
 //! - Stream the upstream response body through `http_body_util::StreamBody`
 //!   so SSE chunks land at the client as they arrive. No buffering,
@@ -284,9 +284,7 @@ fn outbound_body(
 ) -> Bytes {
   use crate::backend::Backend as _;
   // Two surgical edits, each copying every untouched entry as the client's own
-  // bytes. In practice only one of them ever parses the body: the request-model
-  // pin is set only by a config-declared server, and that backend rewrites
-  // nothing.
+  // bytes.
   let body = match request_model {
     Some(model) => with_model(body, model),
     None => body,

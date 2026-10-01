@@ -11,7 +11,6 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 - `init` integrations: Codex CLI profile, used with `codex --profile llamastash` (#93).
 - Claude Code's `/effort` now reaches a llama.cpp model: the proxy maps the Anthropic `output_config.effort` field onto `chat_template_kwargs.reasoning_effort` when forwarding `/v1/messages`, so switching effort changes thinking length instead of doing nothing. `backend.llamacpp.map_anthropic_effort: false` leaves the effort the launch was given in charge. ([#95](https://github.com/llamastash/llamastash/pull/95))
 
-
 ### Changed
 
 - Faster daemon boot and `stop`: looking up one process no longer scans every process on the host, and the boot sweep no longer reads every thread.

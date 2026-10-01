@@ -469,8 +469,10 @@ async fn anthropic_messages_endpoint_forwards() {
 async fn anthropic_messages_effort_reaches_the_upstream_body() {
   // What the upstream actually receives, end to end through the proxy: the
   // launch's backend is resolved from its recorded id, and that backend's
-  // effort mapping is in the bytes the engine sees. A mis-recorded backend id
-  // shows up here rather than passing every unit test.
+  // effort mapping is in the bytes the engine sees. A launch recorded against a
+  // different real backend shows up here, where each unit test on its own would
+  // still pass; an unknown id cannot, since it falls back to the default backend
+  // and maps anyway.
   let dir = unique_temp("effort");
   let catalog_path = "/fixture/qwen-chat.gguf";
   let registry = SupervisorRegistry::new();
