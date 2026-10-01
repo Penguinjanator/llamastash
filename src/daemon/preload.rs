@@ -437,7 +437,11 @@ mod tests {
   #[test]
   fn resolve_path_rejects_a_missing_absolute_path() {
     let rows = vec![row("/m/demo.gguf", Some("llama"))];
-    let err = resolve_path("/no/such/model.gguf", &rows).unwrap_err();
+    // From a tempdir, because `/no/such` has no drive prefix and so is not
+    // absolute on Windows.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("no-such-model.gguf");
+    let err = resolve_path(missing.to_str().unwrap(), &rows).unwrap_err();
     assert!(err.contains("not a readable path"), "{err}");
   }
 
