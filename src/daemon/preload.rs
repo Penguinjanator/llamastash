@@ -116,30 +116,44 @@ async fn collect_with_rows(
       if !body.preload {
         continue;
       }
-      // A preset key is scoped exactly the way the read side scopes it: one
-      // model, a wildcard family, or a whole architecture. Preloading an arch
-      // preset therefore warms every model that arch has, which is what
-      // attaching `preload: true` to it says.
-      let models = preset_models(key, rows);
-      if models.is_empty() {
-        log::warn!("preload: preset `{name}` under `{key}` names no discovered model");
-        continue;
-      }
-      for path in models {
-        // The explicit list already covers this model (that entry picks its
-        // preset, `default:` or none); don't start it twice.
-        if out.iter().any(|l| l.model_path == path) {
+      let path = match preload_target(key, rows) {
+        Ok(path) => path,
+        Err(why) => {
+          log::warn!("preload: skipping preset `{name}` under `{key}` — {why}");
           continue;
         }
-        out.push(PreloadLaunch {
-          label: format!("{key}@{name}"),
-          preset: Some(materialize_preset(name, body, path.clone())),
-          model_path: path,
-        });
+      };
+      // The explicit list already covers this model (that entry picks its
+      // preset, `default:` or none); don't start it twice.
+      if out.iter().any(|l| l.model_path == path) {
+        continue;
       }
+      out.push(PreloadLaunch {
+        label: format!("{key}@{name}"),
+        preset: Some(materialize_preset(name, body, path.clone())),
+        model_path: path,
+      });
     }
   }
   out
+}
+
+/// The one model a `preload: true` entry may start.
+///
+/// A preloaded launch is manual intent, so neither the sweep nor make-room can
+/// ever take it back. A key that scopes a family would therefore pin every model
+/// in it — an arch preset could fill the host one sequential launch at a time,
+/// each waiting on its own load, until admission refuses. One `preload: true`,
+/// one model; name the model (or a glob that matches exactly one).
+fn preload_target(key: &str, rows: &[CatalogRow]) -> Result<PathBuf, String> {
+  match preset_models(key, rows).as_slice() {
+    [] => Err("no discovered model matches this preset key".to_string()),
+    [one] => Ok(one.clone()),
+    many => Err(format!(
+      "this key scopes {} models; `preload: true` needs a key that names exactly one",
+      many.len()
+    )),
+  }
 }
 
 /// The models a preset key applies to, using the same classification
@@ -207,10 +221,12 @@ async fn resolve_entry(
 /// A launch-file preload entry: the same file `llamastash run <file>` takes,
 /// parsed by the same code so the two cannot disagree about what the file runs.
 fn parse_launch_file(entry: &str, rows: &[CatalogRow]) -> Result<Option<PreloadLaunch>, String> {
-  if !crate::cli::launch_file::is_launch_file(entry) {
+  // Expand first: `is_launch_file` needs the extension *and* an existing file,
+  // and neither is true of a literal `~/launches/big.yaml`.
+  let path = crate::util::paths::expand_user_path(Path::new(entry));
+  if !crate::cli::launch_file::is_launch_file(&path.to_string_lossy()) {
     return Ok(None);
   }
-  let path = crate::util::paths::expand_user_path(Path::new(entry));
   let sel = crate::cli::launch_file::load(&path, None).map_err(|e| {
     e.message
       .unwrap_or_else(|| format!("cannot read launch file `{}`", path.display()))
@@ -446,6 +462,55 @@ mod tests {
       vec![PathBuf::from("/repos/other/c-Q4_K_M.gguf")]
     );
     assert!(preset_models("no-such-model.gguf", &rows).is_empty());
+  }
+
+  /// A `~` entry has to be expanded before the launch-file sniff: the check wants
+  /// an existing file, and `~/x.yaml` is not a path the filesystem knows.
+  #[test]
+  fn tilde_launch_file_entry_is_a_launch_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let model = dir.path().join("demo.gguf");
+    std::fs::write(&model, "not a gguf, path is all the launcher needs here").expect("model");
+    let file = dir.path().join("lf.yaml");
+    std::fs::write(
+      &file,
+      "presets:\n  ~/demo.gguf:\n    default: p\n    entries:\n      p:\n        knobs: {}\n",
+    )
+    .expect("launch file");
+
+    let home = std::env::var("HOME").ok();
+    std::env::set_var("HOME", dir.path());
+    let parsed = parse_launch_file("~/lf.yaml", &[]);
+    match home {
+      Some(home) => std::env::set_var("HOME", &home),
+      None => std::env::remove_var("HOME"),
+    }
+    let launch = parsed
+      .expect("parses")
+      .expect("recognised as a launch file, not a model reference");
+    assert_eq!(launch.model_path, model);
+    assert_eq!(launch.preset.as_ref().map(|p| p.name.as_str()), Some("p"));
+  }
+
+  /// One `preload: true` starts one model. A key that scopes a family is refused
+  /// with its count, because a preloaded launch can never be unloaded again.
+  #[test]
+  fn preload_needs_a_key_that_names_exactly_one_model() {
+    let rows = vec![
+      row("/repos/unsloth/a-Q4_K_M.gguf", Some("qwen3")),
+      row("/repos/unsloth/b-Q4_K_M.gguf", Some("qwen3")),
+    ];
+    assert_eq!(
+      preload_target("a-Q4_K_M.gguf", &rows).unwrap(),
+      PathBuf::from("/repos/unsloth/a-Q4_K_M.gguf")
+    );
+    let arch = preload_target("qwen3", &rows).unwrap_err();
+    assert!(arch.contains("2 models"), "{arch}");
+    let glob = preload_target("unsloth/*", &rows).unwrap_err();
+    assert!(glob.contains("2 models"), "{glob}");
+    assert!(preload_target("nope.gguf", &rows)
+      .unwrap_err()
+      .contains("no discovered model"));
   }
 
   #[test]

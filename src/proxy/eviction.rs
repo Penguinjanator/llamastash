@@ -150,16 +150,16 @@ pub async fn sweep_once(state: &Arc<ProxyState>, default_ttl: Duration) {
   let snap = state.ctx.supervisors.snapshot().await;
   for (launch_id, model) in snap {
     let ttl = ttls.get(&launch_id).copied().unwrap_or(default_ttl);
-    if ttl.is_zero() {
-      continue;
-    }
     // An infrastructure launch (a managed-multiplexer umbrella) gets
     // lifecycle-aware eviction: never SIGTERM the shared process — free its
     // idle loaded model via the backend's unload API instead (the umbrella
     // stays Ready and autoloads on the next request). This is the `model.stop`
     // vs API-unload branch.
     if crate::backend::umbrella_owner(&launch_id).is_some() {
-      let targets = umbrella_idle_rows(state, &ttls, ttl, &model).await;
+      // The umbrella's own TTL is not consulted: idleness is shared inside the
+      // multiplexer, but which rows are due is decided per row, and a global TTL
+      // of `0` ("presets only") must not blind the pass to a row that pins one.
+      let targets = umbrella_idle_rows(state, &ttls, default_ttl, &model).await;
       if targets.is_empty() {
         continue;
       }
@@ -173,6 +173,9 @@ pub async fn sweep_once(state: &Arc<ProxyState>, default_ttl: Duration) {
           stop_launch(&ctx, target).await;
         }
       });
+      continue;
+    }
+    if ttl.is_zero() {
       continue;
     }
     let current_state = model.state().await;
@@ -278,13 +281,15 @@ async fn umbrella_idle_rows(
   delegated_rows(&snapshot.running, umbrella.port())
     .filter(|row| row_evictable(row, ttls))
     .filter(|row| {
-      idle
-        >= row
-          .launch_id
-          .as_ref()
-          .and_then(|id| ttls.get(id))
-          .copied()
-          .unwrap_or(default_ttl)
+      let row_ttl = row
+        .launch_id
+        .as_ref()
+        .and_then(|id| ttls.get(id))
+        .copied()
+        .unwrap_or(default_ttl);
+      // `0` is never-unload for that row, and with the global TTL at `0` a row
+      // that pins nothing is `0` too: it waits for a preset, not for nothing.
+      !row_ttl.is_zero() && idle >= row_ttl
     })
     .filter_map(|row| row.launch_id.clone())
     .collect()
@@ -402,18 +407,44 @@ pub async fn make_room(
     crate::launch::admission::human_gib(freed),
     crate::launch::admission::human_gib(refusal.demand_bytes),
   );
-  let ctx = state.ctx.clone();
-  let mut freed_bytes = 0u64;
-  let mut unloaded = 0usize;
+  // Selection is up to the stop grace old by the time the stops start, so every
+  // pick is re-checked before any of them is stopped, and all-or-nothing is
+  // decided again on what survives: giving up the whole plan is better than
+  // unloading half of it for a launch that still will not fit. A request that
+  // arrives in the window between here and an individual stop is still honoured
+  // by the per-candidate check below — that launch is left running.
+  let mut go: Vec<RoomCandidate> = Vec::new();
+  let mut freed_now = 0u64;
   for candidate in picked {
-    // Selection is up to the stop grace old by now. A request that reached a
-    // candidate since then must not be cut off mid-generation, and a launch that
-    // went away on its own is simply not stopped again.
     if !matches!(candidate.guard.state().await, ManagedState::Ready)
       || candidate.guard.inflight() > 0
     {
       log::info!(
         "proxy make-room: {} is busy again — left it running",
+        candidate.targets[0].as_str(),
+      );
+      continue;
+    }
+    freed_now = freed_now.saturating_add(candidate.bytes);
+    go.push(candidate);
+  }
+  if freed_now < short {
+    log::info!(
+      "proxy make-room: {} needed but only {} still freeable after re-check — nothing unloaded",
+      crate::launch::admission::human_gib(short),
+      crate::launch::admission::human_gib(freed_now),
+    );
+    return false;
+  }
+  let ctx = state.ctx.clone();
+  let mut freed_bytes = 0u64;
+  let mut unloaded = 0usize;
+  for candidate in go {
+    if !matches!(candidate.guard.state().await, ManagedState::Ready)
+      || candidate.guard.inflight() > 0
+    {
+      log::info!(
+        "proxy make-room: {} took a request during the stops — left it running",
         candidate.targets[0].as_str(),
       );
       continue;

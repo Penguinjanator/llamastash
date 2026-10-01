@@ -248,8 +248,12 @@ async fn second_lemonade_model_reuses_the_one_umbrella() {
   shutdown(token, handle).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn idle_lemonade_model_is_unloaded_but_umbrella_stays_up() {
+/// Sweep a resident fake-lemond model and assert the model alone is freed.
+///
+/// `preset_ttl` pins the model's own preset TTL (under the preset name the
+/// running row carries); `global_ttl` is what the pass is handed as
+/// `proxy.idle_ttl_secs`.
+async fn lemonade_idle_sweep(preset_ttl: Option<u64>, global_ttl: Duration) {
   // Lifecycle-aware eviction: an idle Lemonade model is freed via
   // /api/v1/unload (not SIGTERM); the shared umbrella process stays Ready.
   let logs = unique_temp("evict");
@@ -281,8 +285,28 @@ async fn idle_lemonade_model_is_unloaded_but_umbrella_stays_up() {
   catalog
     .upsert(lemonade_model("Qwen2.5-0.5B-Instruct"))
     .await;
-  let ctx =
-    MethodContext::with_catalog(ShutdownToken::new(), catalog).with_supervisors(registry.clone());
+  let mut entries = std::collections::BTreeMap::new();
+  if let Some(secs) = preset_ttl {
+    entries.insert(
+      "warm".to_string(),
+      llamastash::config::PresetBody {
+        idle_ttl_secs: Some(secs),
+        ..Default::default()
+      },
+    );
+  }
+  let ctx = MethodContext::with_catalog(ShutdownToken::new(), catalog)
+    .with_supervisors(registry.clone())
+    .with_presets(llamastash::daemon::preset_store::ConfigPresetStore::new(
+      std::collections::BTreeMap::from([(
+        "Qwen2.5-0.5B-Instruct".to_string(),
+        llamastash::config::ConfigPresetBlock {
+          default: None,
+          entries,
+        },
+      )]),
+      None,
+    ));
   let state =
     llamastash::proxy::state::ProxyState::from_context(&ctx, false, true, DEFAULT_BODY_LIMIT_BYTES);
   // Persist the running snapshot + recorded state the way `start_model`
@@ -309,6 +333,7 @@ async fn idle_lemonade_model_is_unloaded_but_umbrella_stays_up() {
           .pid(0)
           .port(port)
           .launch_id("evict-L1")
+          .preset("warm")
           .resolved_backend("lemonade")
           .build(),
       )
@@ -319,7 +344,11 @@ async fn idle_lemonade_model_is_unloaded_but_umbrella_stays_up() {
     .await;
   // Stamp the umbrella's MRU, then sweep with a ~0 TTL so it counts idle.
   state.touch_mru(umbrella.id()).await;
-  eviction::sweep_once(&state, Duration::from_nanos(1)).await;
+  if let Some(secs) = preset_ttl {
+    // A preset TTL is whole seconds, so let it genuinely elapse before the pass.
+    sleep(Duration::from_secs(secs) + Duration::from_millis(100)).await;
+  }
+  eviction::sweep_once(&state, global_ttl).await;
 
   // The sweep dispatches the unload via tokio::spawn; poll the umbrella
   // until it reports no resident model.
@@ -395,4 +424,19 @@ async fn lemonade_request_without_umbrella_fails_cleanly() {
   );
 
   shutdown(token, handle).await;
+}
+
+/// Lifecycle-aware eviction on the global TTL: an idle Lemonade model is freed
+/// via `/api/v1/unload` (not SIGTERM); the shared umbrella stays Ready.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_lemonade_model_is_unloaded_but_umbrella_stays_up() {
+  lemonade_idle_sweep(None, Duration::from_nanos(1)).await;
+}
+
+/// `proxy.idle_ttl_secs: 0` means "only presets decide", so the umbrella must not
+/// be skipped for having no TTL of its own: the pass goes row by row and the row
+/// that pins a TTL is the one that goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lemonade_model_sweeps_on_its_preset_ttl_with_a_zero_global_ttl() {
+  lemonade_idle_sweep(Some(1), Duration::ZERO).await;
 }

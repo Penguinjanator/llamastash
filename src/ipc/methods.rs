@@ -790,20 +790,22 @@ async fn presets_save_handler(
   // params capture knows nothing about it, an absent field inherits what the
   // entry already pins instead of dropping it; only an explicit `null` /
   // `false` clears.
-  let existing = ctx
-    .presets
-    .snapshot()
-    .await
-    .get(&key)
-    .and_then(|block| block.entries.get(&parsed.name))
+  // Inherit from the entry the *name* actually resolves to, which may sit under
+  // an arch or wildcard key the save is about to shadow with a per-model entry of
+  // the same name; looking only under this model's own key would find nothing and
+  // silently drop the pin being shadowed.
+  let before = ctx.presets.snapshot().await;
+  let path_str = parsed.model_path.display().to_string();
+  let inherited = effective_presets(&key, &path_str, arch.as_deref(), &before, &rows)
+    .named(&parsed.name)
     .cloned();
   let idle_ttl_secs = match parsed.idle_ttl_secs {
     Some(pin) => pin,
-    None => existing.as_ref().and_then(|e| e.idle_ttl_secs),
+    None => inherited.as_ref().and_then(|e| e.idle_ttl_secs),
   };
   let preload = parsed
     .preload
-    .unwrap_or_else(|| existing.as_ref().is_some_and(|e| e.preload));
+    .unwrap_or_else(|| inherited.as_ref().is_some_and(|e| e.preload));
   let body = crate::config::PresetBody {
     idle_ttl_secs,
     preload,
@@ -821,7 +823,6 @@ async fn presets_save_handler(
   // the key/arch/rows resolved above — the catalog can't change across the
   // save, so re-deriving the key (a second catalog snapshot) is wasted work.
   let store = ctx.presets.snapshot().await;
-  let path_str = parsed.model_path.display().to_string();
   let eff = effective_presets(&key, &path_str, arch.as_deref(), &store, &rows);
   let default = is_default(&eff, &parsed.name);
   let replaced = prev
@@ -1375,6 +1376,90 @@ mod tests {
     )
     .await;
     assert_eq!(cleared, (None, false));
+  }
+
+  /// The save writes under the model's own key, but the pin it must inherit may
+  /// live on the arch entry of the same name that this save shadows.
+  #[tokio::test]
+  async fn presets_save_inherits_a_pin_from_the_entry_it_shadows() {
+    use crate::config::{ConfigPresetBlock, PresetBody};
+    use crate::daemon::preset_store::ConfigPresetStore;
+    use crate::discovery::{DiscoveredModel, ModelSource};
+    use crate::gguf::metadata::{ModeHint, ModelMetadata, Quant};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    let catalog = ModelCatalog::new();
+    catalog
+      .upsert(DiscoveredModel {
+        path: PathBuf::from("/m/a.gguf"),
+        parent: PathBuf::from("/m"),
+        source: ModelSource::UserPath,
+        metadata: Some(ModelMetadata {
+          arch: Some("qwen3".to_string()),
+          total_parameters: Some(7_000_000_000),
+          parameter_label: Some("7B".to_string()),
+          quant: Quant::Q4_K,
+          quant_label: None,
+          native_ctx: Some(8192),
+          chat_template: None,
+          tokenizer_kind: Some("llama".to_string()),
+          reasoning_hint: false,
+          mode_hint: ModeHint::Chat,
+          weights_bytes: Some(4_000_000_000),
+          lazy_tensor_bytes: Vec::new(),
+          mtp: None,
+        }),
+        parse_error: None,
+        split_siblings: Vec::new(),
+        display_label: None,
+        multimodal: None,
+        supported_backends: Vec::new(),
+        mtp_head: None,
+      })
+      .await;
+    let c = MethodContext::with_catalog(ShutdownToken::new(), catalog).with_presets(
+      ConfigPresetStore::new(
+        BTreeMap::from([(
+          "qwen3".to_string(),
+          ConfigPresetBlock {
+            default: None,
+            entries: BTreeMap::from([(
+              "p".to_string(),
+              PresetBody {
+                idle_ttl_secs: Some(60),
+                preload: true,
+                ..Default::default()
+              },
+            )]),
+          },
+        )]),
+        None,
+      ),
+    );
+
+    dispatch_request(
+      &c,
+      Request::new(
+        1,
+        "presets_save",
+        Some(json!({"model_path": "/m/a.gguf", "name": "p", "ctx": 2048})),
+      ),
+    )
+    .await;
+
+    let store = c.presets.snapshot().await;
+    let saved = store
+      .iter()
+      .filter(|(key, _)| key.as_str() != "qwen3")
+      .find_map(|(_, block)| block.entries.get("p"))
+      .expect("a per-model entry was written");
+    assert_eq!(
+      saved.idle_ttl_secs,
+      Some(60),
+      "the arch entry's TTL pin was dropped by the shadowing save"
+    );
+    assert!(saved.preload, "the arch entry's preload pin was dropped");
   }
 
   #[tokio::test]
