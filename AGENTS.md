@@ -56,6 +56,18 @@ Inline `#[cfg(test)] mod tests` per file is the default; `tests/` for daemon-spa
 
 **Never hand out a bare `llamastash <args>` for a dev task** — it resolves to whatever is on `PATH`, not the working tree, so it won't reflect the change under test. Use `cargo run -- <args>`, a `make` target, or `cargo build` + `./target/debug/llamastash <args>`, and isolate side-by-side daemons with `LLAMASTASH_STATE_DIR` + a non-default `--proxy-port` so you never touch the user's real daemon. Bare `llamastash` is only for genuine model-management work the user is doing with the tool.
 
+## Context budget
+
+Every command's output lands in context. Don't pay twice for the same check.
+
+- **Git hooks run the gates.** pre-commit: `cargo fmt` + `make lint` + `make doc`. pre-push: the same plus `cargo test --features test-fixtures`. Both skip when no Rust file changed. Don't run these by hand before a commit or push; read the hook output only when it fails.
+- **While coding, run the narrowest check:** `cargo check`, one test by name, or one `--test <name>` binary. Batch edits, then check once. No full `make test` after each edit; pre-push runs it.
+- **Reviews start from CI.** `gh pr checks <n>` or `gh run list -c <sha>` for the head commit. Green: don't re-run fmt, clippy, or tests locally; review the diff. Red: `gh run view <id> --log-failed`, reproduce only that job. Pending: `gh pr checks <n> --watch`, don't race it locally.
+- **Filter output.** `2>&1 | tail -n 40` or `rg 'FAILED|panicked|^error'` on cargo runs; `gh ... --json <fields> --jq` instead of full dumps.
+- **Don't re-run a check whose inputs haven't changed** since it last passed.
+- **Docs-only changes need no cargo runs.** The hooks skip them too.
+- **Read narrowly.** Pick the doc from the table above, then `rg -n` + a line range. Don't read large files whole.
+
 ## End-to-end CLI validation (required for user-visible changes)
 
 A passing `cargo test` is necessary but **not sufficient**. Stale daemons, missed env vars, deferred restarts, and client/server schema drift all hide behind green CI. After any change a user would notice, run the binary and look at it:
