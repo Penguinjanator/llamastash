@@ -14,6 +14,7 @@
 mod actuals;
 pub mod caps;
 mod compose;
+mod effort;
 pub mod knobs;
 pub mod list_devices;
 mod telemetry;
@@ -247,6 +248,10 @@ impl Backend for LlamaCppBackend {
   }
   fn id(&self) -> &'static str {
     "llamacpp"
+  }
+
+  fn rewrite_request_body(&self, endpoint: &str, body: &[u8]) -> Option<Vec<u8>> {
+    effort::rewrite_request_body(endpoint, body)
   }
 
   fn lifecycle(&self) -> Lifecycle {

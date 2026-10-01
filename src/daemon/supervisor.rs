@@ -237,6 +237,10 @@ struct ManagedInner {
   /// The backend's floor under every stop grace (see
   /// [`crate::backend::ProcessLaunchSpec::min_stop_grace`]).
   min_stop_grace: Duration,
+  /// The id of the backend this launch resolved to (from [`ManagedSpawn`]).
+  /// Read by the proxy to ask that backend whether a forwarded request body
+  /// needs an engine-specific rewrite.
+  resolved_backend: String,
 }
 
 impl ManagedModel {
@@ -267,6 +271,13 @@ impl ManagedModel {
   /// The shortest grace [`Self::stop`] will use, whatever the caller asks.
   pub fn min_stop_grace(&self) -> Duration {
     self.inner.min_stop_grace
+  }
+
+  /// The id of the backend that produced this launch. An unknown / unmatched
+  /// id is carried through as recorded — callers resolve it through the
+  /// registry and fall back to the default backend.
+  pub fn resolved_backend(&self) -> &str {
+    &self.inner.resolved_backend
   }
 
   /// Snapshot the concurrent-request counter. The idle-TTL sweeper
@@ -513,6 +524,7 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
     origin: input.origin,
     inflight: std::sync::atomic::AtomicU64::new(0),
     min_stop_grace: input.plan.min_stop_grace,
+    resolved_backend: input.resolved_backend.clone(),
   });
   let model = ManagedModel { inner };
 
@@ -1074,6 +1086,7 @@ pub(crate) mod test_support {
         origin: LaunchOrigin::Manual,
         inflight: std::sync::atomic::AtomicU64::new(0),
         min_stop_grace: Duration::ZERO,
+        resolved_backend: crate::backend::DEFAULT_BACKEND_ID.to_string(),
       }),
     }
   }

@@ -501,7 +501,7 @@ pub(crate) async fn running_model_backend(
     .find(|e| e.id.as_gguf().map(|g| g.path == id.path).unwrap_or(false))
     .map(|e| e.resolved_backend.clone())
   {
-    return Backends::all().into_iter().find(|b| b.id() == tag);
+    return Backends::from_id(&tag);
   }
   let cat = state.ctx.catalog.snapshot().await;
   let rb = cat

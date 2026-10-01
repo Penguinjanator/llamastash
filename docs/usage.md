@@ -973,7 +973,7 @@ The resolver accepts every form for every model, collision or not, and each qual
 
 ### Anthropic-shape clients (Claude Code)
 
-llama-server speaks the Anthropic Messages API natively, so the proxy forwards `/v1/messages` and `/v1/messages/count_tokens` on the same path as the OpenAI routes — no body translation. Point Claude Code (or anything that drives the Anthropic shape) at the proxy with `ANTHROPIC_BASE_URL` (no `/v1` suffix — the SDK appends `/v1/messages` itself):
+llama-server speaks the Anthropic Messages API natively, so the proxy forwards `/v1/messages` and `/v1/messages/count_tokens` on the same path as the OpenAI routes — no body translation, apart from the one effort field below. Point Claude Code (or anything that drives the Anthropic shape) at the proxy with `ANTHROPIC_BASE_URL` (no `/v1` suffix — the SDK appends `/v1/messages` itself):
 
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:11435 \
@@ -987,6 +987,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:11435 \
 - **`llamastash init` writes these for you.** Its **Claude Code** integration drops a sourceable `~/.config/llamastash/claude-code.sh` with the `ANTHROPIC_*` exports (separate from the OpenAI `env.sh`); `source ~/.config/llamastash/claude-code.sh && claude` opts Claude Code into the proxy **for that shell only**. It deliberately does *not* write Claude Code's global `~/.claude/settings.json` (whose `env` block applies to every session) — so bare `claude` keeps using your real Anthropic models.
 - **Auth.** Anthropic clients send the key in the `x-api-key` header; the proxy accepts it alongside `Authorization: Bearer` and browser `Basic`. On the keyless loopback default no key is needed (the token value is ignored, but Claude Code still wants one set). When you set `proxy.api_key` (or `LLAMASTASH_PROXY_API_KEY`), auth is enforced and `init`'s generated `env.sh` / `claude-code.sh` carry that real key (mode `0o600`) — so a client only authenticates once the script is sourced into its environment.
 - **Tool calling** needs the backend launched with `--jinja`, which is on by default (`backend.llamacpp.jinja: true` in `config.yaml`; the reasoning toggle also forces it). Set `backend.llamacpp.jinja: false` only if you don't need tool use. Basic chat / streaming work either way. Some model templates (e.g. certain Qwen GGUFs) fail llama-server's tool-parser generation with `System message must be at the beginning`; override with `start <model> -- --chat-template-file <tool-compatible.jinja>` (or the crude `--chat-template chatml`), or use a GGUF whose template is tool-compatible.
+- **`/effort` reaches a llama.cpp model.** Claude Code sends effort as `output_config.effort`, which llama.cpp's own `/v1/messages` translation drops, so the proxy copies that one value to `chat_template_kwargs.reasoning_effort` before forwarding and leaves every other byte alone. A `chat_template_kwargs.reasoning_effort` you send yourself wins over it. An effort the model's chat template doesn't define (e.g. `max` on Qwen3.8) comes back as the template's own error, which names the values it accepts. Other backends forward the body untouched — their engines either read the field themselves or have no effort concept.
 - Compatibility is best-effort (it's llama-server's translation, not a full Anthropic spec implementation) — verify your client end-to-end.
 
 ### Web UI (`/ui`)

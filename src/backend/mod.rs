@@ -355,6 +355,19 @@ pub trait Backend {
     false
   }
 
+  /// Rewrite a forwarded request body for `endpoint` (the client-facing path,
+  /// e.g. `/v1/messages`) before it reaches the engine, or `None` to forward
+  /// `body` unchanged.
+  ///
+  /// Default `None`. A client sends a field the engine's own translator drops,
+  /// and only the engine knows the spelling it does read — so the remap lives
+  /// with the backend instead of naming an engine or a client in the generic
+  /// proxy. Callers must treat the body as opaque bytes; a rewrite that leaves
+  /// bytes untouched is a bug the client sees as a corrupt request.
+  fn rewrite_request_body(&self, _endpoint: &str, _body: &[u8]) -> Option<Vec<u8>> {
+    None
+  }
+
   /// Seed daemon-config-derived launch knobs into `params.backend_knobs`, fresh
   /// each launch (config projection, not user intent). Default: no-op. llama.cpp
   /// projects its `jinja` / `strict_fit` / `fit_ctx_floor` config here so the
@@ -1043,6 +1056,12 @@ impl Backends {
       Backends::Generic(GenericBackend::new()),
     ]
   }
+
+  /// The backend whose [`Backend::id`] is `id`, or `None` for an unknown id.
+  /// For a recorded id string (a launch's `resolved_backend`, a status row).
+  pub fn from_id(id: &str) -> Option<Backends> {
+    Self::all().into_iter().find(|b| b.id() == id)
+  }
 }
 
 /// The id of the backend that **auto-claims** `header` (the first registry
@@ -1094,6 +1113,10 @@ impl Backend for Backends {
 
   fn serves_web_ui(&self) -> bool {
     for_each_backend!(self, b => b.serves_web_ui())
+  }
+
+  fn rewrite_request_body(&self, endpoint: &str, body: &[u8]) -> Option<Vec<u8>> {
+    for_each_backend!(self, b => b.rewrite_request_body(endpoint, body))
   }
 
   fn seed_launch_knobs(&self, ctx: &MethodContext, params: &mut LaunchParams) {
