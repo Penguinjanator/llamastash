@@ -20,7 +20,7 @@
 //! Window assets exist but are out of v2 scope per the plan's Scope
 //! Boundaries.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -28,7 +28,7 @@ use crate::gpu::GpuInfo;
 use crate::init::detection::{CpuArch, HardwareSnapshot, OsFamily};
 use crate::init::fetch::{FetchClient, FetchError};
 
-use super::safe_extract::{safe_extract, safe_extract_libs_tar_gz};
+use super::safe_extract::{existing_install, safe_extract, safe_extract_libs_tar_gz};
 use super::{sha256_file, BinaryInstall, GhBuild, InstallError};
 use crate::init::snapshot::InstallMethod;
 
@@ -134,23 +134,44 @@ pub fn pick_asset_suffix(hw: &HardwareSnapshot) -> Option<String> {
   }
 }
 
-/// The Linux CUDA build this host's NVIDIA driver can run, or `None`
-/// when there is no NVIDIA card on Linux, an AMD card sits beside it, or
-/// the driver is too old or unknown.
+/// What the CUDA build choice needs to know about the NVIDIA cards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NvidiaGpu {
+  pub driver_major: u32,
+  /// Lowest compute capability across the cards, `(major, minor)`.
+  /// `None` when `nvidia-smi` did not report it.
+  pub compute_cap: Option<(u32, u32)>,
+}
+
+/// Upstream's CUDA 13 builds target compute 7.5 (Turing) and newer: the
+/// default arch list in `ggml/src/ggml-cuda/CMakeLists.txt` adds 5.0,
+/// 6.1 and 7.0 only below CUDA 13. On an older card the CUDA 13 build
+/// still lists the device, then fails on the first kernel launch.
+const CUDA13_MIN_COMPUTE_CAP: (u32, u32) = (7, 5);
+
+/// The Linux CUDA build this host's NVIDIA driver and cards can run, or
+/// `None` when there is no NVIDIA card on Linux, an AMD card sits beside
+/// it, or the driver is too old or unknown.
 ///
 /// CUDA 13.x needs driver 580 or newer; 12.x runs on 525 or newer
 /// (NVIDIA's CUDA toolkit release notes, minor version compatibility
-/// table). Upstream ships 12.x for x64 only. The minor is a glob so a
-/// toolkit bump upstream (13.4 → 13.5) still matches.
-pub fn cuda_asset_suffix(hw: &HardwareSnapshot, driver_major: Option<u32>) -> Option<String> {
+/// table). Upstream ships 12.x for x64 only, so an x64 card whose compute
+/// capability is older than 7.5, or unknown, gets 12.x. The minor is a
+/// glob so a toolkit bump upstream (13.4 → 13.5) still matches.
+pub fn cuda_asset_suffix(hw: &HardwareSnapshot, gpu: Option<NvidiaGpu>) -> Option<String> {
   if !wants_cuda(hw) {
     return None;
   }
-  let driver = driver_major?;
-  match (hw.cpu_arch, driver) {
-    (CpuArch::X86_64, 580..) => Some("ubuntu-cuda-13.*-x64.tar.gz".into()),
+  let gpu = gpu?;
+  let cc = gpu.compute_cap;
+  match (hw.cpu_arch, gpu.driver_major) {
+    (CpuArch::X86_64, 580..) if cc.is_some_and(|c| c >= CUDA13_MIN_COMPUTE_CAP) => {
+      Some("ubuntu-cuda-13.*-x64.tar.gz".into())
+    }
     (CpuArch::X86_64, 525..) => Some("ubuntu-cuda-12.*-x64.tar.gz".into()),
-    (CpuArch::Arm64, 580..) => Some("ubuntu-cuda-13.*-arm64.tar.gz".into()),
+    (CpuArch::Arm64, 580..) if cc.is_none_or(|c| c >= CUDA13_MIN_COMPUTE_CAP) => {
+      Some("ubuntu-cuda-13.*-arm64.tar.gz".into())
+    }
     _ => None,
   }
 }
@@ -179,38 +200,72 @@ pub fn cuda_label(suffix: &str) -> Option<String> {
 }
 
 /// The suffix to fetch for `build`: the CUDA build when asked for the
-/// best build and the driver can run one, else [`pick_asset_suffix`].
+/// best build and the host can run one, else [`pick_asset_suffix`].
+/// `Vulkan` swaps the Windows CUDA zip for the Vulkan one too: that zip
+/// carries no CUDA runtime DLLs, so it is the build a failed CUDA check
+/// falls back from.
 pub fn select_asset_suffix(
   hw: &HardwareSnapshot,
   build: GhBuild,
-  driver_major: Option<u32>,
+  gpu: Option<NvidiaGpu>,
 ) -> Option<String> {
-  let cuda = match build {
-    GhBuild::Best => cuda_asset_suffix(hw, driver_major),
-    GhBuild::Vulkan => None,
-  };
-  cuda.or_else(|| pick_asset_suffix(hw))
+  match build {
+    GhBuild::Best => cuda_asset_suffix(hw, gpu).or_else(|| pick_asset_suffix(hw)),
+    GhBuild::Vulkan => pick_asset_suffix(hw).map(|s| match s.strip_prefix("win-cuda-*-") {
+      Some(arch) => format!("win-vulkan-{arch}"),
+      None => s,
+    }),
+  }
 }
 
-/// Major version of the loaded NVIDIA kernel driver, read only on a host
-/// that could take a CUDA build. Reads `/proc/driver/nvidia/version`,
-/// then asks `nvidia-smi`. `None` when neither answers.
-pub fn nvidia_driver_major(hw: &HardwareSnapshot) -> Option<u32> {
+/// The NVIDIA driver and cards, read only on a host that could take a
+/// CUDA build. `nvidia-smi` gives the driver version and each card's
+/// compute capability; without it the driver version comes from
+/// `/proc/driver/nvidia/version`. Blocks for up to 5 s.
+pub fn nvidia_gpu(hw: &HardwareSnapshot) -> Option<NvidiaGpu> {
   if !wants_cuda(hw) {
     return None;
   }
-  if let Some(v) = std::fs::read_to_string("/proc/driver/nvidia/version")
-    .ok()
-    .and_then(|s| parse_driver_major(&s))
-  {
-    return Some(v);
-  }
   let mut cmd = std::process::Command::new("nvidia-smi");
-  cmd.args(["--query-gpu=driver_version", "--format=csv,noheader"]);
-  let out =
+  cmd.args([
+    "--query-gpu=driver_version,compute_cap",
+    "--format=csv,noheader",
+  ]);
+  let smi =
     crate::util::process::run_with_drain_and_timeout(cmd, std::time::Duration::from_secs(5))
-      .ok()?;
-  parse_driver_major(&String::from_utf8_lossy(&out.stdout))
+      .ok()
+      .filter(|out| out.status.success())
+      .and_then(|out| parse_smi(&String::from_utf8_lossy(&out.stdout)));
+  smi.or_else(|| {
+    let version = std::fs::read_to_string("/proc/driver/nvidia/version").ok()?;
+    Some(NvidiaGpu {
+      driver_major: parse_driver_major(&version)?,
+      compute_cap: None,
+    })
+  })
+}
+
+/// `nvidia-smi --query-gpu=driver_version,compute_cap` output, one
+/// `580.82.07, 8.6` line per card. The compute capability is the lowest
+/// card's, and `None` when any card's is unreadable.
+fn parse_smi(text: &str) -> Option<NvidiaGpu> {
+  let mut lines = text
+    .lines()
+    .map(str::trim)
+    .filter(|l| !l.is_empty())
+    .peekable();
+  let driver_major = parse_driver_major(lines.peek()?.split(',').next()?)?;
+  let compute_cap = lines
+    .map(|l| {
+      let (major, minor) = l.split(',').nth(1)?.trim().split_once('.')?;
+      Some((major.parse().ok()?, minor.parse().ok()?))
+    })
+    .collect::<Option<Vec<(u32, u32)>>>()
+    .and_then(|caps| caps.into_iter().min());
+  Some(NvidiaGpu {
+    driver_major,
+    compute_cap,
+  })
 }
 
 /// First `<major>.<minor>[.<patch>]` token in `text`, as its major.
@@ -253,10 +308,8 @@ pub fn asset_matches(asset_name: &str, suffix: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct AssetPick {
   pub tag: String,
-  pub asset_name: String,
-  pub url: String,
-  pub sha256: String,
-  pub size: u64,
+  /// The build archive.
+  pub archive: Download,
   /// Shared libraries the build needs beside it: the `cudart-` bundle
   /// (`libcudart`, `libcublas`, `libcublasLt`) for a Linux CUDA build.
   /// The binaries load them through an `$ORIGIN` rpath, so no CUDA
@@ -278,12 +331,12 @@ impl AssetPick {
   /// the CUDA backend is a plugin that llama.cpp skips when it cannot
   /// load, so the binary still runs and `--version` still passes.
   pub fn is_cuda(&self) -> bool {
-    self.asset_name.contains("-cuda-")
+    self.archive.asset_name.contains("-cuda-")
   }
 
   /// Bytes to download: the build plus its runtime bundle.
   pub fn download_bytes(&self) -> u64 {
-    self.size + self.runtime_libs.as_ref().map_or(0, |l| l.size)
+    self.archive.size + self.runtime_libs.as_ref().map_or(0, |l| l.size)
   }
 }
 
@@ -354,13 +407,12 @@ pub async fn fetch_latest_asset(
   fetch: &FetchClient,
   hw: &HardwareSnapshot,
   build: GhBuild,
-  driver_major: Option<u32>,
+  gpu: Option<NvidiaGpu>,
 ) -> Result<AssetPick, InstallError> {
-  let suffix =
-    select_asset_suffix(hw, build, driver_major).ok_or(InstallError::NoMatchingAsset {
-      os: hw.os,
-      arch: hw.cpu_arch,
-    })?;
+  let suffix = select_asset_suffix(hw, build, gpu).ok_or(InstallError::NoMatchingAsset {
+    os: hw.os,
+    arch: hw.cpu_arch,
+  })?;
   // GH Releases API allows 60 unauthenticated requests/hour.
   // On the first 429/403 we sleep briefly and try again; a second
   // rate-limit response is surfaced as-is so the wizard can offer
@@ -390,23 +442,22 @@ pub async fn fetch_latest_asset(
       os: hw.os,
       arch: hw.cpu_arch,
     })?;
-  let runtime_libs = match runtime {
-    Some(r) => Some(Download {
-      sha256: sha256_of(&r)?,
-      size: size_of(&r)?,
-      asset_name: r.name,
-      url: r.browser_download_url,
-    }),
-    None => None,
-  };
   Ok(AssetPick {
     tag,
-    sha256: sha256_of(&matched)?,
-    size: size_of(&matched)?,
-    asset_name: matched.name,
-    url: matched.browser_download_url,
-    runtime_libs,
+    archive: Download::from_row(matched)?,
+    runtime_libs: runtime.map(Download::from_row).transpose()?,
   })
+}
+
+impl Download {
+  fn from_row(row: AssetRow) -> Result<Self, InstallError> {
+    Ok(Self {
+      sha256: sha256_of(&row)?,
+      size: size_of(&row)?,
+      asset_name: row.name,
+      url: row.browser_download_url,
+    })
+  }
 }
 
 /// Walk the release list from newest to oldest and return the first
@@ -460,39 +511,56 @@ fn pick_release_with_asset(
 ///
 /// Assets stream into a temp file under `install_root` (not `/tmp`,
 /// which is often RAM-backed) and are hashed on the way, so a CUDA build
-/// and its runtime bundle never sit in memory.
+/// and its runtime bundle never sit in memory. A build already extracted
+/// by an earlier run is reused without a download.
 pub async fn install_picked(
   fetch: &FetchClient,
   pick: &AssetPick,
   install_root: &Path,
 ) -> Result<BinaryInstall, InstallError> {
   std::fs::create_dir_all(install_root).map_err(|e| InstallError::Io(e.to_string()))?;
+  remove_stale_temps(install_root, |n| {
+    n.starts_with(".download.") || n.contains(".tmp.")
+  });
+  let dir_name = install_dir_name(pick)?;
+  let existing = existing_install(install_root, &dir_name)?;
+  let libs = match (&pick.runtime_libs, &existing) {
+    (Some(libs), Some(found)) if libs_marker(&found.path, libs)?.exists() => None,
+    (libs, _) => libs.as_ref(),
+  };
+  let archive_bytes = if existing.is_none() {
+    pick.archive.size
+  } else {
+    0
+  };
+  let to_download = archive_bytes + libs.map_or(0, |l| l.size);
   crate::init::download::precheck_disk(
     install_root,
-    pick
-      .download_bytes()
-      .saturating_mul(DISK_PER_DOWNLOADED_BYTE),
+    to_download.saturating_mul(DISK_PER_DOWNLOADED_BYTE),
   )
   .map_err(|e| InstallError::Io(e.to_string()))?;
-  let dir_name = install_dir_name(pick)?;
-  let archive = download_verified(fetch, &pick.url, &pick.sha256, install_root).await?;
-  let extracted = safe_extract(&pick.asset_name, archive.path(), install_root, &dir_name)?;
-  drop(archive);
-  if let Some(libs) = &pick.runtime_libs {
-    let dir = extracted
-      .path
-      .parent()
-      .ok_or_else(|| InstallError::Io("installed binary has no parent dir".into()))?;
-    let marker = dir.join(format!(".{}.installed", safe_component(&libs.asset_name)?));
-    // A re-run over a finished install already has the libraries. The
-    // marker is written last, so an interrupted extract is redone.
-    if !marker.exists() {
-      let lib_archive = download_verified(fetch, &libs.url, &libs.sha256, install_root).await?;
-      let file =
-        std::fs::File::open(lib_archive.path()).map_err(|e| InstallError::Io(e.to_string()))?;
-      safe_extract_libs_tar_gz(std::io::BufReader::new(file), dir)?;
-      std::fs::write(&marker, b"").map_err(|e| InstallError::Io(e.to_string()))?;
+  let extracted = match existing {
+    Some(found) => found,
+    None => {
+      let archive = download_verified(fetch, &pick.archive, install_root).await?;
+      safe_extract(
+        &pick.archive.asset_name,
+        archive.path(),
+        install_root,
+        &dir_name,
+      )?
     }
+  };
+  if let Some(libs) = libs {
+    let dir = bin_dir(&extracted.path)?;
+    remove_stale_temps(dir, |n| n.starts_with(".lib") && n.contains(".tmp."));
+    let lib_archive = download_verified(fetch, libs, install_root).await?;
+    let file =
+      std::fs::File::open(lib_archive.path()).map_err(|e| InstallError::Io(e.to_string()))?;
+    safe_extract_libs_tar_gz(std::io::BufReader::new(file), dir)?;
+    // Written last, so an interrupted extract is redone on the next run.
+    std::fs::write(libs_marker(&extracted.path, libs)?, b"")
+      .map_err(|e| InstallError::Io(e.to_string()))?;
   }
   let digest = sha256_file(&extracted.path)?;
   Ok(BinaryInstall {
@@ -503,12 +571,65 @@ pub async fn install_picked(
   })
 }
 
-/// Stream `url` into a temp file under `dir` and check its SHA-256. The
-/// file is deleted when the returned handle drops.
+fn bin_dir(binary: &Path) -> Result<&Path, InstallError> {
+  binary
+    .parent()
+    .ok_or_else(|| InstallError::Io("installed binary has no parent dir".into()))
+}
+
+/// Marks a runtime bundle as fully extracted beside `binary`.
+fn libs_marker(binary: &Path, libs: &Download) -> Result<PathBuf, InstallError> {
+  Ok(bin_dir(binary)?.join(format!(".{}.installed", safe_component(&libs.asset_name)?)))
+}
+
+/// A temp entry untouched this long is left from a run that was killed
+/// (`init` has no Ctrl-C handler, so its temp files are not cleaned up).
+/// A live run writes to its own temp entries far more often.
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Best-effort removal of temp files and dirs in `dir` that an
+/// interrupted install left behind.
+fn remove_stale_temps(dir: &Path, is_temp: impl Fn(&str) -> bool) {
+  let Ok(entries) = std::fs::read_dir(dir) else {
+    return;
+  };
+  for entry in entries.flatten() {
+    let name = entry.file_name();
+    if !name.to_str().is_some_and(&is_temp) {
+      continue;
+    }
+    let Ok(meta) = entry.metadata() else {
+      continue;
+    };
+    let stale = meta
+      .modified()
+      .ok()
+      .and_then(|m| m.elapsed().ok())
+      .is_some_and(|age| age >= STALE_TEMP_AGE);
+    if !stale {
+      continue;
+    }
+    let path = entry.path();
+    let removed = if meta.is_dir() {
+      std::fs::remove_dir_all(&path)
+    } else {
+      std::fs::remove_file(&path)
+    };
+    match removed {
+      Ok(()) => log::info!(
+        "init server: removed {} left by an interrupted install",
+        path.display()
+      ),
+      Err(e) => log::warn!("init server: could not remove {}: {e}", path.display()),
+    }
+  }
+}
+
+/// Stream `download` into a temp file under `dir` and check its SHA-256.
+/// The file is deleted when the returned handle drops.
 async fn download_verified(
   fetch: &FetchClient,
-  url: &str,
-  expected: &str,
+  download: &Download,
   dir: &Path,
 ) -> Result<tempfile::NamedTempFile, InstallError> {
   let mut tmp = tempfile::Builder::new()
@@ -516,12 +637,12 @@ async fn download_verified(
     .tempfile_in(dir)
     .map_err(|e| InstallError::Io(e.to_string()))?;
   let actual = fetch
-    .download_to(url, ASSET_MAX_BYTES, tmp.as_file_mut())
+    .download_to(&download.url, ASSET_MAX_BYTES, tmp.as_file_mut())
     .await
     .map_err(translate_fetch)?;
-  if actual != expected {
+  if actual != download.sha256 {
     return Err(InstallError::ChecksumMismatch {
-      expected: expected.to_string(),
+      expected: download.sha256.clone(),
       actual,
     });
   }
@@ -533,11 +654,19 @@ async fn download_verified(
 /// the same tag does not find the CUDA one already in `b11302/`.
 fn install_dir_name(pick: &AssetPick) -> Result<String, InstallError> {
   let tag = safe_component(&pick.tag)?;
+  let name = &pick.archive.asset_name;
   let variant = pick
     .is_cuda()
-    .then(|| pick.asset_name.split_once("-bin-ubuntu-"))
-    .flatten()
-    .and_then(|(_, rest)| rest.strip_suffix(".tar.gz"));
+    .then(|| {
+      let rest = name
+        .split_once("-bin-ubuntu-")
+        .or_else(|| name.split_once("-bin-win-"))?
+        .1;
+      rest
+        .strip_suffix(".tar.gz")
+        .or_else(|| rest.strip_suffix(".zip"))
+    })
+    .flatten();
   match variant {
     Some(v) => Ok(format!("{tag}-{}", safe_component(v)?)),
     None => Ok(tag.to_string()),
@@ -664,7 +793,9 @@ mod tests {
   fn linux_nvidia_picks_cuda_by_driver_and_vulkan_otherwise() {
     let x64 = hw(nvidia(), OsFamily::Linux, CpuArch::X86_64);
     let arm = hw(nvidia(), OsFamily::Linux, CpuArch::Arm64);
-    let best = |h: &HardwareSnapshot, d| select_asset_suffix(h, GhBuild::Best, d).unwrap();
+    let best = |h: &HardwareSnapshot, d: Option<u32>| {
+      select_asset_suffix(h, GhBuild::Best, d.map(ampere)).unwrap()
+    };
     assert_eq!(best(&x64, Some(580)), "ubuntu-cuda-13.*-x64.tar.gz");
     assert_eq!(best(&x64, Some(570)), "ubuntu-cuda-12.*-x64.tar.gz");
     assert_eq!(best(&x64, Some(525)), "ubuntu-cuda-12.*-x64.tar.gz");
@@ -674,22 +805,108 @@ mod tests {
     assert_eq!(best(&arm, Some(590)), "ubuntu-cuda-13.*-arm64.tar.gz");
     assert_eq!(best(&arm, Some(570)), "ubuntu-vulkan-arm64.tar.gz");
     assert_eq!(
-      select_asset_suffix(&x64, GhBuild::Vulkan, Some(580)).unwrap(),
+      select_asset_suffix(&x64, GhBuild::Vulkan, Some(ampere(580))).unwrap(),
       "ubuntu-vulkan-x64.tar.gz"
     );
   }
 
+  fn ampere(driver_major: u32) -> NvidiaGpu {
+    NvidiaGpu {
+      driver_major,
+      compute_cap: Some((8, 6)),
+    }
+  }
+
   #[test]
-  fn cuda_is_only_offered_for_nvidia_on_linux() {
-    assert!(cuda_asset_suffix(&hw(amd(), OsFamily::Linux, CpuArch::X86_64), Some(580)).is_none());
-    assert!(
-      cuda_asset_suffix(&hw(nvidia(), OsFamily::Windows, CpuArch::X86_64), Some(580)).is_none()
+  fn a_card_older_than_turing_gets_cuda_12_or_vulkan() {
+    let x64 = hw(nvidia(), OsFamily::Linux, CpuArch::X86_64);
+    let arm = hw(nvidia(), OsFamily::Linux, CpuArch::Arm64);
+    let gpu = |cc| NvidiaGpu {
+      driver_major: 580,
+      compute_cap: cc,
+    };
+    let pascal = gpu(Some((6, 1)));
+    assert_eq!(
+      cuda_asset_suffix(&x64, Some(pascal)).as_deref(),
+      Some("ubuntu-cuda-12.*-x64.tar.gz")
+    );
+    assert_eq!(cuda_asset_suffix(&arm, Some(pascal)), None);
+    assert_eq!(
+      cuda_asset_suffix(&x64, Some(gpu(Some((7, 5))))).as_deref(),
+      Some("ubuntu-cuda-13.*-x64.tar.gz")
+    );
+    // Unknown: CUDA 12 runs on every card x64 drivers 525+ support.
+    assert_eq!(
+      cuda_asset_suffix(&x64, Some(gpu(None))).as_deref(),
+      Some("ubuntu-cuda-12.*-x64.tar.gz")
+    );
+    assert_eq!(
+      cuda_asset_suffix(&arm, Some(gpu(None))).as_deref(),
+      Some("ubuntu-cuda-13.*-arm64.tar.gz")
+    );
+  }
+
+  #[test]
+  fn nvidia_smi_output_gives_the_driver_and_the_lowest_compute_cap() {
+    assert_eq!(
+      parse_smi("580.82.07, 8.9\n580.82.07, 6.1\n"),
+      Some(NvidiaGpu {
+        driver_major: 580,
+        compute_cap: Some((6, 1)),
+      })
+    );
+    assert_eq!(
+      parse_smi("575.57.08, [N/A]\n").map(|g| (g.driver_major, g.compute_cap)),
+      Some((575, None))
+    );
+    assert_eq!(parse_smi(""), None);
+  }
+
+  #[test]
+  fn the_vulkan_build_replaces_the_windows_cuda_zip() {
+    let win = hw(nvidia(), OsFamily::Windows, CpuArch::X86_64);
+    assert_eq!(
+      select_asset_suffix(&win, GhBuild::Best, None).as_deref(),
+      Some("win-cuda-*-x64.zip")
+    );
+    assert_eq!(
+      select_asset_suffix(&win, GhBuild::Vulkan, None).as_deref(),
+      Some("win-vulkan-x64.zip")
     );
     let multi = GpuInfo::Multi {
       devices: vec![dev("nvidia"), dev("unknown")],
     };
     assert_eq!(
-      cuda_asset_suffix(&hw(multi, OsFamily::Linux, CpuArch::X86_64), Some(580)).as_deref(),
+      select_asset_suffix(
+        &hw(multi, OsFamily::Windows, CpuArch::X86_64),
+        GhBuild::Vulkan,
+        None
+      )
+      .as_deref(),
+      Some("win-vulkan-x64.zip")
+    );
+    // Hosts whose pick is not CUDA keep it.
+    assert_eq!(
+      select_asset_suffix(
+        &hw(amd(), OsFamily::Linux, CpuArch::X86_64),
+        GhBuild::Vulkan,
+        None
+      )
+      .as_deref(),
+      Some("ubuntu-rocm-*-x64.tar.gz")
+    );
+  }
+
+  #[test]
+  fn cuda_is_only_offered_for_nvidia_on_linux() {
+    let g = Some(ampere(580));
+    assert!(cuda_asset_suffix(&hw(amd(), OsFamily::Linux, CpuArch::X86_64), g).is_none());
+    assert!(cuda_asset_suffix(&hw(nvidia(), OsFamily::Windows, CpuArch::X86_64), g).is_none());
+    let multi = GpuInfo::Multi {
+      devices: vec![dev("nvidia"), dev("unknown")],
+    };
+    assert_eq!(
+      cuda_asset_suffix(&hw(multi, OsFamily::Linux, CpuArch::X86_64), g).as_deref(),
       Some("ubuntu-cuda-13.*-x64.tar.gz")
     );
     // A CUDA build can't drive the AMD card; Vulkan covers both.
@@ -700,15 +917,15 @@ mod tests {
       OsFamily::Linux,
       CpuArch::X86_64,
     );
-    assert!(cuda_asset_suffix(&mixed, Some(580)).is_none());
+    assert!(cuda_asset_suffix(&mixed, g).is_none());
     assert_eq!(
-      select_asset_suffix(&mixed, GhBuild::Best, Some(580)).as_deref(),
+      select_asset_suffix(&mixed, GhBuild::Best, g).as_deref(),
       Some("ubuntu-vulkan-x64.tar.gz")
     );
     // The driver is not even read where CUDA can't be picked.
-    assert_eq!(nvidia_driver_major(&mixed), None);
+    assert_eq!(nvidia_gpu(&mixed), None);
     assert_eq!(
-      nvidia_driver_major(&hw(amd(), OsFamily::Linux, CpuArch::X86_64)),
+      nvidia_gpu(&hw(amd(), OsFamily::Linux, CpuArch::X86_64)),
       None
     );
   }
@@ -767,21 +984,30 @@ mod tests {
 
   #[test]
   fn a_cuda_build_installs_apart_from_the_same_tags_vulkan_build() {
-    let pick = |name: &str| AssetPick {
-      tag: "b11302".into(),
-      asset_name: name.into(),
-      url: String::new(),
-      sha256: String::new(),
-      size: 0,
-      runtime_libs: None,
-    };
-    let dir = |name: &str| install_dir_name(&pick(name)).expect("safe name");
+    let dir = |name: &str| install_dir_name(&pick("b11302", name)).expect("safe name");
     assert_eq!(
       dir("llama-b11302-bin-ubuntu-cuda-13.4-x64.tar.gz"),
       "b11302-cuda-13.4-x64"
     );
     assert_eq!(dir("llama-b11302-bin-ubuntu-vulkan-x64.tar.gz"), "b11302");
-    assert_eq!(dir("llama-b11302-bin-win-cuda-12.4-x64.zip"), "b11302");
+    assert_eq!(
+      dir("llama-b11302-bin-win-cuda-12.4-x64.zip"),
+      "b11302-cuda-12.4-x64"
+    );
+    assert_eq!(dir("llama-b11302-bin-win-vulkan-x64.zip"), "b11302");
+  }
+
+  fn pick(tag: &str, name: &str) -> AssetPick {
+    AssetPick {
+      tag: tag.into(),
+      archive: Download {
+        asset_name: name.into(),
+        url: String::new(),
+        sha256: String::new(),
+        size: 0,
+      },
+      runtime_libs: None,
+    }
   }
 
   #[test]
@@ -789,14 +1015,6 @@ mod tests {
     // Matches `ubuntu-cuda-13.*-x64.tar.gz`, so it would be picked.
     let hostile = "llama-b1-bin-ubuntu-cuda-13../../../../tmp/evil-x64.tar.gz";
     assert!(asset_matches(hostile, "ubuntu-cuda-13.*-x64.tar.gz"));
-    let pick = |tag: &str, name: &str| AssetPick {
-      tag: tag.into(),
-      asset_name: name.into(),
-      url: String::new(),
-      sha256: String::new(),
-      size: 0,
-      runtime_libs: None,
-    };
     assert!(install_dir_name(&pick("b1", hostile)).is_err());
     assert!(install_dir_name(&pick("../b1", "llama-b1-bin-ubuntu-x64.tar.gz")).is_err());
     assert!(install_dir_name(&pick("..", "llama-b1-bin-ubuntu-x64.tar.gz")).is_err());

@@ -6,9 +6,9 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ### Added
 
-- `init` installs llama.cpp's CUDA build on Linux + NVIDIA (CUDA 13 on driver 580+, CUDA 12 on 525+), with its CUDA runtime libraries, and falls back to Vulkan when the build lists no CUDA device. Mixed NVIDIA + AMD hosts keep Vulkan, and `--install gh-releases:vulkan` keeps Vulkan anywhere. GitHub Releases downloads now stream to disk instead of memory.
-- `init` integrations wire reasoning effort for models whose chat template lists levels (Qwen3.8: `low`, `medium`, `xhigh`, plus `none`): pi gets `reasoning` + `thinkingLevelMap`, OpenCode gets `variants`, Zed gets a `reasoning_effort` default.
-- `init` integrations: Codex CLI entry, written as a `~/.codex/llamastash.config.toml` profile (`codex --profile llamastash`) on the Responses API, with the model's effort pinned so `config.toml`'s doesn't leak in.
+- `init` installs llama.cpp's CUDA build with its CUDA runtime on Linux + NVIDIA, and falls back to Vulkan when CUDA does not load (#93).
+- `init` integrations set reasoning effort to the levels the model's chat template accepts in pi, OpenCode, Zed and Codex (#93).
+- `init` integrations: Codex CLI profile, used with `codex --profile llamastash` (#93).
 
 ### Changed
 
@@ -16,10 +16,11 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ### Fixed
 
-- `init` integrations write the proxy address the running daemon is actually listening on, instead of the config or default port. A proxy that moved past a busy `11435`, or a daemon started with `--proxy-port` / `--host`, no longer leaves tool configs pointing at the wrong port (or at another daemon's proxy).
-- pi integration declared `maxTokens: 8192`, which llama.cpp enforces, so a long think could end before any answer; it now uses 32000 or half the context.
-- `init` integrations declare image input for models with a vision projector (pi, OpenCode, Zed) and send earlier thinking back as `reasoning_content` in Zed.
-- OpenCode integration now declares each model's context and output `limit`; without it OpenCode read the context as `0` and never compacted.
+- `init` integrations and `api-key --json` use the port the daemon's proxy actually listens on (#93).
+- pi integration's output cap no longer cuts long thinking short (#93).
+- `init` integrations declare image input for vision models and, in Zed, send earlier thinking back to the model (#93).
+- OpenCode integration declares each model's context and output limits, so it compacts again (#93).
+- `init`'s GitHub Releases install streams downloads to disk and reuses a build it already installed (#93).
 
 ## [0.5.0] — 2026-09-30
 

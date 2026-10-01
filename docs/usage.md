@@ -1320,15 +1320,20 @@ Examples: `llamastash init server --install gh-releases`, `llamastash init model
 
 On Linux with an NVIDIA card, the GitHub Releases install picks llama.cpp's CUDA build when the driver can run it, and the Vulkan build otherwise. A host with both an NVIDIA and an AMD card keeps the Vulkan build, since a CUDA build drives only the NVIDIA card. The CUDA build ships with a `cudart-` bundle (`libcudart`, `libcublas`, `libcublasLt`) that `init` downloads and places next to `llama-server`, so no CUDA toolkit is needed.
 
-| Driver (from `/proc/driver/nvidia/version`, else `nvidia-smi`) | x86_64 | arm64 |
-| --- | --- | --- |
-| 580 or newer | CUDA 13 | CUDA 13 |
-| 525 to 579 | CUDA 12 | Vulkan |
-| older, or unknown | Vulkan | Vulkan |
+| Driver | Card (compute capability) | x86_64 | arm64 |
+| --- | --- | --- | --- |
+| 580 or newer | 7.5 or newer (Turing and later) | CUDA 13 | CUDA 13 |
+| 580 or newer | older than 7.5 (Maxwell, Pascal, Volta) | CUDA 12 | Vulkan |
+| 525 to 579 | any | CUDA 12 | Vulkan |
+| older, or unknown | any | Vulkan | Vulkan |
 
-The download is larger: about 560 to 730 MiB for build plus runtime (CUDA 13 x86_64 565 MiB, CUDA 13 arm64 667 MiB, CUDA 12 730 MiB at `b11316`), against about 30 MiB for Vulkan. `--recommended`, `--json` and non-interactive runs take the CUDA build too, and `--install gh-releases:vulkan` picks Vulkan instead. The progress line shows the size; under `--json` there is no progress line, so the size is only in the log file (`llamastash.log`), or on stderr with `--verbose`. The interactive picker offers both builds (`GitHub Releases · CUDA 13` and `GitHub Releases · Vulkan`). Downloads stream to disk under the install root and are hashed on the way; the step checks for about three times the download size in free space first. A CUDA build installs to its own directory (`llama-cpp/<tag>-cuda-<ver>-<arch>/`).
+The driver version and each card's compute capability come from `nvidia-smi` (the driver alone from `/proc/driver/nvidia/version` when `nvidia-smi` fails). Upstream's CUDA 13 build has no kernels for cards older than 7.5, and such a card still shows up in `--list-devices`, so the check below would not catch it. With several cards the oldest one decides. When the compute capability is unknown, x86_64 takes CUDA 12, which covers every card a 525+ driver supports.
+
+The download is larger: about 560 to 730 MiB for build plus runtime (CUDA 13 x86_64 565 MiB, CUDA 13 arm64 667 MiB, CUDA 12 730 MiB at `b11316`), against about 30 MiB for Vulkan. `--recommended`, `--json` and non-interactive runs take the CUDA build too, and `--install gh-releases:vulkan` picks Vulkan instead. The progress line shows the size; under `--json` there is no progress line, so the size is only in the log file (`llamastash.log`), or on stderr with `--verbose`. The interactive picker offers both builds (`GitHub Releases · CUDA 13` and `GitHub Releases · Vulkan`). Downloads stream to disk under the install root and are hashed on the way; the step checks for about three times the download size in free space first. A CUDA build installs to its own directory (`llama-cpp/<tag>-cuda-<ver>-<arch>/`). A re-run reuses a build already in its directory without downloading it again. Temp files an interrupted run left behind (`.download.*`, `*.tmp.*`) are removed by the next run once they are 10 minutes old.
 
 After the install, `init` runs `llama-server --list-devices`. llama.cpp loads its CUDA backend as a plugin and skips it when it cannot load, so a broken CUDA install still starts and passes `--version`, on the CPU. When the list shows no CUDA device, `init` says so, removes the CUDA build, and installs the Vulkan build instead. When the check itself fails (timeout after 120 s, non-zero exit), it keeps the CUDA build and says how to check by hand.
+
+On Windows with an NVIDIA card the install picks the `win-cuda` zip, which carries no CUDA runtime DLLs, so it needs a CUDA toolkit on `PATH`. The same check runs there: without a toolkit the zip lists no CUDA device and `init` installs the `win-vulkan` build instead. `--install gh-releases:vulkan` picks the Vulkan build directly.
 
 The three per-step flags are **advisory, not authoritative**: supplying `--install brew` for a step that `--skip server` already excludes emits one stderr warning and proceeds. Conflicting axes don't abort.
 
@@ -1396,11 +1401,11 @@ Per-tool shape: tools whose schema holds a model list (OpenCode, Continue.dev, Z
 
 **Vision and reasoning flags.** A model with a vision projector is declared as taking images: pi.dev `input: ["text", "image"]`, OpenCode `modalities.input: ["text", "image"]` (without it OpenCode replaces an attached image with an error message), Zed `capabilities.images: true`. Codex already assumes image input. Continue.dev gets nothing, because listing `image_input` in its `capabilities` also turns off its own tool-use detection. A reasoning model gets Zed's `capabilities.interleaved_reasoning: true`, so earlier thinking goes back to the server as `reasoning_content` instead of as plain answer text. Embedders are routed by kind — Continue.dev gets `roles: [embed]`; Zed and pi.dev leave them out, since both drive chat only and pi has no embeddings API at all.
 
-**Reasoning effort.** For a reasoning model whose chat template lists the effort levels it accepts, the patchers wire each tool's effort control to those levels. The list comes from the template, not the model family: Qwen3.8's template accepts `low`, `medium` and `xhigh` (its default), and raises an error on any other value. `none` turns thinking off where the template reads `enable_thinking`, since llama.cpp maps `reasoning_effort: "none"` to that. Models without such a list (including safetensors repos, whose template is not read yet) get no effort fields.
+**Reasoning effort.** For a reasoning model whose chat template lists the effort levels it accepts, the patchers wire each tool's effort control to those levels. The list comes from the template, not the model family: Qwen3.8's template accepts `low`, `medium` and `xhigh` (its default), plus `high`, which it turns into `xhigh`, and raises an error on any other value. An alias like `high` is accepted but not offered as a level of its own. `none` turns thinking off where the template reads `enable_thinking`, since llama.cpp maps `reasoning_effort: "none"` to that. Models without such a list (including safetensors repos, whose template is not read yet) get no effort fields.
 
 | Tool | What is written | How to change the level |
 | --- | --- | --- |
-| pi.dev | `reasoning: true` and a `thinkingLevelMap`; levels the template rejects map to `null`, which hides them | `/thinking <level>` |
+| pi.dev | `reasoning: true` and a `thinkingLevelMap`; levels the template rejects, and aliases like `high`, map to `null`, which hides them | `/thinking <level>` |
 | OpenCode | `reasoning: true` and one `variants` entry per level (plus `none`) | the variant picker |
 | Zed | `reasoning_effort` set to the template's default | the effort picker; Zed's list is fixed to minimal ... max, so for Qwen3.8 `minimal` and `max` get an HTTP 500 whose message ends `Unexpected reasoning effort minimal. Supported types are xhigh (default), medium, and low.` |
 | Codex | `model_reasoning_effort` set to the template's default, with the accepted levels in a comment | edit it in the profile (kept on re-run when the model accepts it), or `-c model_reasoning_effort=<level>` per run |
@@ -1432,7 +1437,7 @@ When the run patches a tool that reads the variable **and** the proxy has auth o
 llamastash api-key [--json]
 ```
 
-Prints the proxy's bearer key on stdout, alone on one line, for client configs that resolve a credential by shelling out and for `$(...)` in scripts. Reads the local config only — no daemon contact, so it stays inside a client's shell-out timeout. On the keyless loopback default it prints the `llamastash` stub, since the proxy ignores the value but clients that demand a non-empty key still need one. `--json` emits `{"api_key", "auth", "base_url"}`.
+Prints the proxy's bearer key on stdout, alone on one line, for client configs that resolve a credential by shelling out and for `$(...)` in scripts. Reads the local config only — no daemon contact, so it stays inside a client's shell-out timeout. On the keyless loopback default it prints the `llamastash` stub, since the proxy ignores the value but clients that demand a non-empty key still need one. `--json` emits `{"api_key", "auth", "base_url"}`; `base_url` is the address a running daemon's proxy listens on (asked with a 2 s limit, never starting a daemon), else the configured one.
 
 ### `llamastash pull <repo>`
 

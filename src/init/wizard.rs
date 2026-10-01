@@ -664,14 +664,20 @@ async fn run_install_step(
     }
   }
   let default = default_install_method(hardware);
-  let driver_major = gh_releases::nvidia_driver_major(hardware);
-  let cuda_label = gh_releases::cuda_asset_suffix(hardware, driver_major)
-    .and_then(|s| gh_releases::cuda_label(&s));
+  let nvidia = {
+    let hw = hardware.clone();
+    tokio::task::spawn_blocking(move || gh_releases::nvidia_gpu(&hw))
+      .await
+      .ok()
+      .flatten()
+  };
+  let cuda_label =
+    gh_releases::cuda_asset_suffix(hardware, nvidia).and_then(|s| gh_releases::cuda_label(&s));
   log::debug!(
-    "init: install step (default={:?}, detected_binary={:?}, nvidia_driver={:?})",
+    "init: install step (default={:?}, detected_binary={:?}, nvidia={:?})",
     default,
     binary.resolved_path,
-    driver_major
+    nvidia
   );
   let choice = prompts::pick_install_method(args, default, binary, cuda_label.as_deref()).await?;
   log::debug!("init: install method chosen: {choice:?}");
@@ -699,15 +705,8 @@ async fn run_install_step(
       let install_root = crate::util::paths::state_dir()
         .ok_or_else(|| CliExit::new(INIT_ABORTED, "no state dir"))?
         .join("llama-cpp");
-      let (install, cuda) = install_gh_release(
-        fetch,
-        hardware,
-        build,
-        driver_major,
-        &install_root,
-        emit_progress,
-      )
-      .await?;
+      let (install, cuda) =
+        install_gh_release(fetch, hardware, build, nvidia, &install_root, emit_progress).await?;
       if !cuda {
         return Ok(install);
       }
@@ -717,7 +716,18 @@ async fn run_install_step(
           eprintln!("{}", colors::warning(msg));
         }
       };
-      match gh_releases::check_cuda_device(&install.path) {
+      let sp =
+        prompts::StepProgress::start_if(emit_progress, "Checking the CUDA build for a CUDA device");
+      let installed = install.path.clone();
+      let check = tokio::task::spawn_blocking(move || gh_releases::check_cuda_device(&installed))
+        .await
+        .unwrap_or_else(|e| gh_releases::CudaCheck::Unknown(e.to_string()));
+      match &check {
+        gh_releases::CudaCheck::Loaded => sp.success("The CUDA build lists a CUDA device"),
+        gh_releases::CudaCheck::NotLoaded => sp.fail("The CUDA build lists no CUDA device"),
+        gh_releases::CudaCheck::Unknown(_) => sp.fail("Could not check the CUDA build"),
+      }
+      match check {
         gh_releases::CudaCheck::Loaded => return Ok(install),
         // A failed probe says nothing about CUDA; dropping a working
         // install over it would waste the download.
@@ -745,7 +755,7 @@ async fn run_install_step(
         fetch,
         hardware,
         GhBuild::Vulkan,
-        driver_major,
+        nvidia,
         &install_root,
         emit_progress,
       )
@@ -782,7 +792,7 @@ async fn install_gh_release(
   fetch: &FetchClient,
   hardware: &HardwareSnapshot,
   build: GhBuild,
-  driver_major: Option<u32>,
+  nvidia: Option<gh_releases::NvidiaGpu>,
   install_root: &std::path::Path,
   emit_progress: bool,
 ) -> Result<(BinaryInstall, bool), CliExit> {
@@ -790,11 +800,11 @@ async fn install_gh_release(
     emit_progress,
     "Querying GitHub Releases for the latest llama.cpp asset",
   );
-  let pick = match gh_releases::fetch_latest_asset(fetch, hardware, build, driver_major).await {
+  let pick = match gh_releases::fetch_latest_asset(fetch, hardware, build, nvidia).await {
     Ok(p) => {
       sp_query.success(format!(
         "Selected GitHub Releases asset `{}` ({})",
-        p.asset_name, p.tag
+        p.archive.asset_name, p.tag
       ));
       p
     }
@@ -805,8 +815,11 @@ async fn install_gh_release(
   };
   let size = crate::init::detection::fmt_bytes(pick.download_bytes());
   let what = match &pick.runtime_libs {
-    Some(libs) => format!("`{}` + `{}`, {size}", pick.asset_name, libs.asset_name),
-    None => format!("`{}`, {size}", pick.asset_name),
+    Some(libs) => format!(
+      "`{}` + `{}`, {size}",
+      pick.archive.asset_name, libs.asset_name
+    ),
+    None => format!("`{}`, {size}", pick.archive.asset_name),
   };
   // The non-interactive paths take the CUDA build without showing the
   // picker's size hint, so the size and the way out go to the log too.

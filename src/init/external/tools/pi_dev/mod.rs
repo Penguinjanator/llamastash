@@ -59,7 +59,8 @@ fn thinking_level_map(effort: &EffortLevels) -> Value {
     },
   );
   for level in PI_LEVELS {
-    let v = if effort.accepts(level) {
+    // Aliases stay hidden: they do the same as the level they map to.
+    let v = if effort.levels.iter().any(|l| l == level) {
       json!(level)
     } else {
       Value::Null
@@ -239,12 +240,14 @@ mod tests {
     let mut ctx = PatchContext::fixture(&["Qwen3.8-27B-UD-Q6_K", "qwen3-coder-30b"]);
     ctx.models[0].effort = Some(EffortLevels {
       levels: vec!["low".into(), "medium".into(), "xhigh".into()],
+      aliases: vec!["high".into()],
       default: Some("xhigh".into()),
       can_disable: true,
     });
     let v = PiDev.build_additions(&ctx);
     let models = &v["providers"]["llamastash"]["models"];
     assert_eq!(models[0]["reasoning"], true);
+    // `high` is an alias of `xhigh`, so it is not offered beside it.
     assert_eq!(
       models[0]["thinkingLevelMap"],
       json!({"off": "none", "minimal": null, "low": "low", "medium": "medium",
@@ -275,6 +278,7 @@ mod tests {
       levels: vec!["low".into(), "high".into()],
       default: None,
       can_disable: false,
+      ..Default::default()
     });
     assert_eq!(map["off"], Value::Null);
     assert_eq!(map["high"], "high");

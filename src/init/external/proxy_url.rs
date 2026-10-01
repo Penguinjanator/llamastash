@@ -54,6 +54,19 @@ pub async fn resolve(cli: &Cli, config: &Config) -> ProxyUrl {
   }
 }
 
+/// The address a running daemon's proxy listens on. Never spawns a
+/// daemon, and waits at most 2 s, for `api-key --json`.
+pub async fn from_running_daemon() -> Option<String> {
+  let dir = crate::util::paths::state_dir()?;
+  crate::daemon::existing_daemon_pid(&dir)?;
+  let mut client = crate::ipc::Client::connect(&dir).await.ok()?;
+  let status = client
+    .call_with_timeout("status", None, std::time::Duration::from_secs(2))
+    .await
+    .ok()?;
+  from_status(&status)
+}
+
 /// The address a `listening` proxy reports in `status`. Any other state
 /// carries the address it tried to bind, which serves nothing.
 fn from_status(status: &Value) -> Option<String> {
@@ -65,7 +78,7 @@ fn from_status(status: &Value) -> Option<String> {
   Some(base_url(addr))
 }
 
-fn from_config(config: &Config) -> String {
+pub fn from_config(config: &Config) -> String {
   base_url(SocketAddr::new(
     config.proxy.effective_host(),
     config.proxy.effective_port(),

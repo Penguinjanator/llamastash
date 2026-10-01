@@ -15,9 +15,13 @@
 use std::path::Path;
 
 /// Levels a client may send as `reasoning_effort`, lowest first.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EffortLevels {
   pub levels: Vec<String>,
+  /// Names the template rewrites to one of `levels` before checking
+  /// (Qwen3.8 turns `high` into `xhigh`). Accepted, but not offered as
+  /// levels of their own, since they do the same as their target.
+  pub aliases: Vec<String>,
   /// The level the template uses when none is sent
   /// (`reasoning_effort|default('xhigh')`), when it names one it accepts.
   pub default: Option<String>,
@@ -31,7 +35,16 @@ const RANK: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
 
 impl EffortLevels {
   pub fn accepts(&self, level: &str) -> bool {
-    self.levels.iter().any(|l| l == level)
+    self.levels.iter().chain(&self.aliases).any(|l| l == level)
+  }
+
+  /// The level that applies when the client sends none: the template's
+  /// default, else its highest.
+  pub fn preferred(&self) -> Option<&str> {
+    self
+      .default
+      .as_deref()
+      .or_else(|| self.levels.last().map(String::as_str))
   }
 }
 
@@ -59,8 +72,10 @@ pub fn from_template(template: &str) -> Option<EffortLevels> {
   let default = whole_word_matches(template, KWARG)
     .find_map(|(i, len)| default_value(&template[i + len..]))
     .filter(|d| levels.contains(d));
+  let aliases = aliases(template, &names, &levels);
   Some(EffortLevels {
     levels,
+    aliases,
     default,
     can_disable: template.contains("enable_thinking"),
   })
@@ -119,10 +134,46 @@ fn default_value(rest: &str) -> Option<String> {
     .strip_prefix("default")?
     .trim_start()
     .strip_prefix('(')?;
-  let rest = rest.trim_start();
-  let quote = rest.chars().next().filter(|c| *c == '\'' || *c == '"')?;
-  let body = &rest[1..];
+  quoted(rest.trim_start())
+}
+
+/// The body of a quoted string at the start of `s`.
+fn quoted(s: &str) -> Option<String> {
+  let quote = s.chars().next().filter(|c| *c == '\'' || *c == '"')?;
+  let body = &s[1..];
   Some(body[..body.find(quote)?].to_string())
+}
+
+/// Names compared with `==` and then set to a listed level in the same
+/// block: `{% if <name> == 'high' %}{% set <name> = 'xhigh' %}`.
+fn aliases(template: &str, names: &[String], levels: &[String]) -> Vec<String> {
+  let mut out: Vec<String> = Vec::new();
+  for name in names {
+    for (i, len) in whole_word_matches(template, name) {
+      let after = &template[i + len..];
+      let Some(alias) = after
+        .trim_start()
+        .strip_prefix("==")
+        .and_then(|r| quoted(r.trim_start()))
+      else {
+        continue;
+      };
+      let block = &after[..after.find("endif").unwrap_or(after.len())];
+      let rewrites = whole_word_matches(block, "set").any(|(j, l)| {
+        let target = block[j + l..].trim_start();
+        target
+          .strip_prefix(name.as_str())
+          .filter(|r| !r.bytes().next().is_some_and(is_ident))
+          .and_then(|r| r.trim_start().strip_prefix('='))
+          .and_then(|r| quoted(r.trim_start()))
+          .is_some_and(|t| levels.contains(&t))
+      });
+      if rewrites && !levels.contains(&alias) && !out.contains(&alias) {
+        out.push(alias);
+      }
+    }
+  }
+  out
 }
 
 /// `rest` starts right after a `reasoning_effort` token. Returns the
@@ -193,7 +244,11 @@ mod tests {
     assert_eq!(e.levels, vec!["low", "medium", "xhigh"]);
     assert_eq!(e.default.as_deref(), Some("xhigh"));
     assert!(e.can_disable);
-    assert!(!e.accepts("high"));
+    // The template turns `high` into `xhigh`, so it is accepted but not
+    // offered beside it.
+    assert_eq!(e.aliases, vec!["high"]);
+    assert!(e.accepts("high"));
+    assert!(!e.accepts("minimal"));
   }
 
   #[test]

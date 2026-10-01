@@ -172,6 +172,7 @@ mod tests {
       levels: vec!["low".into(), "medium".into(), "xhigh".into()],
       default: Some("xhigh".into()),
       can_disable: true,
+      ..Default::default()
     });
     let v = OpenCode.build_additions(&ctx);
     let models = &v["provider"]["llamastash"]["models"];

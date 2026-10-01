@@ -58,9 +58,19 @@ fn current_effort(current: &str) -> Option<String> {
     .take_while(|l| !l.starts_with('['))
     .find_map(|l| {
       let value = l.strip_prefix("model_reasoning_effort")?.trim_start();
-      let value = value.strip_prefix('=')?.trim();
-      Some(value.strip_prefix('"')?.strip_suffix('"')?.to_string())
+      toml_string_value(value.strip_prefix('=')?.trim_start())
     })
+}
+
+/// A basic (`"x"`) or literal (`'x'`) TOML string filling the rest of a
+/// line, with an optional trailing comment. Escapes are not decoded; no
+/// level name has one.
+fn toml_string_value(v: &str) -> Option<String> {
+  let quote = v.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+  let body = &v[1..];
+  let end = body.find(quote)?;
+  let tail = body[end + 1..].trim_start();
+  (tail.is_empty() || tail.starts_with('#')).then(|| body[..end].to_string())
 }
 
 /// The level to write: the user's, when the model accepts it, else the
@@ -70,8 +80,7 @@ fn effort_to_write(effort: &EffortLevels, current: Option<&str>) -> Option<Strin
   current
     .and_then(current_effort)
     .filter(|l| accepted(l))
-    .or_else(|| effort.default.clone())
-    .or_else(|| effort.levels.last().cloned())
+    .or_else(|| effort.preferred().map(str::to_string))
 }
 
 impl ToolPatcher for Codex {
@@ -167,6 +176,7 @@ mod tests {
     let mut ctx = PatchContext::fixture(&["Qwen3.8-27B-UD-Q6_K"]);
     ctx.models[0].effort = Some(EffortLevels {
       levels: vec!["low".into(), "medium".into(), "xhigh".into()],
+      aliases: vec!["high".into()],
       default: Some("xhigh".into()),
       can_disable: true,
     });
@@ -195,6 +205,21 @@ mod tests {
       .raw_body_from(&ctx, Some(off))
       .unwrap()
       .contains("model_reasoning_effort = \"none\"\n"));
+    for kept in [
+      "model_reasoning_effort = \"medium\"  # set by hand\n",
+      "model_reasoning_effort = 'medium'\n",
+    ] {
+      assert!(Codex
+        .raw_body_from(&ctx, Some(kept))
+        .unwrap()
+        .contains("model_reasoning_effort = \"medium\"\n"));
+    }
+    // An alias the template rewrites is accepted too.
+    let alias = "model_reasoning_effort = \"high\"\n";
+    assert!(Codex
+      .raw_body_from(&ctx, Some(alias))
+      .unwrap()
+      .contains("model_reasoning_effort = \"high\"\n"));
     // A level the template rejects falls back to the default.
     let rejected = "model_reasoning_effort = \"minimal\"\n";
     assert!(Codex

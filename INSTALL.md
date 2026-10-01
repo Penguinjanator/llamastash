@@ -133,7 +133,7 @@ The bucket repo at [`llamastash/scoop-llamastash`](https://github.com/llamastash
 xattr -d com.apple.quarantine ./llamastash
 ```
 
-**Linux.** All paths work. GPU detection covers NVIDIA (NVML), AMD (rocm-smi), and Vulkan. `init` will install the right `llama-server` variant for whichever it finds. On NVIDIA that is llama.cpp's CUDA build plus its CUDA runtime libraries (no CUDA toolkit needed) when the driver is 525 or newer and no AMD card sits beside it, else the Vulkan build; see [Linux + NVIDIA](docs/usage.md#linux--nvidia-cuda-or-vulkan).
+**Linux.** All paths work. GPU detection covers NVIDIA (NVML), AMD (rocm-smi), and Vulkan. `init` will install the right `llama-server` variant for whichever it finds. On NVIDIA that is llama.cpp's CUDA build plus its CUDA runtime libraries (no CUDA toolkit needed) when the driver is 525 or newer and no AMD card sits beside it (CUDA 13 on driver 580+ with a Turing or newer card, else CUDA 12), else the Vulkan build; see [Linux + NVIDIA](docs/usage.md#linux--nvidia-cuda-or-vulkan).
 
 **Arch Linux.** Prefer the AUR (`yay -S llamastash` / `llamastash-bin` / `llamastash-git`) so updates ride pacman. The install-script path also works if you'd rather not pull in an AUR helper.
 

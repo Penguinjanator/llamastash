@@ -40,11 +40,7 @@ const ZED_LEVELS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh
 /// The template's default level, else its highest; `None` when Zed has
 /// no name for it.
 fn default_effort(effort: &EffortLevels) -> Option<&str> {
-  effort
-    .default
-    .as_deref()
-    .or_else(|| effort.levels.last().map(String::as_str))
-    .filter(|l| ZED_LEVELS.contains(l))
+  effort.preferred().filter(|l| ZED_LEVELS.contains(l))
 }
 
 impl ToolPatcher for Zed {
@@ -134,6 +130,7 @@ mod tests {
       levels: vec!["low".into(), "medium".into(), "xhigh".into()],
       default: Some("xhigh".into()),
       can_disable: true,
+      ..Default::default()
     });
     let v = Zed.build_additions(&ctx);
     let models = &v["language_models"]["openai_compatible"]["LlamaStash"]["available_models"];
@@ -160,6 +157,7 @@ mod tests {
       levels: vec!["fast".into(), "deep".into()],
       default: None,
       can_disable: false,
+      ..Default::default()
     };
     assert_eq!(default_effort(&odd), None);
   }
