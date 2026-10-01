@@ -60,7 +60,7 @@ Inline `#[cfg(test)] mod tests` per file is the default; `tests/` for daemon-spa
 
 Every command's output lands in context. Don't pay twice for the same check.
 
-- **Git hooks run the gates.** pre-commit: `cargo fmt` + `make lint` + `make doc`. pre-push: the same plus `cargo test --features test-fixtures`. Both skip when no Rust file changed. Don't run these by hand before a commit or push; read the hook output only when it fails.
+- **Git hooks run the gates.** pre-commit: `cargo fmt` + `make lint` + `make doc`. pre-push: the same plus `cargo nextest run` and doctests, with `test-fixtures`. Both skip when no Rust file changed. Don't run these by hand before a commit or push; read the hook output only when it fails.
 - **While coding, run the narrowest check:** `cargo check`, one test by name, or one `--test <name>` binary. Batch edits, then check once. No full `make test` after each edit; pre-push runs it.
 - **Reviews start from CI.** `gh pr checks <n>` or `gh run list -c <sha>` for the head commit. Green: don't re-run fmt, clippy, or tests locally; review the diff. Red: `gh run view <id> --log-failed`, reproduce only that job. Pending: `gh pr checks <n> --watch`, don't race it locally.
 - **Filter output.** `2>&1 | tail -n 40` or `rg 'FAILED|panicked|^error'` on cargo runs; `gh ... --json <fields> --jq` instead of full dumps.
