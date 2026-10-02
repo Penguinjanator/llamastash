@@ -50,18 +50,39 @@ gufo_argv() {
 }
 
 # --- halogen knobs -----------------------------------------------------------
+# Defaults here reproduce the live container's env exactly, read with
+# `docker inspect llamastash-halogen-41103`, so a measurement against this file
+# measures the shipping config rather than a guess at it.
 
-HALO_BINARY=ghcr.io/peonist-ai/halogen-flash-server:latest
-# ngram.hgn trades the MTP head for an n-gram drafter; v2 is the 4.16 bpw export.
+HALO_BINARY=ghcr.io/peonist-ai/halogen-flash-server
+# ngram.hgn is v2's lookup table, not an alternative checkpoint. The n-gram knob
+# is HALO_NGRAM below.
 HALO_REPO=models--peonist-ai--halogen-qwen3.8-flash-next
 HALO_CHECKPOINT_NAME=qwen38-flash-next-v2.hgn
+HALO_IMAGE_VERSION=0.15.1
 HALO_SLOTS=4
 HALO_CTX=262144
+# Default would be 2x ctx. Live runs 1x on purpose: the pool takes RAM the 47 GiB
+# n-gram table's page cache would otherwise keep.
 HALO_KV_POOL=262144
 HALO_MAX_TOK=32768
-HALO_MTP_DEPTH=1
+HALO_PREFILL_CHUNK=32768
+HALO_MAX_TOKENS_DEFAULT=16384
+HALO_MAX_TOKENS_CAP=65536
+# Docs: 2 best all-round, 3 better for code, 5-8% worse on agent/prose.
+HALO_MTP_DEPTH=3
+# Prompt lookup as N,K. Vendor's headline decode number includes it.
 HALO_NGRAM=3
 HALO_NGRAM_CHAIN=3
+# MTP adaptive policy W,floor,R: drop the head for R tokens when a W-round window
+# falls under floor acceptance. 0 never adapts.
+HALO_SPEC_ADAPT="32,0.35,64"
+# Prompt-cache mode. 2 resumes anywhere; NUMERIC, so it is out of the speed sweep.
+HALO_PROMPT_CACHE=2
+# Kernel selection. The baked plan was tuned on the vendor's ~85 W reference box.
+HALO_MATMUL_ALGOS=1
+HALO_MATMUL_TUNING_FILE=/opt/halogen/flash-tune.plan
+HALO_ATTN_FA=64
 
 halo_argv() {
   local snap host_ck
@@ -83,13 +104,21 @@ halo_argv() {
     -e "HALOGEN_TOKENIZER=/hub/$HALO_REPO/snapshots/$snap/tokenizer" \
     -e "HALOGEN_CTX=$HALO_CTX" \
     -e "HALOGEN_KV_POOL_POSITIONS=$HALO_KV_POOL" \
-    -e "HALOGEN_MAX_TOKENS_DEFAULT=$HALO_MAX_TOK" \
+    -e "HALOGEN_KV_SLOTS=$HALO_SLOTS" \
+    -e "HALOGEN_MAX_TOK=$HALO_MAX_TOK" \
+    -e "HALOGEN_PREFILL_CHUNK=$HALO_PREFILL_CHUNK" \
+    -e "HALOGEN_MAX_TOKENS_DEFAULT=$HALO_MAX_TOKENS_DEFAULT" \
+    -e "HALOGEN_MAX_TOKENS_CAP=$HALO_MAX_TOKENS_CAP" \
     -e "HALOGEN_MTP_DEPTH=$HALO_MTP_DEPTH" \
-    -e "HALOGEN_NGRAM=$HALO_NGRAM" \
-    -e "HALOGEN_NGRAM_CHAIN=$HALO_NGRAM_CHAIN" \
+    -e "HALOGEN_PLD=$HALO_NGRAM,$HALO_NGRAM_CHAIN" \
+    -e "HALOGEN_SPEC_ADAPT=$HALO_SPEC_ADAPT" \
+    -e "HALOGEN_PROMPT_CACHE=$HALO_PROMPT_CACHE" \
+    -e "HALOGEN_MATMUL_ALGOS=$HALO_MATMUL_ALGOS" \
+    -e "HALOGEN_MATMUL_TUNING_FILE=$HALO_MATMUL_TUNING_FILE" \
+    -e "HALOGEN_ATTN_FA=$HALO_ATTN_FA" \
     -e HALOGEN_TOP_P="$TOP_P" \
     -e HALOGEN_TOP_K="$TOP_K" \
-    "$HALO_BINARY"
+    "${HALO_BINARY}:${HALO_IMAGE_VERSION}"
 }
 
 # One line describing the live config, used as the restart key.

@@ -41,8 +41,10 @@ REPS=3 DEEP=32768 ./.auto/measure.sh   # confirmation run, adds a ~22k depth rep
 one model load, a no-op edit costs nothing. A measurement is ~3 min once the
 engine is warm; an engine switch is far more.
 
-Baseline, halogen at its shipping config (`ctx 262144`, `kv_pool 262144`,
-`slots 4`, `max_tok 32768`, MTP depth 1), power state 55 W / `performance`:
+Baseline, halogen 0.15.1 at the live config (`ctx 262144`, `kv_pool 262144`,
+`slots 4`, `max_tok 32768`, `prefill_chunk 32768`, **`mtp_depth 3`**, prompt
+lookup `3,3`, spec-adapt `32,0.35,64`, prompt_cache 2, matmul plan baked in),
+power state 55 W / `performance`:
 
 | metric | value |
 |---|---|
@@ -133,4 +135,16 @@ Things the harness already had to learn the hard way, so they are not re-learned
 
 ## Ideas not yet tried
 
-Tracked in `.auto/ideas.md`.
+Shortlist from web research, with sources, is in `.auto/ideas.md`. Three things
+there change how to read every number in this file:
+
+- The vendor's reference machine is measured at **~85 W sustained** and names the
+  power envelope and the IOMMU setting as the two cross-machine differences.
+  This box is at 55 W with IOMMU on, which is most of the gap to the published
+  1,584 prefill / 46.0 decode.
+- Upstream halogen is **0.16.1** and ships "decode is faster on both
+  checkpoints". Any sweep should re-baseline after an image bump.
+- llama.cpp issue #27856: on HIP/gfx1151 decode fell 19-21 to 5.5-6.1 t/s past
+  ~1K context (CPU fallback for `ggml_top_k` above 1024 columns), fixed by PR
+  #27466 on 2026-08-31; Vulkan was never affected. Any gufo decode number needs
+  a depth curve before it is believed.
