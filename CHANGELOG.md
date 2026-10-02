@@ -4,6 +4,10 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-10-02
+
+A patch release for `integrations`. It keeps the key order of the tool configs it edits instead of sorting them, and a generic entry like Halogen can now declare the image input and reasoning effort levels it accepts, so pi, OpenCode, Zed and Codex get them like they do for a GGUF model.
+
 ### Added
 
 - A generic entry without `model` can declare `vision: true`, `reasoning_effort: [...]` and `reasoning_effort_default`, so `integrations` gives it image input and effort levels in pi, OpenCode, Zed and Codex like a GGUF model.
@@ -11,6 +15,10 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 ### Fixed
 
 - `integrations` keeps the key order of the tool configs it edits instead of sorting every key alphabetically, and writes pi's thinking levels and OpenCode's effort variants lowest first. OpenCode's model list is replaced on a re-run, like pi's, so unfavorited models and renamed presets no longer stay in it forever.
+
+### Contributors
+
+- [@deepu105](https://github.com/deepu105): everything
 
 ## [0.6.0] — 2026-10-01
 
