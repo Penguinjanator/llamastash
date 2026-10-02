@@ -77,3 +77,27 @@ Python client tops out near 700 req/s on `models`, so run several processes in
 parallel and read the daemon's CPU time per request
 (`/proc/<daemon pid>/stat`) rather than req/s alone. Use it to compare two
 daemon builds on the same upstream, alternating builds between rounds.
+
+## `qwen38-flash-speed/` — Qwen3.8-Flash-Next engine and knob comparison
+
+```sh
+ENGINE=halogen ./scripts/bench/qwen38-flash-speed/serve.sh ensure
+REPS=3 ./.auto/measure.sh
+python3 scripts/bench/qwen38-flash-speed/bench.py --base http://127.0.0.1:41103 \
+    --model <id> --engine halogen --reps 3 --deep-tokens 32768
+```
+
+Drives gufo (GGUF) and halogen (`.hgn`) through the same OpenAI surface, because
+the point is comparing them and each reports timings under its own keys. Reads
+the engine's own decode-window rate rather than wall clock, always runs behind a
+real `src/**/*.rs` corpus prefix — decode at an empty context is a different
+machine — and pins `finish=length` so the rate's denominator cannot drift. Each
+rep gets a disjoint corpus slice and a unique first line: both engines keep
+prompt prefixes across processes, and a warm rep reports a prefill rate that
+measures the cache. `serve.sh` hashes the knob file and restarts only on a real
+change, and refuses to load a second engine while anything else holds the GPU.
+
+Engine choice and every launch knob live in `engine.sh`; that file is the write
+target of the autoresearch session recorded in `.auto/`. See
+`.auto/prompt.md` for the workload, the baseline, and the power state a number is
+only comparable within.

@@ -23,4 +23,7 @@ VP_VULKANINFO_*.json
 /backends/
 
 # skip local bench scripts
-scripts/bench/local/
+.auto/*
+!.auto/prompt.md
+!.auto/ideas.md
+scripts/bench/local/.auto/
