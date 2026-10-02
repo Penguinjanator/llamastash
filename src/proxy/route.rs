@@ -27,6 +27,7 @@ use hyper::body::{Bytes, Incoming};
 
 use crate::daemon::registry::LaunchId;
 use crate::daemon::supervisor::ManagedState;
+use crate::discovery::catalog::catalog_row;
 use crate::discovery::DiscoveredModel;
 use crate::gguf::identity::ModelId;
 use crate::launch::resolve::{
@@ -257,7 +258,7 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
   // `cli::resolve::fetch_catalog` round-trips through IPC, which
   // we explicitly want to avoid on the hot path.
   let snap = state.ctx.catalog.snapshot().await;
-  let rows: Vec<CatalogRow> = snap.iter().map(catalog_row_from_discovered).collect();
+  let rows: Vec<CatalogRow> = snap.iter().map(catalog_row).collect();
 
   // D2 fail-safe: try the whole reference first so a model file whose name
   // contains `@` (e.g. `foo@bar.gguf`) resolves as a plain model reference.
@@ -544,75 +545,6 @@ pub(crate) async fn would_route_backend(
     launch_mode,
     &state.ctx,
   ))
-}
-
-pub(crate) fn catalog_row_from_discovered(m: &DiscoveredModel) -> CatalogRow {
-  let path = m.path.to_string_lossy().into_owned();
-  let parent = m.parent.to_string_lossy().into_owned();
-  let arch = m.metadata.as_ref().and_then(|md| md.arch.clone());
-  let quant = m.metadata.as_ref().map(|md| md.quant_display());
-  let native_ctx = m.metadata.as_ref().and_then(|md| md.native_ctx);
-  let parameter_label = m
-    .metadata
-    .as_ref()
-    .and_then(|md| md.parameter_label.clone());
-  let weights_bytes = m.metadata.as_ref().and_then(|md| md.weights_bytes);
-  let has_chat_template = m
-    .metadata
-    .as_ref()
-    .map(|md| md.chat_template.is_some())
-    .unwrap_or(false);
-  let has_reasoning_hint = m
-    .metadata
-    .as_ref()
-    .map(|md| md.reasoning_hint)
-    .unwrap_or(false);
-  let tokenizer_kind = m.metadata.as_ref().and_then(|md| md.tokenizer_kind.clone());
-  let total_parameters = m.metadata.as_ref().and_then(|md| md.total_parameters);
-  // Surface the GGUF-derived mode hint to the proxy so auto-start
-  // composes the right `llama-server` argv (embedding / rerank
-  // builds need the `--embeddings` / `--rerank` flag set up front;
-  // chat builds need it absent). Without this the proxy defaulted
-  // every auto-start to chat mode and any `POST /v1/embeddings`
-  // call against an embedding-only model returned a 501 from
-  // `llama-server` ("This server does not support embeddings").
-  let mode_hint = m
-    .metadata
-    .as_ref()
-    .and_then(|md| md.mode_hint.as_label())
-    .map(str::to_string);
-  CatalogRow {
-    path,
-    model_id: None,
-    parent,
-    source: m.source.label().to_string(),
-    arch,
-    quant,
-    native_ctx,
-    mode_hint,
-    parameter_label,
-    weights_bytes,
-    display_label: m.display_label.clone(),
-    parse_error: m.parse_error.clone(),
-    split_siblings: m
-      .split_siblings
-      .iter()
-      .map(|p| p.to_string_lossy().into_owned())
-      .collect(),
-    has_chat_template,
-    has_reasoning_hint,
-    tokenizer_kind,
-    total_parameters,
-    backend: None,
-    supported_backends: m.supported_backends.clone(),
-    multimodal: m.multimodal,
-    mtp: m
-      .mtp_capable()
-      .then(|| crate::launch::resolve::MtpCapability {
-        embedded_layers: m.metadata.as_ref().and_then(|md| md.mtp),
-        separate_head: m.mtp_head.is_some(),
-      }),
-  }
 }
 
 /// Compare a `ModelId::path` (PathBuf) with a `CatalogRow::path`
@@ -952,8 +884,7 @@ mod tests {
   // returned a 501 from `llama-server` — the proxy auto-start dropped
   // the GGUF-derived mode hint and the supervisor defaulted to chat
   // mode (no `--embeddings` flag in the composed argv).
-  #[allow(unused_imports)]
-  use super::catalog_row_from_discovered;
+  use crate::discovery::catalog::catalog_row;
   use crate::discovery::DiscoveredModel;
   use crate::gguf::metadata::{ModeHint, ModelMetadata};
 
@@ -989,7 +920,7 @@ mod tests {
   #[test]
   fn catalog_row_propagates_embedding_mode_hint_to_proxy() {
     let m = discovered_with_mode(ModeHint::Embedding);
-    let row = catalog_row_from_discovered(&m);
+    let row = catalog_row(&m);
     assert_eq!(
       row.mode_hint.as_deref(),
       Some("embedding"),
@@ -1000,25 +931,24 @@ mod tests {
   #[test]
   fn catalog_row_propagates_rerank_mode_hint_to_proxy() {
     let m = discovered_with_mode(ModeHint::Rerank);
-    let row = catalog_row_from_discovered(&m);
+    let row = catalog_row(&m);
     assert_eq!(row.mode_hint.as_deref(), Some("rerank"));
   }
 
   #[test]
   fn catalog_row_propagates_chat_mode_hint_to_proxy() {
     let m = discovered_with_mode(ModeHint::Chat);
-    let row = catalog_row_from_discovered(&m);
+    let row = catalog_row(&m);
     assert_eq!(row.mode_hint.as_deref(), Some("chat"));
   }
 
   #[test]
-  fn catalog_row_leaves_unknown_mode_hint_as_none() {
-    // Unknown stays None so the compose_and_spawn default (chat) is
-    // what kicks in — same posture as before the propagation patch
-    // when the GGUF carried no signal.
+  fn catalog_row_labels_unknown_mode_hint() {
+    // `launch_mode_from_hint` reads `unknown` as no hint, so auto-start
+    // keeps the chat default when the GGUF carried no signal.
     let m = discovered_with_mode(ModeHint::Unknown);
-    let row = catalog_row_from_discovered(&m);
-    assert_eq!(row.mode_hint, None);
+    let row = catalog_row(&m);
+    assert_eq!(row.mode_hint.as_deref(), Some("unknown"));
   }
 
   // ─── served-by name resolution ──────────────────────────────────
@@ -1030,7 +960,7 @@ mod tests {
     // so the `x-llamastash-served-by` header is readable.
     let mut m = discovered_with_mode(ModeHint::Chat);
     m.display_label = Some("gemma3:4b".to_string());
-    let labelled = catalog_row_from_discovered(&m);
+    let labelled = catalog_row(&m);
     assert_eq!(served_name_for_row(&labelled), "gemma3:4b");
 
     // Without a display_label the served name derives from the file
@@ -1038,7 +968,7 @@ mod tests {
     let mut plain = discovered_with_mode(ModeHint::Chat);
     plain.display_label = None;
     plain.path = std::path::PathBuf::from("/models/Qwen3-7B-Q4_K_M.gguf");
-    let stem_row = catalog_row_from_discovered(&plain);
+    let stem_row = catalog_row(&plain);
     assert_eq!(served_name_for_row(&stem_row), "Qwen3-7B-Q4_K_M");
   }
 

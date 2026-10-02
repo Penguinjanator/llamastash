@@ -644,7 +644,7 @@ mod tests {
     );
     let patch = |name: &str| {
       let row = GenericBackend::catalog_row(&entry_named(name).unwrap().server);
-      let row = crate::proxy::route::catalog_row_from_discovered(&row);
+      let row = crate::discovery::catalog::catalog_row(&row);
       crate::init::external::PatchModel::from_catalog_row(&row, name.to_string())
     };
     let both = patch("ve-both");

@@ -75,28 +75,34 @@ impl ModelCatalog {
   /// serde impl — this only maps `DiscoveredModel` → `CatalogRow`.
   pub async fn to_list_response(&self, available_routed: &BTreeSet<String>) -> Value {
     let snap = self.snapshot().await;
-    let rows: Vec<CatalogRow> = snap
-      .iter()
-      .map(|m| catalog_row(m, available_routed))
-      .collect();
+    let rows: Vec<CatalogRow> = snap.iter().map(|m| list_row(m, available_routed)).collect();
     json!({ "models": rows })
   }
 }
 
-/// Map one `DiscoveredModel` into the transport-agnostic [`CatalogRow`]. All
-/// JSON shaping lives in `CatalogRow`'s serde impl (the single definition of
-/// the `list_models` wire shape, which agents pin against); this is the only
-/// `DiscoveredModel` → row projection in the tree.
-fn catalog_row(m: &DiscoveredModel, available_routed: &BTreeSet<String>) -> CatalogRow {
-  let md = m.metadata.as_ref();
-  // Primary backend badge (R14 / R13 routing): the highest-priority supported
-  // backend that is available, else the source's default. Names no backend.
+/// A `list_models` row: [`catalog_row`] plus the primary backend badge
+/// (R14 / R13 routing), the highest-priority supported backend that is
+/// available, else the source's default. Names no backend.
+fn list_row(m: &DiscoveredModel, available_routed: &BTreeSet<String>) -> CatalogRow {
   let backend = m
     .supported_backends
     .iter()
     .find(|rb| available_routed.contains(*rb))
     .cloned()
     .unwrap_or_else(|| m.source.backend_id().to_string());
+  CatalogRow {
+    backend: Some(backend),
+    ..catalog_row(m)
+  }
+}
+
+/// Map one `DiscoveredModel` into the transport-agnostic [`CatalogRow`]. All
+/// JSON shaping lives in `CatalogRow`'s serde impl (the single definition of
+/// the `list_models` wire shape, which agents pin against); this is the only
+/// `DiscoveredModel` → row projection in the tree. `backend` is left unset:
+/// only `list_models` shows it.
+pub(crate) fn catalog_row(m: &DiscoveredModel) -> CatalogRow {
+  let md = m.metadata.as_ref();
   CatalogRow {
     path: m.path.to_string_lossy().into_owned(),
     model_id: None,
@@ -122,7 +128,7 @@ fn catalog_row(m: &DiscoveredModel, available_routed: &BTreeSet<String>) -> Cata
     has_reasoning_hint: md.map(|d| d.reasoning_hint).unwrap_or(false),
     tokenizer_kind: md.and_then(|d| d.tokenizer_kind.clone()),
     total_parameters: md.and_then(|d| d.total_parameters),
-    backend: Some(backend),
+    backend: None,
     supported_backends: m.supported_backends.clone(),
     multimodal: m.multimodal,
     mtp: m.mtp_capable().then(|| MtpCapability {
@@ -178,9 +184,9 @@ mod tests {
   }
 
   /// The `list_models` wire `Value` for one model — via the real
-  /// `catalog_row` → `CatalogRow` serde path the daemon uses.
+  /// `list_row` → `CatalogRow` serde path the daemon uses.
   fn row_json(m: &DiscoveredModel, available_routed: &BTreeSet<String>) -> Value {
-    serde_json::to_value(catalog_row(m, available_routed)).unwrap()
+    serde_json::to_value(list_row(m, available_routed)).unwrap()
   }
 
   #[test]

@@ -636,7 +636,7 @@ async fn ollama_show(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyRes
   let snap = state.ctx.catalog.snapshot().await;
   let rows: Vec<CatalogRow> = snap
     .iter()
-    .map(route::catalog_row_from_discovered)
+    .map(crate::discovery::catalog::catalog_row)
     .collect::<Vec<_>>();
   match resolve_model_with_candidates(&rows, &reference) {
     Ok(resolved) => {
