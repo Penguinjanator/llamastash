@@ -278,9 +278,8 @@ pub(crate) fn render_value(value: &YamlValue) -> Result<String, WriteError> {
 /// Render any serializable value as a compact single-line flow token. JSON is
 /// valid single-line YAML flow with faithful typing/quoting (a numeric-looking
 /// string like `"10000"` stays quoted), so this is the single place the
-/// "compact JSON ≡ flow YAML" encoding lives — shared by [`render_value`] (for
-/// nested seq / map leaves) and the presets writer, which builds its body as a
-/// `serde_json::Value` (its sorted-key map gives stable on-disk output).
+/// "compact JSON ≡ flow YAML" encoding lives, used by [`render_value`] for
+/// nested seq / map leaves. Keys are written in the value's own order.
 pub(crate) fn render_flow_json(value: &impl serde::Serialize) -> Result<String, WriteError> {
   serde_json::to_string(value).map_err(|e| WriteError::Serialise(e.to_string()))
 }
