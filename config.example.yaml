@@ -709,6 +709,11 @@ backend:
         # params: 80B
         # quant: Q4_K_M
         # ctx: 262144
+        # What the server accepts, for `integrations` and the TUI. Only
+        # without `model`; not checked against the server.
+        # vision: true                     # takes image input
+        # reasoning_effort: [low, medium, xhigh]   # also marks it a reasoning model
+        # reasoning_effort_default: medium  # what the server uses when none is sent
 
 # ─── Keybindings ──────────────────────────────────────────────────
 #

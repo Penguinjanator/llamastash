@@ -126,7 +126,7 @@ impl GenericBackend {
         native_ctx: server.row_ctx(),
         chat_template: None,
         tokenizer_kind: None,
-        reasoning_hint: false,
+        reasoning_hint: !server.reasoning_effort.is_empty(),
         mode_hint: match server.modes.first() {
           Some(LaunchMode::Embedding) => ModeHint::Embedding,
           Some(LaunchMode::Rerank) => ModeHint::Rerank,
@@ -141,7 +141,10 @@ impl GenericBackend {
       parse_error: None,
       split_siblings: Vec::new(),
       display_label: Some(server.name.clone()),
-      multimodal: None,
+      multimodal: server.vision.then_some(crate::discovery::Multimodal {
+        vision: true,
+        audio: false,
+      }),
       supported_backends: vec![GENERIC_BACKEND_ID.to_string()],
       mtp_head: None,
     }
@@ -287,6 +290,15 @@ impl Backend for GenericBackend {
   ) -> bool {
     entry_for_launch(path, server)
       .is_none_or(|e| e.server.modes.is_empty() || e.server.modes.contains(&mode))
+  }
+
+  fn config_effort(&self, path: &Path) -> super::DeclaredEffort {
+    entry_for_path(path)
+      .map(|e| super::DeclaredEffort {
+        levels: e.server.reasoning_effort.clone(),
+        default: e.server.reasoning_effort_default.clone(),
+      })
+      .unwrap_or_default()
   }
 
   fn config_default_knobs(&self, path: &Path, server: Option<&str>) -> KnobSet {
@@ -616,6 +628,40 @@ mod tests {
     let none = md("info-none");
     assert_eq!(none.arch, None);
     assert_eq!(none.native_ctx, None);
+  }
+
+  /// `vision` and `reasoning_effort` mark the row the way a GGUF's projector
+  /// and chat template would, and `integrations` gets the declared levels.
+  /// `[none]` alone marks a reasoning model with no levels to pick.
+  #[test]
+  fn declared_vision_and_effort_reach_integrations() {
+    install(
+      "servers:\n  \
+       - {name: ve-both, binary: /b, ready: /h, vision: true, reasoning_effort: [xhigh, none, low, medium], reasoning_effort_default: medium}\n  \
+       - {name: ve-top, binary: /b, ready: /h, reasoning_effort: [low, xhigh]}\n  \
+       - {name: ve-off, binary: /b, ready: /h, reasoning_effort: [none]}\n  \
+       - {name: ve-none, binary: /b, ready: /h}\n",
+    );
+    let patch = |name: &str| {
+      let row = GenericBackend::catalog_row(&entry_named(name).unwrap().server);
+      let row = crate::proxy::route::catalog_row_from_discovered(&row);
+      crate::init::external::PatchModel::from_catalog_row(&row, name.to_string())
+    };
+    let both = patch("ve-both");
+    assert!(both.reasoning && both.vision);
+    let effort = both.effort.unwrap();
+    assert_eq!(effort.levels, ["low", "medium", "xhigh"]);
+    assert!(effort.can_disable);
+    assert_eq!(effort.preferred(), Some("medium"));
+    assert_eq!(patch("ve-top").effort.unwrap().preferred(), Some("xhigh"));
+    let off = patch("ve-off");
+    assert!(off.reasoning && off.effort.is_none());
+    let none = patch("ve-none");
+    assert!(!none.reasoning && !none.vision && none.effort.is_none());
+    assert_eq!(
+      crate::backend::config_effort(Path::new("/m/Some-Q4.gguf")),
+      super::super::DeclaredEffort::default()
+    );
   }
 
   /// `integrations` declares this as a favorite's context when no default

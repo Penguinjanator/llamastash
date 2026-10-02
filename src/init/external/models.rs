@@ -117,10 +117,7 @@ impl Catalog {
     id: &str,
     presets: &BTreeMap<String, ConfigPresetBlock>,
   ) -> Vec<PatchModel> {
-    let mut base = PatchModel::from_catalog_row(row, id.to_string());
-    if row.has_reasoning_hint {
-      base.effort = crate::init::external::effort::from_gguf(Path::new(&row.path)).1;
-    }
+    let base = PatchModel::from_catalog_row(row, id.to_string());
     let path = Path::new(&row.path);
     let context = |preset_ctx: Option<u32>, server: Option<&str>| {
       preset_ctx

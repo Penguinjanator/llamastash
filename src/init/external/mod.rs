@@ -97,9 +97,9 @@ pub struct PatchModel {
   pub context_window: Option<u64>,
   /// The model emits reasoning (a `<think>` token in its GGUF).
   pub reasoning: bool,
-  /// Reasoning-effort levels the chat template accepts, for a reasoning
-  /// model whose template lists them. Patchers write effort controls
-  /// only when this is set.
+  /// Reasoning-effort levels the model accepts, for a reasoning model whose
+  /// chat template lists them or whose config entry declares them. Patchers
+  /// write effort controls only when this is set.
   pub effort: Option<effort::EffortLevels>,
   /// The model has a vision projector, so it takes images.
   pub vision: bool,
@@ -137,7 +137,8 @@ impl PatchModel {
 
   /// Project a catalog row under the id the proxy publishes it as. Prefers
   /// the parsed `mode_hint` over the name heuristic — a header that says
-  /// `embedding` is not a guess.
+  /// `embedding` is not a guess. A reasoning row's effort levels come from
+  /// its chat template, else from what its config entry declares.
   ///
   /// `id` is passed in rather than read off the row because
   /// disambiguating a shared basename takes the whole catalog
@@ -148,12 +149,21 @@ impl PatchModel {
       Some(hint) => hint == "embedding",
       None => Self::from_id(id.clone()).is_embed,
     };
+    let path = std::path::Path::new(&row.path);
+    let levels = if row.has_reasoning_hint {
+      effort::from_gguf(path).1.or_else(|| {
+        let declared = crate::backend::config_effort(path);
+        effort::declared(&declared.levels, declared.default.as_deref())
+      })
+    } else {
+      None
+    };
     Self {
       id,
       is_embed,
       context_window: row.native_ctx,
       reasoning: row.has_reasoning_hint,
-      effort: None,
+      effort: levels,
       vision: row.multimodal.is_some_and(|m| m.vision),
     }
   }

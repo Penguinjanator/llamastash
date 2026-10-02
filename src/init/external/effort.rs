@@ -200,6 +200,27 @@ fn validated_list(rest: &str) -> Option<Vec<String>> {
   (!levels.is_empty()).then_some(levels)
 }
 
+/// Levels config declares for a model with no chat template, ranked like a
+/// template's list. `none` turns thinking off instead of being a level.
+pub fn declared(names: &[String], default: Option<&str>) -> Option<EffortLevels> {
+  let mut levels: Vec<String> = Vec::new();
+  for name in names.iter().filter(|n| n.as_str() != "none") {
+    if !levels.contains(name) {
+      levels.push(name.clone());
+    }
+  }
+  levels.sort_by_key(|l| RANK.iter().position(|r| r == l).unwrap_or(RANK.len()));
+  let default = default
+    .filter(|d| levels.iter().any(|l| l == d))
+    .map(str::to_string);
+  (!levels.is_empty()).then(|| EffortLevels {
+    levels,
+    aliases: Vec::new(),
+    default,
+    can_disable: names.iter().any(|n| n == "none"),
+  })
+}
+
 /// Whether a local GGUF carries a reasoning token, and the effort levels
 /// its template lists. `(false, None)` for anything else (a safetensors
 /// repo, a registry entry, an unreadable file).
@@ -226,6 +247,23 @@ pub fn from_gguf(path: &Path) -> (bool, Option<EffortLevels>) {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn declared_levels_rank_and_read_none_as_off() {
+    let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let all = names(&["xhigh", "none", "low", "medium", "low"]);
+    let got = declared(&all, None).unwrap();
+    assert_eq!(got.levels, ["low", "medium", "xhigh"]);
+    assert!(got.can_disable);
+    assert_eq!(got.preferred(), Some("xhigh"));
+    assert_eq!(
+      declared(&all, Some("medium")).unwrap().preferred(),
+      Some("medium")
+    );
+    assert!(!declared(&names(&["low"]), None).unwrap().can_disable);
+    assert_eq!(declared(&names(&["none"]), None), None);
+    assert_eq!(declared(&[], None), None);
+  }
 
   /// The validation block of the chat template shipped in
   /// `unsloth/Qwen3.8-27B-GGUF` and `unsloth/Qwen3.8-Flash-Next-GGUF`.

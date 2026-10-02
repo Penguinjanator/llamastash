@@ -401,6 +401,10 @@ Validate each client at its source and test it live where possible before changi
 
 - [x] ~~`quant_label` needs JSON/TUI rendering~~ — struck, already rendered. `CatalogRow.quant` comes from `quant_display()` (`src/discovery/catalog.rs:108`), which returns `quant_label` whenever a backend overlaid one (`src/gguf/metadata.rs:86-91`), and it reaches `list` (`src/cli/output.rs:128`), the launch picker (`src/cli/picker.rs:97`) and `show` (`src/cli/show.rs:332`). The generic backend populates it today (`src/backend/generic/mod.rs:125`), so a later MLX leaf gets the column with no wiring. `status` has no quant column and is a launch view, not a catalog view.
 
+## R13 (v0.7.0 checklist)
+
+- [x] ~~**`integrations` gives a generic row no effort levels or image input.**~~ Both come from the GGUF (the chat template's effort list, a paired vision projector), and a config-declared entry has no GGUF, so `flash-next-halogen` got no `reasoning` / `thinkingLevelMap` / `input` in pi and no effort or modalities in OpenCode. Done: a generic entry without `model` declares `vision: true`, `reasoning_effort: [...]` and `reasoning_effort_default`; the catalog row carries them, and `integrations` reads the levels through `Backend::config_effort`.
+
 ## General Roadmap
 
 ### High priority

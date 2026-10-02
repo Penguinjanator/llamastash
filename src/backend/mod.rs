@@ -97,6 +97,15 @@ pub struct DraftAcceptance {
   pub generated: u64,
 }
 
+/// The `reasoning_effort` values config declares for a model with no chat
+/// template to read them from.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DeclaredEffort {
+  pub levels: Vec<String>,
+  /// The level the server uses when a request sends none.
+  pub default: Option<String>,
+}
+
 /// How a backend manages the lifecycle of the models it runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lifecycle {
@@ -816,6 +825,12 @@ pub trait Backend {
     None
   }
 
+  /// The `reasoning_effort` values config declares for the model at `path`,
+  /// for a model with no chat template to read them from. Default: none.
+  fn config_effort(&self, _path: &Path) -> DeclaredEffort {
+    DeclaredEffort::default()
+  }
+
   /// Knob values configured for `path` on `server` that apply when no layer
   /// sets one. They resolve below every real layer and are never persisted.
   /// Default: none.
@@ -1333,6 +1348,10 @@ impl Backend for Backends {
     for_each_backend!(self, b => b.knob_scope(path, server))
   }
 
+  fn config_effort(&self, path: &Path) -> DeclaredEffort {
+    for_each_backend!(self, b => b.config_effort(path))
+  }
+
   fn config_default_knobs(
     &self,
     path: &Path,
@@ -1460,6 +1479,17 @@ pub fn config_default_ctx(path: &Path, server: Option<&str>) -> Option<u32> {
   backend
     .config_default_knobs(path, server)
     .u32_by_concept(scope, crate::launch::knobs::def::Concept::ContextLength)
+}
+
+/// The `reasoning_effort` values config declares for the model at `path`,
+/// from the backend that owns its synthetic row. Empty for a model on disk,
+/// whose levels come from its chat template.
+pub fn config_effort(path: &Path) -> DeclaredEffort {
+  Backends::all()
+    .iter()
+    .find(|b| b.synthetic_identity(path).is_some())
+    .map(|b| b.config_effort(path))
+    .unwrap_or_default()
 }
 
 /// Whether config itself declares models to list, so a daemon with

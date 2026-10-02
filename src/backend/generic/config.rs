@@ -65,6 +65,20 @@ pub struct GenericServer {
   pub quant: Option<String>,
   #[serde(default)]
   pub ctx: Option<u64>,
+  /// The server takes image input. With no GGUF there is no vision projector to
+  /// find, so `integrations` and the TUI only know from this.
+  #[serde(default)]
+  pub vision: bool,
+  /// The `reasoning_effort` values the server accepts. Set, the row is a
+  /// reasoning model, and `integrations` offers these levels as it does a
+  /// GGUF's chat-template list. `none` means thinking can be turned off, so
+  /// `[none]` alone marks a reasoning model with no levels to pick.
+  #[serde(default)]
+  pub reasoning_effort: Vec<String>,
+  /// The level the server uses when a request sends none. Unset, tools that
+  /// pin a level pick the highest.
+  #[serde(default)]
+  pub reasoning_effort_default: Option<String>,
 }
 
 // `memory_gib` is the only float, and validation refuses a NaN, so equality
@@ -318,6 +332,13 @@ impl GenericConfig {
         ("params", s.params.is_some(), is_blank(&s.params)),
         ("quant", s.quant.is_some(), is_blank(&s.quant)),
         ("ctx", s.ctx.is_some(), s.ctx == Some(0)),
+        ("vision", s.vision, false),
+        ("reasoning_effort", !s.reasoning_effort.is_empty(), false),
+        (
+          "reasoning_effort_default",
+          s.reasoning_effort_default.is_some(),
+          false,
+        ),
       ];
       for (field, set, blank) in info {
         if set && s.model.is_some() {
@@ -333,6 +354,28 @@ impl GenericConfig {
           };
           return Err(entry(format!("`{field}` {rule}")));
         }
+      }
+      // Levels go to tools and the server verbatim, and tools match them by
+      // exact name, so `Low` or `low ` would silently never match.
+      let is_level = |l: &str| {
+        !l.is_empty()
+          && l
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+      };
+      if let Some(l) = s.reasoning_effort.iter().find(|l| !is_level(l)) {
+        return Err(entry(format!(
+          "`reasoning_effort` level `{l}` must be lowercase letters, digits, `-` or `_`"
+        )));
+      }
+      if let Some(d) = s
+        .reasoning_effort_default
+        .as_ref()
+        .filter(|d| *d == "none" || !s.reasoning_effort.contains(d))
+      {
+        return Err(entry(format!(
+          "`reasoning_effort_default` must be a `reasoning_effort` level other than `none`, got `{d}`"
+        )));
       }
       let placeholders = s.placeholders();
       match s.model.as_deref() {
@@ -562,6 +605,18 @@ servers:
         "{name: e, binary: /b, ready: /h, model: x, args: [\"{model}\"], ctx: 4096}",
         "`ctx` applies only without `model`",
       ),
+      (
+        "{name: e, binary: /b, ready: /h, model: x, args: [\"{model}\"], vision: true}",
+        "`vision` applies only without `model`",
+      ),
+      (
+        "{name: e, binary: /b, ready: /h, model: x, args: [\"{model}\"], reasoning_effort: [low]}",
+        "`reasoning_effort` applies only without `model`",
+      ),
+      (
+        "{name: e, binary: /b, ready: /h, model: x, args: [\"{model}\"], reasoning_effort_default: low}",
+        "`reasoning_effort_default` applies only without `model`",
+      ),
     ] {
       let msg = refusal(&format!("servers:\n  - {entry}\n"));
       assert!(msg.contains(want), "{entry}: {msg}");
@@ -582,6 +637,26 @@ servers:
       (
         "{name: e, binary: /b, ready: /h, ctx: 0}",
         "`ctx` must be > 0",
+      ),
+      (
+        "{name: e, binary: /b, ready: /h, reasoning_effort: [low, ' ']}",
+        "`reasoning_effort` level ` ` must be lowercase letters, digits, `-` or `_`",
+      ),
+      (
+        "{name: e, binary: /b, ready: /h, reasoning_effort: [Low]}",
+        "`reasoning_effort` level `Low` must be lowercase letters, digits, `-` or `_`",
+      ),
+      (
+        "{name: e, binary: /b, ready: /h, reasoning_effort: [low], reasoning_effort_default: high}",
+        "`reasoning_effort_default` must be a `reasoning_effort` level other than `none`, got `high`",
+      ),
+      (
+        "{name: e, binary: /b, ready: /h, reasoning_effort: [low, none], reasoning_effort_default: none}",
+        "`reasoning_effort_default` must be a `reasoning_effort` level other than `none`, got `none`",
+      ),
+      (
+        "{name: e, binary: /b, ready: /h, reasoning_effort_default: low}",
+        "`reasoning_effort_default` must be a `reasoning_effort` level other than `none`, got `low`",
       ),
     ] {
       let msg = refusal(&format!("servers:\n  - {entry}\n"));
@@ -624,6 +699,9 @@ servers:
       params: None,
       quant: None,
       ctx: None,
+      vision: false,
+      reasoning_effort: vec![],
+      reasoning_effort_default: None,
     };
     let split = Path::new("/hf/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf");
     let other = Path::new("/hf/gemma-4-Q4_K_M.gguf");

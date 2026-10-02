@@ -4,6 +4,10 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ## [Unreleased]
 
+### Added
+
+- A generic entry without `model` can declare `vision: true`, `reasoning_effort: [...]` and `reasoning_effort_default`, so `integrations` gives it image input and effort levels in pi, OpenCode, Zed and Codex like a GGUF model.
+
 ## [0.6.0] — 2026-10-01
 
 This release is about which models stay loaded. A preset can pin its own idle TTL, so a model that takes 80 s to read off disk no longer expires on the same clock as one that takes 4 s. A request that does not fit in memory now unloads the least recently used idle models instead of failing with `503`. And `daemon.preload` starts the models you want warm as soon as the daemon is up. Claude Code's `/effort` also reaches llama.cpp models now, and `init` installs llama.cpp's CUDA build on Linux with an NVIDIA card.
