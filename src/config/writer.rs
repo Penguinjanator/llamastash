@@ -59,12 +59,15 @@ pub enum WriteError {
 pub fn merge(current: Value, additions: Value) -> Value {
   match (current, additions) {
     (Value::Mapping(mut cur), Value::Mapping(add)) => {
+      // In place, so existing keys keep their order: `remove` swaps the last
+      // key into the gap.
       for (k, v) in add {
-        let merged = match cur.remove(&k) {
-          Some(existing) => merge(existing, v),
-          None => v,
-        };
-        cur.insert(k, merged);
+        match cur.get_mut(&k) {
+          Some(existing) => *existing = merge(std::mem::replace(existing, Value::Null), v),
+          None => {
+            cur.insert(k, v);
+          }
+        }
       }
       Value::Mapping(cur)
     }
@@ -333,6 +336,23 @@ arch_defaults:
       "sibling under recursed key survives"
     );
     assert!(s.contains("n_gpu_layers: 99"), "added subtree present");
+  }
+
+  /// Existing keys keep their place and new ones go at the end.
+  #[test]
+  fn merge_keeps_existing_key_order() {
+    let cur = yaml("zeta: 1\nalpha: {b: 1, a: 2}\nmid: 3\n");
+    let add = yaml("alpha: {a: 9, c: 4}\nnew: 5\nzeta: 0\n");
+    let out = merge(cur, add);
+    let keys = |v: &Value| {
+      v.as_mapping()
+        .unwrap()
+        .keys()
+        .map(|k| k.as_str().unwrap().to_string())
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(keys(&out), ["zeta", "alpha", "mid", "new"]);
+    assert_eq!(keys(&out["alpha"]), ["b", "a", "c"]);
   }
 
   #[test]

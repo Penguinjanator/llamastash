@@ -404,6 +404,7 @@ Validate each client at its source and test it live where possible before changi
 ## R13 (v0.7.0 checklist)
 
 - [x] ~~**`integrations` gives a generic row no effort levels or image input.**~~ Both come from the GGUF (the chat template's effort list, a paired vision projector), and a config-declared entry has no GGUF, so `flash-next-halogen` got no `reasoning` / `thinkingLevelMap` / `input` in pi and no effort or modalities in OpenCode. Done: a generic entry without `model` declares `vision: true`, `reasoning_effort: [...]` and `reasoning_effort_default`; the catalog row carries them, and `integrations` reads the levels through `Backend::config_effort`.
+- [x] ~~**`integrations` sorted every key of the configs it edits.**~~ serde_json was built without `preserve_order`, so pi's `thinkingLevelMap` and OpenCode's `variants` came out alphabetical (`none` between `medium` and `xhigh`), and a merge re-sorted the user's whole pi, OpenCode and Zed file. The YAML merge (Aider, Continue) reordered keys too, since `remove` swaps the last key into the gap. Fixed: `preserve_order` on, both merges update keys in place, OpenCode's `none` variant goes first, and OpenCode's `provider.llamastash.models` is replaced on a re-run like pi's array, which also drops models no longer registered (they used to stay forever).
 
 ## General Roadmap
 

@@ -253,6 +253,16 @@ mod tests {
       json!({"off": "none", "minimal": null, "low": "low", "medium": "medium",
              "high": null, "xhigh": "xhigh", "max": null})
     );
+    let order: Vec<&String> = models[0]["thinkingLevelMap"]
+      .as_object()
+      .unwrap()
+      .keys()
+      .collect();
+    assert_eq!(
+      order,
+      ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+      "pi's own order, lowest first"
+    );
     // No levels, no fields: pi's defaults stay as they were.
     assert!(models[1].get("reasoning").is_none());
     assert!(models[1].get("thinkingLevelMap").is_none());

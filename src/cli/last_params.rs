@@ -109,8 +109,14 @@ fn render_last_params_human(rows: &[Value]) -> String {
         .and_then(|p| p.get("knobs"))
         .and_then(Value::as_object)
         .map(|m| {
-          m.iter()
+          // Sorted for stable diffs; the map keeps the order it arrived in.
+          let mut knobs: Vec<_> = m
+            .iter()
             .filter(|(k, v)| !v.is_null() && k.as_str() != "ctx" && k.as_str() != "reasoning")
+            .collect();
+          knobs.sort_by_key(|(k, _)| k.as_str());
+          knobs
+            .iter()
             .map(|(k, v)| format!("{k}:{}", knob_value_str(v)))
             .collect::<Vec<_>>()
             .join(", ")
@@ -231,8 +237,8 @@ mod tests {
   fn render_last_params_human_advanced_skips_ctx_reasoning_and_joins_with_commas() {
     // ADVANCED column collapses every knob except `ctx` / `reasoning`
     // (those have dedicated columns) into a comma-joined `k:v` list.
-    // String values render bare (no JSON quoting); the column stays
-    // BTreeMap-sorted for stable diffs.
+    // String values render bare (no JSON quoting); the column is sorted
+    // by key for stable diffs.
     let _g = ColorGuard::set(false);
     let rows = vec![row(
       "/m/qwen.gguf",

@@ -21,15 +21,20 @@ use serde_json::Value;
 use crate::util::config_patch::{DiffEntry, DiffKind};
 
 /// Recursive merge of `additions` into `current`. Pure — no I/O.
+///
+/// Existing keys stay where they are and new keys go at the end, so a
+/// user's file keeps its order. A remove-then-insert would not: `remove`
+/// swaps the last key into the gap.
 pub fn merge(current: Value, additions: Value) -> Value {
   match (current, additions) {
     (Value::Object(mut cur), Value::Object(add)) => {
       for (k, v) in add {
-        let merged = match cur.remove(&k) {
-          Some(existing) => merge(existing, v),
-          None => v,
-        };
-        cur.insert(k, merged);
+        match cur.get_mut(&k) {
+          Some(existing) => *existing = merge(existing.take(), v),
+          None => {
+            cur.insert(k, v);
+          }
+        }
       }
       Value::Object(cur)
     }
@@ -122,6 +127,18 @@ mod tests {
     assert_eq!(by_path["port.start"].kind, DiffKind::Changed);
     assert!(by_path.contains_key("providers"));
     assert_eq!(by_path["providers"].kind, DiffKind::Added);
+  }
+
+  /// A merge into the user's file keeps their key order and appends new keys.
+  #[test]
+  fn merge_keeps_existing_key_order() {
+    let cur = json(r#"{"zeta": 1, "alpha": {"b": 1, "a": 2}, "mid": 3}"#);
+    let add = json(r#"{"alpha": {"a": 9, "c": 4}, "new": 5, "zeta": 0}"#);
+    let out = merge(cur, add);
+    let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    assert_eq!(keys(&out), ["zeta", "alpha", "mid", "new"]);
+    assert_eq!(keys(&out["alpha"]), ["b", "a", "c"]);
+    assert_eq!(out["alpha"]["a"], 9);
   }
 
   #[test]

@@ -48,14 +48,14 @@ fn model_entry(m: &PatchModel) -> serde_json::Value {
     entry["modalities"] = json!({ "input": ["text", "image"], "output": ["text"] });
   }
   if let Some(effort) = &m.effort {
-    let mut variants: serde_json::Map<String, serde_json::Value> = effort
-      .levels
-      .iter()
-      .map(|l| (l.clone(), json!({ "reasoningEffort": l })))
+    // Lowest first, matching the order of the levels.
+    let variants: serde_json::Map<String, serde_json::Value> = effort
+      .can_disable
+      .then_some("none")
+      .into_iter()
+      .chain(effort.levels.iter().map(String::as_str))
+      .map(|l| (l.to_string(), json!({ "reasoningEffort": l })))
       .collect();
-    if effort.can_disable {
-      variants.insert("none".into(), json!({ "reasoningEffort": "none" }));
-    }
     entry["reasoning"] = json!(true);
     entry["variants"] = serde_json::Value::Object(variants);
   }
@@ -92,6 +92,20 @@ impl ToolPatcher for OpenCode {
     // command form, the environment is the only way in that does not put
     // the key on disk.
     Some(super::env_sh::API_KEY_VAR)
+  }
+  /// The `llamastash` provider's `models` map is LlamaStash's own, so it is
+  /// replaced, not merged, like pi's array: a model no longer registered
+  /// drops out, and each entry is written fresh, fields and order alike.
+  fn merge_with_current(
+    &self,
+    mut current: serde_json::Value,
+    ctx: &PatchContext,
+  ) -> serde_json::Value {
+    // Null in place keeps the key where it was; the merge then replaces it.
+    if let Some(models) = current.pointer_mut("/provider/llamastash/models") {
+      *models = serde_json::Value::Null;
+    }
+    crate::init::external::merge::merge(current, self.build_additions(ctx))
   }
   fn build_additions(&self, ctx: &PatchContext) -> serde_json::Value {
     let models: serde_json::Map<String, serde_json::Value> = ctx
@@ -187,8 +201,45 @@ mod tests {
         "none": {"reasoningEffort": "none"},
       })
     );
+    let order: Vec<&String> = qwen["variants"].as_object().unwrap().keys().collect();
+    assert_eq!(order, ["none", "low", "medium", "xhigh"], "lowest first");
     assert!(models["plain"].get("reasoning").is_none());
     assert!(models["plain"].get("variants").is_none());
+  }
+
+  /// Our `models` map is replaced, so a model no longer registered drops out
+  /// and old variant order is rewritten. The user's own keys stay, in order.
+  #[test]
+  fn rerun_replaces_our_models_and_keeps_the_rest() {
+    let dir = crate::util::test_temp::unique_temp_dir("opencode-rerun");
+    let path = dir.join("opencode.json");
+    std::fs::write(
+      &path,
+      r#"{"theme": "x", "provider": {"mine": {"npm": "m"}, "llamastash": {"name": "old",
+        "models": {"gone@preset": {"name": "gone@preset"},
+          "Qwen3.8-27B-UD-Q6_K": {"variants": {"low": {}, "medium": {}, "none": {}, "xhigh": {}}}}}},
+        "agent": {}}"#,
+    )
+    .unwrap();
+    let mut ctx = PatchContext::fixture(&["Qwen3.8-27B-UD-Q6_K"]);
+    ctx.models[0].effort = Some(crate::init::external::effort::EffortLevels {
+      levels: vec!["low".into(), "medium".into(), "xhigh".into()],
+      can_disable: true,
+      ..Default::default()
+    });
+    apply(&OpenCode, &ctx, Some(path.clone())).expect("apply");
+    let body: serde_json::Value =
+      serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let keys = |v: &serde_json::Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    assert_eq!(keys(&body), ["theme", "provider", "agent", "$schema"]);
+    assert_eq!(keys(&body["provider"]), ["mine", "llamastash"]);
+    let models = &body["provider"]["llamastash"]["models"];
+    assert_eq!(keys(models), ["Qwen3.8-27B-UD-Q6_K"], "stale entry dropped");
+    assert_eq!(
+      keys(&models["Qwen3.8-27B-UD-Q6_K"]["variants"]),
+      ["none", "low", "medium", "xhigh"]
+    );
+    std::fs::remove_dir_all(&dir).ok();
   }
 
   #[test]
