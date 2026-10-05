@@ -373,9 +373,9 @@ mod tests {
     cat
       .replace_all(vec![fake_model("/m/b.gguf", ModelSource::Ollama)])
       .await;
-    let view = cat.shared_view().await;
-    assert_eq!(view.len(), 1);
-    assert_eq!(view[0].path, PathBuf::from("/m/b.gguf"));
+    let refreshed = cat.shared_view().await;
+    assert_eq!(refreshed.len(), 1);
+    assert_eq!(refreshed[0].path, PathBuf::from("/m/b.gguf"));
     assert_eq!(
       cat
         .shared_rows()

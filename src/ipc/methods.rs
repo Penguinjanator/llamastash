@@ -1057,6 +1057,38 @@ mod tests {
   /// A config-declared row keys its `last_params` by a backend identity, which
   /// has no GGUF path. `model_path` was null for it, so the TUI dropped the
   /// entry from its Recent section and from the launch picker's seed.
+  /// The R-12 path: a header read for a model the catalog has no row for. It
+  /// went onto a blocking thread, so cover that it still answers (and answers
+  /// with the same tuple the sync resolver produced).
+  #[tokio::test]
+  async fn resolve_model_id_and_arch_reads_the_header_off_the_worker_thread() {
+    let dir = crate::test_support::unique_temp_dir("ls-ipc", "header");
+    let path = dir.join("model.gguf");
+    std::fs::write(
+      &path,
+      crate::gguf::test_fixtures::build_minimal_gguf("llama"),
+    )
+    .expect("write fixture gguf");
+
+    let (id, arch, _, supported, _) = resolve_model_id_and_arch(&path).await.expect("header read");
+    assert_eq!(id.path, path);
+    assert_eq!(arch.as_deref(), Some("llama"));
+    assert!(!supported.is_empty(), "routing tags come from the header");
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[tokio::test]
+  async fn resolve_model_id_and_arch_maps_a_bad_path_to_invalid_params() {
+    let err = resolve_model_id_and_arch(std::path::Path::new("/nope/definitely-missing.gguf"))
+      .await
+      .expect_err("a missing model has no identity");
+    assert_eq!(
+      err.code,
+      ErrorCode::InvalidParams.as_i32(),
+      "a bad path stays the caller's fault: {err:?}"
+    );
+  }
+
   #[tokio::test]
   async fn last_params_list_names_a_backend_identity_by_its_launch_path() {
     use crate::backend::identity::{BackendModelId, ModelIdentity};
