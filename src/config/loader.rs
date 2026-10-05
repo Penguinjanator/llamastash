@@ -2144,6 +2144,50 @@ proxy:
     }
   }
 
+  /// A typo in a block-spelling entry is refused rather than ignored, and the
+  /// case-differing duplicate keeps the file's order, which is what decides it.
+  #[test]
+  fn proxy_alias_entries_follow_the_configs_rules() {
+    let extra = temp_test_dir("proxy-aliases-extra");
+    let extra_path = extra.join("config.yaml");
+    fs::write(
+      &extra_path,
+      "proxy:\n  aliases:\n    - name: a\n      target: x\n      note: documented here\n",
+    )
+    .expect("write failed");
+    let loaded = load_config_from_path(&extra_path);
+    assert!(
+      loaded.warning.is_some(),
+      "an unknown key on an entry is a typo, not a comment"
+    );
+    fs::remove_dir_all(&extra).expect("temp test dir should be removed");
+
+    let twice = temp_test_dir("proxy-aliases-twice");
+    let twice_path = twice.join("config.yaml");
+    fs::write(
+      &twice_path,
+      "proxy:\n  aliases:\n    A: first\n    a: second\n",
+    )
+    .expect("write failed");
+    let repeated = load_config_from_path(&twice_path);
+    assert!(
+      repeated.warning.is_none(),
+      "two spellings of one name is the operator's business: {:?}",
+      repeated.warning
+    );
+    assert_eq!(
+      repeated
+        .config
+        .proxy
+        .aliases
+        .pairs()
+        .collect::<Vec<(&str, &str)>>(),
+      vec![("A", "first"), ("a", "second")],
+      "file order is what settles it later"
+    );
+    fs::remove_dir_all(&twice).expect("temp test dir should be removed");
+  }
+
   /// A target written as a number is read as its text, the way serde_yaml reads a
   /// number into any string field. It then names no model, which the daemon says
   /// once on first use.
