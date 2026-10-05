@@ -358,11 +358,16 @@ struct RoomCandidate {
 /// first. Public for integration tests; production use comes via
 /// `crate::proxy::launch`'s auto-start retry.
 ///
-/// Returns the launches it unloaded. A non-empty list means the caller should
-/// retry the launch: admission runs again on that retry and stays the
-/// authority. All-or-nothing: when every eligible launch together cannot cover
-/// the shortfall, nothing is stopped and the list is empty, because unloading
+/// Returns `true` when something was freed, so the caller should retry the
+/// launch — admission runs again on that retry and stays the authority.
+/// All-or-nothing: when every eligible launch together cannot cover the
+/// shortfall, nothing is stopped and this returns `false`, because unloading
 /// models for a launch that still will not fit is a pure loss.
+///
+/// `unloading` is called once with the launches about to be stopped, before
+/// the first stop. The caller is usually a request future, which is dropped
+/// if its client disconnects during the stops or the wait that follows, and
+/// it should have recorded what it unloaded by then.
 ///
 /// Eligible: `Ready`, zero in-flight, `LaunchOrigin::AutoStart` (manual and
 /// preloaded launches are durable user intent, the same exemption the sweep
@@ -374,12 +379,13 @@ struct RoomCandidate {
 pub async fn make_room(
   state: &Arc<ProxyState>,
   refusal: &crate::launch::admission::Refusal,
-) -> Vec<LaunchId> {
+  unloading: impl FnOnce(&[LaunchId]),
+) -> bool {
   let short = refusal
     .demand_bytes
     .saturating_sub(refusal.available_bytes());
   if short == 0 {
-    return Vec::new();
+    return false;
   }
   let ttls = launch_ttls(state).await;
   let candidates = room_candidates(state, &ttls).await;
@@ -399,7 +405,7 @@ pub async fn make_room(
       crate::launch::admission::human_gib(freed),
       picked.len(),
     );
-    return Vec::new();
+    return false;
   }
   log::info!(
     "proxy make-room: unloading {} idle launch(es) ({} freeable) to fit a {} launch",
@@ -431,10 +437,12 @@ pub async fn make_room(
       crate::launch::admission::human_gib(short),
       crate::launch::admission::human_gib(freed_now),
     );
-    return Vec::new();
+    return false;
   }
   let ctx = &state.ctx;
-  let unloaded: Vec<LaunchId> = go.iter().flat_map(|c| c.targets.iter().cloned()).collect();
+  let targets: Vec<LaunchId> = go.iter().flat_map(|c| c.targets.iter().cloned()).collect();
+  unloading(&targets);
+  let unloaded = targets.len();
   // Candidates stop together, the way the sweep unloads: the re-check above is
   // only honest if nothing else runs before the stops, and stopping one after
   // another would stretch the request's wait to N x the stop grace. The models
@@ -447,11 +455,11 @@ pub async fn make_room(
   .await;
   log::info!(
     "proxy make-room: unloaded {} launch(es) ({}), waiting for the memory to land",
-    unloaded.len(),
+    unloaded,
     crate::launch::admission::human_gib(freed_now),
   );
   wait_for_room(state, refusal.demand_bytes).await;
-  unloaded
+  true
 }
 
 /// The unloadable launches, least-recently-used first.

@@ -415,9 +415,9 @@ async fn handle(
       let want_malformed =
         query.contains("malformed-sse=1") || body_text.contains("__TEST_INJECT_MALFORMED_SSE__");
       // Request-log knobs, all body markers:
-      //   __TEST_EMIT_TIMINGS__    → end the stream with a chunk that carries
-      //                              `timings`, shaped like the one real
-      //                              llama-server b11390 sends.
+      //   __TEST_EMIT_TIMINGS__    → a chunked stream that ends with a chunk
+      //                              carrying `timings`, shaped like the
+      //                              one real llama-server b11390 sends.
       //   __TEST_SLOW_STREAM__     → send the first frame, wait, then the rest,
       //                              so a test can hang up mid-stream.
       //   __TEST_TRUNCATE_STREAM__ → promise more bytes than are sent, then
@@ -455,7 +455,15 @@ async fn handle(
            data: [DONE]\n\n",
           m = echoed_model
         );
-        write_response(&mut wr, 200, "text/event-stream", stream.as_bytes()).await?;
+        // Chunked, the way real llama-server streams: the body ends with
+        // the zero-length chunk, not at a promised length.
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+        wr.write_all(head.as_bytes()).await?;
+        for event in stream.split_inclusive("\n\n") {
+          wr.write_all(format!("{:x}\r\n{event}\r\n", event.len()).as_bytes())
+            .await?;
+        }
+        wr.write_all(b"0\r\n\r\n").await?;
       } else if want_slow || want_truncated {
         let first = format!(
           "data: {{\"model\":\"{m}\",\"choices\":[{{\"delta\":{{\"content\":\"hi\"}}}}]}}\n\n",

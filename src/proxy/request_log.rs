@@ -75,7 +75,7 @@ pub struct RequestRow {
   pub error: Option<String>,
   /// That error's message.
   pub cause: Option<String>,
-  /// The request waited on an auto-start.
+  /// This request started the model: nothing was serving or loading it.
   pub auto_start: bool,
   /// Launches unloaded to make room for this request's auto-start.
   pub evicted: Vec<String>,
@@ -152,7 +152,8 @@ impl RequestRow {
   pub fn note(&self) -> String {
     let mut parts: Vec<String> = Vec::new();
     match self.state {
-      RequestState::InFlight if self.auto_start && self.status.is_none() => {
+      // The model is known and no launch has taken the request yet.
+      RequestState::InFlight if self.model_path.is_some() && self.launch_id.is_none() => {
         parts.push("loading model".to_string());
       }
       RequestState::InFlight => parts.push("in flight".to_string()),
@@ -219,10 +220,11 @@ pub struct RequestSummary {
   pub avg_ttfb_ms: Option<u64>,
   /// Mean of the per-request speeds the server reported.
   pub tokens_per_second_avg: Option<f64>,
-  /// Speed of the request that finished last.
+  /// The most recent speed a request reported.
   pub tokens_per_second_last: Option<f64>,
   pub prompt_tokens: u64,
   pub completion_tokens: u64,
+  /// Requests that started the model.
   pub auto_starts: u64,
   /// Launches unloaded to make room.
   pub evictions: u64,
@@ -741,19 +743,23 @@ mod tests {
       ..RequestRow::default()
     };
     assert_eq!(base.note(), "");
+    // Waiting on a load, whoever started it: the model is known and no
+    // launch has the request yet.
     let loading = RequestRow {
       state: RequestState::InFlight,
-      auto_start: true,
+      model_path: Some("/m/a.gguf".to_string()),
       ..RequestRow::default()
     };
     assert_eq!(loading.note(), "loading model");
-    let streaming = RequestRow {
-      state: RequestState::InFlight,
-      auto_start: true,
-      status: Some(200),
-      ..RequestRow::default()
+    // A launch has it. No status yet on a non-streamed request, which
+    // only arrives with the whole response.
+    let generating = RequestRow {
+      launch_id: Some("L1".to_string()),
+      ..loading.clone()
     };
-    assert_eq!(streaming.note(), "in flight");
+    assert_eq!(generating.note(), "in flight");
+    // Still reading the request body: no model yet.
+    assert_eq!(RequestRow::default().note(), "in flight");
     let made_room = RequestRow {
       auto_start: true,
       evicted: vec!["L3".to_string(), "L4".to_string()],

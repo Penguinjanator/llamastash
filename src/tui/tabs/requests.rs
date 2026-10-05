@@ -121,18 +121,16 @@ pub struct RequestsTabState {
 }
 
 impl RequestsTabState {
-  /// Adopt a poll result. A different model resets the scroll.
+  /// Adopt a poll result.
   pub fn set(&mut self, model_path: String, summary: RequestSummary, rows: Vec<RequestRow>) {
-    if self.model_path.as_deref() != Some(model_path.as_str()) {
-      self.scroll_offset = 0;
-    }
     self.model_path = Some(model_path);
     self.summary = summary;
     self.rows = rows;
     self.scroll_offset = self.scroll_offset.min(self.rows.len().saturating_sub(1));
   }
 
-  /// Drop what is shown when focus moves to a model the data is not for.
+  /// Drop what is shown, scroll included, when focus moves to a model the
+  /// data is not for.
   pub fn clear(&mut self) {
     *self = Self::default();
   }
@@ -153,12 +151,21 @@ impl RequestsTabState {
 
 /// Render the tab body into `area`. The right pane owns the block.
 pub fn render(frame: &mut Frame<'_>, area: Rect, state: &RequestsTabState, palette: &Palette) {
+  // No poll has landed for this model yet. Zeros and "no requests" would
+  // read as an answer.
+  if state.model_path.is_none() {
+    let waiting = Line::from(Span::styled("loading", palette.muted_style()));
+    frame.render_widget(Paragraph::new(waiting), area);
+    return;
+  }
   let width = area.width as usize;
   let mut lines = summary_lines(&state.summary, width, palette);
   lines.push(Line::default());
   if state.rows.is_empty() {
     lines.push(Line::from(Span::styled(
-      "no requests for this model yet",
+      // The Chat / Embed / Rerank tabs talk to the launch's own port, so
+      // what they send does not show here.
+      "no proxy requests for this model yet",
       palette.muted_style(),
     )));
   } else {
@@ -421,12 +428,27 @@ mod tests {
 
   #[test]
   fn an_empty_log_says_so_under_the_summary() {
-    let lines = rendered(&RequestsTabState::default(), 80, 6);
+    let mut state = RequestsTabState::default();
+    state.set(
+      "/m/a.gguf".to_string(),
+      RequestSummary::default(),
+      Vec::new(),
+    );
+    let lines = rendered(&state, 80, 6);
     assert!(lines[0].starts_with("Requests 0"), "{lines:?}");
     assert!(
-      lines.iter().any(|l| l == "no requests for this model yet"),
+      lines
+        .iter()
+        .any(|l| l == "no proxy requests for this model yet"),
       "{lines:?}"
     );
+  }
+
+  #[test]
+  fn before_the_first_poll_lands_the_tab_says_loading() {
+    let lines = rendered(&RequestsTabState::default(), 80, 6);
+    assert_eq!(lines[0], "loading");
+    assert!(lines[1..].iter().all(String::is_empty), "{lines:?}");
   }
 
   #[test]
@@ -448,7 +470,7 @@ mod tests {
   }
 
   #[test]
-  fn set_resets_the_scroll_for_another_model_and_clamps_it_for_the_same() {
+  fn set_clamps_the_scroll_and_clear_resets_it() {
     let mut state = RequestsTabState::default();
     state.set(
       "/m/a.gguf".to_string(),
@@ -462,11 +484,8 @@ mod tests {
       (1..=4).rev().map(row).collect(),
     );
     assert_eq!(state.scroll_offset, 3);
-    state.set(
-      "/m/b.gguf".to_string(),
-      RequestSummary::default(),
-      (1..=4).rev().map(row).collect(),
-    );
+    state.clear();
     assert_eq!(state.scroll_offset, 0);
+    assert_eq!(state.model_path, None);
   }
 }

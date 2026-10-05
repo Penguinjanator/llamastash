@@ -33,7 +33,7 @@ use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use super::request_log::{RequestRecord, RequestState};
 use super::router::{BodyError, ProxyResponse};
 use super::state::ProxyState;
-use super::usage_tap::{ResponseTap, Usage};
+use super::usage_tap::ResponseTap;
 
 /// Hop-by-hop header set — RFC 7230 §6.1. Stripped on both the
 /// outbound request (so we don't leak the inbound peer's keep-alive
@@ -507,11 +507,14 @@ impl Drop for LoggedResponse {
     } else {
       RequestState::ClientClosed
     };
-    // A response that was cut short has no final chunk to read.
-    let usage = match (&self.tap, state) {
-      (Some(tap), RequestState::Done) => tap.usage(),
-      _ => Usage::default(),
-    };
+    // Read whatever the tap holds, however the response ended: a client
+    // that closes on `data: [DONE]` can beat the upstream's end of body,
+    // and its final chunk is already here.
+    let usage = self
+      .tap
+      .as_ref()
+      .map(ResponseTap::usage)
+      .unwrap_or_default();
     self.record.finish(state, usage);
   }
 }

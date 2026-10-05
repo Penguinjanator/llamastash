@@ -116,6 +116,9 @@ pub(crate) enum RouteDecision {
   BackendUnavailable {
     backend: String,
     requested_model: String,
+    /// The catalog entry asked for, so the request log files the 503
+    /// under the model.
+    resolved_row: Box<CatalogRow>,
   },
 }
 
@@ -471,6 +474,7 @@ async fn decide_umbrella_route(
         .unwrap_or(crate::backend::DEFAULT_BACKEND_ID)
         .to_string(),
       requested_model: requested,
+      resolved_row: Box::new(resolved.clone()),
     },
   }
 }
@@ -583,11 +587,7 @@ pub(crate) async fn handle_not_running(
   name: Option<String>,
   mut record: RequestRecord,
 ) -> ProxyResponse {
-  record.set_auto_start();
-  record.publish();
-  let mut evicted = Vec::new();
-  let outcome = launch::auto_start(state, &resolved_row, endpoint_mode, name, &mut evicted).await;
-  record.set_evicted(evicted.iter().map(|id| id.as_str().to_string()).collect());
+  let outcome = launch::auto_start(state, &resolved_row, endpoint_mode, name, &mut record).await;
   match outcome {
     LaunchOutcome::Ready { port, model_id } => {
       // Touch the MRU using the supervisor we just confirmed Ready.

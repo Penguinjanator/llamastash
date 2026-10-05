@@ -198,7 +198,8 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
       model_path,
       ..
     } => record.set_model(served_model_id, model_path),
-    RouteDecision::NotRunning { resolved_row, .. } => record.set_model(
+    RouteDecision::NotRunning { resolved_row, .. }
+    | RouteDecision::BackendUnavailable { resolved_row, .. } => record.set_model(
       &route::served_name_for_row(resolved_row),
       &resolved_row.path,
     ),
@@ -356,6 +357,7 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
     RouteDecision::BackendUnavailable {
       backend,
       requested_model,
+      resolved_row: _,
     } => answered(
       record,
       error_response(

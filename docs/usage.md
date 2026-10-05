@@ -492,7 +492,7 @@ Snapshot of daemon health, managed launches, external (unmanaged) `llama-server`
 
 Each row in `models` carries `name` when the launch was started with `--name`, and `preset` when the launch resolved one — an explicit `--preset` / launch file / TUI preset stop, a `<model>@<preset>` auto-start address, or the model's config `default:`. Both keys are omitted, not nulled, when they don't apply; `preset` is the preset that actually launched this copy, unlike the sibling `default` field, which is the model's configured default either way. The human table has no MODEL column, so its NAME cell renders `<model>@<name>` for a named launch and the model alone otherwise: two different models both named `coder` stay tellable apart in the command you reach for to work out what to stop.
 
-Each row also carries `request_stats`: totals of the proxy requests that launch has served since the daemon started (`requests`, `errors`, `avg_duration_ms`, `avg_ttfb_ms`, `tokens_per_second_avg`, `tokens_per_second_last`, `prompt_tokens`, `completion_tokens`, `auto_starts`, `evictions`). Counts are `0` and averages `null` until the first request. Field meanings are under [`llamastash requests`](#llamastash-requests-model-ref).
+Each row also carries `request_stats`: totals of the proxy requests that launch has served (for a model inside a managed multiplexer, the requests filed under the model since the daemon started) (`requests`, `errors`, `avg_duration_ms`, `avg_ttfb_ms`, `tokens_per_second_avg`, `tokens_per_second_last`, `prompt_tokens`, `completion_tokens`, `auto_starts`, `evictions`). Counts are `0` and averages `null` until the first request. Field meanings are under [`llamastash requests`](#llamastash-requests-model-ref).
 
 The `proxy` block is documented in detail under [Proxy → Is the proxy up?](#is-the-proxy-up).
 
@@ -522,7 +522,7 @@ The requests the proxy handled, newest first. It answers "why did my agent get a
 llamastash requests [model-ref] [-n N] [--json]
 ```
 
-Without `model-ref` it lists every request; with one, only that model's. `-n` sets how many rows to print (default 100).
+Without `model-ref` it lists every request; with one, only that model's. `-n` sets how many rows to print (default 100, at least 1).
 
 ```
 TIME      STATUS  TOTAL  TTFB   TOK/S  IN  OUT  ROUTE             MODEL                         LAUNCH  CLIENT           NOTE
@@ -534,7 +534,7 @@ TIME      STATUS  TOTAL  TTFB   TOK/S  IN  OUT  ROUTE             MODEL         
 
 - `TOTAL` is the time from the proxy receiving the request to the end of the response. `TTFB` is the time to the first response body byte, which includes any model load.
 - `IN` / `OUT` are prompt and generated tokens. `TOK/S` is the generation speed.
-- `NOTE` says what happened beyond the status code: `auto-start`, `unloaded L3` (launches unloaded to make room), `fallback (<reason>) for <model>`, `client closed`, `upstream error`, `loading model`, `in flight`, or the proxy's own error and its message (`launch_failed: auto-start of ...`).
+- `NOTE` says what happened beyond the status code: `auto-start` (this request started the model), `unloaded L3` (launches unloaded to make room), `fallback (<reason>) for <model>`, `client closed`, `upstream error`, `loading model`, `in flight`, or the proxy's own error and its message (`launch_failed: auto-start of ...`).
 - On a terminal a summary block is printed above the table. Piped output is the header plus one tab-separated line per request. The `MODEL` column is dropped when `model-ref` is given.
 
 `--json` emits `{ "summary": {...}, "requests": [...] }`. Every key of a request is always present; a value the proxy does not have is `null`:
@@ -566,7 +566,7 @@ TIME      STATUS  TOTAL  TTFB   TOK/S  IN  OUT  ROUTE             MODEL         
 
 `state` is `in_flight`, `done`, `client_closed` (the client went away before the response was complete) or `upstream_error` (the model's server dropped the connection mid-response). When the proxy answered the request itself, `error` is its error `code`, or its `type` when the error has no code (`model_not_found`, `model_required`, `launch_failed`, ...), and `cause` is the error message. When another model answered because the launch failed, the row is filed under the model that answered and `fallback` holds the reason.
 
-`summary` covers the same scope as the rows (one model, or everything) and counts finished requests since the daemon started, so it keeps counting requests whose rows have left the log. `errors` counts 4xx / 5xx answers and `upstream_error` rows; a client that hung up is not an error. The two averages cover completed 2xx / 3xx requests only. `tokens_per_second_avg` is the mean of the per-request speeds.
+`summary` covers the same scope as the rows (one model, or everything) and counts finished requests since the daemon started, so it keeps counting requests whose rows have left the log. `errors` counts 4xx / 5xx answers and `upstream_error` rows; a client that hung up is not an error. The two averages cover completed 2xx / 3xx requests only. `tokens_per_second_avg` is the mean of the per-request speeds. `tokens_per_second_last` is the most recent speed a request reported. `auto_starts` counts the requests that started the model; a request that waited on a load someone else started is not one. `evictions` counts the launches unloaded to make room.
 
 What is and is not recorded:
 
@@ -574,7 +574,7 @@ What is and is not recorded:
 - The log keeps the last 1000 requests in memory. It is not written to disk and is empty after a daemon restart.
 - No prompt or response text is stored. Token counts are read from the `usage` and `timings` objects at the end of the response as it passes through; the proxy does not change the request to ask for them.
 - `tokens_per_second` is the speed the model's server reported (`timings.predicted_per_second`, `usage.completion_tokens_per_second` or `metrics.tokens_per_second`), never an estimate. It is `null` when the server reports none. With llama-server b11390 that is every `/v1/messages` response and a non-streamed `/v1/responses` response.
-- Token counts and speed are `null` for a compressed response, and for a response that was cut short.
+- Token counts and speed are `null` for a compressed response, and for a response that ended before the server sent them.
 
 ### `llamastash presets <model-ref> <action>`
 
@@ -1776,7 +1776,7 @@ inheritance is visible at the row level.
 
 ### Requests tab
 
-The last tab of every model that has a launch. It shows that model's proxy requests only: the same data as [`llamastash requests <model-ref>`](#llamastash-requests-model-ref), refreshed twice a second while the tab is open.
+The last tab of every model that has a launch. It shows that model's proxy requests only: the same data as [`llamastash requests <model-ref>`](#llamastash-requests-model-ref), refreshed twice a second while the tab is open. The Chat, Embed and Rerank tabs talk to the launch's own port, so what they send does not appear here.
 
 - The top lines are the model's summary: requests, errors, average total time and time to first byte, tok/s (average and last), tokens in and out, auto-starts, and launches unloaded to make room.
 - Below is the table, newest request first. `↑` / `↓` scroll it.

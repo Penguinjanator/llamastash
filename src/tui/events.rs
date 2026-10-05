@@ -2461,13 +2461,9 @@ pub async fn run(
       .lock()
       .unwrap_or_else(std::sync::PoisonError::into_inner) =
       app.focused_managed().map(|m| m.launch_id.clone());
-    let requests_target = requests_poll_target(&app);
-    if requests_target.is_none() {
-      app.requests.clear();
-    }
     *current_requests
       .lock()
-      .unwrap_or_else(std::sync::PoisonError::into_inner) = requests_target;
+      .unwrap_or_else(std::sync::PoisonError::into_inner) = sync_requests_tab(&mut app);
     if needs_redraw {
       terminal.draw(|f| crate::tui::render::render(f, &mut app))?;
     }
@@ -2659,6 +2655,17 @@ fn requests_poll_target(app: &App) -> Option<String> {
   app
     .focused_managed()
     .map(|m| m.path.to_string_lossy().into_owned())
+}
+
+/// Drop the Requests tab's data when it is for another model or the tab
+/// is closed, so one model's rows never sit under another's header, and
+/// return what the poller should fetch next.
+fn sync_requests_tab(app: &mut App) -> Option<String> {
+  let target = requests_poll_target(app);
+  if app.requests.model_path != target {
+    app.requests.clear();
+  }
+  target
 }
 
 /// Spawn a task that polls `requests_tail` for the model in `current`,
@@ -5102,6 +5109,32 @@ mod tests {
     app.right_tab = RightTab::Logs;
     apply_refresh(&mut app, requests_tick("/m/qwen.gguf", &[3, 2, 1]));
     assert_eq!(app.requests.rows.len(), 2);
+  }
+
+  #[test]
+  fn moving_focus_or_closing_the_tab_drops_the_other_models_rows() {
+    let mut app = app_on_requests_tab();
+    app
+      .managed
+      .push(ready_managed_for_events("/m/phi.gguf", 41101));
+    app.clear_rows_cache();
+    assert_eq!(sync_requests_tab(&mut app).as_deref(), Some("/m/qwen.gguf"));
+    apply_refresh(&mut app, requests_tick("/m/qwen.gguf", &[2, 1]));
+    // Same model: the data stays across loop turns.
+    sync_requests_tab(&mut app);
+    assert_eq!(app.requests.rows.len(), 2);
+
+    // Rows: [TableHeader, Header(▶ Running), qwen, phi]. Focus the other
+    // launched model: qwen's rows go at once, before phi's poll lands.
+    app.list_cursor = 3;
+    assert_eq!(sync_requests_tab(&mut app).as_deref(), Some("/m/phi.gguf"));
+    assert!(app.requests.rows.is_empty());
+    assert_eq!(app.requests.model_path, None);
+
+    apply_refresh(&mut app, requests_tick("/m/phi.gguf", &[7]));
+    app.right_tab = RightTab::Logs;
+    assert_eq!(sync_requests_tab(&mut app), None);
+    assert!(app.requests.rows.is_empty());
   }
 
   #[test]

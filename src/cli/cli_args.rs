@@ -658,8 +658,9 @@ pub struct RequestsArgs {
   /// Only this model's requests: name substring, absolute path, or
   /// canonical model id. Without it, every logged request.
   pub model: Option<String>,
-  /// Number of requests to print (default 100; the log keeps 1000).
-  #[arg(short = 'n', long, value_name = "N")]
+  /// Number of requests to print, at least 1 (default 100; the log keeps
+  /// 1000).
+  #[arg(short = 'n', long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
   pub lines: Option<u32>,
   /// Emit `{ "summary", "requests" }` as JSON. Every key of a request row
   /// is always present; an unknown value is `null`.

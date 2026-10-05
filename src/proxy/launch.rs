@@ -41,6 +41,7 @@ use crate::launch::mode::LaunchMode;
 use crate::launch::resolve::CatalogRow;
 
 use super::coalesce::{AcquireOutcome, SharedOutcome};
+use super::request_log::RequestRecord;
 use super::state::ProxyState;
 
 /// Outcome of [`auto_start`]. The proxy's caller branches on this:
@@ -86,9 +87,10 @@ impl From<LaunchOutcome> for SharedOutcome {
 /// (`/v1/embeddings` → embedding, `/v1/rerank` → rerank, `None` for
 /// the chat-shaped routes) — see [`resolve_auto_start_mode`].
 ///
-/// `evicted` receives the launches make-room unloaded for this request.
-/// Only the request that leads the launch fills it; one that waited on
-/// another request's launch unloaded nothing itself.
+/// `record` is the request's log row. The request that spawns the launch
+/// is marked as the auto-start, and what make-room unloads for it is
+/// written to the row before the stops begin. A request that waits on a
+/// launch someone else started is marked with neither.
 ///
 /// The proxy must hold `Arc<ProxyState>` for the duration so the
 /// coalesce + supervisor handles stay alive across the await
@@ -98,7 +100,7 @@ pub(crate) async fn auto_start(
   resolved: &CatalogRow,
   endpoint_mode: Option<LaunchMode>,
   name: Option<String>,
-  evicted: &mut Vec<crate::daemon::registry::LaunchId>,
+  record: &mut RequestRecord,
 ) -> LaunchOutcome {
   // Compute the canonical ModelId from the resolved row. Resolved here rather
   // than from any in-process cache so the single-flight key matches what
@@ -147,7 +149,7 @@ pub(crate) async fn auto_start(
         &model_id,
         endpoint_mode,
         name.clone(),
-        evicted,
+        record,
       )
       .await;
       // Record outcome against the failure tracker before publishing
@@ -205,7 +207,7 @@ async fn drive_launch_as_leader(
   model_id: &ModelId,
   endpoint_mode: Option<LaunchMode>,
   name: Option<String>,
-  evicted: &mut Vec<crate::daemon::registry::LaunchId>,
+  record: &mut RequestRecord,
 ) -> LaunchOutcome {
   // A launch for this file may already be underway from another
   // surface — CLI `start`, the TUI, a boot-time restore — and the
@@ -231,6 +233,8 @@ async fn drive_launch_as_leader(
     mode,
     ..StartParams::default()
   };
+  record.set_auto_start();
+  record.publish();
   let started = match compose_and_spawn(
     &state.ctx,
     start_params(),
@@ -253,8 +257,12 @@ async fn drive_launch_as_leader(
       let Some(refusal) = admission_refusal(&e) else {
         return failed(e);
       };
-      *evicted = super::eviction::make_room(state, &refusal).await;
-      if evicted.is_empty() {
+      let made_room = super::eviction::make_room(state, &refusal, |unloading| {
+        record.set_evicted(unloading.iter().map(|id| id.as_str().to_string()).collect());
+        record.publish();
+      })
+      .await;
+      if !made_room {
         return failed(e);
       }
       match compose_and_spawn(

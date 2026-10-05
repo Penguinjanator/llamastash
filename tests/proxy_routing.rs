@@ -1192,8 +1192,11 @@ async fn tokens_and_speed_come_from_the_end_of_the_response() {
   let streamed = r#"{"model":"qwen3","stream":true,"messages":[{"role":"user","content":"__TEST_EMIT_TIMINGS__"}]}"#;
   let (status, _, response) = http_post(addr, "/v1/chat/completions", streamed, &[]).await;
   assert_eq!(status, 200);
-  // The tap only reads: the client still gets every byte.
-  assert!(String::from_utf8_lossy(&response).ends_with("data: [DONE]\n\n"));
+  // The tap only reads: the client still gets the stream through to its
+  // last event and the end-of-body chunk.
+  let text = String::from_utf8_lossy(&response);
+  assert!(text.contains("\"predicted_per_second\":38.64"), "{text}");
+  assert!(text.ends_with("data: [DONE]\n\n\r\n0\r\n\r\n"), "{text:?}");
   let row = newest_row_when(&ctx.requests, finished).await;
   assert_eq!(row.prompt_tokens, Some(41), "prompt_n + cache_n");
   assert_eq!(row.completion_tokens, Some(3));
@@ -1266,7 +1269,8 @@ async fn requests_the_proxy_answers_itself_are_logged_with_the_error_type() {
   assert!(rows.iter().all(|r| r.launch_id.is_none()));
 
   let failed = &rows[0];
-  assert!(failed.auto_start);
+  // The launch never got as far as a spawn, so it is not an auto-start.
+  assert!(!failed.auto_start);
   assert_eq!(failed.model_path.as_deref(), Some("/m/qwen3.gguf"));
   assert!(
     failed
@@ -1287,7 +1291,7 @@ async fn requests_the_proxy_answers_itself_are_logged_with_the_error_type() {
     1
   );
   let all = ctx.requests.tail(None, 0).summary;
-  assert_eq!((all.requests, all.errors, all.auto_starts), (5, 5, 1));
+  assert_eq!((all.requests, all.errors, all.auto_starts), (5, 5, 0));
 
   shutdown_listener(shutdown, listener_handle).await;
 }
@@ -1383,11 +1387,42 @@ async fn an_upstream_that_dies_mid_body_is_logged_as_upstream_error() {
   assert_eq!(
     (row.prompt_tokens, row.completion_tokens),
     (None, None),
-    "a cut-short body is not read for tokens"
+    "the body ended before any usage arrived"
   );
   assert_eq!(ctx.requests.tail(Some(catalog_path), 0).summary.errors, 1);
 
   let _ = model.stop(Duration::from_secs(3)).await;
   shutdown_listener(shutdown, listener_handle).await;
   std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_503_for_a_model_whose_umbrella_is_down_is_filed_under_the_model() {
+  // A model a managed multiplexer serves, with no umbrella running.
+  let path = "lemonade://qwen-npu";
+  let model = DiscoveredModel {
+    source: ModelSource::Backend("lemonade"),
+    ..discovered(path, Some("qwen-npu"), "qwen3")
+  };
+  let (state, ctx) = proxy_state_and_ctx(
+    vec![model],
+    SupervisorRegistry::new(),
+    DEFAULT_BODY_LIMIT_BYTES,
+  )
+  .await;
+  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+
+  let body = r#"{"model":"qwen-npu","messages":[]}"#;
+  let (status, _, response) = http_post(addr, "/v1/chat/completions", body, &[]).await;
+  assert_eq!(status, 503);
+  let v: Value = serde_json::from_slice(&response).expect("json");
+  assert_eq!(v["error"]["type"], "backend_unavailable");
+
+  let tail = ctx.requests.tail(Some(path), 10);
+  assert_eq!(tail.rows.len(), 1, "the 503 shows under the model");
+  assert_eq!(tail.rows[0].error.as_deref(), Some("backend_unavailable"));
+  assert_eq!(tail.rows[0].model.as_deref(), Some("qwen-npu"));
+  assert_eq!(tail.summary.errors, 1);
+
+  shutdown_listener(shutdown, listener_handle).await;
 }
