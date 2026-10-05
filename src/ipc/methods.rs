@@ -583,11 +583,26 @@ pub(crate) type ResolvedModelInfo = (
 /// still wants. A thin adapter over [`crate::backend::resolve_identity_for_path`]
 /// — the header read, the id, the arch and the supported-backend list all come
 /// from there, so this shape can never drift from what a launch observes.
-pub(crate) fn resolve_model_id_and_arch(
+///
+/// `async` because a caller cannot afford this inline: the header read is up to
+/// ~16 MiB of synchronous file I/O and every caller is an IPC handler, so the
+/// read runs on a blocking thread instead of stalling a tokio worker (same rule
+/// the proxy's auto-start path follows).
+pub(crate) async fn resolve_model_id_and_arch(
   path: &std::path::Path,
 ) -> Result<ResolvedModelInfo, ErrorObject> {
-  let r = crate::backend::resolve_identity_for_path(path, None)
-    .map_err(|e| ErrorObject::new(ErrorCode::InvalidParams, e.to_string()))?;
+  let path = path.to_path_buf();
+  let joined = tokio::task::spawn_blocking(move || {
+    crate::backend::resolve_identity_for_path(&path, None)
+      .map_err(|e| ErrorObject::new(ErrorCode::InvalidParams, e.to_string()))
+  })
+  .await;
+  let r = joined.map_err(|join| {
+    ErrorObject::new(
+      ErrorCode::InternalError,
+      format!("model identity resolution failed: {join}"),
+    )
+  })??;
   Ok((
     r.id,
     r.arch,
@@ -637,6 +652,7 @@ async fn model_key_arch_rows(
     None => (
       crate::util::paths::model_file_label(model_path),
       resolve_model_id_and_arch(model_path)
+        .await
         .ok()
         .and_then(|(_, a, _, _, _)| a),
     ),
