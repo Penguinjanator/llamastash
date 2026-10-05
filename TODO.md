@@ -418,7 +418,7 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 
 - [x] ~~**Proxy perf (R-08)**: share the catalog snapshot instead of cloning it per request~~ — done: the catalog now publishes a shared `Arc<Vec<…>>` view (rows and models) rebuilt on scan, which the proxy reads with one refcount bump.
 - [ ] Model aliases on the proxy (`proxy.aliases`)
-- [ ] `/ui` chooser: models with a UI in green, models without in red
+- [x] ~~`/ui` chooser: models with a UI in green, models without in red~~ — done: chooser names are green when the model's backend serves a web UI and red when it does not.
 - [x] ~~**Proxy stability (R-12)**: move the IPC GGUF header read onto `spawn_blocking`~~ — done: `resolve_model_id_and_arch` is now `async` and does the read on a blocking thread, so no IPC caller can stall a tokio worker.
 
 ### Batch 3: proxy request log and speed stats ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-3-proxy-request-log-and-speed-stats))

@@ -356,9 +356,7 @@ mod tests {
     cat
       .upsert(fake_model("/m/a.gguf", ModelSource::UserPath))
       .await;
-    cat
-      .remove(Path::new("/m/gone.gguf"))
-      .await;
+    cat.remove(Path::new("/m/gone.gguf")).await;
 
     let view = cat.shared_view().await;
     let rows = cat.shared_rows().await;
@@ -379,7 +377,12 @@ mod tests {
     assert_eq!(view.len(), 1);
     assert_eq!(view[0].path, PathBuf::from("/m/b.gguf"));
     assert_eq!(
-      cat.shared_rows().await.iter().map(|r| r.path.clone()).collect::<Vec<_>>(),
+      cat
+        .shared_rows()
+        .await
+        .iter()
+        .map(|r| r.path.clone())
+        .collect::<Vec<_>>(),
       vec!["/m/b.gguf".to_string()]
     );
   }
