@@ -431,7 +431,20 @@ pub(crate) fn resolve_client_reference(
 
   if let Some(target) = state.aliases.target(requested) {
     return match resolve_model_with_candidates(rows, target) {
-      Ok(row) => Ok((None, row)),
+      Ok(row) => {
+        // The alias won. If the same string also reached a model on its own — a
+        // longer file name that contains it — clients that were already being
+        // served move to another model, which is worth one line in the log.
+        if let Ok(other) = resolve_model_with_candidates(rows, requested) {
+          if other.path != row.path && state.aliases.note_overrides_partial(requested) {
+            log::warn!(
+              "proxy.aliases: `{requested}` names `{target}`, but it also matched `{}` on its own; the alias is used",
+              other.name()
+            );
+          }
+        }
+        Ok((None, row))
+      }
       Err(ResolveError::Many(candidates)) => Err(ambiguous(candidates)),
       Err(_) => {
         if state.aliases.note_dead_target(requested) {

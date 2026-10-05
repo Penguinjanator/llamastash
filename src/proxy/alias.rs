@@ -57,6 +57,14 @@ impl AliasTable {
         log::warn!("proxy.aliases: ignoring `{name}` — both the name and the model it points at are required");
         continue;
       }
+      // `name@launch` is a client's address for one launch of a model, and an
+      // alias is consulted before that split. An alias could not honour the
+      // launch half anyway, so a name spelled like an address is refused instead
+      // of quietly taking the address over.
+      if key.contains('@') {
+        log::warn!("proxy.aliases: ignoring `{name}` — an alias names a model, not a `<model>@<launch>` address");
+        continue;
+      }
       if let Some(at) = targets.iter().position(|(existing, _)| *existing == key) {
         log::warn!("proxy.aliases: `{name}` is listed twice; the later entry is used");
         targets.remove(at);
@@ -95,6 +103,20 @@ impl AliasTable {
       return false;
     }
     self.note_once(key)
+  }
+
+  /// Note that the alias `requested` also reaches a model on its own by partial
+  /// match, so adding it moved clients that were already working. Returns `true`
+  /// on the first such report.
+  pub(crate) fn note_overrides_partial(&self, requested: &str) -> bool {
+    if self.targets.is_empty() {
+      return false;
+    }
+    let key = normalize(requested);
+    if !self.targets.iter().any(|(name, _)| *name == key) {
+      return false;
+    }
+    self.note_once(format!("partial {key}"))
   }
 
   /// Note that the alias `requested` points at a reference the catalog has no
@@ -175,6 +197,32 @@ mod tests {
     // different problems, so neither swallows the other.
     assert!(t.note_shadowed("gpt-4o-mini"));
     assert!(!t.note_shadowed("gpt-4o-mini"), "the shadow warns once too");
+  }
+
+  #[test]
+  fn a_name_spelled_like_a_launch_address_is_refused() {
+    // `qwen3@dev` as an alias name would be consulted before the `<model>@<name>`
+    // split, so it would take a client's real address away and honour none of it.
+    let t = table(&[("qwen3@dev", "somewhere-else")]);
+    assert_eq!(t.target("qwen3@dev"), None);
+  }
+
+  #[test]
+  fn an_alias_overriding_a_working_partial_match_is_reported_once() {
+    let t = table(&[("gpt-4o-mini", "qwen3.8-27b")]);
+    assert!(
+      !t.note_overrides_partial("some-real-model"),
+      "not an alias name"
+    );
+    assert!(t.note_overrides_partial("gpt-4o-mini"));
+    assert!(
+      !t.note_overrides_partial("GPT-4o-Mini"),
+      "the same name must not warn twice"
+    );
+    assert!(
+      t.note_shadowed("gpt-4o-mini"),
+      "a third kind of report is not swallowed by this one"
+    );
   }
 
   #[test]

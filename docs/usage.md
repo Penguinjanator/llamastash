@@ -1008,10 +1008,10 @@ proxy:
 A value is any reference `llamastash list` shows — a plain name, a repo-qualified id, or a full path — and it resolves exactly the way a reference you type yourself does, on every surface that takes a model reference. Entries keep the order they are written in, so repeating a name puts the last one in charge. Three rules, all of them so an alias can never surprise a client:
 
 - **A model that owns the name wins.** An alias is consulted when the name the client sent names no model outright — a full path, a file name, a published id, or a repo-qualified id. A longer file name that merely *contains* the alias does not own it, and neither do two models that both contain it: the alias is the tie-break you wrote. When a request arrives for a shadowed alias the daemon logs one warning naming it.
-- **An alias names a model, nothing else.** It cannot pin a launch name or a preset, so a client that wants one sends `<model>@<name>` itself.
+- **An alias names a model, nothing else.** It cannot pin a launch name or a preset, so a client that wants one sends `<model>@<name>` itself. A name written like that address (`qwen3@dev`) is refused when the table is built, because the alias could not honour the launch half and would take the real address away.
 - **Aliases are not listed.** `/v1/models` and `/api/tags` keep showing one row per model, so an alias answers only a client that already sends the name — a listing tells you nothing about it.
 
-An alias whose value names nothing in the catalog 404s, and the daemon logs one warning naming the alias and what it points at. The request body keeps the name the client sent, as it does for any reference the proxy resolves: an engine that answers only to the name it was served with needs `rewrite_model: true` on its generic entry (see [Generic backend](#generic-backend)).
+An alias whose value names nothing in the catalog 404s, and the daemon logs one warning naming the alias and what it points at. So does an alias that takes a name some longer file name already answered to on its own, since that moves clients that were working. The request body keeps the name the client sent, as it does for any reference the proxy resolves: an engine that answers only to the name it was served with needs `rewrite_model: true` on its generic entry (see [Generic backend](#generic-backend)).
 
 Alias names match case-insensitively, like model references do. Editing the map takes a daemon restart.
 
