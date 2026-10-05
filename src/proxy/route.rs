@@ -430,7 +430,12 @@ pub(crate) fn resolve_client_reference(
   }
 
   if let Some(target) = state.aliases.target(requested) {
-    return match resolve_model_with_candidates(rows, target) {
+    // An alias is written once and never looked at again, and the client sending
+    // its name cannot refine it, so the target has to name one model outright: a
+    // path, a file name, a published id or a repo-qualified id. Answering a loose
+    // target with a substring match would auto-start whichever row happened to
+    // contain it, and nothing downstream could tell that was not the model named.
+    return match crate::launch::resolve::resolve_exact_reference(rows, target) {
       Ok(row) => {
         // The alias won. If the same string also reached a model on its own — a
         // longer file name that contains it — clients that were already being
@@ -445,11 +450,18 @@ pub(crate) fn resolve_client_reference(
         }
         Ok((None, row))
       }
-      Err(ResolveError::Many(candidates)) => Err(ambiguous(candidates)),
+      Err(ResolveError::Many(candidates)) => {
+        if state.aliases.note_ambiguous_target(requested) {
+          log::warn!(
+            "proxy.aliases: `{requested}` points at `{target}`, which matches more than one model; name one of them"
+          );
+        }
+        Err(ambiguous(candidates))
+      }
       Err(_) => {
         if state.aliases.note_dead_target(requested) {
           log::warn!(
-            "proxy.aliases: `{requested}` points at `{target}`, which is not a model in the catalog"
+            "proxy.aliases: `{requested}` points at `{target}`, which names no model on its own; give a full name or a path"
           );
         }
         Err(ClientRefMiss::NotFound)

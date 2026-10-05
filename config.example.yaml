@@ -436,10 +436,12 @@ proxy:
   # alias is the tie-break. An alias names a model and nothing else, so a
   # value cannot pin a launch name or a preset — the client has to send
   # `<model>@<name>` itself for that, and a *name* spelled like that address is
-  # refused when the table is built. A value naming nothing in the catalog
-  # 404s, with one warning the first time a request hits it. Aliases are not
-  # listed by `/v1/models` or `/api/tags`. Names match case-insensitively,
-  # and entries keep the order written, so a repeated name uses the last.
+  # refused when the table is built. A value has to name exactly one model by
+  # itself, so one that matches nothing, only matches as a substring, names
+  # another alias, or is shared by two models 404s — with one warning the first
+  # time a request hits it. Aliases are not listed by `/v1/models` or
+  # `/api/tags`. Names match case-insensitively, and entries keep the order
+  # written, so a repeated name uses the last.
   #
   # Sources — CLI: (none) · Env: (none).
   #

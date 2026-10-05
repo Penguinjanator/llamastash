@@ -14,7 +14,9 @@
 //!   logs one warning the first time it is shadowed, and an alias pointing at
 //!   nothing logs once the first time a request hits it.
 //! - An alias names a model and nothing else. Its target is resolved whole, so
-//!   it cannot pin a launch name or a preset.
+//!   it cannot pin a launch name or a preset, and a target that only matches a
+//!   model as a substring is refused rather than guessed at. A target that names
+//!   another alias is refused the same way: it can never mean what it looks like.
 //! - Aliases are not published on `/v1/models` or `/api/tags`, so a listing
 //!   stays one row per model.
 
@@ -71,6 +73,22 @@ impl AliasTable {
       }
       targets.push((key, target));
     }
+    // A target is a model reference. One that names another alias can only be
+    // resolved as a substring of some unrelated row, so it is refused rather than
+    // sent down that path.
+    let names: Vec<String> = targets.iter().map(|(name, _)| name.clone()).collect();
+    let targets = targets
+      .into_iter()
+      .filter(|(name, target)| {
+        let points_at_alias = names.iter().any(|other| *other == normalize(target));
+        if points_at_alias {
+          log::warn!(
+            "proxy.aliases: ignoring `{name}` — it points at `{target}`, which is another alias name; name the model instead"
+          );
+        }
+        !points_at_alias
+      })
+      .collect();
     Self {
       targets,
       warned: Arc::new(RwLock::new(HashSet::new())),
@@ -95,34 +113,33 @@ impl AliasTable {
   /// name. Returns `true` on the first such report, which is the only one worth
   /// logging.
   pub(crate) fn note_shadowed(&self, requested: &str) -> bool {
-    if self.targets.is_empty() {
-      return false;
-    }
-    let key = normalize(requested);
-    if !self.targets.iter().any(|(name, _)| *name == key) {
-      return false;
-    }
-    self.note_once(key)
+    self.note_as_alias(requested, "shadow")
   }
 
   /// Note that the alias `requested` also reaches a model on its own by partial
   /// match, so adding it moved clients that were already working. Returns `true`
   /// on the first such report.
   pub(crate) fn note_overrides_partial(&self, requested: &str) -> bool {
-    if self.targets.is_empty() {
-      return false;
-    }
-    let key = normalize(requested);
-    if !self.targets.iter().any(|(name, _)| *name == key) {
-      return false;
-    }
-    self.note_once(format!("partial {key}"))
+    self.note_as_alias(requested, "partial")
+  }
+
+  /// Note that an alias target matches more than one model, which is a mistake
+  /// only the operator can fix: the client sending that name cannot refine it.
+  /// Returns `true` on the first such report.
+  pub(crate) fn note_ambiguous_target(&self, requested: &str) -> bool {
+    self.note_as_alias(requested, "ambiguous")
   }
 
   /// Note that the alias `requested` points at a reference the catalog has no
-  /// model for, so every request under that name is going to 404. Returns
-  /// `true` on the first such report.
+  /// model for under its own name, so every request under that alias name is
+  /// going to 404. Returns `true` on the first such report.
   pub(crate) fn note_dead_target(&self, requested: &str) -> bool {
+    self.note_as_alias(requested, "target")
+  }
+
+  /// Every report is about a configured alias name, and each kind gets its own
+  /// prefix so two problems about one name cannot swallow each other.
+  fn note_as_alias(&self, requested: &str, kind: &str) -> bool {
     if self.targets.is_empty() {
       return false;
     }
@@ -130,7 +147,7 @@ impl AliasTable {
     if !self.targets.iter().any(|(name, _)| *name == key) {
       return false;
     }
-    self.note_once(format!("target {key}"))
+    self.note_once(format!("{kind} {key}"))
   }
 
   /// First call for this key wins. Shared across clones, so one daemon logs one
@@ -205,6 +222,43 @@ mod tests {
     // split, so it would take a client's real address away and honour none of it.
     let t = table(&[("qwen3@dev", "somewhere-else")]);
     assert_eq!(t.target("qwen3@dev"), None);
+  }
+
+  #[test]
+  fn an_alias_pointing_at_another_alias_is_refused() {
+    // `hardwired -> y` could only ever be resolved as a substring of some
+    // unrelated row, so the model named by `y` never gets reached.
+    let t = table(&[("hardwired", "y"), ("y", "realmodel")]);
+    assert_eq!(t.target("hardwired"), None);
+    assert_eq!(t.target("y"), Some("realmodel"));
+    // Forward and backward references are both chains.
+    let cycle = table(&[("a", "b"), ("b", "a")]);
+    assert_eq!(cycle.target("a"), None);
+    assert_eq!(cycle.target("b"), None);
+  }
+
+  #[test]
+  fn an_ambiguous_target_is_reported_once() {
+    let t = table(&[("gpt-4o-mini", "qwen")]);
+    assert!(t.note_ambiguous_target("gpt-4o-mini"));
+    assert!(!t.note_ambiguous_target("gpt-4o-mini"));
+    assert!(
+      t.note_dead_target("gpt-4o-mini"),
+      "an ambiguous target and a dead one are different problems"
+    );
+  }
+
+  #[test]
+  fn every_kind_of_report_survives_an_alias_named_like_another_kind_of_key() {
+    // The reports share one set, so they are keyed by kind as well as by name.
+    let t = table(&[("target qwen", "alpha"), ("partial qwen", "alpha")]);
+    assert!(t.note_dead_target("target qwen"));
+    assert!(
+      t.note_shadowed("target qwen"),
+      "the dead-target report must not spend the shadow one"
+    );
+    assert!(t.note_overrides_partial("partial qwen"));
+    assert!(t.note_shadowed("partial qwen"));
   }
 
   #[test]

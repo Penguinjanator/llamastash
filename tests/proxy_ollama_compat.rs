@@ -209,13 +209,23 @@ async fn proxy_state_with_alias(
   models: Vec<DiscoveredModel>,
   alias: (&str, &str),
 ) -> Arc<ProxyState> {
+  proxy_state_with_aliases(models, vec![alias]).await
+}
+
+async fn proxy_state_with_aliases(
+  models: Vec<DiscoveredModel>,
+  aliases: Vec<(&str, &str)>,
+) -> Arc<ProxyState> {
   let catalog = ModelCatalog::new();
   for m in models {
     catalog.upsert(m).await;
   }
   let ctx = MethodContext::with_catalog(ShutdownToken::new(), catalog);
-  let aliases =
-    llamastash::config::ProxyAliases::from_pairs(vec![(alias.0.to_string(), alias.1.to_string())]);
+  let aliases = llamastash::config::ProxyAliases::from_pairs(
+    aliases
+      .into_iter()
+      .map(|(name, target)| (name.to_string(), target.to_string())),
+  );
   ProxyState::from_context_with_auth(&ctx, false, true, None, DEFAULT_BODY_LIMIT_BYTES, &aliases)
 }
 
@@ -529,6 +539,84 @@ async fn api_show_an_alias_resolves_what_is_ambiguous_without_it() {
   );
   let v: Value = serde_json::from_slice(&body).expect("json body");
   assert_eq!(v["details"]["family"], "phi");
+
+  shutdown_listener(shutdown, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_show_an_alias_target_has_to_name_a_model_on_its_own() {
+  // `qwen` is a substring of this file's name and of a directory above it, but it
+  // is not a model. Answering it would route to whichever row happened to contain
+  // the string, and the client cannot send anything better.
+  let models = vec![make_model(
+    "/models/qwen/misc/obfuscated-name.gguf",
+    None,
+    "phi",
+    ModeHint::Chat,
+  )];
+  let state = proxy_state_with_alias(models, ("gpt-4o-mini", "qwen")).await;
+  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+
+  let (status, body) = http_post(addr, "/api/show", r#"{"model":"gpt-4o-mini"}"#).await;
+  assert_eq!(
+    status, 404,
+    "a target that only matches as a substring is refused, not guessed: {status} {body:?}"
+  );
+
+  shutdown_listener(shutdown, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_show_an_alias_may_name_a_path() {
+  // The same rungs a client may send: a path is the unambiguous spelling, so it
+  // belongs in the alias surface too.
+  let models = vec![make_model(
+    "/m/qwen-coder.gguf",
+    Some("qwen-coder:7b"),
+    "qwen3",
+    ModeHint::Chat,
+  )];
+  let state = proxy_state_with_alias(models, ("gpt-4o-mini", "/m/qwen-coder.gguf")).await;
+  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+
+  let (status, body) = http_post(addr, "/api/show", r#"{"model":"gpt-4o-mini"}"#).await;
+  assert_eq!(status, 200, "a path target resolves: {status} {body:?}");
+  let v: Value = serde_json::from_slice(&body).expect("json body");
+  assert_eq!(v["details"]["family"], "qwen3");
+
+  shutdown_listener(shutdown, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_show_an_alias_pointing_at_another_alias_is_refused_at_load() {
+  // `hardwired -> y` could only be resolved as a substring of some unrelated row,
+  // so the model the operator named through `y` is never reached.
+  let models = vec![
+    make_model(
+      "/m/realmodel.gguf",
+      Some("realmodel"),
+      "llama",
+      ModeHint::Chat,
+    ),
+    make_model(
+      "/m/synthetic.gguf",
+      Some("synthetic"),
+      "phi",
+      ModeHint::Chat,
+    ),
+  ];
+  let state = proxy_state_with_aliases(models, vec![("hardwired", "y"), ("y", "realmodel")]).await;
+  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+
+  let (status, _) = http_post(addr, "/api/show", r#"{"model":"hardwired"}"#).await;
+  assert_eq!(status, 404, "the chain is dropped, not followed");
+  let (status, body) = http_post(addr, "/api/show", r#"{"model":"y"}"#).await;
+  assert_eq!(
+    status, 200,
+    "the entry that names a model still works: {body:?}"
+  );
+  let v: Value = serde_json::from_slice(&body).expect("json body");
+  assert_eq!(v["details"]["family"], "llama");
 
   shutdown_listener(shutdown, handle).await;
 }
