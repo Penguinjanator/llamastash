@@ -258,38 +258,23 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
   // we explicitly want to avoid on the hot path.
   let rows = state.ctx.catalog.shared_rows().await;
 
-  // D2 fail-safe: try the whole reference first so a model file whose name
-  // contains `@` (e.g. `foo@bar.gguf`) resolves as a plain model reference.
-  // Only when the whole string does not resolve do we split on `@` and treat
-  // the right side as a launch name. When present, the launch must match
-  // both the model (path) and the name; the name is threaded through to
-  // `auto_start` so a second named launch of the same model gets its own
-  // flight and its own addressable id.
-  let (mut name, resolved) = match resolve_model_with_candidates(&rows, &requested) {
-    Ok(r) => (None, r),
-    Err(_) => {
-      let (m, n) = match parse_named_reference(&requested) {
-        Some((m, n)) => (m.to_string(), Some(n.to_string())),
-        None => (requested.clone(), None),
-      };
-      let r = match resolve_model_with_candidates(&rows, &m) {
-        Ok(r) => r,
-        Err(ResolveError::Empty) | Err(ResolveError::None) => {
-          return RouteDecision::NotFound {
-            requested_model: requested,
-          };
-        }
-        Err(ResolveError::Many(candidates)) => {
-          // The ids `/v1/models` publishes, not the bare names: two same-named
-          // GGUFs in different roots listed the identical string twice, leaving
-          // the client nothing to refine with. Every entry here routes.
-          return RouteDecision::Ambiguous {
-            requested_model: requested,
-            candidates: crate::launch::resolve::published_ids_for(&rows, &candidates),
-          };
-        }
-      };
-      (n, r)
+  // Reference → catalog row, in the one order that applies everywhere a client
+  // names a model (whole string, then the `@<launch>` split, then an alias).
+  let (mut name, resolved) = match resolve_client_reference(state, &rows, &requested) {
+    Ok(v) => v,
+    Err(ClientRefMiss::NotFound) => {
+      return RouteDecision::NotFound {
+        requested_model: requested,
+      }
+    }
+    // The ids `/v1/models` publishes, not the bare names: two same-named
+    // GGUFs in different roots listed the identical string twice, leaving
+    // the client nothing to refine with. Every entry here routes.
+    Err(ClientRefMiss::Ambiguous(candidates)) => {
+      return RouteDecision::Ambiguous {
+        requested_model: requested,
+        candidates,
+      }
     }
   };
 
@@ -395,6 +380,67 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
     resolved_row: Box::new(resolved),
     arch,
     name,
+  }
+}
+
+/// What [`resolve_client_reference`] could not settle, left in a shape the
+/// callers render their own error bodies from.
+pub(crate) enum ClientRefMiss {
+  /// Nothing matched, neither as a reference nor as an alias.
+  NotFound,
+  /// Several real models matched. The entries are published ids, each of which
+  /// routes.
+  Ambiguous(Vec<String>),
+}
+
+/// Turn a client's `model` string into `(launch name, catalog row)`.
+///
+/// The order is the whole string as written, then the same string split at `@`
+/// — a `<model>@<launch>` address, taken only when the whole string misses, so
+/// a file named `foo@bar.gguf` still resolves whole — then a `proxy.aliases`
+/// name. A string that matches a real model always beats an alias of the same
+/// name, and an alias target resolves whole: an alias names a model, never a
+/// launch name or a preset.
+pub(crate) fn resolve_client_reference(
+  state: &ProxyState,
+  rows: &[CatalogRow],
+  requested: &str,
+) -> Result<(Option<String>, CatalogRow), ClientRefMiss> {
+  // The published ids of a candidate set, which is what a client has to send to
+  // stop being ambiguous.
+  let ambiguous = |candidates: Vec<CatalogRow>| {
+    ClientRefMiss::Ambiguous(crate::launch::resolve::published_ids_for(rows, &candidates))
+  };
+
+  match resolve_model_with_candidates(rows, requested) {
+    Ok(row) => {
+      if state.aliases.note_shadowed(requested) {
+        log::warn!(
+          "proxy.aliases: `{requested}` names a model that exists, so that model is used and the alias is not"
+        );
+      }
+      return Ok((None, row));
+    }
+    Err(ResolveError::Many(candidates)) => return Err(ambiguous(candidates)),
+    Err(_) => {}
+  }
+
+  if let Some((model, launch)) = parse_named_reference(requested) {
+    match resolve_model_with_candidates(rows, model) {
+      Ok(row) => return Ok((Some(launch.to_string()), row)),
+      Err(ResolveError::Many(candidates)) => return Err(ambiguous(candidates)),
+      Err(_) => {}
+    }
+  }
+
+  match state
+    .aliases
+    .target(requested)
+    .map(|target| resolve_model_with_candidates(rows, target))
+  {
+    Some(Ok(row)) => Ok((None, row)),
+    Some(Err(ResolveError::Many(candidates))) => Err(ambiguous(candidates)),
+    _ => Err(ClientRefMiss::NotFound),
   }
 }
 

@@ -204,6 +204,21 @@ async fn proxy_state_with_models(models: Vec<DiscoveredModel>) -> Arc<ProxyState
   proxy_state_with_models_compat(models, false).await
 }
 
+/// Like [`proxy_state_with_models`] with a `proxy.aliases` map.
+async fn proxy_state_with_alias(
+  models: Vec<DiscoveredModel>,
+  alias: (&str, &str),
+) -> Arc<ProxyState> {
+  let catalog = ModelCatalog::new();
+  for m in models {
+    catalog.upsert(m).await;
+  }
+  let ctx = MethodContext::with_catalog(ShutdownToken::new(), catalog);
+  let aliases: std::collections::BTreeMap<String, String> =
+    std::iter::once((alias.0.to_string(), alias.1.to_string())).collect();
+  ProxyState::from_context_with_auth(&ctx, false, true, None, DEFAULT_BODY_LIMIT_BYTES, &aliases)
+}
+
 async fn proxy_state_with_models_compat(
   models: Vec<DiscoveredModel>,
   ollama_compat: bool,
@@ -425,6 +440,30 @@ async fn api_show_accepts_legacy_name_field() {
   assert_eq!(status, 200);
   let v: Value = serde_json::from_slice(&body).expect("json body");
   assert_eq!(v["details"]["family"], "llama");
+
+  shutdown_listener(shutdown, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_show_resolves_a_proxy_alias() {
+  // A tool hard-wired to `gpt-4o-mini` should get metadata for the model the
+  // alias names, through the Ollama surface as well as the OpenAI one.
+  let models = vec![make_model(
+    "/m/qwen-coder.gguf",
+    Some("qwen-coder:7b"),
+    "qwen3",
+    ModeHint::Chat,
+  )];
+  let state = proxy_state_with_alias(models, ("gpt-4o-mini", "qwen-coder:7b")).await;
+  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+
+  let (status, body) = http_post(addr, "/api/show", r#"{"model":"gpt-4o-mini"}"#).await;
+  assert_eq!(
+    status, 200,
+    "alias must resolve on /api/show: {status} {body:?}"
+  );
+  let v: Value = serde_json::from_slice(&body).expect("json body");
+  assert_eq!(v["details"]["family"], "qwen3");
 
   shutdown_listener(shutdown, handle).await;
 }

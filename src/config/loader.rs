@@ -359,6 +359,25 @@ pub struct ProxyConfig {
   /// Sources — CLI: (none) · Env: (none).
   #[serde(default = "ProxyConfig::default_max_body_size")]
   pub max_body_size: usize,
+  /// Names that stand in for a local model, so a tool with a hard-coded model
+  /// name needs no edit of its own config: `gpt-4o-mini: qwen3.8-27b-q8` answers
+  /// a request for `gpt-4o-mini` with that model. A value is any model reference
+  /// `llamastash list` shows — a plain name, a repo-qualified id, or a full path
+  /// — resolved exactly as a reference a person types is resolved.
+  ///
+  /// Three rules, all so an alias can never surprise a client:
+  /// - A real model id wins. An alias is consulted only when the name the client
+  ///   sent matches no model, so it can never hide a model that really claims
+  ///   that name. The daemon logs one warning the first time an alias is
+  ///   shadowed this way.
+  /// - An alias names a model, nothing else. It cannot pin a launch name or a
+  ///   preset, so a client that wants one sends `<model>@<name>` itself.
+  /// - Aliases are not listed on `/v1/models` or `/api/tags`, which stay one row
+  ///   per model.
+  ///
+  /// Sources — CLI: (none) · Env: (none).
+  #[serde(default)]
+  pub aliases: BTreeMap<String, String>,
 }
 
 impl ProxyConfig {
@@ -441,6 +460,7 @@ impl Default for ProxyConfig {
       api_key: None,
       insecure_no_auth: false,
       max_body_size: Self::default_max_body_size(),
+      aliases: Default::default(),
     }
   }
 }
@@ -1889,6 +1909,36 @@ proxy:
     assert!(loaded.warning.is_none(), "valid config should not warn");
     assert_eq!(loaded.config.proxy.max_body_size, 0);
     fs::remove_dir_all(dir).expect("temp test dir should be removed");
+  }
+
+  #[test]
+  fn proxy_aliases_load_as_a_name_to_model_map() {
+    let dir = temp_test_dir("proxy-aliases");
+    let path = dir.join("config.yaml");
+    fs::write(
+      &path,
+      "proxy:\n  aliases:\n    gpt-4o-mini: qwen3.8-27b-q8\n    claude-haiku: some/other-model\n",
+    )
+    .expect("write failed");
+
+    let loaded = load_config_from_path(&path);
+    assert!(loaded.warning.is_none(), "valid config should not warn");
+    assert_eq!(loaded.config.proxy.aliases.len(), 2);
+    assert_eq!(
+      loaded
+        .config
+        .proxy
+        .aliases
+        .get("gpt-4o-mini")
+        .map(String::as_str),
+      Some("qwen3.8-27b-q8")
+    );
+    // Absent is the default: no aliases until someone asks for them.
+    assert!(
+      ProxyConfig::default().aliases.is_empty(),
+      "aliases default to empty"
+    );
+    fs::remove_dir_all(&dir).expect("temp test dir should be removed");
   }
 
   #[test]

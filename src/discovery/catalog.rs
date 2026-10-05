@@ -24,8 +24,8 @@ use crate::launch::resolve::{CatalogRow, MtpCapability};
 ///
 /// Reads come in two shapes. [`ModelCatalog::snapshot`] deep-clones the
 /// rows (what the `list_models` IPC handler, which serialises them
-/// anyway, wants); the proxy hot path instead takes a shared
-/// [`Arc`](std::sync::Arc) of a pre-built view, so a request costs one
+/// anyway, wants); the proxy hot path instead takes a shared [`Arc`] of a
+/// pre-built view, so a request costs one
 /// refcount bump instead of one allocation per row per request
 /// (R-08). The views are rebuilt on write, and the only production
 /// writer is the discovery task's per-scan [`ModelCatalog::replace_all`].

@@ -987,6 +987,23 @@ A **named launch** publishes one more id: the model's published id, an `@`, and 
 
 A request for the plain model id while it runs more than once goes to an unnamed launch before a named one, and among those to the newest (highest `L#`).
 
+**Aliases** cover a tool that will only ever ask for one fixed name, so it needs no config edit of its own. `proxy.aliases` in `config.yaml` maps such a name to a model:
+
+```yaml
+proxy:
+  aliases:
+    gpt-4o-mini: qwen3.8-27b-q8_0
+    claude-haiku: unsloth/Demo-GGUF/demo-Q4_K_M
+```
+
+A value is any reference `llamastash list` shows — a plain name, a repo-qualified id, or a full path — and it resolves exactly the way a reference you type yourself does. Three rules, all of them so an alias can never surprise a client:
+
+- **A real model id wins.** An alias is consulted only when the name the client sent matches no model, so an alias can never hide a model that really claims that name. When a request arrives for a shadowed alias the daemon logs one warning naming it.
+- **An alias names a model, nothing else.** It cannot pin a launch name or a preset, so a client that wants one sends `<model>@<name>` itself.
+- **Aliases are not listed.** `/v1/models` and `/api/tags` keep showing one row per model, so an alias answers only a client that already sends the name — a listing tells you nothing about it.
+
+Alias names match case-insensitively, like model references do. Editing the map takes a daemon restart.
+
 The resolver accepts every form for every model, collision or not, and each qualified form in both the published spelling and the `.gguf` filename spelling. It also accepts a partial repo reference (`unsloth/Qwen3.8`), which the raw cache path (`models--unsloth--Qwen3.8-…`) never matched. Sending any form two models share — the bare name, or a repo-qualified form that does not separate them — returns `400 ambiguous_model`, and its `matches` array lists the published id of each candidate, every one of which routes, so resend one verbatim.
 
 ### Anthropic-shape clients (Claude Code)
@@ -1290,6 +1307,10 @@ proxy:
   # header_read_timeout_secs: 30
   # idle_ttl_secs: 1800      # 0 disables the global deadline; a preset can still pin its own.
   # max_body_size: 16777216  # Bytes; cap on every request body (default 16 MiB; 0 disables the check).
+  # aliases:                 # Names that stand in for a local model, for a tool
+  #   gpt-4o-mini: qwen3-a-q8  # that will only ever ask for a fixed one. A real model
+  #                            # id always wins; aliases are not listed. See
+  #                            # "Model ids on the proxy".
 ```
 
 Unknown keys inside `[proxy]` are **rejected loudly** (`#[serde(deny_unknown_fields)]`) — a typo never silently falls back to defaults. The top-level config still tolerates unknown keys for forward-compat. No `tls_*` — TLS for a LAN-exposed proxy is still deferred per the plan's Scope Boundaries. The full key set with per-key sources is in `config.example.yaml` under `[proxy]`.

@@ -43,7 +43,7 @@ use crate::daemon::state_store::RunningSnapshot;
 use crate::daemon::supervisor::ManagedState;
 use crate::discovery::DiscoveredModel;
 use crate::gguf::metadata::{ModeHint, ModelMetadata};
-use crate::launch::resolve::{resolve_model_with_candidates, CatalogRow, ResolveError};
+use crate::launch::resolve::CatalogRow;
 
 /// The error type our `BoxBody` carries. Forwarding streams upstream
 /// `reqwest::Response::bytes_stream()` chunks through `StreamBody`,
@@ -631,12 +631,13 @@ async fn ollama_show(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyRes
       );
     }
   };
-  // Resolve against the catalog using the same matcher the OpenAI
-  // compat surface uses, so identical names work across both APIs.
+  // Resolve against the catalog through the same reference rule the OpenAI
+  // surface uses — whole string, then `@<launch>`, then `proxy.aliases` — so
+  // identical names work across both APIs.
   let rows = state.ctx.catalog.shared_rows().await;
   let snap = state.ctx.catalog.shared_view().await;
-  match resolve_model_with_candidates(&rows, &reference) {
-    Ok(resolved) => {
+  match route::resolve_client_reference(&state, &rows, &reference) {
+    Ok((_, resolved)) => {
       // Re-find the DiscoveredModel for the resolved path so we have
       // the live metadata. The resolver returns a CatalogRow clone;
       // metadata projection wants the source DiscoveredModel for the
@@ -649,14 +650,13 @@ async fn ollama_show(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyRes
       let bytes = serde_json::to_vec(&response).expect("json encoding of fixed shape");
       Ok(json_response(StatusCode::OK, bytes))
     }
-    Err(ResolveError::Empty) | Err(ResolveError::None) => error_with_matches(
+    Err(route::ClientRefMiss::NotFound) => error_with_matches(
       StatusCode::NOT_FOUND,
       "model_not_found",
       &format!("{reference} not found"),
       Vec::<String>::new(),
     ),
-    Err(ResolveError::Many(candidates)) => {
-      let names = crate::launch::resolve::published_ids_for(&rows, &candidates);
+    Err(route::ClientRefMiss::Ambiguous(names)) => {
       let n = names.len();
       error_with_matches(
         StatusCode::BAD_REQUEST,
