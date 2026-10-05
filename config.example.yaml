@@ -430,7 +430,8 @@ proxy:
   # (`<cache dir>/logs`), one JSON object per line with the same keys as
   # `llamastash requests --json`. No prompt or response text is written.
   # The file rotates at 10 MiB and keeps 5 older segments. Restart the
-  # daemon to apply.
+  # daemon to apply. `status --json` reports the path and how many rows
+  # could not be written under `proxy.request_log_file`.
   #
   # Sources — CLI: (none) · Env: (none).
   request_log_file: false

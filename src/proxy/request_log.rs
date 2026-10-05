@@ -11,7 +11,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -33,6 +34,33 @@ pub const FILE_NAME: &str = "requests.jsonl";
 /// dropped from the file (the in-memory log still has the row) rather
 /// than holding up the request that produced it.
 const FILE_QUEUE: usize = 1024;
+
+/// The file the log is also written to.
+struct FileSink {
+  path: PathBuf,
+  queue: mpsc::Sender<String>,
+  /// Finished rows that did not reach the file: the queue was full, or
+  /// the file could not be opened or written.
+  dropped: AtomicU64,
+}
+
+/// What `status` reports about the request log file.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FileStatus {
+  pub path: PathBuf,
+  /// Finished rows that were not written to the file.
+  pub dropped: u64,
+}
+
+/// Append every line from `rx` to the rotating file at `path`, until the
+/// file cannot be opened or written.
+async fn write_lines(path: &Path, rx: &mut mpsc::Receiver<String>) -> std::io::Result<()> {
+  let mut writer = crate::daemon::supervisor::LogWriter::open(path.to_path_buf()).await?;
+  while let Some(line) = rx.recv().await {
+    writer.write_line(line.as_bytes()).await?;
+  }
+  Ok(())
+}
 
 /// Strings that come from a client or a child process are cut to these
 /// lengths, and stripped of control characters, before they are stored.
@@ -339,10 +367,12 @@ struct Inner {
   rows: VecDeque<RequestRow>,
   next_seq: u64,
   all: Totals,
-  // One entry per model that got a request and per launch that served
-  // one. Neither is ever removed: a model path comes from the catalog and
-  // a launch takes seconds to create, so the maps stay small.
+  // One entry per model that got a request. Never removed: the keys are
+  // catalog paths, so the map is as large as the catalog at most.
   by_model: HashMap<String, Totals>,
+  // One entry per launch a request was handed to. A launch id is never
+  // reused, so [`RequestLog::forget_launch`] drops the entry when the
+  // launch stops, or every auto-start would leave one behind.
   by_launch: HashMap<String, Totals>,
 }
 
@@ -377,8 +407,8 @@ pub struct Tail {
 #[derive(Clone, Default)]
 pub struct RequestLog {
   inner: Arc<Mutex<Inner>>,
-  /// Queue to the file writer, once [`Self::write_to`] has started one.
-  file: Arc<OnceLock<mpsc::Sender<String>>>,
+  /// Set once [`Self::write_to`] has started a file writer.
+  file: Arc<OnceLock<FileSink>>,
 }
 
 impl RequestLog {
@@ -395,25 +425,49 @@ impl RequestLog {
   /// Also append every finished row to `path`, one JSON object per line
   /// with the keys `requests_tail` returns. The file rotates like a
   /// launch log. Call once, from inside the daemon's runtime.
+  ///
+  /// A failure to open or write the file is logged once and ends the
+  /// writing, the way a launch's log capture pauses. Rows that do not
+  /// reach the file are counted, and [`Self::file_status`] reports the
+  /// count.
   pub fn write_to(&self, path: PathBuf) {
-    let (tx, mut rx) = mpsc::channel::<String>(FILE_QUEUE);
-    if self.file.set(tx).is_err() {
+    let (queue, mut rx) = mpsc::channel::<String>(FILE_QUEUE);
+    let sink = FileSink {
+      path: path.clone(),
+      queue,
+      dropped: AtomicU64::new(0),
+    };
+    if self.file.set(sink).is_err() {
       return;
     }
+    let file = Arc::clone(&self.file);
     tokio::spawn(async move {
-      let mut writer = match crate::daemon::supervisor::LogWriter::open(path.clone()).await {
-        Ok(writer) => writer,
-        Err(e) => {
-          log::warn!("proxy: cannot open request log {}: {e}", path.display());
-          return;
-        }
-      };
-      while let Some(line) = rx.recv().await {
-        if let Err(e) = writer.write_line(line.as_bytes()).await {
-          log::warn!("proxy: request log write to {} failed: {e}", path.display());
-        }
+      if let Err(e) = write_lines(&path, &mut rx).await {
+        log::warn!(
+          "proxy: request log file {} failed: {e}; writing to it stopped (the in-memory log continues, `status` counts the rows dropped)",
+          path.display()
+        );
+      }
+      // Closing the queue makes every later row count as dropped at the
+      // sender. The rows still in it will never be written either.
+      rx.close();
+      let mut stranded = 0;
+      while rx.try_recv().is_ok() {
+        stranded += 1;
+      }
+      if let Some(installed) = file.get() {
+        installed.dropped.fetch_add(stranded, Ordering::Relaxed);
       }
     });
+  }
+
+  /// Where the log is also written and how many finished rows did not
+  /// make it there. `None` when no file was asked for.
+  pub fn file_status(&self) -> Option<FileStatus> {
+    self.file.get().map(|sink| FileStatus {
+      path: sink.path.clone(),
+      dropped: sink.dropped.load(Ordering::Relaxed),
+    })
   }
 
   /// Start a row for a request the proxy just received. The returned
@@ -466,6 +520,12 @@ impl RequestLog {
     }
   }
 
+  /// Drop a stopped launch's totals. `status` only reads the totals of
+  /// launches that are still registered.
+  pub fn forget_launch(&self, launch_id: &str) {
+    self.lock().by_launch.remove(launch_id);
+  }
+
   /// Summary of the requests one launch served.
   pub fn launch_summary(&self, launch_id: &str) -> RequestSummary {
     self
@@ -497,8 +557,17 @@ impl RequestRecord {
     self.row.model_path = Some(path.to_string());
   }
 
+  /// The request was handed to `launch_id`. This is also where the
+  /// launch's totals entry is created; see [`Self::finish`] for why not
+  /// there.
   pub fn set_launch(&mut self, launch_id: &str) {
     self.row.launch_id = Some(launch_id.to_string());
+    self
+      .log
+      .lock()
+      .by_launch
+      .entry(launch_id.to_string())
+      .or_default();
   }
 
   pub fn set_auto_start(&mut self) {
@@ -564,17 +633,23 @@ impl RequestRecord {
           .or_default()
           .add(&self.row);
       }
-      if let Some(launch) = &self.row.launch_id {
-        inner
-          .by_launch
-          .entry(launch.clone())
-          .or_default()
-          .add(&self.row);
+      // No `or_default` here: a response can end after its launch was
+      // stopped and forgotten, and must not bring the entry back.
+      if let Some(totals) = self
+        .row
+        .launch_id
+        .as_ref()
+        .and_then(|launch| inner.by_launch.get_mut(launch))
+      {
+        totals.add(&self.row);
       }
     }
-    if let Some(file) = self.log.file.get() {
-      if let Ok(line) = serde_json::to_string(&self.row) {
-        let _ = file.try_send(line);
+    if let Some(sink) = self.log.file.get() {
+      let queued = serde_json::to_string(&self.row)
+        .ok()
+        .is_some_and(|line| sink.queue.try_send(line).is_ok());
+      if !queued {
+        sink.dropped.fetch_add(1, Ordering::Relaxed);
       }
     }
   }
@@ -988,6 +1063,75 @@ mod tests {
     assert_eq!(rows[1].error.as_deref(), Some("model_not_found"));
     // The in-memory log is unchanged by the file.
     assert_eq!(log.tail(None, 10).rows.len(), 3);
+    assert_eq!(log.file_status(), Some(FileStatus { path, dropped: 0 }));
+    assert_eq!(RequestLog::new().file_status(), None, "no file asked for");
+  }
+
+  #[tokio::test]
+  async fn rows_that_cannot_be_written_are_counted_not_lost_silently() {
+    // The path's parent is a regular file, so the log file cannot be
+    // created.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let blocker = dir.path().join("not-a-dir");
+    std::fs::write(&blocker, b"").expect("write blocker");
+    let log = RequestLog::new();
+    log.write_to(blocker.join(FILE_NAME));
+
+    for _ in 0..3 {
+      served(&log, "/m/a.gguf", "L1", Usage::default());
+    }
+    // A row finished before the writer gave up sits in the queue until
+    // the writer drains it; one finished after is counted at once.
+    let mut dropped = 0;
+    for _ in 0..200 {
+      dropped = log.file_status().expect("file status").dropped;
+      if dropped == 3 {
+        break;
+      }
+      tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(dropped, 3);
+    served(&log, "/m/a.gguf", "L1", Usage::default());
+    assert_eq!(log.file_status().expect("file status").dropped, 4);
+    // The in-memory log has all four.
+    assert_eq!(log.tail(None, 10).summary.requests, 4);
+  }
+
+  #[test]
+  fn a_full_queue_drops_the_line_and_counts_it() {
+    // No runtime here, so nothing drains the queue: fill it by hand.
+    let log = RequestLog::new();
+    let (queue, _rx) = mpsc::channel::<String>(1);
+    let sink = FileSink {
+      path: PathBuf::from("/unused"),
+      queue,
+      dropped: AtomicU64::new(0),
+    };
+    assert!(log.file.set(sink).is_ok());
+    served(&log, "/m/a.gguf", "L1", Usage::default());
+    assert_eq!(log.file_status().expect("file status").dropped, 0);
+    served(&log, "/m/a.gguf", "L1", Usage::default());
+    served(&log, "/m/a.gguf", "L1", Usage::default());
+    assert_eq!(log.file_status().expect("file status").dropped, 2);
+  }
+
+  #[test]
+  fn a_stopped_launch_is_forgotten_and_a_late_finish_does_not_bring_it_back() {
+    let log = RequestLog::new();
+    served(&log, "/m/a.gguf", "L1", Usage::default());
+    // Still streaming when the launch is stopped.
+    let mut late = log.begin(ROUTE, None);
+    late.set_model("m", "/m/a.gguf");
+    late.set_launch("L1");
+    late.set_status(200);
+    assert_eq!(log.launch_summary("L1").requests, 1);
+
+    log.forget_launch("L1");
+    assert_eq!(log.launch_summary("L1"), RequestSummary::default());
+    late.finish(RequestState::UpstreamError, Usage::default());
+    assert_eq!(log.lock().by_launch.len(), 0);
+    // The model's own totals keep both requests.
+    assert_eq!(log.tail(Some("/m/a.gguf"), 0).summary.requests, 2);
   }
 
   #[test]

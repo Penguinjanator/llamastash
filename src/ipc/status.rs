@@ -363,7 +363,13 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
   //   "bind_error": "permission denied" | null,
   // }
   // ```
-  let proxy = ctx.proxy_status.as_ref().map(project_proxy_status);
+  let proxy = ctx.proxy_status.as_ref().map(|cell| {
+    let mut block = project_proxy_status(cell);
+    // Where the request log is also written and how many finished rows
+    // did not get there. `null` unless `proxy.request_log_file` is on.
+    block["request_log_file"] = json!(ctx.requests.file_status());
+    block
+  });
   // Neutral server catalog: every backend's build/binary variants, each with
   // its probed devices + derived id. The single launch-device surface the TUI
   // picker and CLI read — each server carries the `--device` selectors its own
