@@ -27,8 +27,12 @@ use crate::launch::resolve::{CatalogRow, MtpCapability};
 /// anyway, wants); the proxy hot path instead takes a shared [`Arc`] of a
 /// pre-built view, so a request costs one
 /// refcount bump instead of one allocation per row per request
-/// (R-08). The views are rebuilt on write, and the only production
-/// writer is the discovery task's per-scan [`ModelCatalog::replace_all`].
+/// (R-08). The views are rebuilt on write, and the only production writer is
+/// the discovery task's per-scan [`ModelCatalog::replace_all`] — a write pays
+/// the rebuild so the hot read does not, and `rows` is a projection of the
+/// metadata the resolver reads, not a second copy of every row's templates.
+/// [`Self::upsert`] and [`Self::remove`] rebuild per call and so are for
+/// single-row test and dev use, not a per-model production path.
 #[derive(Debug, Clone, Default)]
 pub struct ModelCatalog {
   inner: Arc<RwLock<CatalogSlot>>,
@@ -115,6 +119,15 @@ impl ModelCatalog {
   /// [`Self::shared_view`].
   pub async fn shared_rows(&self) -> Arc<Vec<CatalogRow>> {
     self.inner.read().await.rows.clone()
+  }
+
+  /// Both shared views out of one read lock, for a caller that resolves against
+  /// the rows and then reads metadata out of the models: two separate reads can
+  /// straddle a rescan, and a row that resolves while its metadata view is from
+  /// before the rescan reads back as a model with no metadata at all.
+  pub async fn shared_pair(&self) -> (Arc<Vec<DiscoveredModel>>, Arc<Vec<CatalogRow>>) {
+    let slot = self.inner.read().await;
+    (slot.view.clone(), slot.rows.clone())
   }
 
   /// Serialise the catalog into the JSON shape `list_models` returns.

@@ -632,10 +632,11 @@ async fn ollama_show(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyRes
     }
   };
   // Resolve against the catalog through the same reference rule the OpenAI
-  // surface uses — whole string, then `@<launch>`, then `proxy.aliases` — so
-  // identical names work across both APIs.
-  let rows = state.ctx.catalog.shared_rows().await;
-  let snap = state.ctx.catalog.shared_view().await;
+  // surface uses — an outright name, then `proxy.aliases`, then a partial match,
+  // then `<model>@<launch>` — so identical names work across both APIs. One read
+  // for both views: resolving in one snapshot while the metadata view is from
+  // before a rescan answers with a model that has no metadata.
+  let (snap, rows) = state.ctx.catalog.shared_pair().await;
   match route::resolve_client_reference(&state, &rows, &reference) {
     Ok((_, resolved)) => {
       // Re-find the DiscoveredModel for the resolved path so we have
