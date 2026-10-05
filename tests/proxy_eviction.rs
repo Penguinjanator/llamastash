@@ -488,7 +488,7 @@ async fn make_room_stops_nothing_when_the_shortfall_exceeds_every_candidate() {
     build_state_with_presets(registry, &log_dir, persisted, ConfigPresetStore::empty()).await;
   state.touch_mru(model.id()).await;
 
-  let fits = eviction::make_room(
+  let fits = !eviction::make_room(
     &state,
     &Refusal {
       demand_bytes: 1_000,
@@ -496,7 +496,8 @@ async fn make_room_stops_nothing_when_the_shortfall_exceeds_every_candidate() {
       reserved_bytes: 0,
     },
   )
-  .await;
+  .await
+  .is_empty();
   assert!(!fits, "800 needed against 100 freeable must refuse");
   sleep(Duration::from_millis(100)).await;
   assert!(
@@ -524,7 +525,7 @@ async fn make_room_unloads_the_least_recently_used_and_stops_there() {
     build_state_with_presets(registry, &log_dir, persisted, ConfigPresetStore::empty()).await;
   state.touch_mru(fresh.id()).await;
 
-  let fits = eviction::make_room(
+  let fits = !eviction::make_room(
     &state,
     &Refusal {
       demand_bytes: 400,
@@ -532,7 +533,8 @@ async fn make_room_unloads_the_least_recently_used_and_stops_there() {
       reserved_bytes: 0,
     },
   )
-  .await;
+  .await
+  .is_empty();
   assert!(fits, "300 needed, 1000 idle freeable");
   wait_until_not_ready(&stale, "least recently used launch").await;
   assert!(
@@ -572,7 +574,7 @@ async fn make_room_never_picks_a_manual_or_never_unload_launch() {
     let state = build_state_with_presets(registry, &log_dir, persisted, presets).await;
     state.touch_mru(model.id()).await;
 
-    let fits = eviction::make_room(
+    let fits = !eviction::make_room(
       &state,
       &Refusal {
         demand_bytes: 5_000,
@@ -580,7 +582,8 @@ async fn make_room_never_picks_a_manual_or_never_unload_launch() {
         reserved_bytes: 0,
       },
     )
-    .await;
+    .await
+    .is_empty();
     assert!(
       !fits,
       "{origin:?} preset={preset:?} was treated as a candidate"
@@ -619,7 +622,7 @@ async fn make_room_skips_a_candidate_that_took_a_request() {
   let _guard = busy.inflight_guard();
   assert_eq!(busy.inflight(), 1);
 
-  let fits = eviction::make_room(
+  let fits = !eviction::make_room(
     &state,
     &Refusal {
       demand_bytes: 550,
@@ -627,7 +630,8 @@ async fn make_room_skips_a_candidate_that_took_a_request() {
       reserved_bytes: 0,
     },
   )
-  .await;
+  .await
+  .is_empty();
   assert!(fits, "450 needed, the idle launch alone covers 500");
   assert!(
     matches!(busy.state().await, ManagedState::Ready),

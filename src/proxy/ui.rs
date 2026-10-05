@@ -247,6 +247,8 @@ async fn forward_ui(
       fallback: false,
       fallback_reason: None,
     },
+    // Web-UI traffic stays out of the request log.
+    None,
   )
   .await
 }

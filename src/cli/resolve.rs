@@ -85,6 +85,9 @@ pub struct RunningRow {
   /// backend's floor), `0` when it has none. The CLI sizes its stop deadline
   /// around it.
   pub stop_grace_secs: u64,
+  /// Totals of the proxy requests this launch served, mirrored from the
+  /// IPC `status` row. `None` from a daemon that predates the field.
+  pub request_stats: Option<Value>,
 }
 
 impl RunningRow {
@@ -442,6 +445,7 @@ fn parse_running_row(v: &Value) -> Option<RunningRow> {
     .get("stop_grace_secs")
     .and_then(Value::as_u64)
     .unwrap_or(0);
+  let request_stats = v.get("request_stats").cloned();
   Some(RunningRow {
     launch_id,
     model_path,
@@ -463,6 +467,7 @@ fn parse_running_row(v: &Value) -> Option<RunningRow> {
     preset_default,
     backend,
     stop_grace_secs,
+    request_stats,
   })
 }
 
@@ -912,6 +917,7 @@ mod tests {
         preset: None,
         backend: None,
         stop_grace_secs: 0,
+        request_stats: None,
       },
       RunningRow {
         launch_id: "L2".into(),
@@ -934,6 +940,7 @@ mod tests {
         preset: None,
         backend: None,
         stop_grace_secs: 0,
+        request_stats: None,
       },
     ];
     assert_eq!(resolve_running(&rows, "41100").unwrap().launch_id, "L1");
@@ -963,6 +970,7 @@ mod tests {
       preset: None,
       backend: None,
       stop_grace_secs: 0,
+      request_stats: None,
     }];
     let err = resolve_running(&rows, "9999").unwrap_err();
     assert_eq!(err.code, MODEL_NOT_FOUND);
@@ -991,6 +999,7 @@ mod tests {
       preset: None,
       backend: None,
       stop_grace_secs: 0,
+      request_stats: None,
     };
     let rows = vec![
       row("L1", "/cache/gemma-4-E2B-it-Q4_K_M.gguf", 41100),

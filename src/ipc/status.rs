@@ -150,6 +150,9 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
       // default name (config-only). The full set lives in `presets_list`.
       "preset_count": preset_count,
       "default": preset_default,
+      // Totals of the proxy requests this launch served: counts, average
+      // latency, tokens and tok/s. Zeros until the first request.
+      "request_stats": ctx.requests.launch_summary(launch_id.as_str()),
     });
     // Omitted when unset — the same convention `state.json` and the CLI's
     // `launch_status_json` use — so the unnamed-row shape stays byte-stable
@@ -272,6 +275,12 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
         "latest_cpu_pct": u_cpu,
         "preset_count": preset_count,
         "default": preset_default,
+        // A delegated model's requests are served by the umbrella launch,
+        // so its totals are the ones filed under the model itself.
+        "request_stats": ctx
+          .requests
+          .tail(Some(&running_snap.params.model_path.to_string_lossy()), 0)
+          .summary,
       });
       // Same only-when-set `preset` the managed branch stamps, so a
       // delegated row is shape-identical to a process row.

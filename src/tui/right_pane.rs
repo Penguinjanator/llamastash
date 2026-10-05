@@ -22,7 +22,7 @@ use crate::theme::Palette;
 use crate::tui::app::App;
 use crate::tui::fmt::format_bytes;
 use crate::tui::status_icons::{glyph_for, label_for};
-use crate::tui::tabs::{chat, embed, logs, rerank, settings, RightTab};
+use crate::tui::tabs::{chat, embed, logs, requests, rerank, settings, RightTab};
 
 /// Render the right-pane area as a single unnested Block. `focused`
 /// flips the border to the theme's focus tone (`palette.highlight`
@@ -105,6 +105,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &Palette, f
     RightTab::Embed => embed::render(frame, body_area, app, palette),
     RightTab::Rerank => rerank::render(frame, body_area, app, palette),
     RightTab::Settings => settings::render(frame, body_area, app, palette),
+    RightTab::Requests => requests::render(frame, body_area, &app.requests, palette),
   }
 }
 
@@ -247,6 +248,8 @@ pub(crate) fn bottom_hint_chips(app: &App) -> Vec<crate::tui::hint_picker::Ranke
         );
       }
     }
+    // Read-only table: the top bar's scroll chip is its only verb.
+    (_, RightTab::Requests) => {}
     (_, RightTab::Settings) => {
       let running_readonly = app.launch_picker.is_none() && app.focused_managed().is_some();
       if running_readonly {
@@ -487,40 +490,43 @@ fn block_title_with_rects(
     // pane reads as live. The mnemonic underline is applied by
     // [`mnemonic_spans`].
     let active = *tab == app.right_tab && focused;
-    spans.extend(mnemonic_spans(label, active, palette));
+    spans.extend(mnemonic_spans(label, tab.mnemonic_index(), active, palette));
     col = col.saturating_add(label_width);
   }
   spans.push(Span::raw(" "));
   (Line::from(spans), rects)
 }
 
-/// Split a tab label into spans that underline the first character
-/// when it should serve as a quick-jump mnemonic. The selected tab
-/// drops the underline (its panel_title style already calls focus
-/// to it; doubling up with an underline reads as noise).
-fn mnemonic_spans(label: &str, active: bool, palette: &Palette) -> Vec<Span<'static>> {
+/// Split a tab label into spans that underline the character at
+/// `mnemonic` when it should serve as a quick-jump mnemonic. The
+/// selected tab drops the underline (its panel_title style already
+/// calls focus to it; doubling up with an underline reads as noise).
+fn mnemonic_spans(
+  label: &str,
+  mnemonic: usize,
+  active: bool,
+  palette: &Palette,
+) -> Vec<Span<'static>> {
   let base_style = if active {
     palette.title_style()
   } else {
     palette.muted_style()
   };
-  let mut chars = label.chars();
-  let first = match chars.next() {
-    Some(c) => c.to_string(),
-    None => return vec![Span::styled(label.to_string(), base_style)],
-  };
-  let rest: String = chars.collect();
-  let first_style = if active {
-    base_style
-  } else {
-    base_style.add_modifier(Modifier::UNDERLINED)
-  };
-  let mut spans: Vec<Span<'static>> = Vec::with_capacity(2);
-  spans.push(Span::styled(first, first_style));
-  if !rest.is_empty() {
-    spans.push(Span::styled(rest, base_style));
+  if active || label.chars().nth(mnemonic).is_none() {
+    return vec![Span::styled(label.to_string(), base_style)];
   }
-  spans
+  let before: String = label.chars().take(mnemonic).collect();
+  let letter: String = label.chars().skip(mnemonic).take(1).collect();
+  let after: String = label.chars().skip(mnemonic + 1).collect();
+  [
+    (before, base_style),
+    (letter, base_style.add_modifier(Modifier::UNDERLINED)),
+    (after, base_style),
+  ]
+  .into_iter()
+  .filter(|(text, _)| !text.is_empty())
+  .map(|(text, style)| Span::styled(text, style))
+  .collect()
 }
 
 /// Render line 1 of the header: the model's display name in bold
@@ -1913,5 +1919,37 @@ mod tests {
       }
     }
     assert!(found, "did not locate `qwen` in the header line");
+  }
+
+  #[test]
+  fn the_requests_tab_underlines_its_u_not_its_r() {
+    // `R` is the Rerank tab's jump key, so Requests marks the `u` that
+    // `Shift+U` matches.
+    use ratatui::style::Modifier;
+    let palette = crate::theme::palette_for(crate::theme::ThemeName::Macchiato);
+    let spans = mnemonic_spans(
+      RightTab::Requests.label(),
+      RightTab::Requests.mnemonic_index(),
+      false,
+      palette,
+    );
+    let text: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(text, vec!["Req", "u", "ests"]);
+    let underlined: Vec<bool> = spans
+      .iter()
+      .map(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+      .collect();
+    assert_eq!(underlined, vec![false, true, false]);
+
+    // The active tab carries no underline at all.
+    let active = mnemonic_spans("Requests", 3, true, palette);
+    assert_eq!(active.len(), 1);
+    assert!(!active[0].style.add_modifier.contains(Modifier::UNDERLINED));
+
+    // A first-letter mnemonic still splits into two spans.
+    let logs = mnemonic_spans("Logs", 0, false, palette);
+    let logs_text: Vec<&str> = logs.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(logs_text, vec!["L", "ogs"]);
+    assert!(logs[0].style.add_modifier.contains(Modifier::UNDERLINED));
   }
 }

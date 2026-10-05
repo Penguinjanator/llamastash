@@ -99,6 +99,9 @@ pub struct MethodContext {
   /// shape. Production wiring always sets this; if `proxy.enabled:
   /// false` the cell holds the disabled proxy status variant.
   pub proxy_status: Option<crate::proxy::StatusCell>,
+  /// The proxy's request log. The proxy writes it; `requests_tail` and
+  /// `status` read it. Empty when the proxy never comes up.
+  pub requests: crate::proxy::request_log::RequestLog,
   /// HTTP control-plane URL the daemon bound, e.g.
   /// `http://127.0.0.1:48134`. Surfaced under `status.daemon.ipc_url`
   /// so the TUI / CLI can render where IPC is listening (helpful when
@@ -291,6 +294,7 @@ impl MethodContext {
       launch: None,
       external: Arc::new(RwLock::new(Vec::new())),
       proxy_status: None,
+      requests: crate::proxy::request_log::RequestLog::new(),
       ipc_url: None,
       backend: crate::backend::BackendConfig::default(),
       backend_force: std::collections::BTreeMap::new(),

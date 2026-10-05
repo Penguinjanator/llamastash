@@ -4,11 +4,11 @@ This is the reference for the non-interactive CLI surface and the TUI keybinding
 
 ## Concepts
 
-**Single binary, three roles.** `llamastash` (no args) opens the TUI. `llamastash daemon ...` controls the background daemon. Every other subcommand (`list`, `start`, `stop`, `status`, `logs`, `presets`, `favorites`) is a CLI client.
+**Single binary, three roles.** `llamastash` (no args) opens the TUI. `llamastash daemon ...` controls the background daemon. Every other subcommand (`list`, `start`, `stop`, `status`, `logs`, `requests`, `presets`, `favorites`) is a CLI client.
 
 **Daemon on demand.** The first TUI or CLI client that runs auto-spawns the daemon if no socket is present. The daemon survives client exit; running models survive daemon shutdown via process detach. Pass `--no-spawn` to fail fast against a missing daemon (useful in scripts).
 
-**Model references.** `start`, `stop`, `logs`, `presets`, `favorites` all accept the same model reference: an absolute path, a canonical model id, or a case-insensitive substring of the file name or its parent directory. Ambiguous references exit `66` with a disambiguation list.
+**Model references.** `start`, `stop`, `logs`, `requests`, `presets`, `favorites` all accept the same model reference: an absolute path, a canonical model id, or a case-insensitive substring of the file name or its parent directory. Ambiguous references exit `66` with a disambiguation list.
 
 **Launch names.** One model can run several times at once, each under a name you choose: `start qwen3 --name coder`, then `start qwen3 --name writer`. The launch is then addressable as `<model-ref>@<name>` everywhere a reference is taken (`stop qwen3@coder`, `logs qwen3@coder`, `show qwen3@coder`) and as `<model-id>@<name>` in a request's `body.model` on the proxy. A bare `stop coder` works too when exactly one live launch answers to that name; a launch that failed to load keeps its row but stops holding the address, so the name reaches the copy that is actually running and only falls back to the failed one when nothing else answers. Names are unique per model, case-insensitive, limited to letters/digits/`-`/`_` (so the address always parses back), live only as long as the launch, and are refused for backends that serve every model from one shared process (Lemonade), where a second launch is not a second instance.
 
@@ -203,6 +203,7 @@ Bare letters are for tool actions (`f` favorite, `e` edit, `u/c/p` yank, `t` the
 | `focus_logs_tab`                        | `Shift+L`                         | Nav focuses — gated on a running model                                             |
 | `focus_chat_tab`                        | `Shift+C` · `Shift+E` · `Shift+R` | Nav focuses — picks mode-appropriate tab (Chat / Embed / Rerank), gated on running |
 | `focus_settings_tab`                    | `Shift+S`                         | Nav focuses — always available                                                     |
+| `focus_requests_tab`                    | `Shift+U`                         | Nav focuses, gated on a model that has a launch                                    |
 | `next_field` / `prev_field`             | `↓` / `↑`                         | Rerank input — cycles Query / Candidate                                            |
 | `cycle_value_next` / `cycle_value_prev` | `→` / `←`                         | Right pane (Settings) — cycles the focused row's value (incl. the preset row, and the `server` row when a model has >1 compatible build) |
 | `save_preset`                           | `Ctrl+P`                          | Save the settings in view as a named preset (name prompt → confirm). Settings pane always (the form, or a running model); Models list only on a running row |
@@ -491,6 +492,8 @@ Snapshot of daemon health, managed launches, external (unmanaged) `llama-server`
 
 Each row in `models` carries `name` when the launch was started with `--name`, and `preset` when the launch resolved one — an explicit `--preset` / launch file / TUI preset stop, a `<model>@<preset>` auto-start address, or the model's config `default:`. Both keys are omitted, not nulled, when they don't apply; `preset` is the preset that actually launched this copy, unlike the sibling `default` field, which is the model's configured default either way. The human table has no MODEL column, so its NAME cell renders `<model>@<name>` for a named launch and the model alone otherwise: two different models both named `coder` stay tellable apart in the command you reach for to work out what to stop.
 
+Each row also carries `request_stats`: totals of the proxy requests that launch has served since the daemon started (`requests`, `errors`, `avg_duration_ms`, `avg_ttfb_ms`, `tokens_per_second_avg`, `tokens_per_second_last`, `prompt_tokens`, `completion_tokens`, `auto_starts`, `evictions`). Counts are `0` and averages `null` until the first request. Field meanings are under [`llamastash requests`](#llamastash-requests-model-ref).
+
 The `proxy` block is documented in detail under [Proxy → Is the proxy up?](#is-the-proxy-up).
 
 On a host where more than one GPU backend reports a device (e.g. an
@@ -510,6 +513,68 @@ LlamaStash logs <target> [-n N] [-f]
 ```
 
 `-f` polls `logs_tail` and de-dupes against a rolling window. SIGINT exits cleanly with code `0`. `BrokenPipe` (e.g. piping to `head`) also exits `0`. Daemon disconnect during follow exits `65`.
+
+### `llamastash requests [model-ref]`
+
+The requests the proxy handled, newest first. It answers "why did my agent get a 503" without reading the daemon log.
+
+```
+llamastash requests [model-ref] [-n N] [--json]
+```
+
+Without `model-ref` it lists every request; with one, only that model's. `-n` sets how many rows to print (default 100).
+
+```
+TIME      STATUS  TOTAL  TTFB   TOK/S  IN  OUT  ROUTE             MODEL                         LAUNCH  CLIENT           NOTE
+16:05:11  200     1.0s   22ms   -      -   -    chat/completions  Llama-3.2-1B-Instruct-Q4_K_M  L1      127.0.0.1:49178  client closed
+16:05:11  200     29ms   12ms   122.6  41  3    chat/completions  Llama-3.2-1B-Instruct-Q4_K_M  L1      127.0.0.1:49120  -
+16:05:07  200     3.4s   3.4s   110.4  41  7    chat/completions  Llama-3.2-1B-Instruct-Q4_K_M  L1      127.0.0.1:49106  auto-start
+16:05:07  404     0ms    -      -      -   -    chat/completions  nope                          -       127.0.0.1:49062  model_not_found: nope not found
+```
+
+- `TOTAL` is the time from the proxy receiving the request to the end of the response. `TTFB` is the time to the first response body byte, which includes any model load.
+- `IN` / `OUT` are prompt and generated tokens. `TOK/S` is the generation speed.
+- `NOTE` says what happened beyond the status code: `auto-start`, `unloaded L3` (launches unloaded to make room), `fallback (<reason>) for <model>`, `client closed`, `upstream error`, `loading model`, `in flight`, or the proxy's own error and its message (`launch_failed: auto-start of ...`).
+- On a terminal a summary block is printed above the table. Piped output is the header plus one tab-separated line per request. The `MODEL` column is dropped when `model-ref` is given.
+
+`--json` emits `{ "summary": {...}, "requests": [...] }`. Every key of a request is always present; a value the proxy does not have is `null`:
+
+```json
+{
+  "seq": 13,
+  "started_at_ms": 1791209111562,
+  "client": "127.0.0.1:49178",
+  "route": "/v1/chat/completions",
+  "requested_model": "Llama-3.2-1B",
+  "model": "Llama-3.2-1B-Instruct-Q4_K_M",
+  "model_path": "/models/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+  "launch_id": "L1",
+  "state": "client_closed",
+  "status": 200,
+  "error": null,
+  "cause": null,
+  "auto_start": false,
+  "evicted": [],
+  "fallback": null,
+  "ttfb_ms": 22,
+  "duration_ms": 1000,
+  "prompt_tokens": null,
+  "completion_tokens": null,
+  "tokens_per_second": null
+}
+```
+
+`state` is `in_flight`, `done`, `client_closed` (the client went away before the response was complete) or `upstream_error` (the model's server dropped the connection mid-response). When the proxy answered the request itself, `error` is its error `code`, or its `type` when the error has no code (`model_not_found`, `model_required`, `launch_failed`, ...), and `cause` is the error message. When another model answered because the launch failed, the row is filed under the model that answered and `fallback` holds the reason.
+
+`summary` covers the same scope as the rows (one model, or everything) and counts finished requests since the daemon started, so it keeps counting requests whose rows have left the log. `errors` counts 4xx / 5xx answers and `upstream_error` rows; a client that hung up is not an error. The two averages cover completed 2xx / 3xx requests only. `tokens_per_second_avg` is the mean of the per-request speeds.
+
+What is and is not recorded:
+
+- Only requests on the forwarded `/v1/*` routes. `/v1/models`, `/health`, `/api/*`, `/ui` and requests refused for a missing or wrong API key are not logged.
+- The log keeps the last 1000 requests in memory. It is not written to disk and is empty after a daemon restart.
+- No prompt or response text is stored. Token counts are read from the `usage` and `timings` objects at the end of the response as it passes through; the proxy does not change the request to ask for them.
+- `tokens_per_second` is the speed the model's server reported (`timings.predicted_per_second`, `usage.completion_tokens_per_second` or `metrics.tokens_per_second`), never an estimate. It is `null` when the server reports none. With llama-server b11390 that is every `/v1/messages` response and a non-streamed `/v1/responses` response.
+- Token counts and speed are `null` for a compressed response, and for a response that was cut short.
 
 ### `llamastash presets <model-ref> <action>`
 
@@ -1515,7 +1580,7 @@ These are the defaults. Override any binding via the `keybindings:` block in `co
 | `t` / `Shift+T`                               | Cycle theme forward / backward                                                                                                                                                                           |
 | `Alt+L` (`⌥L` on macOS)                       | Cycle the left/right pane split through `left_pane_ratios` (wide mode; session-only). `100` hides the right pane, `0` hides the list.                                                                    |
 | `Tab` / `Shift+Tab`                           | Move focus across panes (`h` / `l` do the same — Left/Right arrows are intentionally unbound on Models to avoid an asymmetric pane-jump)                                                                 |
-| `Shift+M` / `Shift+L` / `Shift+C` / `Shift+S` | Jump focus to Models / Logs / Chat / Settings respectively. `L` and `C` only fire when the focused model is running.                                                                                     |
+| `Shift+M` / `Shift+L` / `Shift+C` / `Shift+S` / `Shift+U` | Jump focus to Models / Logs / Chat / Settings / Requests respectively. `L` and `C` only fire when the focused model is running, `U` when it has a launch.                                    |
 | `Shift+P`                                     | Open the HuggingFace pull dialog (Models list focus only — search + sort + paginate, download via the pinned status strip). "P" for Pull.                                                                |
 | `Ctrl+P`                                      | Save the launch settings in view (the Settings form's knobs, or a running model's live knobs) as a named preset in `config.yaml` — prompts for a name, then an overwrite confirm if it already exists. "P" for Preset.                                                              |
 | `Ctrl+S`                                      | Stop the focused running launch (any nav focus; opens a confirmation popup)                                                                                                                              |
@@ -1556,7 +1621,7 @@ When enabled, left-click moves focus and the wheel replays the `↑`/`↓` actio
 | Left-click on the Models list                                                     | Focus → `List`                                                                                                                                                                                                                                                                                |
 | Left-click on the right pane (body, not a tab label)                              | Focus → `RightPane` (keyboard still drives `e` to enter Chat/Embed/Rerank text input)                                                                                                                                                                                                         |
 | Left-click on a tab label (`Settings`/`Logs`/`Chat`/`Embed`/`Rerank`)             | Switch `right_tab` + focus → `RightPane`                                                                                                                                                                                                                                                      |
-| Wheel up/down                                                                     | Same as pressing `↑`/`↓`: moves the list cursor in `List` focus, scrolls the active buffer in Logs / Chat / Embed / Rerank, cycles fields in the Settings form (scrolls the read-only running view). To scroll Logs without leaving an input, click the right pane first to land focus there. |
+| Wheel up/down                                                                     | Same as pressing `↑`/`↓`: moves the list cursor in `List` focus, scrolls the active buffer in Logs / Chat / Embed / Rerank / Requests, cycles fields in the Settings form (scrolls the read-only running view). To scroll Logs without leaving an input, click the right pane first to land focus there. |
 | Drag / Up / Moved                                                                 | Filtered out — preserves terminal text selection during drag and prevents mouse-motion events from saturating the event channel.                                                                                                                                                              |
 | Any mouse event while a modal owns input (HF dialog, confirm popup, help overlay) | Ignored — modals own their own dismissal contract; a stray click cannot confirm a destructive action.                                                                                                                                                                                         |
 
@@ -1698,15 +1763,24 @@ inheritance is visible at the row level.
 | Key                                                       | Action                                                                                    |
 | --------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
 | `Tab` / `Shift+Tab`                                       | Cycle pane focus (universal across the TUI; `l` / `h` are vi aliases)                     |
-| `↑` / `↓` (or `k` / `j`)                                  | Settings tab: move between editor rows. Logs tab: scroll the buffer.                      |
+| `↑` / `↓` (or `k` / `j`)                                  | Settings tab: move between editor rows. Logs tab: scroll the buffer. Requests tab: scroll the table. |
 | `←` / `→`                                                 | Settings tab: cycle the focused row's value through its preset list (no-op on other tabs) |
 | `Esc` / `Shift+M`                                         | Return focus to the Models list                                                           |
 | `Shift+L` / `Shift+C` / `Shift+S` / `Shift+E` / `Shift+R` | Jump to Logs / Chat / Settings tab. `L` and `C/E/R` are gated on a running model.         |
+| `Shift+U`                                                 | Jump to the Requests tab (the `u` underlined in its label). Gated on a model that has a launch. |
 | `s`                                                       | Toggle Logs auto-scroll (toasts `auto-scroll on` / `off`)                                 |
 | `c` (or `y`)                                              | Logs tab: copy the full log buffer to clipboard                                           |
 | `r`                                                       | Chat tab: toggle `<think>` block collapse (toasts `reasoning shown` / `collapsed`)        |
 | `Ctrl+S`                                                  | Stop the focused running launch (confirmation popup)                                      |
 | `e`                                                       | Enter edit mode on the active tab's input field                                           |
+
+### Requests tab
+
+The last tab of every model that has a launch. It shows that model's proxy requests only: the same data as [`llamastash requests <model-ref>`](#llamastash-requests-model-ref), refreshed twice a second while the tab is open.
+
+- The top lines are the model's summary: requests, errors, average total time and time to first byte, tok/s (average and last), tokens in and out, auto-starts, and launches unloaded to make room.
+- Below is the table, newest request first. `↑` / `↓` scroll it.
+- Columns drop out as the pane narrows, in this order: `Client`, `Route`, `Out`, `In`, `TTFB`, `Tok/s`, `Total`, then `Time` and `Code`. `Note` takes whatever width is left.
 
 ### Chat tab (`Focus::ChatInput`)
 

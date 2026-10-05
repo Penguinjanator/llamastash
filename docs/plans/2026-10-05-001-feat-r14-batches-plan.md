@@ -56,44 +56,69 @@ session, in order. Tick an item here and in `TODO.md` in the same change.
 
 ### Plan
 
-1. Request log with clock fields only: a bounded ring buffer on `ProxyState`, filled where the proxy dispatches a request and where `GuardedBody` drops ([`src/proxy/forward.rs`](../../src/proxy/forward.rs)). No body parsing yet. Each row carries the resolved `ModelId` and the launch id when one exists, so readers can filter by model.
-2. Expose it: a new method in the `src/ipc/methods.rs` dispatch table and a CLI command with `--json` (name to decide, e.g. `llamastash requests [<model>]`). The method takes an optional model filter and returns `{ summary, rows }`, with the summary computed in the daemon. Document both in `docs/usage.md` and `docs/architecture.md` § IPC surface.
+1. Request log with clock fields only: a bounded ring buffer, filled where the proxy dispatches a request and where `GuardedBody` drops ([`src/proxy/forward.rs`](../../src/proxy/forward.rs)). No body parsing yet. Each row carries the resolved model path and the launch id when one exists, so readers can filter by model. The log sits on `MethodContext`, not `ProxyState`, because the IPC handlers read it and only see the context.
+2. Expose it: `requests_tail` in the `src/ipc/methods.rs` dispatch table and `llamastash requests [<model>]` with `--json`. The method takes an optional `model_path` and returns `{ summary, requests }`, with the summary computed in the daemon. Document both in `docs/usage.md` and `docs/architecture.md` § IPC surface.
 3. TUI `Requests` tab with the clock fields, per the design below. Token fields render `—` until step 5.
-4. Before the body tap, send one streamed and one non-streamed request to llama.cpp, Halogen and gufo and record which of `timings` / `usage` the last chunk carries. This closes the open question in the speed stats item.
-5. Body tap: extend `GuardedBody` to keep the tail of the response and read `timings` / `usage` / `metrics` by field name at end of stream. Add token counts and tok/s to the log rows; the tab's token columns and tok/s summary fill in.
-6. Speed stats: add the per-launch summary to `status`. It is the same summary the tab's top strip shows, so `status --json` and the TUI report the same numbers.
-7. Measure proxy overhead with and without the tap using the proxy bench in `scripts/bench/`. Check the tab with `--render` at 80x24, 120x40 and 160x45 and update the golden snapshots.
+4. Before the body tap, send one streamed and one non-streamed request to llama.cpp, Halogen and gufo and record which of `timings` / `usage` the last chunk carries. Done for llama.cpp only, see Result.
+5. Body tap: `GuardedBody` keeps the head and the tail of the response and reads `timings` / `usage` / `metrics` by field name at end of stream ([`src/proxy/usage_tap.rs`](../../src/proxy/usage_tap.rs)). Token counts and tok/s land on the log rows; the tab's token columns and tok/s summary fill in.
+6. Speed stats: add the per-launch summary to `status` as `request_stats`. It is the same summary the tab's top strip shows, so `status --json` and the TUI report the same numbers.
+7. Measure proxy overhead with and without the tap using the proxy bench in `scripts/bench/`. Not run, see Follow-ups. Check the tab with `--render` and the pty driver and update the golden snapshots.
 
 ### Requests tab
 
-- **Placement.** A `Requests` variant in `RightTab` (`src/tui/tabs/mod.rs`), last in `tabs_for_mode`: `Settings, Logs, Chat|Embed|Rerank, Requests`. A delegated multiplexer model keeps it (only `Settings` is filtered out there). `Error` / `Stopped` rows also get the tab with last recorded details.
-- **Filter.** Only the focused model's requests, matched on `ModelId`, not launch id, so a request that never got a launch (a 503 at auto-start) still shows. No Model column.
-- **Data.** Poll the new IPC method with the focused model, the way `spawn_logs_poller` follows focus, and only while the tab is open. One call returns the summary and the rows.
-- **Top strip: summary.** Requests, errors (4xx / 5xx), average total time, average time to first byte, tok/s (average and last), prompt tokens, generated tokens, auto-starts and evictions triggered. The TUI renders the daemon's summary and does not recompute it from the visible rows.
+- **Placement.** A `Requests` variant in `RightTab` (`src/tui/tabs/mod.rs`), last in `tabs_for_mode`: `Settings, Logs, Chat|Embed|Rerank, Requests`. A delegated multiplexer model keeps it (only `Settings` is filtered out there). `Launching`, `Loading`, `Error` and `Stopped` rows get the tab too: a failed auto-start leaves the row in `Error` and its 503 rows are what the log is for. Tabs are reached by a Shift-letter jump, and `R` is Rerank's, so Requests underlines the `u` of its label and takes `Shift+U`.
+- **Filter.** Only the focused model's requests, matched on the model's catalog path, not launch id, so a request that never got a launch (a 503 at auto-start) still shows. No Model column.
+- **Data.** Poll `requests_tail` with the focused model through the same loop the Logs tab uses (`spawn_tab_poller`), and only while the tab is open. One call returns the summary and the rows.
+- **Top strip: summary.** Requests, errors (4xx / 5xx), average total time, average time to first byte, tok/s (average and last), prompt tokens, generated tokens, auto-starts and evictions triggered. The TUI renders the daemon's summary and does not recompute it from the visible rows. The summary counts finished requests since the daemon started, so it keeps counting after a row leaves the ring.
 - **Table.** Below the strip, newest first, scrolled with the existing right-pane scroll actions. Key labels come from `KeyMap`. Empty state: one line saying the model has no requests yet.
 - **Ranked columns.** Each column has a fixed width and a rank; lower rank stays longer as the pane narrows. Lift the picker out of `src/tui/list_pane.rs` (`Column { label, width, rank }` plus the strict rank-tail drop in `layout_columns`) into a shared helper and use it for both tables. Declaration order is display order. `Note` is the flexible column and takes the leftover width, like `Name` in the list pane.
 
   | Column | Width | Rank | Content |
   |---|---|---|---|
   | Time | 8 | 10 | `HH:MM:SS`, local |
-  | Status | 4 | 10 | HTTP status, coloured by class |
+  | Code | 4 | 10 | HTTP status, coloured by class |
   | Total | 7 | 20 | total time |
   | Tok/s | 6 | 30 | generation speed |
-  | TTFB | 6 | 40 | time to first byte |
+  | TTFB | 7 | 40 | time to first byte |
   | In | 6 | 50 | prompt tokens |
-  | Out | 6 | 50 | generated tokens |
-  | Route | 9 | 60 | `chat`, `embed`, `rerank`, `messages` |
-  | Client | 15 | 70 | client address |
+  | Out | 6 | 55 | generated tokens |
+  | Route | 16 | 60 | the route without `/v1/`, e.g. `chat/completions` |
+  | Client | 21 | 70 | client address (`ip:port`) |
   | Note | flex | n/a | auto-start, eviction, or the 503 cause |
 
-  Widths and ranks are starting values; adjust them under `--render`.
+  These are the shipped values. `In` and `Out` have different ranks because two columns of one rank do not leave together: the picker stops at the first column that does not fit.
 - **Tests.** `tabs_for_mode` and `available_right_tabs` order, the column picker at three widths, and the golden snapshots.
 - **Docs.** `docs/usage.md` and `docs/architecture.md` § Right pane tabs. That table lists `Logs, Chat` for a ready chat model and omits `Settings`, which the code returns first; fix it in the same change.
 
 ### Items
 
-- [ ] **Proxy request log.** Keep the last N proxy requests in memory (time, client address, route, model, launch, HTTP status, latency, time to first byte, the auto-start or eviction it triggered) and show them in a per-model `Requests` tab in the TUI (design under Requests tab above) and a CLI command with `--json`. It answers "why did my agent get a 503" without reading daemon logs. No request log exists today. Token counts and tok/s per request need the response body: llama-server puts a `timings` object in it, and the proxy streams bytes through untouched ([`src/proxy/forward.rs`](../../src/proxy/forward.rs) `GuardedBody`), so that part is a tap on the body wrapper and can ship second. Store no prompt or response text. Nothing request-shaped exists today to build on: no counters or log ring in the proxy, no `/metrics` route, and `DaemonState` (`src/daemon/state_store.rs`) has no request field, so an in-memory ring owned by `ProxyState` is the starting shape. Hook points for one shared tap: `GuardedBody` in `src/proxy/forward.rs` (status, latency, time to first byte, later the `usage` object), `route::decide` for the routing decision, and `eviction.rs` `make_room` plus `failure_tracker.rs` for the 503 causes, which are the answer to the "why did my agent get a 503" question this exists for. Ship metadata first, tokens second, per the speed-stats entry above.
-- [ ] **Live speed stats per model.** Show tok/s, time to first token and prompt/generated token counts for running models in the summary strip of the TUI `Requests` tab and in `status --json`. Read them from the response as it passes through the proxy, the same body tap the proxy request log needs: (1) the proxy's clock for time to first byte and total time, (2) the OpenAI `usage` object for token counts, (3) the server's own speed fields when present: `timings` (llama.cpp, Halogen), `usage.*_tokens_per_second` (gufo), `metrics` (vLLM with `--enable-per-request-metrics`). Match on field names, not backend ids. Open: whether Halogen and gufo put `timings` / `usage` in the last streamed chunk (only non-streaming is checked, in `scripts/bench/qwen38-flash-speed/bench.py`). A streamed OpenAI response carries `usage` only when the client sends `stream_options.include_usage: true`, and the proxy should not add it by default. Optional second source for requests that skip the proxy: poll `/metrics` (llama.cpp needs `--metrics`; Halogen 0.16.2 serves the same `llamacpp:*` names; vLLM `vllm:*`; SGLang `sglang:*` with `--enable-metrics`). Checked 2026-10-05. Confirmed absent today, so the tap has no prior art in-tree: no read of `usage` / `prompt_tokens` / `completion_tokens` anywhere in `src/proxy`, and no `/metrics` route on either server. Two notes for whoever picks it up: the same tap is what the **Proxy request log** entry below needs, so design the `GuardedBody` hook once for both; and `daemon.metrics_interval_secs` is the host sampler (CPU/GPU/temp), so name this surface something else (`launch_stats`, `speed`) to keep the two apart. Nothing request-shaped is persisted: `DaemonState` (`src/daemon/state_store.rs`) holds favorites, `last_params`, `running` and `schema_version` only, so totals that survive a restart need a new field there or they die with the daemon.
+- [x] **Proxy request log.** Keep the last N proxy requests in memory (time, client address, route, model, launch, HTTP status, latency, time to first byte, the auto-start or eviction it triggered) and show them in a per-model `Requests` tab in the TUI (design under Requests tab above) and a CLI command with `--json`. It answers "why did my agent get a 503" without reading daemon logs. No request log exists today. Token counts and tok/s per request need the response body: llama-server puts a `timings` object in it, and the proxy streams bytes through untouched ([`src/proxy/forward.rs`](../../src/proxy/forward.rs) `GuardedBody`), so that part is a tap on the body wrapper and can ship second. Store no prompt or response text. Nothing request-shaped exists today to build on: no counters or log ring in the proxy, no `/metrics` route, and `DaemonState` (`src/daemon/state_store.rs`) has no request field, so an in-memory ring owned by `ProxyState` is the starting shape. Hook points for one shared tap: `GuardedBody` in `src/proxy/forward.rs` (status, latency, time to first byte, later the `usage` object), `route::decide` for the routing decision, and `eviction.rs` `make_room` plus `failure_tracker.rs` for the 503 causes, which are the answer to the "why did my agent get a 503" question this exists for. Ship metadata first, tokens second, per the speed-stats entry above.
+- [x] **Live speed stats per model.** Show tok/s, time to first token and prompt/generated token counts for running models in the summary strip of the TUI `Requests` tab and in `status --json`. Read them from the response as it passes through the proxy, the same body tap the proxy request log needs: (1) the proxy's clock for time to first byte and total time, (2) the OpenAI `usage` object for token counts, (3) the server's own speed fields when present: `timings` (llama.cpp, Halogen), `usage.*_tokens_per_second` (gufo), `metrics` (vLLM with `--enable-per-request-metrics`). Match on field names, not backend ids. Open: whether Halogen and gufo put `timings` / `usage` in the last streamed chunk (only non-streaming is checked, in `scripts/bench/qwen38-flash-speed/bench.py`). A streamed OpenAI response carries `usage` only when the client sends `stream_options.include_usage: true`, and the proxy should not add it by default. Optional second source for requests that skip the proxy: poll `/metrics` (llama.cpp needs `--metrics`; Halogen 0.16.2 serves the same `llamacpp:*` names; vLLM `vllm:*`; SGLang `sglang:*` with `--enable-metrics`). Checked 2026-10-05. Confirmed absent today, so the tap has no prior art in-tree: no read of `usage` / `prompt_tokens` / `completion_tokens` anywhere in `src/proxy`, and no `/metrics` route on either server. Two notes for whoever picks it up: the same tap is what the **Proxy request log** entry below needs, so design the `GuardedBody` hook once for both; and `daemon.metrics_interval_secs` is the host sampler (CPU/GPU/temp), so name this surface something else (`launch_stats`, `speed`) to keep the two apart. Nothing request-shaped is persisted: `DaemonState` (`src/daemon/state_store.rs`) holds favorites, `last_params`, `running` and `schema_version` only, so totals that survive a restart need a new field there or they die with the daemon.
+
+### Result (2026-10-05)
+
+Shipped: the log, `requests_tail`, `llamastash requests`, the `Requests` tab, the body tap, and `request_stats` on `status`.
+
+Response shapes, recorded from llama-server b11390 (upstream was at b11417) with `Llama-3.2-1B-Instruct-Q4_K_M` on CPU:
+
+| Route | Streamed | `usage` | `timings` |
+|---|---|---|---|
+| `/v1/chat/completions`, `/v1/completions` | no | yes | yes |
+| `/v1/chat/completions` | yes | only with `stream_options.include_usage` | yes, in the last chunk |
+| `/v1/messages` | no | yes (`input_tokens` excludes `cache_read_input_tokens`) | no |
+| `/v1/messages` | yes | `message_start` has the input tokens, `message_delta` the output tokens | no |
+| `/v1/responses` | no | yes (`input_tokens` includes cached tokens) | no |
+| `/v1/responses` | yes | yes, in `response.completed` | yes, in `response.completed` |
+
+So on a stream without `usage` the token counts come from `timings` (`prompt_n + cache_n`, `predicted_n`), and the tap keeps the head of the response as well as the tail because an Anthropic stream reports its input tokens in the first event.
+
+The vLLM field name (`metrics.tokens_per_second`, sent with `--enable-per-request-metrics`, on a stream only in the final usage chunk) is from the upstream source on 2026-10-05 (`vllm/entrypoints/generate/base/protocol.py`, release v0.31.0), not from a live server. gufo's `usage.completion_tokens_per_second` is from `scripts/bench/qwen38-flash-speed/bench.py`, non-streamed only.
+
+### Follow-ups
+
+- [ ] Run the proxy overhead bench with and without the tap (plan step 7). Skipped on 2026-10-05: a Halogen run held the GPU, and the bench needs a quiet machine.
+- [ ] Check which of `timings` / `usage` Halogen and gufo put in the last streamed chunk. Skipped for the same reason: it means sending requests to a model that was in use.
+- [ ] Decide whether to estimate tok/s from the proxy clock where the server reports none (`/v1/messages`, non-streamed `/v1/responses` on llama.cpp). Today the column is empty there.
 
 ## Batch 4: faster reloads
 

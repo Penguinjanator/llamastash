@@ -127,6 +127,7 @@ pub async fn dispatch_request(ctx: &MethodContext, req: Request) -> Response {
     "stop_all" => respond(id, stop_all_handler(ctx, req.params).await),
     "stop_external" => respond(id, stop_external_handler(ctx, req.params).await),
     "logs_tail" => respond(id, logs_tail_handler(ctx, req.params).await),
+    "requests_tail" => respond(id, requests_tail_handler(ctx, req.params)),
     "presets_list" => respond(id, presets_list_handler(ctx, req.params).await),
     "presets_save" => respond(id, presets_save_handler(ctx, req.params).await),
     "presets_delete" => respond(id, presets_delete_handler(ctx, req.params).await),
@@ -487,6 +488,31 @@ async fn logs_tail_handler(
   }))
 }
 
+#[derive(Deserialize, Default)]
+struct RequestsTailParams {
+  /// Catalog path of one model. Absent: every request.
+  #[serde(default)]
+  model_path: Option<String>,
+  #[serde(default)]
+  limit: Option<usize>,
+}
+
+/// The proxy's request log: the newest rows, newest first, and the summary
+/// for the same scope.
+fn requests_tail_handler(ctx: &MethodContext, params: Option<Value>) -> Result<Value, ErrorObject> {
+  use crate::proxy::request_log::{CAPACITY, DEFAULT_TAIL};
+  let parsed: RequestsTailParams = match params {
+    None | Some(Value::Null) => RequestsTailParams::default(),
+    some => parse_params(some)?,
+  };
+  let limit = parsed.limit.unwrap_or(DEFAULT_TAIL).min(CAPACITY);
+  let tail = ctx.requests.tail(parsed.model_path.as_deref(), limit);
+  Ok(json!({
+    "summary": tail.summary,
+    "requests": tail.rows,
+  }))
+}
+
 /// Sorted list of every method `dispatch_request` knows. Used by
 /// the `capabilities` handler so clients can feature-detect. The
 /// names here mirror the wire spec in `docs/architecture.md`; a new
@@ -503,6 +529,7 @@ const PUBLIC_METHODS: &[&str] = &[
   "stop_all",
   "stop_external",
   "logs_tail",
+  "requests_tail",
   "presets_list",
   "presets_save",
   "presets_delete",
@@ -1061,6 +1088,48 @@ mod tests {
       body["last_params"][0]["model_path"], "enginex://row",
       "{body}"
     );
+  }
+
+  #[tokio::test]
+  async fn requests_tail_returns_the_summary_and_rows_and_clamps_the_limit() {
+    let ctx = ctx();
+    for _ in 0..3 {
+      let mut rec = ctx.requests.begin("/v1/chat/completions", None);
+      rec.set_model("m", "/m/a.gguf");
+      rec.respond(404, Some("model_not_found"), None);
+    }
+    let call = |params: Option<Value>| {
+      let ctx = ctx.clone();
+      async move { dispatch_request(&ctx, Request::new(1, "requests_tail", params)).await }
+    };
+    let one_model = call(Some(json!({"model_path": "/m/a.gguf", "limit": 2})))
+      .await
+      .result
+      .unwrap();
+    assert_eq!(one_model["summary"]["requests"], 3);
+    assert_eq!(one_model["summary"]["errors"], 3);
+    let rows = one_model["requests"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["seq"], 3, "newest first");
+
+    // No params, `null` params and `{}` all mean "every request". A limit
+    // past the ring size is cut to it rather than refused.
+    for params in [
+      None,
+      Some(Value::Null),
+      Some(json!({})),
+      Some(json!({"limit": 1_000_000})),
+    ] {
+      let every = call(params).await.result.unwrap();
+      assert_eq!(every["requests"].as_array().unwrap().len(), 3);
+    }
+    // A limit of 0 is a summary-only call.
+    let summary_only = call(Some(json!({"limit": 0}))).await.result.unwrap();
+    assert!(summary_only["requests"].as_array().unwrap().is_empty());
+    assert_eq!(summary_only["summary"]["requests"], 3);
+
+    let bad = call(Some(json!({"limit": "ten"}))).await;
+    assert_eq!(bad.error.unwrap().code, ErrorCode::InvalidParams.as_i32());
   }
 
   #[tokio::test]

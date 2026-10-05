@@ -303,7 +303,7 @@ pub async fn serve_with_options(
       }
       accept = listener.accept() => {
         match accept {
-          Ok((stream, _peer)) => {
+          Ok((stream, peer)) => {
             let conn_state = Arc::clone(&state);
             let conn_tracker = Arc::clone(&tracker);
             conn_tracker.active.fetch_add(1, Ordering::SeqCst);
@@ -315,7 +315,7 @@ pub async fn serve_with_options(
             let task_tracker = Arc::clone(&conn_tracker);
             let header_read_timeout = options.header_read_timeout;
             let handle = tokio::spawn(async move {
-              serve_connection(stream, conn_state, header_read_timeout).await;
+              serve_connection(stream, conn_state, header_read_timeout, peer).await;
               activity.mark();
               task_tracker.active.fetch_sub(1, Ordering::SeqCst);
             });
@@ -373,14 +373,18 @@ async fn serve_connection(
   stream: tokio::net::TcpStream,
   state: Arc<ProxyState>,
   header_read_timeout: Duration,
+  peer: SocketAddr,
 ) {
   // `TokioIo` bridges `tokio::net::TcpStream` (which implements the
   // tokio `AsyncRead`/`AsyncWrite` traits) onto hyper 1.x's `Io`
   // traits without a `tower-service` dep. Owned by the connection
   // future so it lives exactly as long as the connection does.
   let io = TokioIo::new(stream);
-  let service = service_fn(move |req| {
+  let service = service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
     let state = Arc::clone(&state);
+    // Carried as an extension so `route` keeps its two-argument shape;
+    // the request log reads it back.
+    req.extensions_mut().insert(super::router::ClientAddr(peer));
     async move { route(state, req).await }
   });
   let mut builder = http1::Builder::new();

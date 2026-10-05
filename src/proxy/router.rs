@@ -37,6 +37,7 @@ use super::ollama_compat::{
   TagsResponse, VersionResponse, FAR_FUTURE_EXPIRY, UNKNOWN_MTIME,
 };
 use super::openai::{ErrorObject, ErrorResponse, ModelList, ModelObject};
+use super::request_log::RequestRecord;
 use super::route::{self, RouteDecision};
 use super::state::ProxyState;
 use crate::daemon::state_store::RunningSnapshot;
@@ -58,6 +59,11 @@ pub type BodyError = Box<dyn StdError + Send + Sync>;
 /// pick whatever concrete `Body` makes sense without poisoning the
 /// outer signature.
 pub type ProxyResponse = Result<Response<BoxBody<Bytes, BodyError>>, hyper::Error>;
+
+/// Peer address of the connection a request arrived on. The listener
+/// stores it in the request's extensions for the request log.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClientAddr(pub std::net::SocketAddr);
 
 /// Entry point invoked by the `service_fn` closure. Returns a fully
 /// constructed `Response`; the caller hands it back to hyper.
@@ -171,15 +177,34 @@ fn text_response(status: StatusCode, body: &'static str) -> Response<BoxBody<Byt
 /// extract `body.model`, run the resolver, pick a Ready supervisor,
 /// forward.
 async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyResponse {
+  let client = req.extensions().get::<ClientAddr>().map(|c| c.0);
   let (method, uri, headers, body) = forward::deconstruct(req);
   let cap = state.max_body_size;
+  // The log row for this request. Every return below either finishes it
+  // (`answered`) or hands it to the forward path; a return that did
+  // neither drops it, which logs the request as closed by the client.
+  let mut record = state.ctx.requests.begin(uri.path(), client);
 
   let parsed = match route::buffer_and_extract(body, cap).await {
     Ok(p) => p,
-    Err(e) => return route::body_error_response(e, cap),
+    Err(e) => return answered(record, route::body_error_response(e, cap)),
   };
+  record.set_requested_model(parsed.model.as_deref());
 
   let decision = route::decide(&state, parsed.model).await;
+  match &decision {
+    RouteDecision::ReadyAt {
+      served_model_id,
+      model_path,
+      ..
+    } => record.set_model(served_model_id, model_path),
+    RouteDecision::NotRunning { resolved_row, .. } => record.set_model(
+      &route::served_name_for_row(resolved_row),
+      &resolved_row.path,
+    ),
+    _ => {}
+  }
+  record.publish();
   // Some backends serve chat/completions but not embeddings/rerank. Refuse such
   // a request bound for a backend that doesn't serve the mode with a clear JSON
   // error instead of forwarding into the backend's bare 404 — covering both a
@@ -228,7 +253,10 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
           b.id(),
           mode.label()
         );
-        return error_response(StatusCode::BAD_REQUEST, "unsupported_endpoint", &msg);
+        return answered(
+          record,
+          error_response(StatusCode::BAD_REQUEST, "unsupported_endpoint", &msg),
+        );
       }
     }
   }
@@ -246,6 +274,7 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
       port,
       served_model_id,
       served_model_key,
+      model_path: _,
       upstream_path_prefix,
       fallback,
       fallback_reason,
@@ -267,13 +296,13 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
           fallback,
           fallback_reason: fallback_reason.as_deref(),
         },
+        Some(record),
       )
       .await
     }
     RouteDecision::NotRunning {
       requested_model,
       resolved_row,
-      arch,
       name,
     } => {
       route::handle_not_running(
@@ -281,17 +310,20 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
         inbound,
         requested_model,
         *resolved_row,
-        arch,
         req_mode,
         name,
+        record,
       )
       .await
     }
-    RouteDecision::NotFound { requested_model } => error_with_matches(
-      StatusCode::NOT_FOUND,
-      "model_not_found",
-      &format!("{requested_model} not found"),
-      Vec::<String>::new(),
+    RouteDecision::NotFound { requested_model } => answered(
+      record,
+      error_with_matches(
+        StatusCode::NOT_FOUND,
+        "model_not_found",
+        &format!("{requested_model} not found"),
+        Vec::<String>::new(),
+      ),
     ),
     RouteDecision::Ambiguous {
       requested_model,
@@ -301,30 +333,39 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
         "`{requested_model}` matched {n} models; send one of `matches` (the repo-qualified id `/v1/models` publishes), a full path, or a unique substring",
         n = candidates.len()
       );
-      error_with_matches(
-        StatusCode::BAD_REQUEST,
-        "ambiguous_model",
-        &message,
-        candidates,
+      answered(
+        record,
+        error_with_matches(
+          StatusCode::BAD_REQUEST,
+          "ambiguous_model",
+          &message,
+          candidates,
+        ),
       )
     }
-    RouteDecision::ModelRequired => error_with_code(
-      StatusCode::BAD_REQUEST,
-      "invalid_request",
-      "the `model` field is required",
-      "model_required",
-      Some("model"),
+    RouteDecision::ModelRequired => answered(
+      record,
+      error_with_code(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        "the `model` field is required",
+        "model_required",
+        Some("model"),
+      ),
     ),
     RouteDecision::BackendUnavailable {
       backend,
       requested_model,
-    } => error_response(
-      StatusCode::SERVICE_UNAVAILABLE,
-      "backend_unavailable",
-      &format!(
-        "`{requested_model}` is served by the {backend} backend, but the llamastash managed \
-         instance is not running; set up {backend} and start the daemon with `--lemonade` \
-         (see docs/lemonade-setup.md)"
+    } => answered(
+      record,
+      error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "backend_unavailable",
+        &format!(
+          "`{requested_model}` is served by the {backend} backend, but the llamastash managed \
+           instance is not running; set up {backend} and start the daemon with `--lemonade` \
+           (see docs/lemonade-setup.md)"
+        ),
       ),
     ),
   }
@@ -844,16 +885,52 @@ fn unauthorized_body() -> Vec<u8> {
   .expect("json encoding of fixed shape")
 }
 
+/// What an error response the proxy built says about the failure. It rides
+/// on the response as an extension, so the request log reads it from the
+/// answer instead of each call site repeating the status and type.
+#[derive(Debug, Clone)]
+pub(crate) struct ProxyError {
+  /// The error's `code` when it has one, else its `type`.
+  kind: String,
+  message: String,
+}
+
+/// The response for `error`: the OpenAI-shaped `{"error": {...}}` body,
+/// tagged with a [`ProxyError`].
+pub(crate) fn error_json(
+  status: StatusCode,
+  error: ErrorObject,
+) -> Response<BoxBody<Bytes, BodyError>> {
+  let tag = ProxyError {
+    kind: error.code.clone().unwrap_or_else(|| error.r#type.clone()),
+    message: error.message.clone(),
+  };
+  let bytes = serde_json::to_vec(&ErrorResponse { error }).expect("json encoding of fixed shape");
+  let mut response = json_response(status, bytes);
+  response.extensions_mut().insert(tag);
+  response
+}
+
+/// Finish `record` with an answer the proxy built itself, and return the
+/// answer.
+pub(crate) fn answered(record: RequestRecord, response: ProxyResponse) -> ProxyResponse {
+  if let Ok(resp) = &response {
+    let error = resp.extensions().get::<ProxyError>();
+    record.respond(
+      resp.status().as_u16(),
+      error.map(|e| e.kind.as_str()),
+      error.map(|e| e.message.as_str()),
+    );
+  }
+  response
+}
+
 /// Build an OpenAI-shaped error response from a `(status, type,
 /// message)` triple. Centralised so the 404 / `model_not_running`
 /// arms all emit the same
 /// `{"error":{"type":..., "message":...}}` envelope.
 pub(crate) fn error_response(status: StatusCode, r#type: &str, message: &str) -> ProxyResponse {
-  let body = ErrorResponse {
-    error: ErrorObject::new(r#type, message),
-  };
-  let bytes = serde_json::to_vec(&body).expect("json encoding of fixed shape");
-  Ok(json_response(status, bytes))
+  Ok(error_json(status, ErrorObject::new(r#type, message)))
 }
 
 /// Variant of [`error_response`] that stamps `code` (e.g.
@@ -871,8 +948,7 @@ pub(crate) fn error_with_code(
   if let Some(p) = param {
     error = error.with_param(p);
   }
-  let bytes = serde_json::to_vec(&ErrorResponse { error }).expect("json encoding of fixed shape");
-  Ok(json_response(status, bytes))
+  Ok(error_json(status, error))
 }
 
 /// Variant of [`error_response`] that stamps the candidate-name
@@ -888,9 +964,10 @@ where
   I: IntoIterator<Item = S>,
   S: Into<String>,
 {
-  let error = ErrorObject::new(r#type, message).with_matches(matches);
-  let bytes = serde_json::to_vec(&ErrorResponse { error }).expect("json encoding of fixed shape");
-  Ok(json_response(status, bytes))
+  Ok(error_json(
+    status,
+    ErrorObject::new(r#type, message).with_matches(matches),
+  ))
 }
 
 pub(crate) fn json_response(

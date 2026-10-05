@@ -799,6 +799,8 @@ pub fn status_json(snap: &StatusSnapshot) -> Value {
           serde_json::json!(r.stop_grace_secs),
         );
       }
+      // Proxy request totals for the launch, mirrored from IPC `status`.
+      obj.insert("request_stats".into(), serde_json::json!(r.request_stats));
       Value::Object(obj)
     })
     .collect();
@@ -1546,6 +1548,7 @@ mod tests {
         preset: None,
         backend: None,
         stop_grace_secs: 0,
+        request_stats: None,
       }],
       external: vec![ExternalRow {
         pid: 999,
@@ -1706,6 +1709,7 @@ mod tests {
       preset: None,
       backend: None,
       stop_grace_secs: 0,
+      request_stats: None,
     }
   }
 

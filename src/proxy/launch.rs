@@ -86,6 +86,10 @@ impl From<LaunchOutcome> for SharedOutcome {
 /// (`/v1/embeddings` → embedding, `/v1/rerank` → rerank, `None` for
 /// the chat-shaped routes) — see [`resolve_auto_start_mode`].
 ///
+/// `evicted` receives the launches make-room unloaded for this request.
+/// Only the request that leads the launch fills it; one that waited on
+/// another request's launch unloaded nothing itself.
+///
 /// The proxy must hold `Arc<ProxyState>` for the duration so the
 /// coalesce + supervisor handles stay alive across the await
 /// points.
@@ -94,6 +98,7 @@ pub(crate) async fn auto_start(
   resolved: &CatalogRow,
   endpoint_mode: Option<LaunchMode>,
   name: Option<String>,
+  evicted: &mut Vec<crate::daemon::registry::LaunchId>,
 ) -> LaunchOutcome {
   // Compute the canonical ModelId from the resolved row. Resolved here rather
   // than from any in-process cache so the single-flight key matches what
@@ -136,8 +141,15 @@ pub(crate) async fn auto_start(
     .await
   {
     AcquireOutcome::Leader(leader) => {
-      let outcome =
-        drive_launch_as_leader(state, resolved, &model_id, endpoint_mode, name.clone()).await;
+      let outcome = drive_launch_as_leader(
+        state,
+        resolved,
+        &model_id,
+        endpoint_mode,
+        name.clone(),
+        evicted,
+      )
+      .await;
       // Record outcome against the failure tracker before publishing
       // to followers so a follower that wakes up immediately and asks
       // `over_limit` sees a coherent count.
@@ -193,6 +205,7 @@ async fn drive_launch_as_leader(
   model_id: &ModelId,
   endpoint_mode: Option<LaunchMode>,
   name: Option<String>,
+  evicted: &mut Vec<crate::daemon::registry::LaunchId>,
 ) -> LaunchOutcome {
   // A launch for this file may already be underway from another
   // surface — CLI `start`, the TUI, a boot-time restore — and the
@@ -240,7 +253,8 @@ async fn drive_launch_as_leader(
       let Some(refusal) = admission_refusal(&e) else {
         return failed(e);
       };
-      if !super::eviction::make_room(state, &refusal).await {
+      *evicted = super::eviction::make_room(state, &refusal).await;
+      if evicted.is_empty() {
         return failed(e);
       }
       match compose_and_spawn(

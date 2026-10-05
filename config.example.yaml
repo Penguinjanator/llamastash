@@ -772,6 +772,7 @@ keybindings:
   focus_logs_tab: L
   focus_chat_tab: C # also: E, R (mnemonic aliases)
   focus_settings_tab: S
+  focus_requests_tab: U # the `u` underlined in the tab label; R is Rerank
   open_hf_dialog: P # i.e. shift+p — "Pull"
 
   # ── Models list local actions ─────────────────────────────

@@ -423,8 +423,9 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 
 ### Batch 3: proxy request log and speed stats ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-3-proxy-request-log-and-speed-stats))
 
-- [ ] Proxy request log
-- [ ] Live speed stats per model
+- [x] ~~Proxy request log~~
+- [x] ~~Live speed stats per model~~
+- [ ] Batch 3 follow-ups: proxy overhead bench with the body tap, streamed response shapes on Halogen and gufo, tok/s on routes where the server reports none ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#follow-ups))
 
 ### Batch 4: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
 

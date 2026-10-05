@@ -881,6 +881,7 @@ fn apply_action(app: &mut App, action: Action, writer: Option<&mpsc::Sender<Writ
     Action::FocusLogsTab => apply_focus_logs_tab(app),
     Action::FocusChatTab => apply_focus_chat_tab(app),
     Action::FocusSettingsTab => apply_focus_settings_tab(app),
+    Action::FocusRequestsTab => apply_focus_requests_tab(app),
     Action::InsertNewline => {
       // Force-insert a newline into whichever modal field is in
       // focus. Skips the input component's modifier filter so
@@ -990,6 +991,11 @@ fn apply_arrow_in_pane(app: &mut App, dir: ArrowDir) {
       RightTab::Rerank => match dir {
         ArrowDir::Up => app.rerank.scroll_up(),
         ArrowDir::Down => app.rerank.scroll_down(),
+      },
+      // Requests: newest on top, so down walks toward older rows.
+      RightTab::Requests => match dir {
+        ArrowDir::Up => app.requests.scroll_up(),
+        ArrowDir::Down => app.requests.scroll_down(),
       },
     },
     // Composer focuses: ↑/↓ scroll the tab's output viewport. The
@@ -1142,6 +1148,17 @@ fn apply_focus_chat_tab(app: &mut App) {
       app.focus = Focus::RightPane;
     }
     None => app.show_toast("Chat/Embed/Rerank unavailable — focus a running model"),
+  }
+}
+
+/// `U` quick-jump: park focus on the Requests tab when it's reachable,
+/// which is for any model that has a launch.
+fn apply_focus_requests_tab(app: &mut App) {
+  if app.available_right_tabs().contains(&RightTab::Requests) {
+    app.right_tab = RightTab::Requests;
+    app.focus = Focus::RightPane;
+  } else {
+    app.show_toast("Requests unavailable — this model has no launch");
   }
 }
 
@@ -1538,7 +1555,7 @@ fn edit_focus_for_tab(tab: RightTab) -> Option<Focus> {
     RightTab::Chat => Some(Focus::ChatInput),
     RightTab::Embed => Some(Focus::EmbedInput),
     RightTab::Rerank => Some(Focus::RerankInput),
-    RightTab::Logs | RightTab::Settings => None,
+    RightTab::Logs | RightTab::Settings | RightTab::Requests => None,
   }
 }
 
@@ -1953,6 +1970,12 @@ pub enum RefreshTick {
   Logs {
     launch_id: String,
     lines: Vec<String>,
+  },
+  /// `requests_tail` body for `model_path`, from
+  /// [`spawn_requests_poller`].
+  Requests {
+    model_path: String,
+    body: Value,
   },
   Disconnected,
   /// Failure surfaced by the writer task after dispatching a
@@ -2415,6 +2438,8 @@ pub async fn run(
   spawn_refresher(socket.clone(), events_tx.clone());
   let current_launch = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
   spawn_logs_poller(socket.clone(), current_launch.clone(), events_tx.clone());
+  let current_requests = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+  spawn_requests_poller(socket.clone(), current_requests.clone(), events_tx.clone());
   let writer_tx = spawn_writer(socket, daemon_opts, Some(events_tx.clone()));
 
   // Prime the screen once before blocking on the event channel so
@@ -2436,6 +2461,13 @@ pub async fn run(
       .lock()
       .unwrap_or_else(std::sync::PoisonError::into_inner) =
       app.focused_managed().map(|m| m.launch_id.clone());
+    let requests_target = requests_poll_target(&app);
+    if requests_target.is_none() {
+      app.requests.clear();
+    }
+    *current_requests
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner) = requests_target;
     if needs_redraw {
       terminal.draw(|f| crate::tui::render::render(f, &mut app))?;
     }
@@ -2573,6 +2605,19 @@ fn apply_refresh(app: &mut App, tick: RefreshTick) {
         app.logs_state.set_tail(launch_id, lines);
       }
     }
+    RefreshTick::Requests { model_path, body } => {
+      mark_daemon_connected(app);
+      // Same race as Logs: keep the result only while the model it is
+      // for is still the focused one.
+      if requests_poll_target(app).as_deref() == Some(model_path.as_str()) {
+        let field = |key: &str| body.get(key).cloned().unwrap_or(Value::Null);
+        app.requests.set(
+          model_path,
+          serde_json::from_value(field("summary")).unwrap_or_default(),
+          serde_json::from_value(field("requests")).unwrap_or_default(),
+        );
+      }
+    }
     RefreshTick::Disconnected => {
       app.daemon_connected = false;
     }
@@ -2600,10 +2645,43 @@ fn writer_error_toast(method: &str, message: &str) -> String {
   }
 }
 
-/// Cadence used by the dedicated logs poller. Slower than
+/// Cadence of the per-tab pollers (Logs, Requests). Slower than
 /// [`REFRESH_INTERVAL`] because log lines arrive at the daemon's
 /// stderr cadence; we just need them visibly fresh.
-const LOGS_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const TAB_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The model the Requests tab is showing, or `None` while the tab is
+/// closed. Nothing is polled then.
+fn requests_poll_target(app: &App) -> Option<String> {
+  if app.right_tab != RightTab::Requests {
+    return None;
+  }
+  app
+    .focused_managed()
+    .map(|m| m.path.to_string_lossy().into_owned())
+}
+
+/// Spawn a task that polls `requests_tail` for the model in `current`,
+/// which is `None` while the Requests tab is closed.
+pub fn spawn_requests_poller(
+  socket: PathBuf,
+  current: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+  tx: mpsc::Sender<Event>,
+) {
+  spawn_tab_poller(
+    socket,
+    current,
+    tx,
+    |model_path| {
+      let params = json!({
+        "model_path": model_path,
+        "limit": crate::tui::tabs::requests::POLL_ROWS,
+      });
+      ("requests_tail", params)
+    },
+    |model_path, body| RefreshTick::Requests { model_path, body },
+  );
+}
 
 /// Spawn a task that polls `logs_tail` for the currently focused
 /// launch. The caller updates `current` with the launch the user
@@ -2614,39 +2692,54 @@ pub fn spawn_logs_poller(
   current: std::sync::Arc<std::sync::Mutex<Option<String>>>,
   tx: mpsc::Sender<Event>,
 ) {
+  spawn_tab_poller(
+    socket,
+    current,
+    tx,
+    |launch_id| ("logs_tail", json!({ "launch_id": launch_id, "lines": 200 })),
+    |launch_id, body| {
+      let lines: Vec<String> = body
+        .get("lines")
+        .and_then(Value::as_array)
+        .map(|a| {
+          a.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+        })
+        .unwrap_or_default();
+      RefreshTick::Logs { launch_id, lines }
+    },
+  );
+}
+
+/// The loop behind the per-tab pollers: every [`TAB_POLL_INTERVAL`], call
+/// the IPC method `request` builds for whatever `current` names and send
+/// the response on as the tick `tick` makes of it. A `None` target skips
+/// the call.
+fn spawn_tab_poller(
+  socket: PathBuf,
+  current: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+  tx: mpsc::Sender<Event>,
+  request: fn(&str) -> (&'static str, Value),
+  tick: fn(String, Value) -> RefreshTick,
+) {
   tokio::spawn(async move {
     // Exponential backoff mirrors `spawn_refresher` so a daemon
     // outage doesn't produce a 2 Hz connect-attempt rate. Reset on
     // any successful connect.
     let mut backoff = RECONNECT_INITIAL;
     loop {
-      let launch_id = current
+      let target = current
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-      if let Some(launch_id) = launch_id {
+      if let Some(target) = target {
         match Client::connect(&socket).await {
           Ok(mut client) => {
             backoff = RECONNECT_INITIAL;
-            if let Ok(body) = client
-              .call(
-                "logs_tail",
-                Some(json!({ "launch_id": &launch_id, "lines": 200 })),
-              )
-              .await
-            {
-              let lines: Vec<String> = body
-                .get("lines")
-                .and_then(Value::as_array)
-                .map(|a| {
-                  a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-                })
-                .unwrap_or_default();
-              let _ = tx
-                .send(Event::Refresh(RefreshTick::Logs { launch_id, lines }))
-                .await;
+            let (method, params) = request(&target);
+            if let Ok(body) = client.call(method, Some(params)).await {
+              let _ = tx.send(Event::Refresh(tick(target, body))).await;
             }
           }
           Err(_) => {
@@ -2660,7 +2753,7 @@ pub fn spawn_logs_poller(
           }
         }
       }
-      tokio::time::sleep(LOGS_POLL_INTERVAL).await;
+      tokio::time::sleep(TAB_POLL_INTERVAL).await;
       if tx.is_closed() {
         return;
       }
@@ -4939,5 +5032,126 @@ mod tests {
       app.chat.response, "abc",
       "every queued delta must be applied within the single coalesced batch"
     );
+  }
+
+  // ── Requests tab ───────────────────────────────────────────────
+
+  fn app_on_requests_tab() -> App {
+    let mut app = App::new(Default::default());
+    app.models = vec![
+      fake_model_for_events("/m/qwen.gguf", "/m"),
+      fake_model_for_events("/m/phi.gguf", "/m"),
+    ];
+    app.managed = vec![ready_managed_for_events("/m/qwen.gguf", 41100)];
+    // Rows: [TableHeader, Header(▶ Running), qwen, …].
+    app.list_cursor = 2;
+    app.focus = Focus::RightPane;
+    app.right_tab = RightTab::Requests;
+    app
+  }
+
+  fn requests_tick(model_path: &str, seqs: &[u64]) -> RefreshTick {
+    let rows: Vec<Value> = seqs
+      .iter()
+      .map(|seq| {
+        serde_json::to_value(crate::proxy::request_log::RequestRow {
+          seq: *seq,
+          status: Some(200),
+          ..Default::default()
+        })
+        .unwrap()
+      })
+      .collect();
+    RefreshTick::Requests {
+      model_path: model_path.to_string(),
+      body: json!({
+        "model_path": model_path,
+        "summary": {"requests": seqs.len()},
+        "requests": rows,
+      }),
+    }
+  }
+
+  #[test]
+  fn requests_are_polled_only_while_the_tab_is_open_on_a_launched_model() {
+    let mut app = app_on_requests_tab();
+    assert_eq!(requests_poll_target(&app).as_deref(), Some("/m/qwen.gguf"));
+    app.right_tab = RightTab::Logs;
+    assert_eq!(requests_poll_target(&app), None, "another tab is open");
+    app.right_tab = RightTab::Requests;
+    app.managed.clear();
+    app.clear_rows_cache();
+    assert_eq!(requests_poll_target(&app), None, "the model has no launch");
+  }
+
+  #[test]
+  fn a_requests_tick_fills_the_tab_for_the_focused_model_only() {
+    let mut app = app_on_requests_tab();
+    apply_refresh(&mut app, requests_tick("/m/qwen.gguf", &[2, 1]));
+    assert_eq!(app.requests.model_path.as_deref(), Some("/m/qwen.gguf"));
+    assert_eq!(app.requests.summary.requests, 2);
+    assert_eq!(
+      app.requests.rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+      vec![2, 1]
+    );
+    // A poll that raced a focus change is for another model: dropped.
+    apply_refresh(&mut app, requests_tick("/m/phi.gguf", &[9]));
+    assert_eq!(app.requests.model_path.as_deref(), Some("/m/qwen.gguf"));
+    assert_eq!(app.requests.rows.len(), 2);
+    // So is one that lands after the tab was left.
+    app.right_tab = RightTab::Logs;
+    apply_refresh(&mut app, requests_tick("/m/qwen.gguf", &[3, 2, 1]));
+    assert_eq!(app.requests.rows.len(), 2);
+  }
+
+  #[test]
+  fn a_requests_tick_with_a_malformed_body_shows_an_empty_tab() {
+    let mut app = app_on_requests_tab();
+    apply_refresh(
+      &mut app,
+      RefreshTick::Requests {
+        model_path: "/m/qwen.gguf".into(),
+        body: json!({"summary": "nope", "requests": 7}),
+      },
+    );
+    assert!(app.requests.rows.is_empty());
+    assert_eq!(app.requests.summary.requests, 0);
+  }
+
+  #[test]
+  fn arrows_scroll_the_requests_table() {
+    let mut app = app_on_requests_tab();
+    apply_refresh(&mut app, requests_tick("/m/qwen.gguf", &[5, 4, 3, 2, 1]));
+    pump_input(&mut app, key(KeyCode::Down, KeyModifiers::NONE));
+    pump_input(&mut app, key(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(app.requests.scroll_offset, 2);
+    pump_input(&mut app, key(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(app.requests.scroll_offset, 1);
+    assert_eq!(app.right_tab, RightTab::Requests);
+  }
+
+  #[test]
+  fn shift_u_jumps_to_the_requests_tab_of_a_launched_model() {
+    let mut app = app_on_requests_tab();
+    app.focus = Focus::List;
+    app.right_tab = RightTab::Settings;
+    pump_input(&mut app, key(KeyCode::Char('U'), KeyModifiers::SHIFT));
+    assert_eq!(app.right_tab, RightTab::Requests);
+    assert_eq!(app.focus, Focus::RightPane);
+
+    // A model with no launch has no Requests tab: toast, no jump.
+    let mut idle = App::new(Default::default());
+    idle.models = vec![fake_model_for_events("/m/phi.gguf", "/m")];
+    idle.list_cursor = 2;
+    pump_input(&mut idle, key(KeyCode::Char('U'), KeyModifiers::SHIFT));
+    assert_eq!(idle.right_tab, RightTab::Settings);
+    assert!(idle
+      .toast_message()
+      .is_some_and(|t| t.contains("Requests unavailable")));
+  }
+
+  #[test]
+  fn e_on_the_requests_tab_enters_no_edit_mode() {
+    assert_eq!(edit_focus_for_tab(RightTab::Requests), None);
   }
 }

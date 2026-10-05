@@ -84,6 +84,23 @@ pub fn secs_to_ymdhms(total_secs: u64) -> (i32, u32, u32, u32, u32, u32) {
   (y, mo, d, h, mi, s)
 }
 
+/// Wall-clock `(hour, minute, second)` of a Unix timestamp in the machine's
+/// local time zone. UTC on a platform without `localtime_r`.
+pub fn local_hms(epoch_secs: u64) -> (u32, u32, u32) {
+  #[cfg(unix)]
+  {
+    let t = epoch_secs as libc::time_t;
+    // SAFETY: `tm` is plain integers (and a pointer `localtime_r` sets), so
+    // the zeroed value is valid; both pointers outlive the call.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if !unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+      return (tm.tm_hour as u32, tm.tm_min as u32, tm.tm_sec as u32);
+    }
+  }
+  let (_, _, _, h, m, s) = secs_to_ymdhms(epoch_secs);
+  (h, m, s)
+}
+
 /// Howard Hinnant's `civil_from_days` (public domain).
 pub fn civil_from_days(z: i64) -> (i32, u32, u32) {
   let z = z + 719_468;

@@ -36,6 +36,7 @@ use crate::launch::resolve::{
 
 use super::launch::{self, LaunchOutcome};
 use super::mru::{pick_fallback, FallbackCandidate};
+use super::request_log::RequestRecord;
 use super::router::ProxyResponse;
 use super::state::ProxyState;
 
@@ -66,6 +67,10 @@ pub(crate) enum RouteDecision {
     /// where a different model could be answering on the same port
     /// by the time we connect.
     served_model_key: ModelId,
+    /// Catalog path of the model that answers. The request log files the
+    /// row under it. Differs from `served_model_key.path` for a model inside
+    /// a managed multiplexer, whose key is the umbrella's.
+    model_path: String,
     /// Upstream OpenAI path prefix (`None` → the direct backend's `/v1/...`,
     /// `Some("/api")` → a managed-multiplexer umbrella's `/api/v1/...`).
     upstream_path_prefix: Option<String>,
@@ -75,7 +80,7 @@ pub(crate) enum RouteDecision {
   /// The catalog has the model but no Ready supervisor is serving it.
   /// Dispatched into `handle_not_running` which runs the auto-start +
   /// single-flight + family-MRU fallback flow. The variant carries the
-  /// resolved row + arch so the launch path doesn't repeat the lookup.
+  /// resolved row so the launch path doesn't repeat the lookup.
   NotRunning {
     requested_model: String,
     /// Resolved catalog entry consumed by the launch path to build
@@ -85,12 +90,6 @@ pub(crate) enum RouteDecision {
     // the field itself is moved out, not read by name.
     #[allow(dead_code)]
     resolved_row: Box<CatalogRow>,
-    /// Catalog arch metadata (e.g. `"llama"`, `"qwen3"`). `None`
-    /// when discovery couldn't parse the GGUF header. The family-MRU
-    /// fallback pivots on this field.
-    // dead_code: consumed via destructuring in router::forward_request.
-    #[allow(dead_code)]
-    arch: Option<String>,
     /// User-chosen launch name parsed from the `@name` suffix. `None`
     /// for unnamed launches. Threaded through to `auto_start` so a
     /// second named launch of the same model gets its own flight.
@@ -382,6 +381,7 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
       port: model.port(),
       served_model_id: served_name_for_row(&resolved),
       served_model_key: model.id().clone(),
+      model_path: resolved.path.clone(),
       upstream_path_prefix: None,
       fallback: false,
       fallback_reason: None,
@@ -391,11 +391,9 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
   // Catalog matched but no supervisor is in Ready state — dispatch
   // into the auto-start + single-flight + family-MRU-fallback flow
   // implemented by `route::handle_not_running`.
-  let arch = resolved.arch.clone();
   RouteDecision::NotRunning {
     requested_model: requested,
     resolved_row: Box::new(resolved),
-    arch,
     name,
   }
 }
@@ -457,6 +455,7 @@ async fn decide_umbrella_route(
         // The umbrella's own ModelId — the forward path re-verifies and
         // takes an inflight guard against this supervisor entry.
         served_model_key: umbrella.id().clone(),
+        model_path: resolved.path.clone(),
         // The OpenAI path prefix the owning backend's umbrella serves under
         // (its `umbrella_openai_prefix`), so this arm names no backend.
         upstream_path_prefix: backend
@@ -580,11 +579,15 @@ pub(crate) async fn handle_not_running(
   inbound: super::forward::InboundRequest,
   requested_model: String,
   resolved_row: CatalogRow,
-  requested_arch: Option<String>,
   endpoint_mode: Option<crate::launch::mode::LaunchMode>,
   name: Option<String>,
+  mut record: RequestRecord,
 ) -> ProxyResponse {
-  let outcome = launch::auto_start(state, &resolved_row, endpoint_mode, name).await;
+  record.set_auto_start();
+  record.publish();
+  let mut evicted = Vec::new();
+  let outcome = launch::auto_start(state, &resolved_row, endpoint_mode, name, &mut evicted).await;
+  record.set_evicted(evicted.iter().map(|id| id.as_str().to_string()).collect());
   match outcome {
     LaunchOutcome::Ready { port, model_id } => {
       // Touch the MRU using the supervisor we just confirmed Ready.
@@ -603,6 +606,7 @@ pub(crate) async fn handle_not_running(
           fallback: false,
           fallback_reason: None,
         },
+        Some(record),
       )
       .await
     }
@@ -614,15 +618,22 @@ pub(crate) async fn handle_not_running(
       // `launch_failed` response below — clients never silently get a
       // payload from a different model.
       if !state.fallback_enabled {
-        return launch_failed_response(&cause, &requested_model);
+        return super::router::answered(record, launch_failed_response(&cause, &requested_model));
       }
       // Family-MRU fallback. Walk the supervisor snapshot, filter
       // to Ready, attach each entry's catalog arch + MRU
-      // timestamp, then defer to `pick_fallback` for the policy.
+      // timestamp, then defer to `pick_fallback` for the policy,
+      // which pivots on the requested row's arch (`None` when
+      // discovery couldn't parse the GGUF header).
+      let requested_arch = resolved_row.arch.as_deref();
       let candidates = collect_fallback_candidates(state).await;
-      if let Some(pick) = pick_fallback(candidates, requested_arch.as_deref()) {
+      if let Some(pick) = pick_fallback(candidates, requested_arch) {
         state.mru.touch(&pick.model_id).await;
-        let reason = fallback_reason_for(requested_arch.as_deref(), pick.arch.as_deref());
+        let reason = fallback_reason_for(requested_arch, pick.arch.as_deref());
+        // Another model answers, so the row moves to it. `requested_model`
+        // and `fallback` on the row keep what was asked for and why.
+        record.set_model(&pick.served_model_id, &pick.model_id.path.to_string_lossy());
+        record.set_fallback(reason);
         return super::forward::forward_to_upstream(
           state,
           inbound,
@@ -634,6 +645,7 @@ pub(crate) async fn handle_not_running(
             fallback: true,
             fallback_reason: Some(reason),
           },
+          Some(record),
         )
         .await;
       }
@@ -642,7 +654,7 @@ pub(crate) async fn handle_not_running(
       // `pick_fallback` only returns None when zero Ready candidates
       // exist). Drop the requested model name into the message so
       // logs surface what was being attempted.
-      launch_failed_response(&cause, &requested_model)
+      super::router::answered(record, launch_failed_response(&cause, &requested_model))
     }
   }
 }
@@ -674,15 +686,13 @@ fn fallback_reason_for(requested: Option<&str>, picked: Option<&str>) -> &'stati
 /// which means zero Ready supervisors existed. The message surfaces
 /// the supervisor's `cause` so clients see *why* the launch failed.
 pub(crate) fn launch_failed_response(cause: &str, requested_model: &str) -> ProxyResponse {
-  use super::openai::{ErrorObject, ErrorResponse};
-
   let message =
     format!("auto-start of `{requested_model}` failed and no running model is available: {cause}");
-  let error = ErrorObject::new("launch_failed", message).with_running(Vec::<String>::new());
-  let bytes = serde_json::to_vec(&ErrorResponse { error }).expect("json encoding of fixed shape");
-  Ok(super::router::json_response(
+  let error =
+    super::openai::ErrorObject::new("launch_failed", message).with_running(Vec::<String>::new());
+  Ok(super::router::error_json(
     hyper::StatusCode::SERVICE_UNAVAILABLE,
-    bytes,
+    error,
   ))
 }
 
@@ -692,7 +702,7 @@ pub(crate) fn launch_failed_response(cause: &str, requested_model: &str) -> Prox
 /// [`crate::util::paths::model_display_name`] so the value of
 /// `x-llamastash-served-by` is byte-equal to the corresponding
 /// `/v1/models` `id` for the same model (closes R-11).
-fn served_name_for_row(row: &CatalogRow) -> String {
+pub(crate) fn served_name_for_row(row: &CatalogRow) -> String {
   if let Some(label) = &row.display_label {
     return label.clone();
   }

@@ -414,6 +414,17 @@ async fn handle(
       let want_fail = query.contains("fail=400") || body_text.contains("__TEST_INJECT_FAIL_400__");
       let want_malformed =
         query.contains("malformed-sse=1") || body_text.contains("__TEST_INJECT_MALFORMED_SSE__");
+      // Request-log knobs, all body markers:
+      //   __TEST_EMIT_TIMINGS__    → end the stream with a chunk that carries
+      //                              `timings`, shaped like the one real
+      //                              llama-server b11390 sends.
+      //   __TEST_SLOW_STREAM__     → send the first frame, wait, then the rest,
+      //                              so a test can hang up mid-stream.
+      //   __TEST_TRUNCATE_STREAM__ → promise more bytes than are sent, then
+      //                              close: an upstream that died mid-body.
+      let want_timings = body_text.contains("__TEST_EMIT_TIMINGS__");
+      let want_slow = body_text.contains("__TEST_SLOW_STREAM__");
+      let want_truncated = body_text.contains("__TEST_TRUNCATE_STREAM__");
       // Mirror real llama-server's OpenAI-compat behavior: echo
       // `body.model` into every emitted frame's `model` field so
       // proxy/router code paths can rely on the pass-through
@@ -437,6 +448,33 @@ async fn handle(
           m = echoed_model
         );
         write_response(&mut wr, 200, "text/event-stream", stream.as_bytes()).await?;
+      } else if want_timings {
+        let stream = format!(
+          "data: {{\"choices\":[{{\"finish_reason\":null,\"index\":0,\"delta\":{{\"content\":\"hi\"}}}}],\"model\":\"{m}\",\"object\":\"chat.completion.chunk\"}}\n\n\
+           data: {{\"choices\":[{{\"finish_reason\":\"stop\",\"index\":0,\"delta\":{{}}}}],\"model\":\"{m}\",\"object\":\"chat.completion.chunk\",\"timings\":{{\"cache_n\":40,\"prompt_n\":1,\"prompt_ms\":25.704,\"prompt_per_second\":38.9,\"predicted_n\":3,\"predicted_ms\":51.759,\"predicted_per_second\":38.64}}}}\n\n\
+           data: [DONE]\n\n",
+          m = echoed_model
+        );
+        write_response(&mut wr, 200, "text/event-stream", stream.as_bytes()).await?;
+      } else if want_slow || want_truncated {
+        let first = format!(
+          "data: {{\"model\":\"{m}\",\"choices\":[{{\"delta\":{{\"content\":\"hi\"}}}}]}}\n\n",
+          m = echoed_model
+        );
+        let rest = "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let header = format!(
+          "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+          first.len() + rest.len()
+        );
+        wr.write_all(header.as_bytes()).await?;
+        wr.write_all(first.as_bytes()).await?;
+        wr.flush().await?;
+        if want_slow {
+          tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+          wr.write_all(rest.as_bytes()).await?;
+        }
+        // `want_truncated` returns here with `rest` unsent; the caller
+        // closes the socket short of the promised length.
       } else {
         let stream = format!(
           "event: message\ndata: {{\"model\":\"{m}\",\"choices\":[{{\"delta\":{{\"content\":\"hi\"}}}}]}}\n\n\

@@ -118,6 +118,7 @@ Tab-driven Logs / Chat / Embed / Rerank that hits the same OpenAI-compatible end
 - **[Embed tab](docs/usage.md#embed-tab-focusembedinput).** Shows vectors and optional cosine similarity.
 - **[Rerank tab](docs/usage.md#rerank-tab-focusrerankinput).** Stages a query + candidate list; `Tab` cycles fields and stages candidates.
 - **[Logs tab](docs/usage.md#right-pane).** `s` toggles auto-scroll; `c` copies the full buffer to clipboard with a toast confirmation.
+- **[Requests tab](docs/usage.md#requests-tab).** The focused model's proxy requests: a summary (requests, errors, latency, tok/s, tokens) over a table with status, total time, time to first byte, tokens and the auto-start or error behind each request. Columns drop by rank as the pane narrows.
 
 ### In-TUI HuggingFace browser
 
@@ -149,7 +150,7 @@ The model list columns and hint chips both carry **priority ranks** rather than 
 
 ### Subcommands cover every TUI capability
 
-`list`, `start`, `stop`, `status`, `logs`, `presets`, `favorites`, `last-params`, `daemon`, `init`, `doctor`, `pull`, `recommend` — see [`docs/usage.md` § Subcommands](docs/usage.md#subcommands) for the full reference. Every read+mutation command supports `--json` as the agent contract. `--no-spawn` opts out of daemon auto-spawn for scripts that want to fail fast.
+`list`, `start`, `stop`, `status`, `logs`, `requests`, `presets`, `favorites`, `last-params`, `daemon`, `init`, `doctor`, `pull`, `recommend` — see [`docs/usage.md` § Subcommands](docs/usage.md#subcommands) for the full reference. Every read+mutation command supports `--json` as the agent contract. `--no-spawn` opts out of daemon auto-spawn for scripts that want to fail fast.
 
 ### Documented exit codes per failure class
 

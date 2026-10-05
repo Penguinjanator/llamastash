@@ -33,8 +33,10 @@ use llamastash::daemon::supervisor::{spawn as supervisor_spawn, ManagedSpawn, Ma
 use llamastash::discovery::{DiscoveredModel, ModelCatalog, ModelSource};
 use llamastash::gguf::identity::ModelId;
 use llamastash::gguf::metadata::{ModeHint, ModelMetadata, Quant};
+use llamastash::ipc::{dispatch_request, Request};
 use llamastash::launch::mode::LaunchMode;
 use llamastash::launch::params::LaunchParams;
+use llamastash::proxy::request_log::{RequestLog, RequestRow, RequestState};
 use llamastash::proxy::server::{
   loopback_addr, new_status_cell, serve_with_options, ProxyStatus, ServeOptions, StatusCell,
 };
@@ -223,13 +225,9 @@ async fn proxy_state_with_cap(
   supervisors: SupervisorRegistry,
   max_body_size: usize,
 ) -> Arc<ProxyState> {
-  let catalog = ModelCatalog::new();
-  for m in models {
-    catalog.upsert(m).await;
-  }
-  let ctx =
-    MethodContext::with_catalog(ShutdownToken::new(), catalog).with_supervisors(supervisors);
-  ProxyState::from_context(&ctx, false, true, max_body_size)
+  proxy_state_and_ctx(models, supervisors, max_body_size)
+    .await
+    .0
 }
 
 /// Send an HTTP POST and read the response head + body. Returns
@@ -1031,6 +1029,365 @@ async fn partial_request_closes_within_header_read_timeout() {
   // once the timeout fires; we don't expect any response bytes.
   assert_eq!(n, 0, "expected EOF on timeout; got {n} bytes: {buf:?}");
 
+  shutdown_listener(shutdown, listener_handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+// --- request log ----------------------------------------------------------
+
+/// Like [`proxy_state_with`], and also hands back the context so a test
+/// can read the request log the proxy writes and call IPC methods on it.
+async fn proxy_state_and_ctx(
+  models: Vec<DiscoveredModel>,
+  supervisors: SupervisorRegistry,
+  max_body_size: usize,
+) -> (Arc<ProxyState>, MethodContext) {
+  let catalog = ModelCatalog::new();
+  for m in models {
+    catalog.upsert(m).await;
+  }
+  let ctx =
+    MethodContext::with_catalog(ShutdownToken::new(), catalog).with_supervisors(supervisors);
+  (
+    ProxyState::from_context(&ctx, false, true, max_body_size),
+    ctx,
+  )
+}
+
+/// The newest log row once it satisfies `done`. The proxy finishes a row
+/// when hyper drops the response body, which can trail the client's read
+/// by a scheduler tick.
+async fn newest_row_when<P: Fn(&RequestRow) -> bool>(log: &RequestLog, done: P) -> RequestRow {
+  let deadline = std::time::Instant::now() + Duration::from_secs(5);
+  loop {
+    let row = log.tail(None, 1).rows.into_iter().next();
+    match row {
+      Some(row) if done(&row) => return row,
+      other => {
+        assert!(
+          std::time::Instant::now() < deadline,
+          "log row never reached the expected state; last seen: {other:?}"
+        );
+        sleep(Duration::from_millis(10)).await;
+      }
+    }
+  }
+}
+
+fn finished(row: &RequestRow) -> bool {
+  row.state != RequestState::InFlight
+}
+
+async fn ipc(ctx: &MethodContext, method: &str, params: Option<Value>) -> Value {
+  dispatch_request(ctx, Request::new(1, method, params))
+    .await
+    .result
+    .unwrap_or_else(|| panic!("{method} returned an error"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_served_request_is_logged_and_reaches_requests_tail_and_status() {
+  let dir = unique_temp("reqlog-served");
+  let catalog_path = "/fixture/qwen3.gguf";
+  let registry = SupervisorRegistry::new();
+  let (model, _port, _id) = spawn_fake_supervisor(catalog_path, &dir, LaunchMode::Chat).await;
+  let launch_id = registry.next_id();
+  registry.insert(launch_id.clone(), model.clone()).await;
+  let (state, ctx) = proxy_state_and_ctx(
+    vec![
+      discovered(catalog_path, Some("qwen3"), "qwen3"),
+      discovered("/fixture/other.gguf", Some("other"), "llama"),
+    ],
+    registry,
+    DEFAULT_BODY_LIMIT_BYTES,
+  )
+  .await;
+  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+
+  let body = r#"{"model":"qwen3","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+  let (status, _, _) = http_post(addr, "/v1/chat/completions", body, &[]).await;
+  assert_eq!(status, 200);
+
+  let row = newest_row_when(&ctx.requests, finished).await;
+  assert_eq!(row.state, RequestState::Done);
+  assert_eq!(row.status, Some(200));
+  assert_eq!(row.route, "/v1/chat/completions");
+  assert_eq!(row.requested_model.as_deref(), Some("qwen3"));
+  assert_eq!(row.model.as_deref(), Some("qwen3"));
+  assert_eq!(row.model_path.as_deref(), Some(catalog_path));
+  assert_eq!(row.launch_id.as_deref(), Some(launch_id.as_str()));
+  let client: SocketAddr = row.client.as_deref().unwrap().parse().expect("ip:port");
+  assert!(client.ip().is_loopback());
+  assert!(row.ttfb_ms.unwrap() <= row.duration_ms.unwrap());
+  assert_eq!(
+    (
+      row.error,
+      row.cause,
+      row.fallback,
+      row.auto_start,
+      row.evicted.len()
+    ),
+    (None, None, None, false, 0)
+  );
+  // The fake's plain stream carries no `usage` and no `timings`.
+  assert_eq!(
+    (
+      row.prompt_tokens,
+      row.completion_tokens,
+      row.tokens_per_second
+    ),
+    (None, None, None)
+  );
+
+  // `requests_tail`, filtered to the model and to one that got nothing.
+  let tail = ipc(
+    &ctx,
+    "requests_tail",
+    Some(serde_json::json!({"model_path": catalog_path})),
+  )
+  .await;
+  assert_eq!(tail["summary"]["requests"], 1);
+  assert_eq!(tail["summary"]["errors"], 0);
+  assert_eq!(tail["requests"].as_array().unwrap().len(), 1);
+  assert_eq!(tail["requests"][0]["status"], 200);
+  let other = ipc(
+    &ctx,
+    "requests_tail",
+    Some(serde_json::json!({"model_path": "/fixture/other.gguf"})),
+  )
+  .await;
+  assert_eq!(other["summary"]["requests"], 0);
+  assert!(other["requests"].as_array().unwrap().is_empty());
+  // No params at all means every request.
+  let all = ipc(&ctx, "requests_tail", None).await;
+  assert_eq!(all["requests"].as_array().unwrap().len(), 1);
+
+  // `status` carries the launch's totals.
+  let status_body = ipc(&ctx, "status", None).await;
+  let stats = &status_body["models"][0]["request_stats"];
+  assert_eq!(stats["requests"], 1, "{status_body}");
+  assert!(stats["avg_duration_ms"].is_number());
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, listener_handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokens_and_speed_come_from_the_end_of_the_response() {
+  let dir = unique_temp("reqlog-tokens");
+  let catalog_path = "/fixture/qwen3.gguf";
+  let registry = SupervisorRegistry::new();
+  let (model, _port, _id) = spawn_fake_supervisor(catalog_path, &dir, LaunchMode::Chat).await;
+  registry.insert(registry.next_id(), model.clone()).await;
+  let (state, ctx) = proxy_state_and_ctx(
+    vec![discovered(catalog_path, Some("qwen3"), "qwen3")],
+    registry,
+    DEFAULT_BODY_LIMIT_BYTES,
+  )
+  .await;
+  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+
+  // A stream whose last chunk carries `timings` and no `usage`.
+  let streamed = r#"{"model":"qwen3","stream":true,"messages":[{"role":"user","content":"__TEST_EMIT_TIMINGS__"}]}"#;
+  let (status, _, response) = http_post(addr, "/v1/chat/completions", streamed, &[]).await;
+  assert_eq!(status, 200);
+  // The tap only reads: the client still gets every byte.
+  assert!(String::from_utf8_lossy(&response).ends_with("data: [DONE]\n\n"));
+  let row = newest_row_when(&ctx.requests, finished).await;
+  assert_eq!(row.prompt_tokens, Some(41), "prompt_n + cache_n");
+  assert_eq!(row.completion_tokens, Some(3));
+  assert_eq!(row.tokens_per_second, Some(38.64));
+
+  // An Anthropic-shape body: `usage.input_tokens` / `output_tokens`.
+  let messages = r#"{"model":"qwen3","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#;
+  let (status, _, _) = http_post(addr, "/v1/messages", messages, &[]).await;
+  assert_eq!(status, 200);
+  let row = newest_row_when(&ctx.requests, |r| finished(r) && r.route == "/v1/messages").await;
+  assert_eq!(
+    (
+      row.prompt_tokens,
+      row.completion_tokens,
+      row.tokens_per_second
+    ),
+    (Some(1), Some(1), None)
+  );
+
+  let summary = ctx.requests.tail(Some(catalog_path), 0).summary;
+  assert_eq!(summary.requests, 2);
+  assert_eq!(summary.prompt_tokens, 42);
+  assert_eq!(summary.completion_tokens, 4);
+  assert_eq!(summary.tokens_per_second_avg, Some(38.64));
+  assert_eq!(summary.tokens_per_second_last, Some(38.64));
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, listener_handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn requests_the_proxy_answers_itself_are_logged_with_the_error_type() {
+  let registry = SupervisorRegistry::new();
+  let (state, ctx) = proxy_state_and_ctx(
+    vec![discovered("/m/qwen3.gguf", Some("qwen3"), "qwen3")],
+    registry,
+    64,
+  )
+  .await;
+  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let post =
+    |body: &'static str| async move { http_post(addr, "/v1/chat/completions", body, &[]).await.0 };
+
+  assert_eq!(post(r#"{"model":"nope","messages":[]}"#).await, 404);
+  assert_eq!(post(r#"{"messages":[]}"#).await, 400);
+  assert_eq!(post("{not json").await, 400);
+  let big =
+    Box::leak(format!(r#"{{"model":"qwen3","pad":"{}"}}"#, "x".repeat(100)).into_boxed_str());
+  assert_eq!(post(big).await, 413);
+  // In the catalog, but the file does not exist: the auto-start fails.
+  assert_eq!(post(r#"{"model":"qwen3","messages":[]}"#).await, 503);
+
+  let rows = ctx.requests.tail(None, 10).rows;
+  let seen: Vec<(Option<u16>, Option<&str>)> = rows
+    .iter()
+    .map(|r| (r.status, r.error.as_deref()))
+    .collect();
+  assert_eq!(
+    seen,
+    vec![
+      (Some(503), Some("launch_failed")),
+      (Some(413), Some("payload_too_large")),
+      (Some(400), Some("invalid_request")),
+      (Some(400), Some("model_required")),
+      (Some(404), Some("model_not_found")),
+    ]
+  );
+  assert!(rows.iter().all(|r| r.state == RequestState::Done));
+  assert!(rows.iter().all(|r| r.launch_id.is_none()));
+
+  let failed = &rows[0];
+  assert!(failed.auto_start);
+  assert_eq!(failed.model_path.as_deref(), Some("/m/qwen3.gguf"));
+  assert!(
+    failed
+      .cause
+      .as_deref()
+      .is_some_and(|c| c.starts_with("auto-start of `qwen3` failed")),
+    "a failed auto-start names its cause: {failed:?}"
+  );
+  assert!(rows[2].cause.as_deref().unwrap().contains("not valid JSON"));
+  let not_found = &rows[4];
+  assert_eq!(not_found.cause.as_deref(), Some("nope not found"));
+  assert_eq!(not_found.requested_model.as_deref(), Some("nope"));
+  assert_eq!(not_found.model_path, None);
+
+  // The model's summary counts its one failure; the unfiltered one all five.
+  assert_eq!(
+    ctx.requests.tail(Some("/m/qwen3.gguf"), 0).summary.errors,
+    1
+  );
+  let all = ctx.requests.tail(None, 0).summary;
+  assert_eq!((all.requests, all.errors, all.auto_starts), (5, 5, 1));
+
+  shutdown_listener(shutdown, listener_handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_that_hangs_up_mid_stream_is_logged_as_client_closed() {
+  let dir = unique_temp("reqlog-hangup");
+  let catalog_path = "/fixture/qwen3.gguf";
+  let registry = SupervisorRegistry::new();
+  let (model, _port, _id) = spawn_fake_supervisor(catalog_path, &dir, LaunchMode::Chat).await;
+  registry.insert(registry.next_id(), model.clone()).await;
+  let (state, ctx) = proxy_state_and_ctx(
+    vec![discovered(catalog_path, Some("qwen3"), "qwen3")],
+    registry,
+    DEFAULT_BODY_LIMIT_BYTES,
+  )
+  .await;
+  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+
+  let body = r#"{"model":"qwen3","stream":true,"messages":[{"role":"user","content":"__TEST_SLOW_STREAM__"}]}"#;
+  let mut sock = TcpStream::connect(addr).await.expect("connect");
+  let req = format!(
+    "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{body}",
+    body.len()
+  );
+  sock.write_all(req.as_bytes()).await.expect("write");
+  // Read until the first SSE frame has arrived; the fake then stalls.
+  let mut seen = Vec::new();
+  let mut buf = [0u8; 1024];
+  while !String::from_utf8_lossy(&seen).contains("\"content\":\"hi\"") {
+    let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf))
+      .await
+      .expect("first frame arrives")
+      .expect("read");
+    assert!(n > 0, "connection closed before the first frame");
+    seen.extend_from_slice(&buf[..n]);
+  }
+
+  // Mid-stream the row is visible, in flight, with its first-byte time.
+  let streaming = newest_row_when(&ctx.requests, |r| r.ttfb_ms.is_some()).await;
+  assert_eq!(streaming.state, RequestState::InFlight);
+  assert_eq!(streaming.status, Some(200));
+  assert_eq!(streaming.duration_ms, None);
+
+  drop(sock);
+  let row = newest_row_when(&ctx.requests, finished).await;
+  assert_eq!(row.state, RequestState::ClientClosed);
+  assert_eq!(row.status, Some(200));
+  let summary = ctx.requests.tail(Some(catalog_path), 0).summary;
+  assert_eq!(
+    (summary.requests, summary.errors),
+    (1, 0),
+    "a hang-up is not an error"
+  );
+  // A cut-short response does not count toward the latency averages.
+  assert_eq!(summary.avg_duration_ms, None);
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, listener_handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upstream_that_dies_mid_body_is_logged_as_upstream_error() {
+  let dir = unique_temp("reqlog-truncated");
+  let catalog_path = "/fixture/qwen3.gguf";
+  let registry = SupervisorRegistry::new();
+  let (model, _port, _id) = spawn_fake_supervisor(catalog_path, &dir, LaunchMode::Chat).await;
+  registry.insert(registry.next_id(), model.clone()).await;
+  let (state, ctx) = proxy_state_and_ctx(
+    vec![discovered(catalog_path, Some("qwen3"), "qwen3")],
+    registry,
+    DEFAULT_BODY_LIMIT_BYTES,
+  )
+  .await;
+  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+
+  let body = r#"{"model":"qwen3","stream":true,"messages":[{"role":"user","content":"__TEST_TRUNCATE_STREAM__"}]}"#;
+  let mut sock = TcpStream::connect(addr).await.expect("connect");
+  let req = format!(
+    "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+    body.len()
+  );
+  sock.write_all(req.as_bytes()).await.expect("write");
+  // The proxy aborts the client connection when the upstream body errors,
+  // so the read may end in a reset; either way it ends.
+  let mut sink = Vec::new();
+  let _ = tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut sink)).await;
+
+  let row = newest_row_when(&ctx.requests, finished).await;
+  assert_eq!(row.state, RequestState::UpstreamError);
+  assert_eq!(row.status, Some(200));
+  assert_eq!(
+    (row.prompt_tokens, row.completion_tokens),
+    (None, None),
+    "a cut-short body is not read for tokens"
+  );
+  assert_eq!(ctx.requests.tail(Some(catalog_path), 0).summary.errors, 1);
+
+  let _ = model.stop(Duration::from_secs(3)).await;
   shutdown_listener(shutdown, listener_handle).await;
   std::fs::remove_dir_all(&dir).ok();
 }

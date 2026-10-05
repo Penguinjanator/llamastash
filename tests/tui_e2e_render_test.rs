@@ -255,6 +255,17 @@ fn chat_view_golden_render_matches_fixture() {
   assert_golden(&mut seeded_chat_view_app(), "tests/golden/chat-view.txt");
 }
 
+#[test]
+fn requests_view_golden_render_matches_fixture() {
+  // The Time column is local wall-clock time; pin the zone so the frame
+  // is the same on every machine. Set before the first conversion.
+  std::env::set_var("TZ", "UTC");
+  assert_golden(
+    &mut seeded_requests_view_app(),
+    "tests/golden/requests-view.txt",
+  );
+}
+
 #[cfg_attr(target_os = "macos", ignore = "fixture uses Linux key glyphs")]
 #[test]
 fn named_launch_golden_render_matches_fixture() {
@@ -387,6 +398,92 @@ fn seeded_logs_view_app() -> App {
     "main: server listening on 127.0.0.1:41100".into(),
     "srv  update_slots: all slots are idle".into(),
   ];
+  app
+}
+
+/// Dashboard with the right pane focused on the Requests tab of the
+/// running launch: a served request, one that auto-started the model and
+/// unloaded another for it, a failed auto-start, a client that hung up,
+/// and one still streaming.
+fn seeded_requests_view_app() -> App {
+  use llamastash::proxy::request_log::{RequestRow, RequestState, RequestSummary};
+  let mut app = seeded_dashboard_app();
+  app.focus = Focus::RightPane;
+  app.right_tab = RightTab::Requests;
+  let row = |seq: u64| RequestRow {
+    seq,
+    // 2023-11-14T22:13:20Z plus one minute per row.
+    started_at_ms: 1_700_000_000_000 + seq * 60_000,
+    client: Some("127.0.0.1:53412".into()),
+    route: "/v1/chat/completions".into(),
+    requested_model: Some("qwen-7b".into()),
+    model: Some("qwen-7b".into()),
+    model_path: Some("/m/x/qwen-7b.gguf".into()),
+    launch_id: Some("L1".into()),
+    state: RequestState::Done,
+    status: Some(200),
+    ttfb_ms: Some(182),
+    duration_ms: Some(4_310),
+    prompt_tokens: Some(18_432),
+    completion_tokens: Some(164),
+    tokens_per_second: Some(41.27),
+    ..RequestRow::default()
+  };
+  let rows = vec![
+    RequestRow {
+      state: RequestState::InFlight,
+      duration_ms: None,
+      prompt_tokens: None,
+      completion_tokens: None,
+      tokens_per_second: None,
+      ..row(5)
+    },
+    RequestRow {
+      state: RequestState::ClientClosed,
+      prompt_tokens: None,
+      completion_tokens: None,
+      tokens_per_second: None,
+      route: "/v1/messages".into(),
+      ..row(4)
+    },
+    RequestRow {
+      status: Some(503),
+      launch_id: None,
+      auto_start: true,
+      error: Some("launch_failed".into()),
+      cause: Some("compose_and_spawn: not enough memory".into()),
+      ttfb_ms: None,
+      duration_ms: Some(96),
+      prompt_tokens: None,
+      completion_tokens: None,
+      tokens_per_second: None,
+      ..row(3)
+    },
+    RequestRow {
+      auto_start: true,
+      evicted: vec!["L7".into()],
+      ttfb_ms: Some(31_870),
+      duration_ms: Some(36_020),
+      ..row(2)
+    },
+    row(1),
+  ];
+  app.requests.set(
+    "/m/x/qwen-7b.gguf".into(),
+    RequestSummary {
+      requests: 4,
+      errors: 1,
+      avg_duration_ms: Some(20_165),
+      avg_ttfb_ms: Some(16_026),
+      tokens_per_second_avg: Some(41.27),
+      tokens_per_second_last: Some(41.27),
+      prompt_tokens: 36_864,
+      completion_tokens: 328,
+      auto_starts: 2,
+      evictions: 1,
+    },
+    rows,
+  );
   app
 }
 
