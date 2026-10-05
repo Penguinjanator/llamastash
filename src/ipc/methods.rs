@@ -1071,9 +1071,13 @@ mod tests {
     .expect("write fixture gguf");
 
     let (id, arch, _, supported, _) = resolve_model_id_and_arch(&path).await.expect("header read");
-    // The identity resolver canonicalizes, which on macOS resolves the `/tmp`
-    // symlink and on Windows expands a short directory name.
-    assert_eq!(id.path, path.canonicalize().expect("canonical path"));
+    // The identity resolver canonicalizes on the way, which resolves the `/tmp`
+    // symlink on macOS and drops the verbatim prefix Windows canonicalization
+    // adds. Same helper, so the same answer on every platform.
+    assert_eq!(
+      id.path,
+      crate::util::paths::canonicalize(&path).expect("canonical path")
+    );
     assert_eq!(arch.as_deref(), Some("llama"));
     assert!(!supported.is_empty(), "routing tags come from the header");
     std::fs::remove_dir_all(&dir).ok();
