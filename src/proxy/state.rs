@@ -140,7 +140,7 @@ impl ProxyState {
   }
 
   /// Like [`Self::from_context`] but with a resolved bearer `api_key`
-  /// (`None` disables auth) and the `proxy.aliases` map. The daemon's
+  /// (`None` disables auth) and the `proxy.aliases` table. The daemon's
   /// `run_foreground` passes both from the loaded
   /// [`crate::config::loader::ProxyConfig`]; tests use the keyless,
   /// alias-less [`Self::from_context`].
@@ -150,7 +150,7 @@ impl ProxyState {
     fallback_enabled: bool,
     api_key: Option<String>,
     max_body_size: usize,
-    aliases: &std::collections::BTreeMap<String, String>,
+    aliases: &crate::config::ProxyAliases,
   ) -> Arc<Self> {
     Arc::new(Self {
       http_client: Arc::new(build_http_client()),

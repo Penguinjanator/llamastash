@@ -365,11 +365,17 @@ pub struct ProxyConfig {
   /// `llamastash list` shows — a plain name, a repo-qualified id, or a full path
   /// — resolved exactly as a reference a person types is resolved.
   ///
+  /// Written either as a map of `name: target` or as `[[proxy.aliases]]` blocks
+  /// carrying `name` and `target`, which is the form that keeps comments next to
+  /// each entry. Both spellings decode to [`ProxyAliases`], and both keep the
+  /// order they appear in, so a repeated name resolves to the last entry.
+  ///
   /// Three rules, all so an alias can never surprise a client:
-  /// - A real model id wins. An alias is consulted only when the name the client
-  ///   sent matches no model, so it can never hide a model that really claims
-  ///   that name. The daemon logs one warning the first time an alias is
-  ///   shadowed this way.
+  /// - A reference that names a model outright wins over an alias of the same
+  ///   name, so an alias can never hide a model that really claims that name. A
+  ///   name that only *contains* the alias, or that two models share, does not
+  ///   own it: there the alias is the tie-break. The daemon logs one warning the
+  ///   first time an alias is shadowed this way.
   /// - An alias names a model, nothing else. It cannot pin a launch name or a
   ///   preset, so a client that wants one sends `<model>@<name>` itself.
   /// - Aliases are not listed on `/v1/models` or `/api/tags`, which stay one row
@@ -377,7 +383,105 @@ pub struct ProxyConfig {
   ///
   /// Sources — CLI: (none) · Env: (none).
   #[serde(default)]
-  pub aliases: BTreeMap<String, String>,
+  pub aliases: ProxyAliases,
+}
+
+/// One `proxy.aliases` entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct ProxyAlias {
+  /// The name a client sends.
+  pub name: String,
+  /// The model reference it stands for.
+  pub target: String,
+}
+
+/// `proxy.aliases`, in the order the operator wrote it. Accepts the map
+/// spelling (`name: target` pairs) and the block spelling
+/// (`[[proxy.aliases]]` with `name =` and `target =`); order is kept for both,
+/// because it is what settles a repeated name.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ProxyAliases(Vec<ProxyAlias>);
+
+impl ProxyAlias {
+  /// A pair as written in the map spelling.
+  fn from_pair(name: impl Into<String>, target: impl Into<String>) -> Self {
+    Self {
+      name: name.into(),
+      target: target.into(),
+    }
+  }
+}
+
+impl ProxyAliases {
+  /// Entries in the order given, which is how a caller hands over a table
+  /// decoded from either spelling.
+  pub fn from_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> Self {
+    Self(
+      pairs
+        .into_iter()
+        .map(|(name, target)| ProxyAlias::from_pair(name, target))
+        .collect(),
+    )
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.0.is_empty()
+  }
+
+  pub fn len(&self) -> usize {
+    self.0.len()
+  }
+
+  pub fn iter(&self) -> impl Iterator<Item = &ProxyAlias> {
+    self.0.iter()
+  }
+
+  /// Entries in file order as `(name, target)`.
+  pub fn pairs(&self) -> impl Iterator<Item = (&str, &str)> {
+    self.0.iter().map(|a| (a.name.as_str(), a.target.as_str()))
+  }
+}
+
+impl<'de> Deserialize<'de> for ProxyAliases {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    struct Accept;
+
+    impl<'de> serde::de::Visitor<'de> for Accept {
+      type Value = ProxyAliases;
+
+      fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a map of alias to model, or a list of {name, target} entries")
+      }
+
+      fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+      where
+        A: serde::de::SeqAccess<'de>,
+      {
+        let mut out = Vec::new();
+        while let Some(entry) = seq.next_element::<ProxyAlias>()? {
+          out.push(entry);
+        }
+        Ok(ProxyAliases(out))
+      }
+
+      fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+      where
+        A: serde::de::MapAccess<'de>,
+      {
+        let mut out = Vec::new();
+        while let Some((name, target)) = map.next_entry::<String, String>()? {
+          out.push(ProxyAlias { name, target });
+        }
+        Ok(ProxyAliases(out))
+      }
+    }
+
+    deserializer.deserialize_any(Accept)
+  }
 }
 
 impl ProxyConfig {
@@ -1912,7 +2016,7 @@ proxy:
   }
 
   #[test]
-  fn proxy_aliases_load_as_a_name_to_model_map() {
+  fn proxy_aliases_load_in_both_spellings() {
     let dir = temp_test_dir("proxy-aliases");
     let path = dir.join("config.yaml");
     fs::write(
@@ -1923,15 +2027,17 @@ proxy:
 
     let loaded = load_config_from_path(&path);
     assert!(loaded.warning.is_none(), "valid config should not warn");
-    assert_eq!(loaded.config.proxy.aliases.len(), 2);
     assert_eq!(
       loaded
         .config
         .proxy
         .aliases
-        .get("gpt-4o-mini")
-        .map(String::as_str),
-      Some("qwen3.8-27b-q8")
+        .pairs()
+        .collect::<Vec<(&str, &str)>>(),
+      vec![
+        ("gpt-4o-mini", "qwen3.8-27b-q8"),
+        ("claude-haiku", "some/other-model")
+      ]
     );
     // Absent is the default: no aliases until someone asks for them.
     assert!(
@@ -1939,6 +2045,34 @@ proxy:
       "aliases default to empty"
     );
     fs::remove_dir_all(&dir).expect("temp test dir should be removed");
+
+    // The block spelling, which is the one that carries a comment per entry.
+    let block_dir = temp_test_dir("proxy-aliases-block");
+    let block_path = block_dir.join("config.yaml");
+    fs::write(
+      &block_path,
+      "proxy:\n  aliases:\n    - name: gpt-4o-mini # the harness default\n      target: qwen3.8-27b-q8\n    - name: claude-haiku\n      target: some/other-model\n",
+    )
+    .expect("write failed");
+    let block = load_config_from_path(&block_path);
+    assert!(
+      block.warning.is_none(),
+      "valid config should not warn: {:?}",
+      block.warning
+    );
+    assert_eq!(
+      block
+        .config
+        .proxy
+        .aliases
+        .pairs()
+        .collect::<Vec<(&str, &str)>>(),
+      vec![
+        ("gpt-4o-mini", "qwen3.8-27b-q8"),
+        ("claude-haiku", "some/other-model")
+      ]
+    );
+    fs::remove_dir_all(&block_dir).expect("temp test dir should be removed");
   }
 
   #[test]

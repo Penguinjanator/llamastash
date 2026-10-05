@@ -204,7 +204,7 @@ async fn proxy_state_with_models(models: Vec<DiscoveredModel>) -> Arc<ProxyState
   proxy_state_with_models_compat(models, false).await
 }
 
-/// Like [`proxy_state_with_models`] with a `proxy.aliases` map.
+/// Like [`proxy_state_with_models`] with a `proxy.aliases` entry.
 async fn proxy_state_with_alias(
   models: Vec<DiscoveredModel>,
   alias: (&str, &str),
@@ -214,8 +214,8 @@ async fn proxy_state_with_alias(
     catalog.upsert(m).await;
   }
   let ctx = MethodContext::with_catalog(ShutdownToken::new(), catalog);
-  let aliases: std::collections::BTreeMap<String, String> =
-    std::iter::once((alias.0.to_string(), alias.1.to_string())).collect();
+  let aliases =
+    llamastash::config::ProxyAliases::from_pairs(vec![(alias.0.to_string(), alias.1.to_string())]);
   ProxyState::from_context_with_auth(&ctx, false, true, None, DEFAULT_BODY_LIMIT_BYTES, &aliases)
 }
 
@@ -464,6 +464,101 @@ async fn api_show_resolves_a_proxy_alias() {
   );
   let v: Value = serde_json::from_slice(&body).expect("json body");
   assert_eq!(v["details"]["family"], "qwen3");
+
+  shutdown_listener(shutdown, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_show_an_alias_beats_a_model_that_merely_contains_the_name() {
+  // The alias is the operator's explicit mapping, so it outranks a partial
+  // match: `gpt-4o-mini` must not be stolen by the `gpt-4o-mini-Q4_K_M.gguf`
+  // that shows up on disk later.
+  let models = vec![
+    make_model(
+      "/m/gpt-4o-mini-Q4_K_M.gguf",
+      Some("gpt-4o-mini-Q4_K_M"),
+      "llama",
+      ModeHint::Chat,
+    ),
+    make_model(
+      "/m/qwen-coder.gguf",
+      Some("qwen-coder:7b"),
+      "qwen3",
+      ModeHint::Chat,
+    ),
+  ];
+  let state = proxy_state_with_alias(models, ("gpt-4o-mini", "qwen-coder:7b")).await;
+  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+
+  let (status, body) = http_post(addr, "/api/show", r#"{"model":"gpt-4o-mini"}"#).await;
+  let v: Value = serde_json::from_slice(&body).expect("json body");
+  assert_eq!(
+    v["details"]["family"], "qwen3",
+    "the alias must answer, not the longer file name: {status} {body:?}"
+  );
+
+  shutdown_listener(shutdown, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_show_an_alias_resolves_what_is_ambiguous_without_it() {
+  // Two rows contain `gpt-oss`, so the bare name is ambiguous on its own. An
+  // alias for it is the tie-break the operator wrote, and has to win over the
+  // 400 the same string would otherwise get.
+  let models = vec![
+    make_model(
+      "/m/gpt-oss-20b.gguf",
+      Some("gpt-oss-20b"),
+      "phi",
+      ModeHint::Chat,
+    ),
+    make_model(
+      "/m/gpt-oss-120b.gguf",
+      Some("gpt-oss-120b"),
+      "llama",
+      ModeHint::Chat,
+    ),
+  ];
+  let state = proxy_state_with_alias(models, ("gpt-oss", "gpt-oss-20b")).await;
+  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+
+  let (status, body) = http_post(addr, "/api/show", r#"{"model":"gpt-oss"}"#).await;
+  assert_eq!(
+    status, 200,
+    "the alias must settle what the catalog cannot: {status} {body:?}"
+  );
+  let v: Value = serde_json::from_slice(&body).expect("json body");
+  assert_eq!(v["details"]["family"], "phi");
+
+  shutdown_listener(shutdown, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_show_without_the_alias_still_calls_that_name_ambiguous() {
+  // The same two rows with no alias: the alias is what changed behaviour, not
+  // the matcher.
+  let models = vec![
+    make_model(
+      "/m/gpt-oss-20b.gguf",
+      Some("gpt-oss-20b"),
+      "phi",
+      ModeHint::Chat,
+    ),
+    make_model(
+      "/m/gpt-oss-120b.gguf",
+      Some("gpt-oss-120b"),
+      "llama",
+      ModeHint::Chat,
+    ),
+  ];
+  let state = proxy_state_with_models(models).await;
+  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+
+  let (status, body) = http_post(addr, "/api/show", r#"{"model":"gpt-oss"}"#).await;
+  assert_eq!(
+    status, 400,
+    "an ambiguous name with no alias stays ambiguous: {status} {body:?}"
+  );
 
   shutdown_listener(shutdown, handle).await;
 }

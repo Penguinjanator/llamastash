@@ -245,10 +245,9 @@ async fn proxy_state_with_aliases(
   }
   let ctx =
     MethodContext::with_catalog(ShutdownToken::new(), catalog).with_supervisors(supervisors);
-  let aliases: std::collections::BTreeMap<String, String> = aliases
-    .iter()
-    .map(|(k, v)| (k.to_string(), v.to_string()))
-    .collect();
+  let aliases = llamastash::config::ProxyAliases::from_pairs(
+    aliases.iter().map(|(k, v)| (k.to_string(), v.to_string())),
+  );
   ProxyState::from_context_with_auth(&ctx, false, true, None, DEFAULT_BODY_LIMIT_BYTES, &aliases)
 }
 
@@ -646,6 +645,58 @@ async fn proxy_alias_reaches_the_model_it_names() {
   );
 
   let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, listener_handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_alias_settles_a_name_two_models_both_contain() {
+  let dir = unique_temp("alias-ambiguous");
+  let catalog_path = "/fixture/gpt-oss-20b.gguf";
+  let registry = SupervisorRegistry::new();
+  let (model, _port, _id) = spawn_fake_supervisor(catalog_path, &dir, LaunchMode::Chat).await;
+  registry.insert(registry.next_id(), model.clone()).await;
+
+  // A second row contains the same string, so `gpt-oss` alone is ambiguous and
+  // the proxy answers 400 for it. The alias is the operator's tie-break, so it
+  // has to route instead of forwarding the ambiguity to the client.
+  let state = proxy_state_with_aliases(
+    vec![
+      discovered(catalog_path, Some("gpt-oss-20b"), "qwen3"),
+      discovered("/fixture/gpt-oss-120b.gguf", Some("gpt-oss-120b"), "qwen3"),
+    ],
+    registry,
+    &[("gpt-oss", "gpt-oss-20b")],
+  )
+  .await;
+  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+
+  let body = r#"{"model":"gpt-oss","messages":[]}"#;
+  let (status, _headers, response) = http_post(addr, "/v1/chat/completions", body, &[]).await;
+  assert_eq!(
+    status, 200,
+    "the alias must beat the ambiguity of the bare name, got {status}: {response:?}"
+  );
+
+  // Without the alias the same string is still ambiguous: the alias is what
+  // changed the outcome, not the matcher.
+  let plain = proxy_state_with(
+    vec![
+      discovered(catalog_path, Some("gpt-oss-20b"), "qwen3"),
+      discovered("/fixture/gpt-oss-120b.gguf", Some("gpt-oss-120b"), "qwen3"),
+    ],
+    SupervisorRegistry::new(),
+  )
+  .await;
+  let (plain_addr, plain_shutdown, plain_handle) = spawn_listener_with_state(plain).await;
+  let (status, _headers, response) = http_post(plain_addr, "/v1/chat/completions", body, &[]).await;
+  assert_eq!(
+    status, 400,
+    "with no alias the name stays ambiguous, got {status}: {response:?}"
+  );
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(plain_shutdown, plain_handle).await;
   shutdown_listener(shutdown, listener_handle).await;
   std::fs::remove_dir_all(&dir).ok();
 }

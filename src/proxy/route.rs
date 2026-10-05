@@ -395,12 +395,14 @@ pub(crate) enum ClientRefMiss {
 
 /// Turn a client's `model` string into `(launch name, catalog row)`.
 ///
-/// The order is the whole string as written, then the same string split at `@`
-/// — a `<model>@<launch>` address, taken only when the whole string misses, so
-/// a file named `foo@bar.gguf` still resolves whole — then a `proxy.aliases`
-/// name. A string that matches a real model always beats an alias of the same
-/// name, and an alias target resolves whole: an alias names a model, never a
-/// launch name or a preset.
+/// The order is a reference that names one model outright, then a
+/// `proxy.aliases` name, then the whole string as a partial match, then the
+/// same string split at `@` — a `<model>@<launch>` address, taken only when the
+/// whole string misses, so a file named `foo@bar.gguf` still resolves whole. An
+/// alias beats a partial match: `gpt-4o-mini` standing for one model must not be
+/// swallowed by a `gpt-4o-mini-Q4_K_M.gguf` that appears later, nor by two
+/// models that both contain the string. An alias target is resolved whole, so an
+/// alias names a model, never a launch name or a preset.
 pub(crate) fn resolve_client_reference(
   state: &ProxyState,
   rows: &[CatalogRow],
@@ -412,7 +414,7 @@ pub(crate) fn resolve_client_reference(
     ClientRefMiss::Ambiguous(crate::launch::resolve::published_ids_for(rows, &candidates))
   };
 
-  match resolve_model_with_candidates(rows, requested) {
+  match crate::launch::resolve::resolve_exact_reference(rows, requested) {
     Ok(row) => {
       if state.aliases.note_shadowed(requested) {
         log::warn!(
@@ -421,6 +423,29 @@ pub(crate) fn resolve_client_reference(
       }
       return Ok((None, row));
     }
+    // No outright model under this name, so an alias of it is next.
+    Err(ResolveError::None) => {}
+    Err(ResolveError::Many(_)) => {}
+    Err(ResolveError::Empty) => return Err(ClientRefMiss::NotFound),
+  }
+
+  if let Some(target) = state.aliases.target(requested) {
+    return match resolve_model_with_candidates(rows, target) {
+      Ok(row) => Ok((None, row)),
+      Err(ResolveError::Many(candidates)) => Err(ambiguous(candidates)),
+      Err(_) => {
+        if state.aliases.note_dead_target(requested) {
+          log::warn!(
+            "proxy.aliases: `{requested}` points at `{target}`, which is not a model in the catalog"
+          );
+        }
+        Err(ClientRefMiss::NotFound)
+      }
+    };
+  }
+
+  match resolve_model_with_candidates(rows, requested) {
+    Ok(row) => return Ok((None, row)),
     Err(ResolveError::Many(candidates)) => return Err(ambiguous(candidates)),
     Err(_) => {}
   }
@@ -433,15 +458,7 @@ pub(crate) fn resolve_client_reference(
     }
   }
 
-  match state
-    .aliases
-    .target(requested)
-    .map(|target| resolve_model_with_candidates(rows, target))
-  {
-    Some(Ok(row)) => Ok((None, row)),
-    Some(Err(ResolveError::Many(candidates))) => Err(ambiguous(candidates)),
-    _ => Err(ClientRefMiss::NotFound),
-  }
+  Err(ClientRefMiss::NotFound)
 }
 
 /// Which of several Ready launches of one model a request goes to: an unnamed

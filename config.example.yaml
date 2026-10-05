@@ -428,18 +428,29 @@ proxy:
   # any reference `llamastash list` shows — a plain name, a repo-qualified
   # id, or a full path. Commented out by default; add entries as needed.
   #
-  # A name the catalog already publishes belongs to that model: the alias
-  # is never consulted, and the daemon logs one warning the first time a
-  # request for that name arrives. An alias names a model and nothing else,
-  # so a value cannot pin a launch name or a preset — the client has to send
-  # `<model>@<name>` itself for that. Aliases are not listed by
-  # `/v1/models` or `/api/tags`. Names match case-insensitively.
+  # A name that names a model outright — its path, file name, published id
+  # or repo-qualified id — belongs to that model: the alias is never
+  # consulted, and the daemon logs one warning the first time a request for
+  # that name arrives. A longer file name that only contains the alias does
+  # not own it, and neither do two models that both contain it; there the
+  # alias is the tie-break. An alias names a model and nothing else, so a
+  # value cannot pin a launch name or a preset — the client has to send
+  # `<model>@<name>` itself for that. A value naming nothing in the catalog
+  # 404s, with one warning the first time a request hits it. Aliases are not
+  # listed by `/v1/models` or `/api/tags`. Names match case-insensitively,
+  # and entries keep the order written, so a repeated name uses the last.
   #
   # Sources — CLI: (none) · Env: (none).
   #
   # aliases:
   #   gpt-4o-mini: qwen3.8-27b-q8
   #   claude-haiku: unsloth/Demo-GGUF/demo-Q4_K_M
+  #
+  # Or one entry per block, which is the spelling that carries a comment:
+  #
+  # aliases:
+  #   - name: gpt-4o-mini # what the harness hard-codes
+  #     target: qwen3.8-27b-q8
 
 # ─── Backend engines ──────────────────────────────────────────────
 #
