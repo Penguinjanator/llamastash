@@ -572,7 +572,7 @@ TIME      STATUS  TOTAL  TTFB   TOK/S  IN  OUT  ROUTE             MODEL         
 What is and is not recorded:
 
 - Only requests on the forwarded `/v1/*` routes. `/v1/models`, `/health`, `/api/*`, `/ui` and requests refused for a missing or wrong API key are not logged.
-- The log keeps the last 1000 requests in memory. It is not written to disk and is empty after a daemon restart.
+- The log keeps the last 1000 requests in memory and is empty after a daemon restart. Set `proxy.request_log_file: true` to also append every finished request to `requests.jsonl` in the daemon's log directory (`<cache dir>/logs`), one JSON object per line with the keys above. The file rotates at 10 MiB and keeps 5 older segments (`requests.jsonl.1` is the newest of them). The in-memory log and the summaries still start empty after a restart; they are not read back from the file.
 - No prompt or response text is stored. Token counts are read from the `usage` and `timings` objects at the end of the response as it passes through; the proxy does not change the request to ask for them.
 - `tokens_per_second` is the speed the model's server reported (`timings.predicted_per_second`, `usage.completion_tokens_per_second` or `metrics.tokens_per_second`). When the server reports none and the response carries the generated token count, the proxy estimates it from its own clock and sets `tokens_per_second_estimated`. With llama-server b11390 that is every `/v1/messages` response and a non-streamed `/v1/responses` response.
 - The estimate is the generated tokens over the time generation took: since the first response byte for a stream, and since the request went to the model for a response that arrives whole. The second includes prompt processing, so it reads lower than the server's own figure would. Short answers make either one noisy.
@@ -1357,6 +1357,7 @@ proxy:
   # header_read_timeout_secs: 30
   # idle_ttl_secs: 1800      # 0 disables the global deadline; a preset can still pin its own.
   # max_body_size: 16777216  # Bytes; cap on every request body (default 16 MiB; 0 disables the check).
+  # request_log_file: false  # true => also append each finished request to <cache dir>/logs/requests.jsonl.
 ```
 
 Unknown keys inside `[proxy]` are **rejected loudly** (`#[serde(deny_unknown_fields)]`) — a typo never silently falls back to defaults. The top-level config still tolerates unknown keys for forward-compat. No `tls_*` — TLS for a LAN-exposed proxy is still deferred per the plan's Scope Boundaries. The full key set with per-key sources is in `config.example.yaml` under `[proxy]`.

@@ -906,7 +906,8 @@ async fn pump_stream<R>(
   }
 }
 
-/// Rotating writer for one launch's log file. Wraps a `tokio::fs::File`
+/// Rotating writer for one log file: a launch's log, or the proxy's
+/// request log. Wraps a `tokio::fs::File`
 /// plus a running byte counter; when the counter crosses
 /// [`LOG_ROTATE_BYTES`], the current file is renamed to `<base>.1`,
 /// older segments shift up by one, and the [`LOG_KEEP_SEGMENTS`]th
@@ -935,7 +936,7 @@ impl LogWriter {
     })
   }
 
-  async fn write_line(&mut self, body: &[u8]) -> std::io::Result<()> {
+  pub(crate) async fn write_line(&mut self, body: &[u8]) -> std::io::Result<()> {
     self.file.write_all(body).await?;
     self.file.write_all(b"\n").await?;
     self.written += body.len() as u64 + 1;

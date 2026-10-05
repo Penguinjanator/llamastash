@@ -557,6 +557,11 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
            and llama-server children stay loopback"
         );
       }
+      if opts.proxy.request_log_file {
+        ctx
+          .requests
+          .write_to(opts.log_dir.join(proxy::request_log::FILE_NAME));
+      }
       let state = proxy::ProxyState::from_context_with_auth(
         &ctx,
         opts.proxy.ollama_compat,

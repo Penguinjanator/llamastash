@@ -6,7 +6,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ### Added
 
-- **Proxy request log.** `llamastash requests [model]` and a per-model Requests tab in the TUI (`Shift+Q`) show the last 1000 proxy requests: status, total time, time to first byte, token counts, tok/s, and the auto-start, unload or error behind each one. `status --json` gains per-launch `request_stats`. ([#97](https://github.com/llamastash/llamastash/pull/97))
+- **Proxy request log.** `llamastash requests [model]` and a per-model Requests tab in the TUI (`Shift+Q`) show the last 1000 proxy requests: status, total time, time to first byte, token counts, tok/s, and the auto-start, unload or error behind each one. `status --json` gains per-launch `request_stats`, and `proxy.request_log_file: true` also writes the requests to a JSON Lines file. ([#97](https://github.com/llamastash/llamastash/pull/97))
 
 ## [0.6.1] — 2026-10-02
 

@@ -359,6 +359,15 @@ pub struct ProxyConfig {
   /// Sources — CLI: (none) · Env: (none).
   #[serde(default = "ProxyConfig::default_max_body_size")]
   pub max_body_size: usize,
+  /// Also append every finished request-log row to `requests.jsonl` in
+  /// the daemon's log directory, one JSON object per line with the keys
+  /// `llamastash requests --json` prints. The file rotates like a launch
+  /// log. Default `false`: the request log lives in memory only and is
+  /// empty after a daemon restart.
+  ///
+  /// Sources — CLI: (none) · Env: (none).
+  #[serde(default)]
+  pub request_log_file: bool,
 }
 
 impl ProxyConfig {
@@ -441,6 +450,7 @@ impl Default for ProxyConfig {
       api_key: None,
       insecure_no_auth: false,
       max_body_size: Self::default_max_body_size(),
+      request_log_file: false,
     }
   }
 }
@@ -1873,6 +1883,19 @@ proxy:
       Some(std::path::Path::new("/opt/lemonade/lemond"))
     );
     fs::remove_dir_all(on_dir).expect("temp test dir should be removed");
+  }
+
+  #[test]
+  fn proxy_request_log_file_is_off_unless_set() {
+    assert!(!Config::default().proxy.request_log_file);
+    let dir = temp_test_dir("proxy-request-log-file");
+    let path = dir.join("config.yaml");
+    fs::write(&path, "proxy:\n  request_log_file: true\n").expect("write failed");
+
+    let loaded = load_config_from_path(&path);
+    assert!(loaded.warning.is_none(), "valid config should not warn");
+    assert!(loaded.config.proxy.request_log_file);
+    fs::remove_dir_all(dir).expect("temp test dir should be removed");
   }
 
   #[test]

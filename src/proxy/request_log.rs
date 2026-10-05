@@ -6,15 +6,17 @@
 //!
 //! Rows live in a ring of [`CAPACITY`]. Totals per model and per launch are
 //! kept apart from the ring, so a summary still counts requests whose rows
-//! have been pushed out. Nothing is persisted: all of it is lost when the
-//! daemon stops.
+//! have been pushed out. The ring and the totals are lost when the daemon
+//! stops. [`RequestLog::write_to`] also appends each finished row to a file.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 use super::usage_tap::Usage;
 
@@ -23,6 +25,14 @@ pub const CAPACITY: usize = 1000;
 
 /// Rows one `requests_tail` call returns when it names no `limit`.
 pub const DEFAULT_TAIL: usize = 100;
+
+/// Name of the request log file inside the daemon's log directory.
+pub const FILE_NAME: &str = "requests.jsonl";
+
+/// Finished rows that may wait for the file writer. Past this the line is
+/// dropped from the file (the in-memory log still has the row) rather
+/// than holding up the request that produced it.
+const FILE_QUEUE: usize = 1024;
 
 /// Strings that come from a client or a child process are cut to these
 /// lengths, and stripped of control characters, before they are stored.
@@ -367,6 +377,8 @@ pub struct Tail {
 #[derive(Clone, Default)]
 pub struct RequestLog {
   inner: Arc<Mutex<Inner>>,
+  /// Queue to the file writer, once [`Self::write_to`] has started one.
+  file: Arc<OnceLock<mpsc::Sender<String>>>,
 }
 
 impl RequestLog {
@@ -378,6 +390,30 @@ impl RequestLog {
   // few field writes, so a poisoned lock still guards consistent data.
   fn lock(&self) -> MutexGuard<'_, Inner> {
     self.inner.lock().unwrap_or_else(|e| e.into_inner())
+  }
+
+  /// Also append every finished row to `path`, one JSON object per line
+  /// with the keys `requests_tail` returns. The file rotates like a
+  /// launch log. Call once, from inside the daemon's runtime.
+  pub fn write_to(&self, path: PathBuf) {
+    let (tx, mut rx) = mpsc::channel::<String>(FILE_QUEUE);
+    if self.file.set(tx).is_err() {
+      return;
+    }
+    tokio::spawn(async move {
+      let mut writer = match crate::daemon::supervisor::LogWriter::open(path.clone()).await {
+        Ok(writer) => writer,
+        Err(e) => {
+          log::warn!("proxy: cannot open request log {}: {e}", path.display());
+          return;
+        }
+      };
+      while let Some(line) = rx.recv().await {
+        if let Err(e) = writer.write_line(line.as_bytes()).await {
+          log::warn!("proxy: request log write to {} failed: {e}", path.display());
+        }
+      }
+    });
   }
 
   /// Start a row for a request the proxy just received. The returned
@@ -516,23 +552,30 @@ impl RequestRecord {
     self.row.completion_tokens = usage.completion_tokens;
     self.row.tokens_per_second = usage.tokens_per_second;
     self.row.tokens_per_second_estimated = usage.tokens_per_second_estimated;
-    let mut inner = self.log.lock();
-    let inner = &mut *inner;
-    inner.store(&self.row);
-    inner.all.add(&self.row);
-    if let Some(path) = &self.row.model_path {
-      inner
-        .by_model
-        .entry(path.clone())
-        .or_default()
-        .add(&self.row);
+    {
+      let mut inner = self.log.lock();
+      let inner = &mut *inner;
+      inner.store(&self.row);
+      inner.all.add(&self.row);
+      if let Some(path) = &self.row.model_path {
+        inner
+          .by_model
+          .entry(path.clone())
+          .or_default()
+          .add(&self.row);
+      }
+      if let Some(launch) = &self.row.launch_id {
+        inner
+          .by_launch
+          .entry(launch.clone())
+          .or_default()
+          .add(&self.row);
+      }
     }
-    if let Some(launch) = &self.row.launch_id {
-      inner
-        .by_launch
-        .entry(launch.clone())
-        .or_default()
-        .add(&self.row);
+    if let Some(file) = self.log.file.get() {
+      if let Ok(line) = serde_json::to_string(&self.row) {
+        let _ = file.try_send(line);
+      }
     }
   }
 
@@ -908,6 +951,43 @@ mod tests {
     assert_eq!(filled_cells[2].1, "1.2s");
     assert_eq!(filled_cells[4].1, "39.6");
     assert_eq!(filled_cells[6].1, "12.3k");
+  }
+
+  #[tokio::test]
+  async fn finished_rows_are_appended_to_the_file_as_json_lines() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("logs").join(FILE_NAME);
+    let log = RequestLog::new();
+    log.write_to(path.clone());
+
+    let first = served(&log, "/m/a.gguf", "L1", Usage::default());
+    let _in_flight = log.begin(ROUTE, None);
+    let failed = log.begin(ROUTE, None);
+    failed.respond(404, Some("model_not_found"), Some("nope not found"));
+
+    // The writer runs on its own task; wait for both lines to land.
+    let mut text = String::new();
+    for _ in 0..200 {
+      text = std::fs::read_to_string(&path).unwrap_or_default();
+      if text.lines().count() >= 2 {
+        break;
+      }
+      tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let rows: Vec<RequestRow> = text
+      .lines()
+      .map(|line| serde_json::from_str(line).expect("one JSON row per line"))
+      .collect();
+    // Finished rows only, in the order they finished. The in-flight row
+    // (`seq` 2) is not written.
+    assert_eq!(
+      rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+      vec![first, 3]
+    );
+    assert_eq!(rows[0].model_path.as_deref(), Some("/m/a.gguf"));
+    assert_eq!(rows[1].error.as_deref(), Some("model_not_found"));
+    // The in-memory log is unchanged by the file.
+    assert_eq!(log.tail(None, 10).rows.len(), 3);
   }
 
   #[test]

@@ -114,6 +114,8 @@ So on a stream without `usage` the token counts come from `timings` (`prompt_n +
 
 The vLLM field name (`metrics.tokens_per_second`, sent with `--enable-per-request-metrics`, on a stream only in the final usage chunk) is from the upstream source on 2026-10-05 (`vllm/entrypoints/generate/base/protocol.py`, release v0.31.0), not from a live server. gufo's `usage.completion_tokens_per_second` is from `scripts/bench/qwen38-flash-speed/bench.py`, non-streamed only.
 
+`proxy.request_log_file: true` (added 2026-10-05, off by default) also appends each finished row to `<log dir>/requests.jsonl`. The in-memory log is not read back from it.
+
 ### Follow-ups
 
 - [ ] Run the proxy overhead bench with and without the tap (plan step 7). Skipped on 2026-10-05: a Halogen run held the GPU, and the bench needs a quiet machine.

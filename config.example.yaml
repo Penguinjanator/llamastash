@@ -423,6 +423,18 @@ proxy:
   # Sources — CLI: (none) · Env: (none).
   max_body_size: 16777216
 
+  # Also write the proxy's request log to a file. Default `false`: the
+  # log (`llamastash requests`, the TUI Requests tab) lives in memory
+  # only and is empty after a daemon restart. `true` appends every
+  # finished request to `requests.jsonl` in the daemon's log directory
+  # (`<cache dir>/logs`), one JSON object per line with the same keys as
+  # `llamastash requests --json`. No prompt or response text is written.
+  # The file rotates at 10 MiB and keeps 5 older segments. Restart the
+  # daemon to apply.
+  #
+  # Sources — CLI: (none) · Env: (none).
+  request_log_file: false
+
 # ─── Backend engines ──────────────────────────────────────────────
 #
 # All backend configuration lives under `backend:`. llama.cpp is the
