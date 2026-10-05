@@ -1201,27 +1201,31 @@ async fn tokens_and_speed_come_from_the_end_of_the_response() {
   assert_eq!(row.prompt_tokens, Some(41), "prompt_n + cache_n");
   assert_eq!(row.completion_tokens, Some(3));
   assert_eq!(row.tokens_per_second, Some(38.64));
+  assert!(!row.tokens_per_second_estimated, "the server reported it");
 
-  // An Anthropic-shape body: `usage.input_tokens` / `output_tokens`.
+  // An Anthropic-shape body: `usage.input_tokens` / `output_tokens`, and
+  // no speed from the server, so the proxy estimates it from its clock.
   let messages = r#"{"model":"qwen3","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#;
   let (status, _, _) = http_post(addr, "/v1/messages", messages, &[]).await;
   assert_eq!(status, 200);
   let row = newest_row_when(&ctx.requests, |r| finished(r) && r.route == "/v1/messages").await;
   assert_eq!(
-    (
-      row.prompt_tokens,
-      row.completion_tokens,
-      row.tokens_per_second
-    ),
-    (Some(1), Some(1), None)
+    (row.prompt_tokens, row.completion_tokens),
+    (Some(1), Some(1))
   );
+  assert!(row.tokens_per_second_estimated);
+  let estimate = row.tokens_per_second.expect("estimated speed");
+  assert!(estimate > 0.0 && estimate.is_finite(), "{estimate}");
 
   let summary = ctx.requests.tail(Some(catalog_path), 0).summary;
   assert_eq!(summary.requests, 2);
   assert_eq!(summary.prompt_tokens, 42);
   assert_eq!(summary.completion_tokens, 4);
-  assert_eq!(summary.tokens_per_second_avg, Some(38.64));
-  assert_eq!(summary.tokens_per_second_last, Some(38.64));
+  assert_eq!(summary.tokens_per_second_last, Some(estimate));
+  assert_eq!(
+    summary.tokens_per_second_avg,
+    Some((38.64 + estimate) / 2.0)
+  );
 
   let _ = model.stop(Duration::from_secs(3)).await;
   shutdown_listener(shutdown, listener_handle).await;

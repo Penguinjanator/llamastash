@@ -23,6 +23,7 @@
 //!   family-MRU fallback path.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::TryStreamExt;
 use http_body_util::{combinators::BoxBody, BodyExt, StreamBody};
@@ -212,6 +213,7 @@ pub(crate) async fn forward_to_upstream(
     .headers(outbound_headers)
     .body(body);
 
+  let sent = Instant::now();
   let upstream = match request.send().await {
     Ok(r) => r,
     Err(err) => {
@@ -233,6 +235,7 @@ pub(crate) async fn forward_to_upstream(
     fallback_reason,
     inflight_guard,
     record,
+    sent,
   )
 }
 
@@ -354,6 +357,7 @@ fn build_streaming_response(
   fallback_reason: Option<&str>,
   inflight_guard: crate::daemon::supervisor::InflightGuard,
   record: Option<RequestRecord>,
+  sent: Instant,
 ) -> ProxyResponse {
   let status = upstream.status();
   let inbound_headers = upstream.headers().clone();
@@ -369,6 +373,11 @@ fn build_streaming_response(
       seen: 0,
       ended: false,
       errored: false,
+      streamed: inbound_headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/event-stream")),
+      generating_since: sent,
     }
   });
 
@@ -470,6 +479,13 @@ struct LoggedResponse {
   seen: u64,
   ended: bool,
   errored: bool,
+  /// The response is an event stream.
+  streamed: bool,
+  /// Where the proxy's clock starts timing generation, for the tok/s
+  /// estimate: the first byte of a stream, or the moment the request went
+  /// upstream for a response that arrives whole. The second includes
+  /// prompt processing, so that estimate reads low.
+  generating_since: Instant,
 }
 
 impl LoggedResponse {
@@ -482,6 +498,9 @@ impl LoggedResponse {
         if self.seen == 0 {
           self.record.mark_first_byte();
           self.record.publish();
+          if self.streamed {
+            self.generating_since = Instant::now();
+          }
         }
         self.seen += data.len() as u64;
         if let Some(tap) = self.tap.as_mut() {
@@ -510,11 +529,14 @@ impl Drop for LoggedResponse {
     // Read whatever the tap holds, however the response ended: a client
     // that closes on `data: [DONE]` can beat the upstream's end of body,
     // and its final chunk is already here.
-    let usage = self
+    let mut usage = self
       .tap
       .as_ref()
       .map(ResponseTap::usage)
       .unwrap_or_default();
+    if state == RequestState::Done {
+      usage.estimate_speed(self.generating_since.elapsed());
+    }
     self.record.finish(state, usage);
   }
 }

@@ -203,7 +203,7 @@ Bare letters are for tool actions (`f` favorite, `e` edit, `u/c/p` yank, `t` the
 | `focus_logs_tab`                        | `Shift+L`                         | Nav focuses — gated on a running model                                             |
 | `focus_chat_tab`                        | `Shift+C` · `Shift+E` · `Shift+R` | Nav focuses — picks mode-appropriate tab (Chat / Embed / Rerank), gated on running |
 | `focus_settings_tab`                    | `Shift+S`                         | Nav focuses — always available                                                     |
-| `focus_requests_tab`                    | `Shift+U`                         | Nav focuses, gated on a model that has a launch                                    |
+| `focus_requests_tab`                    | `Shift+Q`                         | Nav focuses, gated on a model that has a launch                                    |
 | `next_field` / `prev_field`             | `↓` / `↑`                         | Rerank input — cycles Query / Candidate                                            |
 | `cycle_value_next` / `cycle_value_prev` | `→` / `←`                         | Right pane (Settings) — cycles the focused row's value (incl. the preset row, and the `server` row when a model has >1 compatible build) |
 | `save_preset`                           | `Ctrl+P`                          | Save the settings in view as a named preset (name prompt → confirm). Settings pane always (the form, or a running model); Models list only on a running row |
@@ -533,7 +533,7 @@ TIME      STATUS  TOTAL  TTFB   TOK/S  IN  OUT  ROUTE             MODEL         
 ```
 
 - `TOTAL` is the time from the proxy receiving the request to the end of the response. `TTFB` is the time to the first response body byte, which includes any model load.
-- `IN` / `OUT` are prompt and generated tokens. `TOK/S` is the generation speed.
+- `IN` / `OUT` are prompt and generated tokens. `TOK/S` is the generation speed. A leading `~` marks a speed the proxy estimated because the model's server reported none.
 - `NOTE` says what happened beyond the status code: `auto-start` (this request started the model), `unloaded L3` (launches unloaded to make room), `fallback (<reason>) for <model>`, `client closed`, `upstream error`, `loading model`, `in flight`, or the proxy's own error and its message (`launch_failed: auto-start of ...`).
 - On a terminal a summary block is printed above the table. Piped output is the header plus one tab-separated line per request. The `MODEL` column is dropped when `model-ref` is given.
 
@@ -560,20 +560,22 @@ TIME      STATUS  TOTAL  TTFB   TOK/S  IN  OUT  ROUTE             MODEL         
   "duration_ms": 1000,
   "prompt_tokens": null,
   "completion_tokens": null,
-  "tokens_per_second": null
+  "tokens_per_second": null,
+  "tokens_per_second_estimated": false
 }
 ```
 
 `state` is `in_flight`, `done`, `client_closed` (the client went away before the response was complete) or `upstream_error` (the model's server dropped the connection mid-response). When the proxy answered the request itself, `error` is its error `code`, or its `type` when the error has no code (`model_not_found`, `model_required`, `launch_failed`, ...), and `cause` is the error message. When another model answered because the launch failed, the row is filed under the model that answered and `fallback` holds the reason.
 
-`summary` covers the same scope as the rows (one model, or everything) and counts finished requests since the daemon started, so it keeps counting requests whose rows have left the log. `errors` counts 4xx / 5xx answers and `upstream_error` rows; a client that hung up is not an error. The two averages cover completed 2xx / 3xx requests only. `tokens_per_second_avg` is the mean of the per-request speeds. `tokens_per_second_last` is the most recent speed a request reported. `auto_starts` counts the requests that started the model; a request that waited on a load someone else started is not one. `evictions` counts the launches unloaded to make room.
+`summary` covers the same scope as the rows (one model, or everything) and counts finished requests since the daemon started, so it keeps counting requests whose rows have left the log. `errors` counts 4xx / 5xx answers and `upstream_error` rows; a client that hung up is not an error. The two averages cover completed 2xx / 3xx requests only. `tokens_per_second_avg` is the mean of the per-request speeds, estimated ones included. `tokens_per_second_last` is the most recent speed a request reported. `auto_starts` counts the requests that started the model; a request that waited on a load someone else started is not one. `evictions` counts the launches unloaded to make room.
 
 What is and is not recorded:
 
 - Only requests on the forwarded `/v1/*` routes. `/v1/models`, `/health`, `/api/*`, `/ui` and requests refused for a missing or wrong API key are not logged.
 - The log keeps the last 1000 requests in memory. It is not written to disk and is empty after a daemon restart.
 - No prompt or response text is stored. Token counts are read from the `usage` and `timings` objects at the end of the response as it passes through; the proxy does not change the request to ask for them.
-- `tokens_per_second` is the speed the model's server reported (`timings.predicted_per_second`, `usage.completion_tokens_per_second` or `metrics.tokens_per_second`), never an estimate. It is `null` when the server reports none. With llama-server b11390 that is every `/v1/messages` response and a non-streamed `/v1/responses` response.
+- `tokens_per_second` is the speed the model's server reported (`timings.predicted_per_second`, `usage.completion_tokens_per_second` or `metrics.tokens_per_second`). When the server reports none and the response carries the generated token count, the proxy estimates it from its own clock and sets `tokens_per_second_estimated`. With llama-server b11390 that is every `/v1/messages` response and a non-streamed `/v1/responses` response.
+- The estimate is the generated tokens over the time generation took: since the first response byte for a stream, and since the request went to the model for a response that arrives whole. The second includes prompt processing, so it reads lower than the server's own figure would. Short answers make either one noisy.
 - Token counts and speed are `null` for a compressed response, and for a response that ended before the server sent them.
 
 ### `llamastash presets <model-ref> <action>`
@@ -1580,7 +1582,7 @@ These are the defaults. Override any binding via the `keybindings:` block in `co
 | `t` / `Shift+T`                               | Cycle theme forward / backward                                                                                                                                                                           |
 | `Alt+L` (`⌥L` on macOS)                       | Cycle the left/right pane split through `left_pane_ratios` (wide mode; session-only). `100` hides the right pane, `0` hides the list.                                                                    |
 | `Tab` / `Shift+Tab`                           | Move focus across panes (`h` / `l` do the same — Left/Right arrows are intentionally unbound on Models to avoid an asymmetric pane-jump)                                                                 |
-| `Shift+M` / `Shift+L` / `Shift+C` / `Shift+S` / `Shift+U` | Jump focus to Models / Logs / Chat / Settings / Requests respectively. `L` and `C` only fire when the focused model is running, `U` when it has a launch.                                    |
+| `Shift+M` / `Shift+L` / `Shift+C` / `Shift+S` / `Shift+Q` | Jump focus to Models / Logs / Chat / Settings / Requests respectively. `L` and `C` only fire when the focused model is running, `Q` when it has a launch.                                    |
 | `Shift+P`                                     | Open the HuggingFace pull dialog (Models list focus only — search + sort + paginate, download via the pinned status strip). "P" for Pull.                                                                |
 | `Ctrl+P`                                      | Save the launch settings in view (the Settings form's knobs, or a running model's live knobs) as a named preset in `config.yaml` — prompts for a name, then an overwrite confirm if it already exists. "P" for Preset.                                                              |
 | `Ctrl+S`                                      | Stop the focused running launch (any nav focus; opens a confirmation popup)                                                                                                                              |
@@ -1767,7 +1769,7 @@ inheritance is visible at the row level.
 | `←` / `→`                                                 | Settings tab: cycle the focused row's value through its preset list (no-op on other tabs) |
 | `Esc` / `Shift+M`                                         | Return focus to the Models list                                                           |
 | `Shift+L` / `Shift+C` / `Shift+S` / `Shift+E` / `Shift+R` | Jump to Logs / Chat / Settings tab. `L` and `C/E/R` are gated on a running model.         |
-| `Shift+U`                                                 | Jump to the Requests tab (the `u` underlined in its label). Gated on a model that has a launch. |
+| `Shift+Q`                                                 | Jump to the Requests tab (the `q` underlined in its label). Gated on a model that has a launch. |
 | `s`                                                       | Toggle Logs auto-scroll (toasts `auto-scroll on` / `off`)                                 |
 | `c` (or `y`)                                              | Logs tab: copy the full log buffer to clipboard                                           |
 | `r`                                                       | Chat tab: toggle `<think>` block collapse (toasts `reasoning shown` / `collapsed`)        |

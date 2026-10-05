@@ -30,8 +30,28 @@ pub struct Usage {
   /// Whole prompt, cached tokens included.
   pub prompt_tokens: Option<u64>,
   pub completion_tokens: Option<u64>,
-  /// Generation speed as the server reported it.
+  /// Generation speed: what the server reported, or the proxy's estimate
+  /// when [`Self::tokens_per_second_estimated`] is set.
   pub tokens_per_second: Option<f64>,
+  /// The speed was worked out by [`Self::estimate_speed`].
+  pub tokens_per_second_estimated: bool,
+}
+
+impl Usage {
+  /// When the server reported no speed, estimate it as the generated
+  /// tokens over `window`, the time generation took by the proxy's clock.
+  /// A server-reported speed is never replaced, and without a token count
+  /// there is nothing to estimate from.
+  pub fn estimate_speed(&mut self, window: std::time::Duration) {
+    let secs = window.as_secs_f64();
+    match self.completion_tokens {
+      Some(tokens) if self.tokens_per_second.is_none() && tokens > 0 && secs > 0.0 => {
+        self.tokens_per_second = Some(tokens as f64 / secs);
+        self.tokens_per_second_estimated = true;
+      }
+      _ => {}
+    }
+  }
 }
 
 #[derive(Default)]
@@ -152,6 +172,7 @@ impl Fields {
       prompt_tokens: from_usage.or(from_timings),
       completion_tokens: self.completion_tokens.or(self.predicted_n),
       tokens_per_second: self.timings_tps.or(self.usage_tps).or(self.metrics_tps),
+      tokens_per_second_estimated: false,
     }
   }
 }
@@ -235,6 +256,7 @@ mod tests {
         prompt_tokens: Some(41),
         completion_tokens: Some(7),
         tokens_per_second: Some(39.639020651929755),
+        ..Usage::default()
       }
     );
   }
@@ -255,6 +277,7 @@ mod tests {
         prompt_tokens: Some(41),
         completion_tokens: Some(3),
         tokens_per_second: Some(38.64062288684094),
+        ..Usage::default()
       }
     );
   }
@@ -271,6 +294,7 @@ mod tests {
         prompt_tokens: Some(41),
         completion_tokens: Some(7),
         tokens_per_second: Some(39.12465113852735),
+        ..Usage::default()
       }
     );
   }
@@ -296,6 +320,7 @@ mod tests {
         prompt_tokens: Some(41),
         completion_tokens: Some(4),
         tokens_per_second: None,
+        ..Usage::default()
       }
     );
   }
@@ -309,6 +334,7 @@ mod tests {
         prompt_tokens: Some(41),
         completion_tokens: Some(7),
         tokens_per_second: None,
+        ..Usage::default()
       }
     );
   }
@@ -327,8 +353,45 @@ mod tests {
         prompt_tokens: Some(41),
         completion_tokens: Some(4),
         tokens_per_second: Some(39.544447959506485),
+        ..Usage::default()
       }
     );
+  }
+
+  #[test]
+  fn speed_is_estimated_only_when_the_server_reported_none() {
+    use std::time::Duration;
+    let mut counted = Usage {
+      completion_tokens: Some(30),
+      ..Usage::default()
+    };
+    counted.estimate_speed(Duration::from_millis(1500));
+    assert_eq!(counted.tokens_per_second, Some(20.0));
+    assert!(counted.tokens_per_second_estimated);
+
+    let mut reported = Usage {
+      completion_tokens: Some(30),
+      tokens_per_second: Some(41.5),
+      ..Usage::default()
+    };
+    reported.estimate_speed(Duration::from_millis(1500));
+    assert_eq!(reported.tokens_per_second, Some(41.5));
+    assert!(!reported.tokens_per_second_estimated);
+
+    // No token count, no tokens, or no elapsed time: nothing to divide.
+    for (tokens, window) in [
+      (None, Duration::from_secs(1)),
+      (Some(0), Duration::from_secs(1)),
+      (Some(30), Duration::ZERO),
+    ] {
+      let mut usage = Usage {
+        completion_tokens: tokens,
+        ..Usage::default()
+      };
+      usage.estimate_speed(window);
+      assert_eq!(usage.tokens_per_second, None, "{tokens:?} {window:?}");
+      assert!(!usage.tokens_per_second_estimated);
+    }
   }
 
   #[test]

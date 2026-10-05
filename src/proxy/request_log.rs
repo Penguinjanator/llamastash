@@ -87,8 +87,11 @@ pub struct RequestRow {
   pub duration_ms: Option<u64>,
   pub prompt_tokens: Option<u64>,
   pub completion_tokens: Option<u64>,
-  /// Generation speed as the server reported it.
+  /// Generation speed: what the server reported, or the proxy's estimate.
   pub tokens_per_second: Option<f64>,
+  /// The server reported no speed, so the proxy worked it out from the
+  /// token count and its own clock.
+  pub tokens_per_second_estimated: bool,
 }
 
 /// A row as table-cell text. The CLI table and the TUI tab both render
@@ -99,6 +102,7 @@ pub struct RequestCells {
   pub status: String,
   pub total: String,
   pub ttfb: String,
+  /// Prefixed with `~` when the speed is the proxy's estimate.
   pub speed: String,
   pub tokens_in: String,
   pub tokens_out: String,
@@ -131,7 +135,14 @@ impl RequestRow {
       status: or_none(self.status.map(|s| s.to_string())),
       total: or_none(self.duration_ms.map(fmt_ms)),
       ttfb: or_none(self.ttfb_ms.map(fmt_ms)),
-      speed: or_none(self.tokens_per_second.map(|t| format!("{t:.1}"))),
+      speed: or_none(self.tokens_per_second.map(|t| {
+        let mark = if self.tokens_per_second_estimated {
+          "~"
+        } else {
+          ""
+        };
+        format!("{mark}{t:.1}")
+      })),
       tokens_in: or_none(self.prompt_tokens.map(fmt_count)),
       tokens_out: or_none(self.completion_tokens.map(fmt_count)),
       route: self
@@ -218,7 +229,7 @@ pub struct RequestSummary {
   pub errors: u64,
   pub avg_duration_ms: Option<u64>,
   pub avg_ttfb_ms: Option<u64>,
-  /// Mean of the per-request speeds the server reported.
+  /// Mean of the per-request speeds, estimated ones included.
   pub tokens_per_second_avg: Option<f64>,
   /// The most recent speed a request reported.
   pub tokens_per_second_last: Option<f64>,
@@ -504,6 +515,7 @@ impl RequestRecord {
     self.row.prompt_tokens = usage.prompt_tokens;
     self.row.completion_tokens = usage.completion_tokens;
     self.row.tokens_per_second = usage.tokens_per_second;
+    self.row.tokens_per_second_estimated = usage.tokens_per_second_estimated;
     let mut inner = self.log.lock();
     let inner = &mut *inner;
     inner.store(&self.row);
@@ -644,6 +656,7 @@ mod tests {
       prompt_tokens: Some(10),
       completion_tokens: Some(20),
       tokens_per_second: Some(tps),
+      ..Usage::default()
     };
     served(&log, "/m/a.gguf", "L1", usage(40.0));
     served(&log, "/m/a.gguf", "L1", usage(60.0));
@@ -838,6 +851,11 @@ mod tests {
         ""
       ]
     );
+    let estimated = RequestRow {
+      tokens_per_second_estimated: true,
+      ..row.clone()
+    };
+    assert_eq!(estimated.cells("-").speed, "~39.6");
     // Nothing served it: the model asked for stands in, the rest is blank.
     let pending = RequestRow {
       requested_model: Some("qwen".to_string()),
@@ -928,6 +946,7 @@ mod tests {
       "prompt_tokens",
       "completion_tokens",
       "tokens_per_second",
+      "tokens_per_second_estimated",
     ] {
       assert!(v.get(key).is_some(), "missing key {key}");
     }

@@ -66,7 +66,7 @@ session, in order. Tick an item here and in `TODO.md` in the same change.
 
 ### Requests tab
 
-- **Placement.** A `Requests` variant in `RightTab` (`src/tui/tabs/mod.rs`), last in `tabs_for_mode`: `Settings, Logs, Chat|Embed|Rerank, Requests`. A delegated multiplexer model keeps it (only `Settings` is filtered out there). `Launching`, `Loading`, `Error` and `Stopped` rows get the tab too: a failed auto-start leaves the row in `Error` and its 503 rows are what the log is for. Tabs are reached by a Shift-letter jump, and `R` is Rerank's, so Requests underlines the `u` of its label and takes `Shift+U`.
+- **Placement.** A `Requests` variant in `RightTab` (`src/tui/tabs/mod.rs`), last in `tabs_for_mode`: `Settings, Logs, Chat|Embed|Rerank, Requests`. A delegated multiplexer model keeps it (only `Settings` is filtered out there). `Launching`, `Loading`, `Error` and `Stopped` rows get the tab too: a failed auto-start leaves the row in `Error` and its 503 rows are what the log is for. Tabs are reached by a Shift-letter jump, and `R` is Rerank's, so Requests underlines the `q` of its label and takes `Shift+Q`.
 - **Filter.** Only the focused model's requests, matched on the model's catalog path, not launch id, so a request that never got a launch (a 503 at auto-start) still shows. No Model column.
 - **Data.** Poll `requests_tail` with the focused model through the same loop the Logs tab uses (`spawn_tab_poller`), and only while the tab is open. One call returns the summary and the rows.
 - **Top strip: summary.** Requests, errors (4xx / 5xx), average total time, average time to first byte, tok/s (average and last), prompt tokens, generated tokens, auto-starts and evictions triggered. The TUI renders the daemon's summary and does not recompute it from the visible rows. The summary counts finished requests since the daemon started, so it keeps counting after a row leaves the ring.
@@ -118,7 +118,7 @@ The vLLM field name (`metrics.tokens_per_second`, sent with `--enable-per-reques
 
 - [ ] Run the proxy overhead bench with and without the tap (plan step 7). Skipped on 2026-10-05: a Halogen run held the GPU, and the bench needs a quiet machine.
 - [ ] Check which of `timings` / `usage` Halogen and gufo put in the last streamed chunk. Skipped for the same reason: it means sending requests to a model that was in use.
-- [ ] Decide whether to estimate tok/s from the proxy clock where the server reports none (`/v1/messages`, non-streamed `/v1/responses` on llama.cpp). Today the column is empty there.
+- [x] Estimate tok/s from the proxy clock where the server reports none (`/v1/messages`, non-streamed `/v1/responses` on llama.cpp). Decided 2026-10-05: estimate, for any backend. The row carries `tokens_per_second_estimated` and the tables mark the value with `~`. The clock starts at the first response byte for a stream and at the upstream send for a response that arrives whole.
 
 ## Batch 4: faster reloads
 

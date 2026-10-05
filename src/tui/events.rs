@@ -1151,7 +1151,7 @@ fn apply_focus_chat_tab(app: &mut App) {
   }
 }
 
-/// `U` quick-jump: park focus on the Requests tab when it's reachable,
+/// `Q` quick-jump: park focus on the Requests tab when it's reachable,
 /// which is for any model that has a launch.
 fn apply_focus_requests_tab(app: &mut App) {
   if app.available_right_tabs().contains(&RightTab::Requests) {
@@ -5164,11 +5164,11 @@ mod tests {
   }
 
   #[test]
-  fn shift_u_jumps_to_the_requests_tab_of_a_launched_model() {
+  fn shift_q_jumps_to_the_requests_tab_of_a_launched_model() {
     let mut app = app_on_requests_tab();
     app.focus = Focus::List;
     app.right_tab = RightTab::Settings;
-    pump_input(&mut app, key(KeyCode::Char('U'), KeyModifiers::SHIFT));
+    pump_input(&mut app, key(KeyCode::Char('Q'), KeyModifiers::SHIFT));
     assert_eq!(app.right_tab, RightTab::Requests);
     assert_eq!(app.focus, Focus::RightPane);
 
@@ -5176,7 +5176,7 @@ mod tests {
     let mut idle = App::new(Default::default());
     idle.models = vec![fake_model_for_events("/m/phi.gguf", "/m")];
     idle.list_cursor = 2;
-    pump_input(&mut idle, key(KeyCode::Char('U'), KeyModifiers::SHIFT));
+    pump_input(&mut idle, key(KeyCode::Char('Q'), KeyModifiers::SHIFT));
     assert_eq!(idle.right_tab, RightTab::Settings);
     assert!(idle
       .toast_message()

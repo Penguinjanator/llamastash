@@ -48,10 +48,10 @@ impl RightTab {
 
   /// Index in [`Self::label`] of the letter underlined as the tab's
   /// Shift quick-jump key. The first letter, except for `Requests`:
-  /// `R` already jumps to Rerank, so it takes its `u`.
+  /// `R` already jumps to Rerank, so it takes its `q`.
   pub fn mnemonic_index(&self) -> usize {
     match self {
-      RightTab::Requests => 3,
+      RightTab::Requests => 2,
       _ => 0,
     }
   }

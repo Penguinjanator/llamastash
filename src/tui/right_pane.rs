@@ -1922,9 +1922,9 @@ mod tests {
   }
 
   #[test]
-  fn the_requests_tab_underlines_its_u_not_its_r() {
-    // `R` is the Rerank tab's jump key, so Requests marks the `u` that
-    // `Shift+U` matches.
+  fn the_requests_tab_underlines_its_q_not_its_r() {
+    // `R` is the Rerank tab's jump key, so Requests marks the `q` that
+    // `Shift+Q` matches.
     use ratatui::style::Modifier;
     let palette = crate::theme::palette_for(crate::theme::ThemeName::Macchiato);
     let spans = mnemonic_spans(
@@ -1934,7 +1934,7 @@ mod tests {
       palette,
     );
     let text: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
-    assert_eq!(text, vec!["Req", "u", "ests"]);
+    assert_eq!(text, vec!["Re", "q", "uests"]);
     let underlined: Vec<bool> = spans
       .iter()
       .map(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
@@ -1942,7 +1942,7 @@ mod tests {
     assert_eq!(underlined, vec![false, true, false]);
 
     // The active tab carries no underline at all.
-    let active = mnemonic_spans("Requests", 3, true, palette);
+    let active = mnemonic_spans("Requests", 2, true, palette);
     assert_eq!(active.len(), 1);
     assert!(!active[0].style.add_modifier.contains(Modifier::UNDERLINED));
 

@@ -732,12 +732,12 @@ fn build_default_bindings() -> Vec<Binding> {
     hint: "settings", description: Some("settings tab"),
     chords: [(KeyCode::Char('S'), KeyModifiers::SHIFT, "S", CAT_GLOBAL)],
   });
-  // `R` belongs to the Rerank tab, so Requests takes the `u` its label
+  // `R` belongs to the Rerank tab, so Requests takes the `q` its label
   // underlines.
   v.extend_from_slice(&binds! {
     action: Action::FocusRequestsTab, scopes: FocusSet::NAV,
     hint: "requests", description: Some("requests tab"),
-    chords: [(KeyCode::Char('U'), KeyModifiers::SHIFT, "U", CAT_GLOBAL)],
+    chords: [(KeyCode::Char('Q'), KeyModifiers::SHIFT, "Q", CAT_GLOBAL)],
   });
   v.extend_from_slice(&binds! {
     action: Action::OpenHfDialog, scopes: FocusSet::NAV,
@@ -1566,17 +1566,17 @@ mod tests {
   }
 
   #[test]
-  fn shift_u_jumps_to_the_requests_tab_and_plain_u_still_yanks_the_url() {
+  fn shift_q_jumps_to_the_requests_tab_and_plain_q_still_quits() {
     for focus in [Focus::List, Focus::RightPane] {
       assert_eq!(
-        action_for(focus, KeyCode::Char('U'), KeyModifiers::SHIFT),
+        action_for(focus, KeyCode::Char('Q'), KeyModifiers::SHIFT),
         Some(Action::FocusRequestsTab),
         "{focus:?}"
       );
     }
     assert_eq!(
-      action_for(Focus::List, KeyCode::Char('u'), KeyModifiers::NONE),
-      Some(Action::YankUrl)
+      action_for(Focus::List, KeyCode::Char('q'), KeyModifiers::NONE),
+      Some(Action::Quit)
     );
     // The Rerank jump keeps its key.
     assert_eq!(

@@ -195,7 +195,7 @@ llamastash requests            # every model
 llamastash requests <model>    # one model
 ```
 
-The `NOTE` column says what happened beyond the status code: the proxy's own error and its message (`model_not_found: ...`, `launch_failed: ...`, `upstream_unreachable: ...`), `auto-start` or `loading model` for a request that waited on a model load, `unloaded L3` when another launch was unloaded to make room, and `client closed` when the client gave up first. An error status with an empty `NOTE` came from the model's own server, so read `llamastash logs <launch-id>`. The TUI shows the same rows on the model's Requests tab (`Shift+U`). See [`usage.md` § `llamastash requests`](usage.md#llamastash-requests-model-ref).
+The `NOTE` column says what happened beyond the status code: the proxy's own error and its message (`model_not_found: ...`, `launch_failed: ...`, `upstream_unreachable: ...`), `auto-start` or `loading model` for a request that waited on a model load, `unloaded L3` when another launch was unloaded to make room, and `client closed` when the client gave up first. An error status with an empty `NOTE` came from the model's own server, so read `llamastash logs <launch-id>`. The TUI shows the same rows on the model's Requests tab (`Shift+Q`). See [`usage.md` § `llamastash requests`](usage.md#llamastash-requests-model-ref).
 
 ## Proxy returned a different model than I asked for
 
