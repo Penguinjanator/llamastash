@@ -478,6 +478,24 @@ impl<'de> Deserialize<'de> for ProxyAliases {
         }
         Ok(ProxyAliases(out))
       }
+
+      // `proxy:` with a bare `aliases:` under it is the shape of a section written
+      // before its entries, and it has to read as no aliases. A failed load replaces
+      // the whole config, which would take the proxy port and the model paths with
+      // it.
+      fn visit_unit<E>(self) -> Result<Self::Value, E>
+      where
+        E: serde::de::Error,
+      {
+        Ok(ProxyAliases::default())
+      }
+
+      fn visit_none<E>(self) -> Result<Self::Value, E>
+      where
+        E: serde::de::Error,
+      {
+        Ok(ProxyAliases::default())
+      }
     }
 
     deserializer.deserialize_any(Accept)
@@ -2094,6 +2112,63 @@ proxy:
       ]
     );
     fs::remove_dir_all(&block_dir).expect("temp test dir should be removed");
+  }
+
+  /// A bare `aliases:` is the shape of a section written before its entries. It
+  /// has to read as no aliases: a config that fails to parse is replaced whole by
+  /// defaults, which takes the proxy port and the model paths with it.
+  #[test]
+  fn proxy_aliases_accepts_an_empty_section_and_an_empty_list() {
+    for (label, body) in [
+      ("bare key", "proxy:\n  port: 11999\n  aliases:\n"),
+      ("empty list", "proxy:\n  port: 11999\n  aliases: []\n"),
+      ("empty map", "proxy:\n  port: 11999\n  aliases: {}\n"),
+    ] {
+      let dir = temp_test_dir("proxy-aliases-empty");
+      let path = dir.join("config.yaml");
+      fs::write(&path, body).expect("write failed");
+
+      let loaded = load_config_from_path(&path);
+      assert!(
+        loaded.warning.is_none(),
+        "{label} should load clean: {:?}",
+        loaded.warning
+      );
+      assert!(loaded.config.proxy.aliases.is_empty(), "{label}");
+      assert_eq!(
+        loaded.config.proxy.port,
+        Some(11999),
+        "{label} must not cost the rest of the config"
+      );
+      fs::remove_dir_all(&dir).expect("temp test dir should be removed");
+    }
+  }
+
+  /// A target written as a number is read as its text, the way serde_yaml reads a
+  /// number into any string field. It then names no model, which the daemon says
+  /// once on first use.
+  #[test]
+  fn proxy_aliases_reads_a_numeric_target_as_text() {
+    let dir = temp_test_dir("proxy-aliases-bad");
+    let path = dir.join("config.yaml");
+    fs::write(&path, "proxy:\n  aliases:\n    gpt-4o-mini: 42\n").expect("write failed");
+
+    let loaded = load_config_from_path(&path);
+    assert!(
+      loaded.warning.is_none(),
+      "a numeric target is text like any other: {:?}",
+      loaded.warning
+    );
+    assert_eq!(
+      loaded
+        .config
+        .proxy
+        .aliases
+        .pairs()
+        .collect::<Vec<(&str, &str)>>(),
+      vec![("gpt-4o-mini", "42")]
+    );
+    fs::remove_dir_all(&dir).expect("temp test dir should be removed");
   }
 
   #[test]
