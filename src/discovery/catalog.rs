@@ -21,9 +21,39 @@ use crate::gguf::metadata::ModeHint;
 use crate::launch::resolve::{CatalogRow, MtpCapability};
 
 /// Shared, cheap-to-clone catalog of every model discovery has seen.
+///
+/// Reads come in two shapes. [`ModelCatalog::snapshot`] deep-clones the
+/// rows (what the `list_models` IPC handler, which serialises them
+/// anyway, wants); the proxy hot path instead takes a shared
+/// [`Arc`](std::sync::Arc) of a pre-built view, so a request costs one
+/// refcount bump instead of one allocation per row per request
+/// (R-08). The views are rebuilt on write, and the only production
+/// writer is the discovery task's per-scan [`ModelCatalog::replace_all`].
 #[derive(Debug, Clone, Default)]
 pub struct ModelCatalog {
-  inner: Arc<RwLock<BTreeMap<PathBuf, DiscoveredModel>>>,
+  inner: Arc<RwLock<CatalogSlot>>,
+}
+
+/// The map plus the read views handed out to proxy readers.
+#[derive(Debug, Default)]
+struct CatalogSlot {
+  models: BTreeMap<PathBuf, DiscoveredModel>,
+  /// Rows in canonical-path order, shared with every reader that wants
+  /// [`DiscoveredModel`].
+  view: Arc<Vec<DiscoveredModel>>,
+  /// The same rows projected to [`CatalogRow`] — the shape the model
+  /// resolver speaks — so the proxy resolves without rebuilding a row
+  /// per model on every request.
+  rows: Arc<Vec<CatalogRow>>,
+}
+
+impl CatalogSlot {
+  /// Rebuild the shared views from `models`. Called under the write lock
+  /// after every mutation, so a view can never disagree with the map.
+  fn rebuild(&mut self) {
+    self.view = Arc::new(self.models.values().cloned().collect());
+    self.rows = Arc::new(self.models.values().map(catalog_row).collect());
+  }
 }
 
 impl ModelCatalog {
@@ -35,38 +65,56 @@ impl ModelCatalog {
   /// discovery task as each `DiscoveredModel` streams in.
   pub async fn upsert(&self, model: DiscoveredModel) {
     let key = model.path.clone();
-    self.inner.write().await.insert(key, model);
+    let mut slot = self.inner.write().await;
+    slot.models.insert(key, model);
+    slot.rebuild();
   }
 
   /// Drop a model by canonical path. Called by the watcher path when
   /// a `.gguf` is deleted under a watched root.
   pub async fn remove(&self, path: &Path) {
-    self.inner.write().await.remove(path);
+    let mut slot = self.inner.write().await;
+    slot.models.remove(path);
+    slot.rebuild();
   }
 
   /// Replace the entire catalog atomically. Used after a full rescan
   /// to drop rows for files that no longer exist on disk.
   pub async fn replace_all(&self, models: Vec<DiscoveredModel>) {
-    let mut guard = self.inner.write().await;
-    guard.clear();
+    let mut slot = self.inner.write().await;
+    slot.models.clear();
     for m in models {
-      guard.insert(m.path.clone(), m);
+      slot.models.insert(m.path.clone(), m);
     }
+    slot.rebuild();
   }
 
   /// Number of models currently surfaced.
   pub async fn len(&self) -> usize {
-    self.inner.read().await.len()
+    self.inner.read().await.models.len()
   }
 
   pub async fn is_empty(&self) -> bool {
-    self.inner.read().await.is_empty()
+    self.inner.read().await.models.is_empty()
   }
 
   /// Snapshot of every model, sorted by canonical path. Used by the
   /// `list_models` IPC handler and by inline tests.
   pub async fn snapshot(&self) -> Vec<DiscoveredModel> {
-    self.inner.read().await.values().cloned().collect()
+    self.inner.read().await.models.values().cloned().collect()
+  }
+
+  /// Shared, path-ordered row view. A clone is one refcount bump, so a
+  /// proxy request can read the whole catalog without copying it (R-08).
+  pub async fn shared_view(&self) -> Arc<Vec<DiscoveredModel>> {
+    self.inner.read().await.view.clone()
+  }
+
+  /// Shared, path-ordered [`CatalogRow`] view — the resolver's input
+  /// shape, pre-built on write for the same reason as
+  /// [`Self::shared_view`].
+  pub async fn shared_rows(&self) -> Arc<Vec<CatalogRow>> {
+    self.inner.read().await.rows.clone()
   }
 
   /// Serialise the catalog into the JSON shape `list_models` returns.
@@ -299,6 +347,40 @@ mod tests {
     assert_eq!(
       paths,
       vec![PathBuf::from("/m/b.gguf"), PathBuf::from("/m/c.gguf")]
+    );
+  }
+
+  #[tokio::test]
+  async fn shared_views_track_the_map() {
+    let cat = ModelCatalog::new();
+    cat
+      .upsert(fake_model("/m/a.gguf", ModelSource::UserPath))
+      .await;
+    cat
+      .remove(Path::new("/m/gone.gguf"))
+      .await;
+
+    let view = cat.shared_view().await;
+    let rows = cat.shared_rows().await;
+    assert_eq!(view.len(), 1);
+    assert_eq!(
+      rows.iter().map(|r| r.path.clone()).collect::<Vec<_>>(),
+      vec!["/m/a.gguf".to_string()]
+    );
+    // A second read hands out the same allocation, not a copy of it.
+    assert!(Arc::ptr_eq(&view, &cat.shared_view().await));
+
+    // Every mutation path rebuilds the views, so a reader can never see
+    // a row that is no longer on disk.
+    cat
+      .replace_all(vec![fake_model("/m/b.gguf", ModelSource::Ollama)])
+      .await;
+    let view = cat.shared_view().await;
+    assert_eq!(view.len(), 1);
+    assert_eq!(view[0].path, PathBuf::from("/m/b.gguf"));
+    assert_eq!(
+      cat.shared_rows().await.iter().map(|r| r.path.clone()).collect::<Vec<_>>(),
+      vec!["/m/b.gguf".to_string()]
     );
   }
 

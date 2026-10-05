@@ -416,7 +416,7 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 
 ### Batch 2: proxy model resolution and listing ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-2-proxy-model-resolution-and-listing))
 
-- [ ] Proxy perf (R-08): share the catalog snapshot instead of cloning it per request
+- [x] ~~**Proxy perf (R-08)**: share the catalog snapshot instead of cloning it per request~~ — done: the catalog now publishes a shared `Arc<Vec<…>>` view (rows and models) rebuilt on scan, which the proxy reads with one refcount bump.
 - [ ] Model aliases on the proxy (`proxy.aliases`)
 - [ ] `/ui` chooser: models with a UI in green, models without in red
 - [ ] Proxy stability (R-12): move the IPC GGUF header read onto `spawn_blocking`

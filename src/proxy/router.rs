@@ -378,7 +378,7 @@ async fn count_ready(state: &ProxyState) -> usize {
 /// sorted alphabetically by `id`. Empty catalog returns
 /// `{"object":"list","data":[]}` (not a 404, not an error).
 async fn list_models(state: Arc<ProxyState>) -> ProxyResponse {
-  let snap = state.ctx.catalog.snapshot().await;
+  let snap = state.ctx.catalog.shared_view().await;
   let ids = published_ids(&snap);
   let mut rows: Vec<ModelObject> = snap
     .iter()
@@ -489,7 +489,7 @@ fn named_launch_ids<'a>(
 /// sorted alphabetically by `name` (parity with `/v1/models`). Empty
 /// catalog returns `{"models":[]}` (not a 404).
 async fn ollama_tags(state: Arc<ProxyState>) -> ProxyResponse {
-  let snap = state.ctx.catalog.snapshot().await;
+  let snap = state.ctx.catalog.shared_view().await;
   let ids = published_ids(&snap);
   let mut models: Vec<TagModel> = snap
     .iter()
@@ -537,7 +537,7 @@ fn ollama_version() -> ProxyResponse {
 /// running-list shape. Empty when no model is Ready.
 async fn ollama_ps(state: Arc<ProxyState>) -> ProxyResponse {
   let sup_snap = state.ctx.supervisors.snapshot().await;
-  let cat_snap = state.ctx.catalog.snapshot().await;
+  let cat_snap = state.ctx.catalog.shared_view().await;
   let ids = published_ids(&cat_snap);
   let by_path = route::index_catalog_by_path(&cat_snap);
   let mut models: Vec<PsModel> = Vec::new();
@@ -633,11 +633,8 @@ async fn ollama_show(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyRes
   };
   // Resolve against the catalog using the same matcher the OpenAI
   // compat surface uses, so identical names work across both APIs.
-  let snap = state.ctx.catalog.snapshot().await;
-  let rows: Vec<CatalogRow> = snap
-    .iter()
-    .map(crate::discovery::catalog::catalog_row)
-    .collect::<Vec<_>>();
+  let rows = state.ctx.catalog.shared_rows().await;
+  let snap = state.ctx.catalog.shared_view().await;
   match resolve_model_with_candidates(&rows, &reference) {
     Ok(resolved) => {
       // Re-find the DiscoveredModel for the resolved path so we have

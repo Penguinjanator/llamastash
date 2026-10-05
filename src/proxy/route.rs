@@ -27,7 +27,6 @@ use hyper::body::{Bytes, Incoming};
 
 use crate::daemon::registry::LaunchId;
 use crate::daemon::supervisor::ManagedState;
-use crate::discovery::catalog::catalog_row;
 use crate::discovery::DiscoveredModel;
 use crate::gguf::identity::ModelId;
 use crate::launch::resolve::{
@@ -253,12 +252,11 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
     _ => return RouteDecision::ModelRequired,
   };
 
-  // Catalog snapshot → CatalogRow vec (the resolver speaks
-  // `&[CatalogRow]`). Built in-process here because the existing
-  // `cli::resolve::fetch_catalog` round-trips through IPC, which
+  // The catalog's shared pre-built row view (the resolver speaks
+  // `&[CatalogRow]`). Shared rather than rebuilt per request — a request
+  // costs one refcount bump (R-08) — and never fetched over IPC, which
   // we explicitly want to avoid on the hot path.
-  let snap = state.ctx.catalog.snapshot().await;
-  let rows: Vec<CatalogRow> = snap.iter().map(catalog_row).collect();
+  let rows = state.ctx.catalog.shared_rows().await;
 
   // D2 fail-safe: try the whole reference first so a model file whose name
   // contains `@` (e.g. `foo@bar.gguf`) resolves as a plain model reference.
@@ -504,7 +502,7 @@ pub(crate) async fn running_model_backend(
   {
     return Backends::from_id(&tag);
   }
-  let cat = state.ctx.catalog.snapshot().await;
+  let cat = state.ctx.catalog.shared_view().await;
   let rb = cat
     .iter()
     .find(|m| m.path == id.path)
@@ -523,7 +521,7 @@ pub(crate) async fn would_route_backend(
   state: &Arc<ProxyState>,
   row: &CatalogRow,
 ) -> Option<crate::backend::Backends> {
-  let cat = state.ctx.catalog.snapshot().await;
+  let cat = state.ctx.catalog.shared_view().await;
   let m = cat.iter().find(|m| same_path(&m.path, &row.path))?;
   let launch_mode = match row.mode_hint.as_deref() {
     Some("embedding") => crate::launch::mode::LaunchMode::Embedding,
@@ -720,7 +718,7 @@ async fn collect_fallback_candidates(state: &Arc<ProxyState>) -> Vec<FallbackCan
   let sup_snap = state.ctx.supervisors.snapshot().await;
   // Index the catalog by canonical path so each supervisor entry can
   // attach arch + display label without re-walking the catalog.
-  let cat_snap = state.ctx.catalog.snapshot().await;
+  let cat_snap = state.ctx.catalog.shared_view().await;
   let by_path = index_catalog_by_path(&cat_snap);
 
   let mut out: Vec<FallbackCandidate> = Vec::with_capacity(sup_snap.len());

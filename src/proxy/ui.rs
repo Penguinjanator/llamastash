@@ -162,7 +162,7 @@ fn resolve_target(headers: &HeaderMap, mut running: Vec<RunningEntry>) -> UiTarg
 /// umbrella is skipped — it's a multiplexer process, not a web UI.
 async fn collect_running(state: &Arc<ProxyState>) -> Vec<RunningEntry> {
   let sup_snap = state.ctx.supervisors.snapshot().await;
-  let cat_snap = state.ctx.catalog.snapshot().await;
+  let cat_snap = state.ctx.catalog.shared_view().await;
   let by_path = route::index_catalog_by_path(&cat_snap);
 
   let mut out = Vec::new();
