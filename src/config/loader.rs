@@ -365,8 +365,8 @@ pub struct ProxyConfig {
   /// `llamastash list` shows — a plain name, a repo-qualified id, or a full path
   /// — resolved exactly as a reference a person types is resolved.
   ///
-  /// Written either as a map of `name: target` or as `[[proxy.aliases]]` blocks
-  /// carrying `name` and `target`, which is the form that keeps comments next to
+  /// Written either as a map of `name: target` or as a list of
+  /// `- name:` / `target:` entries, which is the form that keeps comments next to
   /// each entry. Both spellings decode to [`ProxyAliases`], and both keep the
   /// order they appear in, so a repeated name resolves to the last entry.
   ///
@@ -397,9 +397,9 @@ pub struct ProxyAlias {
 }
 
 /// `proxy.aliases`, in the order the operator wrote it. Accepts the map
-/// spelling (`name: target` pairs) and the block spelling
-/// (`[[proxy.aliases]]` with `name =` and `target =`); order is kept for both,
-/// because it is what settles a repeated name.
+/// spelling (`name: target` pairs) and the list spelling (a sequence of
+/// `name:` / `target:` entries); order is kept for both, because it is what
+/// settles a repeated name.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct ProxyAliases(Vec<ProxyAlias>);
 
@@ -2013,6 +2013,27 @@ proxy:
     assert!(loaded.warning.is_none(), "valid config should not warn");
     assert_eq!(loaded.config.proxy.max_body_size, 0);
     fs::remove_dir_all(dir).expect("temp test dir should be removed");
+  }
+
+  #[test]
+  fn proxy_aliases_survives_a_serialize_round_trip() {
+    // Whatever serializes a loaded config (doctor, a future config writer) has to
+    // be able to read back, in either spelling.
+    let dir = temp_test_dir("proxy-aliases-roundtrip");
+    let path = dir.join("config.yaml");
+    fs::write(
+      &path,
+      "proxy:\n  aliases:\n    gpt-4o-mini: qwen3.8-27b-q8\n",
+    )
+    .expect("write failed");
+    let loaded = load_config_from_path(&path);
+    let text = yaml_serde::to_string(&loaded.config.proxy.aliases).expect("serialises");
+    let back: ProxyAliases = yaml_serde::from_str(&text).expect("reads back");
+    assert_eq!(
+      back.pairs().collect::<Vec<(&str, &str)>>(),
+      vec![("gpt-4o-mini", "qwen3.8-27b-q8")]
+    );
+    fs::remove_dir_all(&dir).expect("temp test dir should be removed");
   }
 
   #[test]

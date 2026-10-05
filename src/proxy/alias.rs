@@ -6,13 +6,13 @@
 //! while the daemon runs, so lookups are read-only. The rules the config page
 //! documents:
 //!
-//! - A real model id always wins. An alias is consulted when the string the
-//!   client sent does not name a model outright (see
+//! - A reference that names a model outright wins. An alias is consulted when the
+//!   string the client sent does not name a model on its own (see
 //!   [`crate::proxy::route::resolve_client_reference`]), so an alias can never
-//!   hide a model that really claims that name — but it does beat a partial
-//!   match, which is the point of writing it. A shadowed alias logs one warning
-//!   the first time it is shadowed, and an alias pointing at nothing logs once
-//!   the first time a request hits it.
+//!   hide a model that really claims that name — but it does beat a partial match
+//!   and a name two models share, which is why it was written. A shadowed alias
+//!   logs one warning the first time it is shadowed, and an alias pointing at
+//!   nothing logs once the first time a request hits it.
 //! - An alias names a model and nothing else. Its target is resolved whole, so
 //!   it cannot pin a launch name or a preset.
 //! - Aliases are not published on `/v1/models` or `/api/tags`, so a listing
@@ -180,7 +180,7 @@ mod tests {
   #[test]
   fn a_repeated_name_keeps_the_entry_written_last() {
     // Order is the operator's, so the entry they wrote last is the one that
-    // answers — for a map as much as for a `[[proxy.aliases]]` block.
+    // answers — for the map spelling as much as for the `name:`/`target:` list.
     let t = table(&[("gpt-4o-mini", "first"), ("gpt-4o-mini", "second")]);
     assert_eq!(t.target("gpt-4o-mini"), Some("second"));
   }
