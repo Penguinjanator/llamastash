@@ -9,6 +9,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 - `proxy.aliases` maps a model name a tool is hard-wired to onto a local model (`gpt-4o-mini: qwen3.8-27b-q8`, or a `name:`/`target:` list when you want a comment per entry), so that tool needs no config edit. A name that names a model outright wins over an alias of the same name, an alias settles a name two models share, an alias names a model rather than a preset, and aliases are not listed by `/v1/models` or `/api/tags`.
 - The `/ui` model chooser colours each row: green for a model whose backend has a web UI you can open, red for one that is running but serves none.
 - A preset lookup no longer reads a model header on the daemon's async worker thread, so a slow disk cannot stall the control-plane calls queued behind it.
+- `/api/show` reads `<model>@<launch>` the way the chat surfaces do: the launch name is a pointer to a running launch, and a name that does not exist falls back to that model's unnamed launch. It used to answer `404` for anything containing an `@`.
 - The proxy reads the model catalog through one shared snapshot instead of copying every row for every request, so routing a request no longer allocates in proportion to how many models are on disk.
 
 ## [0.6.1] — 2026-10-02
