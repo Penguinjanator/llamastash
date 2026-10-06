@@ -153,23 +153,26 @@ impl Fields {
   }
 
   fn usage(&self) -> Usage {
-    // OpenAI's `prompt_tokens` and the Responses API's `input_tokens`
-    // count the whole prompt. Anthropic's `input_tokens` leaves out the
-    // cached part and reports it in the two `cache_*` fields, which the
-    // other shapes do not have, so adding them is right for all three.
-    let from_usage = self.prompt_tokens.or_else(|| {
-      self.input_tokens.map(|n| {
-        n.saturating_add(self.cache_read_input_tokens.unwrap_or(0))
-          .saturating_add(self.cache_creation_input_tokens.unwrap_or(0))
-      })
-    });
-    // `prompt_n` is what the server evaluated, `cache_n` what it reused.
+    // `prompt_n` is what the server evaluated and `cache_n` what it
+    // reused, so their sum is the whole prompt on every route.
     let from_timings = match (self.prompt_n, self.cache_n) {
       (None, None) => None,
       (evaluated, cached) => Some(evaluated.unwrap_or(0).saturating_add(cached.unwrap_or(0))),
     };
+    // `input_tokens` is the last resort, because servers disagree on it.
+    // Anthropic's leaves the cached part out and reports it in the two
+    // `cache_*` fields; the Responses API's counts the whole prompt and
+    // has no such fields; adding them is right for both. But a server can
+    // also count the cached tokens in `input_tokens` and again in
+    // `cache_read_input_tokens`, and then the sum is double. Such a
+    // server was seen to send `timings` too, which is why that wins.
+    let from_input = self.input_tokens.map(|n| {
+      n.saturating_add(self.cache_read_input_tokens.unwrap_or(0))
+        .saturating_add(self.cache_creation_input_tokens.unwrap_or(0))
+    });
     Usage {
-      prompt_tokens: from_usage.or(from_timings),
+      // OpenAI's `prompt_tokens` is the whole prompt by definition.
+      prompt_tokens: self.prompt_tokens.or(from_timings).or(from_input),
       completion_tokens: self.completion_tokens.or(self.predicted_n),
       tokens_per_second: self.timings_tps.or(self.usage_tps).or(self.metrics_tps),
       tokens_per_second_estimated: false,
@@ -392,6 +395,50 @@ mod tests {
       assert_eq!(usage.tokens_per_second, None, "{tokens:?} {window:?}");
       assert!(!usage.tokens_per_second_estimated);
     }
+  }
+
+  // The next two bodies are from a second engine (its own `timings`
+  // object, llama-server's field names), captured 2026-10-06 and cut down.
+
+  #[test]
+  fn timings_win_over_an_input_tokens_that_already_counts_the_cache() {
+    // A 58-token prompt, all of it cached. This server reports 58 as
+    // `input_tokens` and 58 again as `cache_read_input_tokens`.
+    let body = r#"{"type":"message","role":"assistant","content":[{"type":"text","text":"Hi"}],"usage":{"input_tokens":58,"output_tokens":8,"cache_creation_input_tokens":0,"cache_read_input_tokens":58},"timings":{"prompt_n":0,"prompt_ms":0,"prompt_per_second":0,"predicted_n":8,"predicted_ms":153.92376399999998,"predicted_per_second":51.97378099459679,"cache_n":58,"draft_n":6,"draft_n_accepted":6}}"#;
+    assert_eq!(
+      usage_of(body),
+      Usage {
+        prompt_tokens: Some(58),
+        completion_tokens: Some(8),
+        tokens_per_second: Some(51.97378099459679),
+        ..Usage::default()
+      }
+    );
+  }
+
+  #[test]
+  fn a_stream_whose_last_chunk_has_only_timings_reads_a_fully_cached_prompt() {
+    let body = concat!(
+      r#"data: {"id":"chatcmpl-19b6","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"reasoning_content":" ""},"finish_reason":null}]}"#,
+      "
+
+",
+      r#"data: {"id":"chatcmpl-19b6","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"length"}],"timings":{"prompt_n":0,"prompt_ms":0,"prompt_per_token_ms":0,"prompt_per_second":0,"predicted_n":8,"predicted_ms":142.473023,"predicted_per_token_ms":17.809127875,"predicted_per_second":56.15098094745978,"cache_n":58,"cache_restore_ms":3.082299,"draft_rounds":1,"draft_n":6,"draft_n_accepted":6}}"#,
+      "
+
+data: [DONE]
+
+",
+    );
+    assert_eq!(
+      usage_of(body),
+      Usage {
+        prompt_tokens: Some(58),
+        completion_tokens: Some(8),
+        tokens_per_second: Some(56.15098094745978),
+        ..Usage::default()
+      }
+    );
   }
 
   #[test]

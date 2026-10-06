@@ -124,11 +124,31 @@ Halogen 0.16.2, read from `tools/serve_api.py` in the image of a running contain
 
 So the tap needs nothing Halogen-specific. A live Halogen run through the proxy the same day showed it: 69 streamed `chat/completions` rows with server-reported tok/s (41.6 to 46.4, no `~`) and both token counts.
 
+gufo, the local build from the 0.7.1 checkout (`96a4647`; upstream was at v0.8.1), probed on its own port with `Qwen3.8-27B-UD-Q6_K` on 2026-10-06:
+
+- A streamed chat or completions response puts `timings` on the last chunk, with or without `stream_options.include_usage`. With it, one more chunk carries `usage`, which has `completion_tokens_per_second`.
+- Non-streamed chat, `/v1/messages` and `/v1/responses` carry `usage` and `timings`. A streamed `/v1/responses` has both in `response.completed`.
+- `timings` uses llama-server's field names (`prompt_n`, `cache_n`, `predicted_n`, `predicted_per_second`).
+- `/v1/messages` rejects `stream: true` with a 400, and `/v1/messages/count_tokens` is not implemented.
+- On `/v1/messages` it reported a fully cached 58-token prompt as `input_tokens: 58` and `cache_read_input_tokens: 58`. llama.cpp reports the same case as `input_tokens: 1` and `cache_read_input_tokens: 40` for 41. Adding the cache fields to `input_tokens` therefore double-counted on gufo. The tap now prefers `timings` (`prompt_n + cache_n`) over `input_tokens` for the prompt size.
+
+The build tested is two releases behind. The upstream source on 2026-10-06 (`src/cli/serve/http_server.cpp`, `openai_chat.cpp`) still sets the `/v1/messages` `input_tokens` to the whole prompt beside `cache_read_input_tokens`, and still puts `timings` on a stream's last chunk whether or not usage was asked for. The stream and `count_tokens` refusals were only seen on the local build.
+
+Proxy overhead, 2026-10-06, on `deepu-flowz13-arch` (AC power, `performance` profile, nothing else on the GPU). Two release builds on isolated daemons: `main` at `a5ad9beb` (no request log) and this branch at `acf89d02`. Model `gemma-4-E2B-it-Q4_K_M` on llama-server b11390, three rounds per build, alternating builds.
+
+| Measure | `main` | this branch |
+|---|---|---|
+| TTFT, proxy minus direct (Suite C, 20 reps a round) | +1.34, +3.42, -0.47 ms | +3.12, -0.92, +0.73 ms |
+| Decode tok/s lost through the proxy (Suite C) | -0.01, -1.18, +1.37 % | +1.63, -2.31, +0.89 % |
+| Daemon CPU per request (240 streamed chats, 8 at a time, 64 tokens each) | 3.92, 4.00, 3.96 ms | 4.21, 4.33, 4.38 ms |
+
+Suite C shows no difference between the builds: both sit inside its noise (TTFT varied by 12 to 16 % of about 39 ms within a round, decode by 3 to 4 %). The request log and tap cost about 0.35 ms of daemon CPU per request, roughly 9 % more than before, on requests that took about 3.1 s each. The raw reports are under `target/bench-batch3/out/` and were not added to `docs/benchmarks/`.
+
 ### Follow-ups
 
-- [ ] Run the proxy overhead bench with and without the tap (plan step 7). Skipped on 2026-10-05: a Halogen run held the GPU, and the bench needs a quiet machine.
+- [x] Run the proxy overhead bench with and without the tap (plan step 7). Run 2026-10-06, see below.
 - [x] Check which of `timings` / `usage` Halogen puts in the last streamed chunk. Checked 2026-10-06 against Halogen 0.16.2, see below.
-- [ ] Check the same for gufo. Only its non-streamed `usage.completion_tokens_per_second` is known, from `scripts/bench/qwen38-flash-speed/bench.py`.
+- [x] Check the same for gufo. Checked 2026-10-06, see below.
 - [x] Estimate tok/s from the proxy clock where the server reports none (`/v1/messages`, non-streamed `/v1/responses` on llama.cpp). Decided 2026-10-05: estimate, for any backend. The row carries `tokens_per_second_estimated` and the tables mark the value with `~`. The clock starts at the first response byte for a stream and at the upstream send for a response that arrives whole.
 
 ## Batch 4: faster reloads
