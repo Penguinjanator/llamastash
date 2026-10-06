@@ -2126,7 +2126,9 @@ impl App {
     // honors no launch knobs, so Settings is dropped; the mode surface
     // (Chat / Embed / Rerank) stays — requests ride the umbrella's
     // OpenAI-compat port directly — and Logs tails the shared umbrella log. A
-    // model with no mode surface (hint `Unknown`) gets Logs alone. Keys on the
+    // model with no mode surface (hint `Unknown`), or one that is not Ready,
+    // gets Logs and Requests: the 503s of a failed load are filed under the
+    // model, and Requests is where they show. Keys on the
     // resolved `backend`'s lifecycle (the umbrella row is already dropped at
     // ingest), since the launch id is a plain `L#` shared with every backend.
     if managed
@@ -2135,7 +2137,7 @@ impl App {
       .is_some_and(crate::backend::is_managed_multiplexer)
     {
       if managed.state != SurfaceState::Ready {
-        return vec![RightTab::Logs];
+        return vec![RightTab::Logs, RightTab::Requests];
       }
       return tabs_for_mode(self.mode_hint_for(&managed.path))
         .into_iter()
@@ -3894,6 +3896,18 @@ mod tests {
       vec![RightTab::Logs, RightTab::Requests],
       "transcription model has no mode surface: logs and requests"
     );
+    // Not Ready (loading, or a failed load): no mode surface yet, but the
+    // requests that waited on it or got a 503 still show.
+    for state in [SurfaceState::Loading, SurfaceState::Error] {
+      app.managed[0].state = state;
+      app.list_cursor = 2;
+      app.clear_rows_cache();
+      assert_eq!(
+        app.available_right_tabs(),
+        vec![RightTab::Logs, RightTab::Requests],
+        "{state:?}"
+      );
+    }
   }
 
   #[test]

@@ -87,9 +87,9 @@ impl From<LaunchOutcome> for SharedOutcome {
 /// (`/v1/embeddings` → embedding, `/v1/rerank` → rerank, `None` for
 /// the chat-shaped routes) — see [`resolve_auto_start_mode`].
 ///
-/// `record` is the request's log row. The request that spawns the launch
-/// is marked as the auto-start, and what make-room unloads for it is
-/// written to the row before the stops begin. A request that waits on a
+/// `record` is the request's log row. The request whose spawn succeeds is
+/// marked as the auto-start, and what make-room unloads for it is written
+/// to the row before the stops begin. A request that waits on a
 /// launch someone else started is marked with neither.
 ///
 /// The proxy must hold `Arc<ProxyState>` for the duration so the
@@ -233,8 +233,6 @@ async fn drive_launch_as_leader(
     mode,
     ..StartParams::default()
   };
-  record.set_auto_start();
-  record.publish();
   let started = match compose_and_spawn(
     &state.ctx,
     start_params(),
@@ -277,6 +275,10 @@ async fn drive_launch_as_leader(
       }
     }
   };
+  // Only now is this request the one that started the model: a spawn that
+  // was refused, or one the client did not wait for, started nothing.
+  record.set_auto_start();
+  record.publish();
   // No human watches an auto-start; log any advisories (dropped knobs,
   // deepseek4 KV-blind note, ssd_streaming bypass) to the daemon log.
   for w in &started.warnings {

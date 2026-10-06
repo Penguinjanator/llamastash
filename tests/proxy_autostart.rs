@@ -949,7 +949,8 @@ async fn a_client_that_hangs_up_during_make_room_still_logs_the_unload() {
   let row = newest_row_when(&ctx, |r| r.state != RequestState::InFlight).await;
   assert_eq!(row.state, RequestState::ClientClosed);
   assert_eq!(row.status, None);
-  assert!(row.auto_start);
+  // It unloaded a model, but gave up before the retry spawned anything.
+  assert!(!row.auto_start);
   assert_eq!(row.evicted, vec![first_launch]);
   let summary = ctx
     .requests

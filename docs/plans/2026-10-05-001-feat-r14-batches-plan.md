@@ -61,7 +61,7 @@ session, in order. Tick an item here and in `TODO.md` in the same change.
 3. TUI `Requests` tab with the clock fields, per the design below. Token fields render `—` until step 5.
 4. Before the body tap, send one streamed and one non-streamed request to llama.cpp, Halogen and gufo and record which of `timings` / `usage` the last chunk carries. Done for llama.cpp only, see Result.
 5. Body tap: `GuardedBody` keeps the head and the tail of the response and reads `timings` / `usage` / `metrics` by field name at end of stream ([`src/proxy/usage_tap.rs`](../../src/proxy/usage_tap.rs)). Token counts and tok/s land on the log rows; the tab's token columns and tok/s summary fill in.
-6. Speed stats: add the per-launch summary to `status` as `request_stats`. It is the same summary the tab's top strip shows, so `status --json` and the TUI report the same numbers.
+6. Speed stats: add the per-launch summary to `status` as `request_stats`, with the same fields as the tab's top strip. The scopes differ: the tab totals a model's requests since the daemon started, `status` totals one launch's and drops them when the launch stops. The numbers match while a model has had one launch and no fallback traffic.
 7. Measure proxy overhead with and without the tap using the proxy bench in `scripts/bench/`. Not run, see Follow-ups. Check the tab with `--render` and the pty driver and update the golden snapshots.
 
 ### Requests tab

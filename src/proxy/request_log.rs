@@ -113,7 +113,8 @@ pub struct RequestRow {
   pub error: Option<String>,
   /// That error's message.
   pub cause: Option<String>,
-  /// This request started the model: nothing was serving or loading it.
+  /// This request spawned the model's launch. Not set when the spawn was
+  /// refused, or when the request waited on a launch something else started.
   pub auto_start: bool,
   /// Launches unloaded to make room for this request's auto-start.
   pub evicted: Vec<String>,
@@ -1095,6 +1096,29 @@ mod tests {
     assert_eq!(log.file_status().expect("file status").dropped, 4);
     // The in-memory log has all four.
     assert_eq!(log.tail(None, 10).summary.requests, 4);
+  }
+
+  /// `/dev/full` opens and then fails every write with `ENOSPC`.
+  #[cfg(target_os = "linux")]
+  #[tokio::test]
+  async fn a_write_failure_stops_the_writer_and_later_rows_are_counted() {
+    let log = RequestLog::new();
+    log.write_to(PathBuf::from("/dev/full"));
+    // The writer gives up on the first row it cannot write. Rows keep
+    // being finished meanwhile; none of them reaches a file.
+    let mut dropped = 0;
+    for _ in 0..200 {
+      served(&log, "/m/a.gguf", "L1", Usage::default());
+      tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+      dropped = log.file_status().expect("file status").dropped;
+      if dropped > 0 {
+        break;
+      }
+    }
+    assert!(dropped > 0, "the writer never stopped");
+    // Once it has stopped, every further row is counted at once.
+    served(&log, "/m/a.gguf", "L1", Usage::default());
+    assert_eq!(log.file_status().expect("file status").dropped, dropped + 1);
   }
 
   #[test]

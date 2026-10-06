@@ -158,8 +158,68 @@ async fn daemon_starts_with_proxy_enabled_and_health_returns_ok() {
   assert_eq!(parsed2["error"]["code"], "model_required");
   assert_eq!(parsed2["error"]["param"], "model");
 
-  // Shutdown.
+  // `proxy.request_log_file` is off by default: no file, and `status` says so.
   let mut client = Client::connect(&socket_path).await.expect("connect daemon");
+  let status_body = client.call("status", None).await.expect("status");
+  assert_eq!(
+    status_body["proxy"]["request_log_file"],
+    serde_json::Value::Null
+  );
+  assert!(!dir.join("logs").join("requests.jsonl").exists());
+
+  // Shutdown.
+  let _ = client.call("shutdown", None).await.expect("shutdown");
+  let _ = timeout(Duration::from_secs(3), handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `proxy.request_log_file: true` end to end: the daemon starts the file
+/// writer, a finished request lands in `<log dir>/requests.jsonl`, and
+/// `status` reports the path with nothing dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_log_file_option_writes_finished_requests_and_shows_in_status() {
+  let dir = unique_temp_dir("request-log-file");
+  let mut opts = DaemonOptions::rooted_at(dir.clone());
+  opts.proxy = ProxyConfig {
+    enabled: true,
+    port: Some(pick_free_port()),
+    request_log_file: true,
+    ..ProxyConfig::default()
+  };
+  let log_file = opts.log_dir.join("requests.jsonl");
+  let socket_path = opts.state_dir.clone();
+  let handle = tokio::spawn(async move { run_foreground(opts).await });
+
+  wait_for_socket(&socket_path).await;
+  let proxy_addr = wait_for_proxy(&socket_path).await;
+  let (status, _) = http_post(proxy_addr, "/v1/chat/completions", "{}").await;
+  assert_eq!(status, 400);
+
+  // The writer runs on its own task; wait for the line to land.
+  let mut text = String::new();
+  for _ in 0..200 {
+    text = std::fs::read_to_string(&log_file).unwrap_or_default();
+    if text.ends_with('\n') {
+      break;
+    }
+    sleep(Duration::from_millis(10)).await;
+  }
+  let rows: Vec<serde_json::Value> = text
+    .lines()
+    .map(|line| serde_json::from_str(line).expect("one JSON row per line"))
+    .collect();
+  assert_eq!(rows.len(), 1, "{text}");
+  assert_eq!(rows[0]["status"], 400);
+  assert_eq!(rows[0]["error"], "model_required");
+  assert_eq!(rows[0]["route"], "/v1/chat/completions");
+
+  let mut client = Client::connect(&socket_path).await.expect("connect daemon");
+  let status_body = client.call("status", None).await.expect("status");
+  assert_eq!(
+    status_body["proxy"]["request_log_file"],
+    serde_json::json!({ "path": log_file, "dropped": 0 })
+  );
+
   let _ = client.call("shutdown", None).await.expect("shutdown");
   let _ = timeout(Duration::from_secs(3), handle).await;
   std::fs::remove_dir_all(&dir).ok();

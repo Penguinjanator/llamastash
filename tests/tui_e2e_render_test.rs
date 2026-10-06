@@ -169,7 +169,11 @@ const SKIP_ROWS: &[usize] = &[0];
 /// and the platform-specific key glyphs, both of which churn
 /// independently of the structural layout these goldens defend.
 fn assert_golden(app: &mut App, rel_path: &str) {
-  let rendered = render_to_lines(app).join("\n") + "\n";
+  assert_golden_text(render_to_lines(app).join("\n") + "\n", rel_path);
+}
+
+/// [`assert_golden`] for a frame that is already rendered.
+fn assert_golden_text(rendered: String, rel_path: &str) {
   let manifest = env!("CARGO_MANIFEST_DIR");
   let fixture_path = std::path::Path::new(manifest).join(rel_path);
 
@@ -255,15 +259,35 @@ fn chat_view_golden_render_matches_fixture() {
   assert_golden(&mut seeded_chat_view_app(), "tests/golden/chat-view.txt");
 }
 
+#[cfg_attr(target_os = "macos", ignore = "fixture uses Linux key glyphs")]
 #[test]
 fn requests_view_golden_render_matches_fixture() {
-  // The Time column is local wall-clock time; pin the zone so the frame
-  // is the same on every machine. Set before the first conversion.
-  std::env::set_var("TZ", "UTC");
-  assert_golden(
-    &mut seeded_requests_view_app(),
-    "tests/golden/requests-view.txt",
-  );
+  // The Time column is local wall-clock time, which depends on the
+  // machine's zone, so the fixture holds `HH:MM:SS` in its place.
+  let rendered = mask_clock_times(&render_to_lines(&mut seeded_requests_view_app()).join("\n"));
+  assert_golden_text(rendered + "\n", "tests/golden/requests-view.txt");
+}
+
+/// `text` with every `dd:dd:dd` clock time replaced by `HH:MM:SS`.
+fn mask_clock_times(text: &str) -> String {
+  const MASK: &str = "HH:MM:SS";
+  let mut chars: Vec<char> = text.chars().collect();
+  let is_time = |w: &[char]| {
+    w.iter().zip(MASK.chars()).all(|(c, m)| match m {
+      ':' => *c == ':',
+      _ => c.is_ascii_digit(),
+    })
+  };
+  let mut i = 0;
+  while i + MASK.len() <= chars.len() {
+    if is_time(&chars[i..i + MASK.len()]) {
+      chars.splice(i..i + MASK.len(), MASK.chars());
+      i += MASK.len();
+    } else {
+      i += 1;
+    }
+  }
+  chars.into_iter().collect()
 }
 
 #[cfg_attr(target_os = "macos", ignore = "fixture uses Linux key glyphs")]
