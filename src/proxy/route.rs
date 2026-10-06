@@ -615,11 +615,6 @@ async fn decide_umbrella_route(
   }
 }
 
-/// Project a discovered-model entry onto the `CatalogRow` shape the
-/// resolver expects. In-process equivalent of
-/// `cli::resolve::parse_catalog_row` (which goes through the JSON
-/// wire); kept here so the proxy doesn't pay a serialize/deserialize
-/// round-trip on the hot path.
 /// The backend a **running** model (keyed by its [`ModelId`]) is actually
 /// served by, or `None` for the default (llama.cpp) backend. Prefers the
 /// `resolved_backend` tag stamped on `last_params` — the launch's real backend,

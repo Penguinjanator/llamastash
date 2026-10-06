@@ -987,6 +987,8 @@ A **named launch** publishes one more id: the model's published id, an `@`, and 
 
 A request for the plain model id while it runs more than once goes to an unnamed launch before a named one, and among those to the newest (highest `L#`).
 
+The resolver accepts every form for every model, collision or not, and each qualified form in both the published spelling and the `.gguf` filename spelling. It also accepts a partial repo reference (`unsloth/Qwen3.8`), which the raw cache path (`models--unsloth--Qwen3.8-…`) never matched. Sending any form two models share — the bare name, or a repo-qualified form that does not separate them — returns `400 ambiguous_model`, and its `matches` array lists the published id of each candidate, every one of which routes, so resend one verbatim.
+
 **Aliases** cover a tool that will only ever ask for one fixed name, so it needs no config edit of its own. `proxy.aliases` in `config.yaml` maps such a name to a model:
 
 ```yaml
@@ -1014,8 +1016,6 @@ A value is any reference `llamastash list` shows — a plain name, a repo-qualif
 An alias whose value names no model outright 404s, and the daemon logs one warning naming the alias and what it points at — which covers a value that matches nothing and one that only matches as a substring. A value two models answer to comes back as the same `ambiguous_model` answer with both candidates that a client sending that name itself would get, and the same warning says naming one of them is your call. So the daemon warns once about an alias that takes a name some longer file name already answered to on its own, since that moves clients that were working. The request body keeps the name the client sent, as it does for any reference the proxy resolves: an engine that answers only to the name it was served with needs `rewrite_model: true` on its generic entry (see [Generic backend](#generic-backend)).
 
 Alias names match case-insensitively, like model references do. Editing the map takes a daemon restart.
-
-The resolver accepts every form for every model, collision or not, and each qualified form in both the published spelling and the `.gguf` filename spelling. It also accepts a partial repo reference (`unsloth/Qwen3.8`), which the raw cache path (`models--unsloth--Qwen3.8-…`) never matched. Sending any form two models share — the bare name, or a repo-qualified form that does not separate them — returns `400 ambiguous_model`, and its `matches` array lists the published id of each candidate, every one of which routes, so resend one verbatim.
 
 ### Anthropic-shape clients (Claude Code)
 

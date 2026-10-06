@@ -4,13 +4,16 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ## [Unreleased]
 
+### Added
+
+- `proxy.aliases` maps a model name a tool is hard-wired to onto a local model (`gpt-4o-mini: qwen3.8-27b-q8`, or a `name:`/`target:` list when you want a comment per entry), so that tool needs no config edit. A value has to name exactly one model by itself, so it never routes to a guess. A name that names a model outright wins over an alias of the same name, an alias settles a name two models share, an alias names a model rather than a preset, and aliases are not listed by `/v1/models` or `/api/tags`. ([#99](https://github.com/llamastash/llamastash/pull/99))
+- The `/ui` model chooser colours each row: green for a model whose backend has a web UI you can open, red for one that is running but serves none. ([#99](https://github.com/llamastash/llamastash/pull/99))
+
 ### Changed
 
-- `proxy.aliases` maps a model name a tool is hard-wired to onto a local model (`gpt-4o-mini: qwen3.8-27b-q8`, or a `name:`/`target:` list when you want a comment per entry), so that tool needs no config edit. A value has to name exactly one model by itself, so it never routes to a guess. A name that names a model outright wins over an alias of the same name, an alias settles a name two models share, an alias names a model rather than a preset, and aliases are not listed by `/v1/models` or `/api/tags`.
-- The `/ui` model chooser colours each row: green for a model whose backend has a web UI you can open, red for one that is running but serves none.
-- A preset lookup no longer reads a model header on the daemon's async worker thread, so a slow disk cannot stall the control-plane calls queued behind it.
-- `/api/show` reads `<model>@<launch>` the way the chat surfaces do: the launch name is a pointer to a running launch, and a name that does not exist falls back to that model's unnamed launch. It used to answer `404` for anything containing an `@`.
-- The proxy reads the model catalog through one shared snapshot instead of copying every row for every request, so routing a request no longer allocates in proportion to how many models are on disk.
+- A preset lookup no longer reads a model header on the daemon's async worker thread, so a slow disk cannot stall the control-plane calls queued behind it. ([#99](https://github.com/llamastash/llamastash/pull/99))
+- `/api/show` reads `<model>@<launch>` the way the chat surfaces do: the launch name is a pointer to a running launch, and a name that does not exist falls back to that model's unnamed launch. It used to answer `404` for anything containing an `@`. ([#99](https://github.com/llamastash/llamastash/pull/99))
+- The proxy reads the model catalog through one shared snapshot instead of copying every row for every request, so routing a request no longer allocates in proportion to how many models are on disk. ([#99](https://github.com/llamastash/llamastash/pull/99))
 
 ## [0.6.1] — 2026-10-02
 
