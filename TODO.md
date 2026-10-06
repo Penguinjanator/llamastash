@@ -425,7 +425,7 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 
 - [x] ~~Proxy request log~~
 - [x] ~~Live speed stats per model~~
-- [ ] Batch 3 follow-ups: proxy overhead bench with the body tap, streamed response shapes on Halogen and gufo ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#follow-ups))
+- [ ] Batch 3 follow-ups: proxy overhead bench with the body tap, streamed response shapes on gufo ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#follow-ups))
 
 ### Batch 4: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
 

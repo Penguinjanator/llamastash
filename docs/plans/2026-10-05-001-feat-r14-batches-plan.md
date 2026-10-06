@@ -116,10 +116,19 @@ The vLLM field name (`metrics.tokens_per_second`, sent with `--enable-per-reques
 
 `proxy.request_log_file: true` (added 2026-10-05, off by default) also appends each finished row to `<log dir>/requests.jsonl`. The in-memory log is not read back from it.
 
+Halogen 0.16.2, read from `tools/serve_api.py` in the image of a running container on 2026-10-06:
+
+- A streamed chat or completions response puts `timings` on the finish chunk whether or not usage was asked for. With `stream_options.include_usage` one more chunk follows, carrying `usage` and `timings`, then `[DONE]`.
+- Non-streamed chat, `/v1/messages` and `/v1/responses` carry both `usage` and `timings`.
+- `timings` has llama-server's shape and meaning: `prompt_n` is what the engine processed, `cache_n` the reused prefix, `predicted_per_second` the engine's own decode rate. `cache_n` is only present when the engine reports a cached count.
+
+So the tap needs nothing Halogen-specific. A live Halogen run through the proxy the same day showed it: 69 streamed `chat/completions` rows with server-reported tok/s (41.6 to 46.4, no `~`) and both token counts.
+
 ### Follow-ups
 
 - [ ] Run the proxy overhead bench with and without the tap (plan step 7). Skipped on 2026-10-05: a Halogen run held the GPU, and the bench needs a quiet machine.
-- [ ] Check which of `timings` / `usage` Halogen and gufo put in the last streamed chunk. Skipped for the same reason: it means sending requests to a model that was in use.
+- [x] Check which of `timings` / `usage` Halogen puts in the last streamed chunk. Checked 2026-10-06 against Halogen 0.16.2, see below.
+- [ ] Check the same for gufo. Only its non-streamed `usage.completion_tokens_per_second` is known, from `scripts/bench/qwen38-flash-speed/bench.py`.
 - [x] Estimate tok/s from the proxy clock where the server reports none (`/v1/messages`, non-streamed `/v1/responses` on llama.cpp). Decided 2026-10-05: estimate, for any backend. The row carries `tokens_per_second_estimated` and the tables mark the value with `~`. The clock starts at the first response byte for a stream and at the upstream send for a response that arrives whole.
 
 ## Batch 4: faster reloads
