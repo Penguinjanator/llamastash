@@ -101,7 +101,9 @@ pub struct ProxyState {
   /// `proxy.aliases`: client names that stand in for a local model. Built
   /// once at daemon startup from `config.yaml`; read-only thereafter. See
   /// [`super::alias`].
-  pub(crate) aliases: super::alias::AliasTable,
+  /// Behind an `Arc` like the rest of this struct's fields: the table is
+  /// per-daemon and immutable, and a connection clones this struct.
+  pub(crate) aliases: Arc<super::alias::AliasTable>,
 }
 
 impl ProxyState {
@@ -163,7 +165,7 @@ impl ProxyState {
       fallback_enabled,
       auth: super::auth::ProxyAuth::new(api_key),
       max_body_size,
-      aliases: super::alias::AliasTable::from_config(aliases),
+      aliases: Arc::new(super::alias::AliasTable::from_config(aliases)),
     })
   }
 }

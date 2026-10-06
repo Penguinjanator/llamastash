@@ -21,13 +21,14 @@
 //!   stays one row per model.
 
 use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
-/// Client name → model reference, plus the shadow warnings already logged.
+/// Client name → model reference, plus the warnings already logged about it.
 ///
-/// Cloned per proxy connection, so the warn set is shared behind an `Arc`:
-/// a shadowed alias has to warn once for the daemon, not once per connection.
-#[derive(Debug, Default, Clone)]
+/// One table per daemon, held behind an `Arc` on `ProxyState` so a connection
+/// cloning that struct shares it. That sharing is what makes "one line per
+/// problem" true: a table copied per connection would warn again for each copy.
+#[derive(Debug, Default)]
 pub(crate) struct AliasTable {
   /// `(name, model reference)` in config order, names already through
   /// [`normalize`]. A table is small and scanned once per request that misses,
@@ -36,7 +37,7 @@ pub(crate) struct AliasTable {
   targets: Vec<(String, String)>,
   /// Names already reported, so a warning fires once per name rather than once
   /// per request.
-  warned: Arc<RwLock<HashSet<String>>>,
+  warned: RwLock<HashSet<String>>,
 }
 
 /// One spelling for every alias name: model references already resolve
@@ -91,7 +92,7 @@ impl AliasTable {
       .collect();
     Self {
       targets,
-      warned: Arc::new(RwLock::new(HashSet::new())),
+      warned: RwLock::new(HashSet::new()),
     }
   }
 
@@ -150,8 +151,7 @@ impl AliasTable {
     self.note_once(format!("{kind} {key}"))
   }
 
-  /// First call for this key wins. Shared across clones, so one daemon logs one
-  /// line per problem name however many connections hit it.
+  /// First call for this key wins, for the whole daemon.
   fn note_once(&self, key: String) -> bool {
     self
       .warned
