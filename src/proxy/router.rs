@@ -180,9 +180,10 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
   let client = req.extensions().get::<ClientAddr>().map(|c| c.0);
   let (method, uri, headers, body) = forward::deconstruct(req);
   let cap = state.max_body_size;
-  // The log row for this request. Every return below either finishes it
-  // (`answered`) or hands it to the forward path; a return that did
-  // neither drops it, which logs the request as closed by the client.
+  // The log row for this request. A request that reaches a model hands it
+  // to the forward path; an answer the proxy builds itself finishes it
+  // through `answered`. A return that did neither drops it, which logs
+  // the request as closed by the client.
   let mut record = state.ctx.requests.begin(uri.path(), client);
 
   let parsed = match route::buffer_and_extract(body, cap).await {
@@ -270,7 +271,7 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
     headers,
     body_bytes: parsed.bytes,
   };
-  match decision {
+  let response = match decision {
     RouteDecision::ReadyAt {
       port,
       served_model_id,
@@ -286,7 +287,7 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
       // timestamp. Direct touch by ModelId avoids the second
       // supervisor snapshot the port-only path used to take.
       state.mru.touch(&served_model_key).await;
-      forward::forward_to_upstream(
+      return forward::forward_to_upstream(
         &state,
         inbound,
         forward::Target {
@@ -299,14 +300,14 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
         },
         Some(record),
       )
-      .await
+      .await;
     }
     RouteDecision::NotRunning {
       requested_model,
       resolved_row,
       name,
     } => {
-      route::handle_not_running(
+      return route::handle_not_running(
         &state,
         inbound,
         requested_model,
@@ -315,16 +316,13 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
         name,
         record,
       )
-      .await
+      .await;
     }
-    RouteDecision::NotFound { requested_model } => answered(
-      record,
-      error_with_matches(
-        StatusCode::NOT_FOUND,
-        "model_not_found",
-        &format!("{requested_model} not found"),
-        Vec::<String>::new(),
-      ),
+    RouteDecision::NotFound { requested_model } => error_with_matches(
+      StatusCode::NOT_FOUND,
+      "model_not_found",
+      &format!("{requested_model} not found"),
+      Vec::<String>::new(),
     ),
     RouteDecision::Ambiguous {
       requested_model,
@@ -334,43 +332,35 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
         "`{requested_model}` matched {n} models; send one of `matches` (the repo-qualified id `/v1/models` publishes), a full path, or a unique substring",
         n = candidates.len()
       );
-      answered(
-        record,
-        error_with_matches(
-          StatusCode::BAD_REQUEST,
-          "ambiguous_model",
-          &message,
-          candidates,
-        ),
+      error_with_matches(
+        StatusCode::BAD_REQUEST,
+        "ambiguous_model",
+        &message,
+        candidates,
       )
     }
-    RouteDecision::ModelRequired => answered(
-      record,
-      error_with_code(
-        StatusCode::BAD_REQUEST,
-        "invalid_request",
-        "the `model` field is required",
-        "model_required",
-        Some("model"),
-      ),
+    RouteDecision::ModelRequired => error_with_code(
+      StatusCode::BAD_REQUEST,
+      "invalid_request",
+      "the `model` field is required",
+      "model_required",
+      Some("model"),
     ),
     RouteDecision::BackendUnavailable {
       backend,
       requested_model,
       resolved_row: _,
-    } => answered(
-      record,
-      error_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "backend_unavailable",
-        &format!(
-          "`{requested_model}` is served by the {backend} backend, but the llamastash managed \
-           instance is not running; set up {backend} and start the daemon with `--lemonade` \
-           (see docs/lemonade-setup.md)"
-        ),
+    } => error_response(
+      StatusCode::SERVICE_UNAVAILABLE,
+      "backend_unavailable",
+      &format!(
+        "`{requested_model}` is served by the {backend} backend, but the llamastash managed \
+         instance is not running; set up {backend} and start the daemon with `--lemonade` \
+         (see docs/lemonade-setup.md)"
       ),
     ),
-  }
+  };
+  answered(record, response)
 }
 
 async fn health(state: Arc<ProxyState>) -> ProxyResponse {

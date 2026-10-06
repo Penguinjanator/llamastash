@@ -36,12 +36,13 @@ use llamastash::gguf::metadata::{ModeHint, ModelMetadata, Quant};
 use llamastash::ipc::{dispatch_request, Request};
 use llamastash::launch::mode::LaunchMode;
 use llamastash::launch::params::LaunchParams;
-use llamastash::proxy::request_log::{RequestLog, RequestRow, RequestState};
+use llamastash::proxy::request_log::RequestState;
 use llamastash::proxy::server::{
   loopback_addr, new_status_cell, serve_with_options, ProxyStatus, ServeOptions, StatusCell,
 };
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
+use llamastash::test_support::{finished_request, newest_request_when};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -1054,30 +1055,6 @@ async fn proxy_state_and_ctx(
   )
 }
 
-/// The newest log row once it satisfies `done`. The proxy finishes a row
-/// when hyper drops the response body, which can trail the client's read
-/// by a scheduler tick.
-async fn newest_row_when<P: Fn(&RequestRow) -> bool>(log: &RequestLog, done: P) -> RequestRow {
-  let deadline = std::time::Instant::now() + Duration::from_secs(5);
-  loop {
-    let row = log.tail(None, 1).rows.into_iter().next();
-    match row {
-      Some(row) if done(&row) => return row,
-      other => {
-        assert!(
-          std::time::Instant::now() < deadline,
-          "log row never reached the expected state; last seen: {other:?}"
-        );
-        sleep(Duration::from_millis(10)).await;
-      }
-    }
-  }
-}
-
-fn finished(row: &RequestRow) -> bool {
-  row.state != RequestState::InFlight
-}
-
 async fn ipc(ctx: &MethodContext, method: &str, params: Option<Value>) -> Value {
   dispatch_request(ctx, Request::new(1, method, params))
     .await
@@ -1108,7 +1085,7 @@ async fn a_served_request_is_logged_and_reaches_requests_tail_and_status() {
   let (status, _, _) = http_post(addr, "/v1/chat/completions", body, &[]).await;
   assert_eq!(status, 200);
 
-  let row = newest_row_when(&ctx.requests, finished).await;
+  let row = finished_request(&ctx.requests).await;
   assert_eq!(row.state, RequestState::Done);
   assert_eq!(row.status, Some(200));
   assert_eq!(row.route, "/v1/chat/completions");
@@ -1197,7 +1174,7 @@ async fn tokens_and_speed_come_from_the_end_of_the_response() {
   let text = String::from_utf8_lossy(&response);
   assert!(text.contains("\"predicted_per_second\":38.64"), "{text}");
   assert!(text.ends_with("data: [DONE]\n\n\r\n0\r\n\r\n"), "{text:?}");
-  let row = newest_row_when(&ctx.requests, finished).await;
+  let row = finished_request(&ctx.requests).await;
   assert_eq!(row.prompt_tokens, Some(41), "prompt_n + cache_n");
   assert_eq!(row.completion_tokens, Some(3));
   assert_eq!(row.tokens_per_second, Some(38.64));
@@ -1208,7 +1185,10 @@ async fn tokens_and_speed_come_from_the_end_of_the_response() {
   let messages = r#"{"model":"qwen3","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#;
   let (status, _, _) = http_post(addr, "/v1/messages", messages, &[]).await;
   assert_eq!(status, 200);
-  let row = newest_row_when(&ctx.requests, |r| finished(r) && r.route == "/v1/messages").await;
+  let row = newest_request_when(&ctx.requests, |r| {
+    r.state != RequestState::InFlight && r.route == "/v1/messages"
+  })
+  .await;
   assert_eq!(
     (row.prompt_tokens, row.completion_tokens),
     (Some(1), Some(1))
@@ -1335,13 +1315,13 @@ async fn a_client_that_hangs_up_mid_stream_is_logged_as_client_closed() {
   }
 
   // Mid-stream the row is visible, in flight, with its first-byte time.
-  let streaming = newest_row_when(&ctx.requests, |r| r.ttfb_ms.is_some()).await;
+  let streaming = newest_request_when(&ctx.requests, |r| r.ttfb_ms.is_some()).await;
   assert_eq!(streaming.state, RequestState::InFlight);
   assert_eq!(streaming.status, Some(200));
   assert_eq!(streaming.duration_ms, None);
 
   drop(sock);
-  let row = newest_row_when(&ctx.requests, finished).await;
+  let row = finished_request(&ctx.requests).await;
   assert_eq!(row.state, RequestState::ClientClosed);
   assert_eq!(row.status, Some(200));
   let summary = ctx.requests.tail(Some(catalog_path), 0).summary;
@@ -1385,7 +1365,7 @@ async fn an_upstream_that_dies_mid_body_is_logged_as_upstream_error() {
   let mut sink = Vec::new();
   let _ = tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut sink)).await;
 
-  let row = newest_row_when(&ctx.requests, finished).await;
+  let row = finished_request(&ctx.requests).await;
   assert_eq!(row.state, RequestState::UpstreamError);
   assert_eq!(row.status, Some(200));
   assert_eq!(

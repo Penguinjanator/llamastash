@@ -21,10 +21,10 @@ use serde_json::{json, Value};
 
 use crate::cli::cli_args::{Cli, CtxArg, LaunchMode as CliLaunchMode, ReasoningFlag, StartArgs};
 use crate::cli::client::connect_or_spawn;
-use crate::cli::exit_codes::{
-  CliExit, CliResult, BINARY_NOT_FOUND, LAUNCH_FAILED, MODEL_NOT_FOUND, USAGE,
+use crate::cli::exit_codes::{CliExit, CliResult, BINARY_NOT_FOUND, LAUNCH_FAILED, USAGE};
+use crate::cli::resolve::{
+  fetch_catalog, model_miss, resolve_model_with_candidates, CatalogRow, ResolveError,
 };
-use crate::cli::resolve::{fetch_catalog, resolve_model_with_candidates, CatalogRow, ResolveError};
 use crate::cli::tail_args::parse_tail_args;
 use crate::config::Config;
 use crate::ipc::Client;
@@ -356,38 +356,21 @@ fn select_start_row(
   args: &StartArgs,
   model: &str,
 ) -> Result<CatalogRow, CliExit> {
-  match resolve_model_with_candidates(rows, model) {
-    Ok(row) => Ok(row),
-    Err(ResolveError::Empty) => Err(CliExit::new(
-      MODEL_NOT_FOUND,
-      "empty model reference; supply a name substring, absolute path, or short id",
-    )),
-    Err(ResolveError::None) => {
-      if let Some(path) = direct_path_candidate(model, args)? {
-        return Ok(direct_catalog_row(
-          path,
-          args
-            .mode
-            .expect("direct_path_candidate requires explicit mode"),
-        ));
-      }
-      Err(CliExit::new(
-        MODEL_NOT_FOUND,
-        format!("no model matches `{model}` ({} known)", rows.len()),
-      ))
-    }
-    Err(ResolveError::Many(candidates)) => {
-      let names: Vec<String> = candidates.iter().map(|r| r.name()).collect();
-      Err(CliExit::new(
-        MODEL_NOT_FOUND,
-        format!(
-          "`{model}` matches {} models: {}\nrefine the reference (full path or unique substring) and retry",
-          candidates.len(),
-          names.join(", ")
-        ),
-      ))
+  let miss = match resolve_model_with_candidates(rows, model) {
+    Ok(row) => return Ok(row),
+    Err(miss) => miss,
+  };
+  if matches!(miss, ResolveError::None) {
+    if let Some(path) = direct_path_candidate(model, args)? {
+      return Ok(direct_catalog_row(
+        path,
+        args
+          .mode
+          .expect("direct_path_candidate requires explicit mode"),
+      ));
     }
   }
+  Err(model_miss(miss, model, rows.len()))
 }
 
 fn direct_path_candidate(model: &str, args: &StartArgs) -> Result<Option<PathBuf>, CliExit> {

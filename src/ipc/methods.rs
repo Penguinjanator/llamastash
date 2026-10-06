@@ -506,11 +506,9 @@ fn requests_tail_handler(ctx: &MethodContext, params: Option<Value>) -> Result<V
     some => parse_params(some)?,
   };
   let limit = parsed.limit.unwrap_or(DEFAULT_TAIL).min(CAPACITY);
-  let tail = ctx.requests.tail(parsed.model_path.as_deref(), limit);
-  Ok(json!({
-    "summary": tail.summary,
-    "requests": tail.rows,
-  }))
+  Ok(json!(ctx
+    .requests
+    .tail(parsed.model_path.as_deref(), limit)))
 }
 
 /// Sorted list of every method `dispatch_request` knows. Used by

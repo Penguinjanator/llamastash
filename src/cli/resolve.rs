@@ -146,32 +146,29 @@ pub async fn fetch_catalog(client: &mut Client) -> Result<Vec<CatalogRow>, CliEx
 /// 2. exact name match (basename),
 /// 3. case-insensitive substring of name OR parent dir.
 ///
-/// Returns `MODEL_NOT_FOUND` when zero or many rows match. The error
-/// message names every candidate when matches > 1 so callers can
-/// re-issue with a tighter reference.
+/// Returns `MODEL_NOT_FOUND` when zero or many rows match.
 pub fn resolve_model(rows: &[CatalogRow], reference: &str) -> Result<CatalogRow, CliExit> {
-  match resolve_model_with_candidates(rows, reference) {
-    Ok(row) => Ok(row),
-    Err(ResolveError::Empty) => Err(CliExit::new(
-      MODEL_NOT_FOUND,
-      "empty model reference; supply a name substring, absolute path, or short id",
-    )),
-    Err(ResolveError::None) => Err(CliExit::new(
-      MODEL_NOT_FOUND,
-      format!("no model matches `{reference}` ({} known)", rows.len()),
-    )),
-    Err(ResolveError::Many(candidates)) => {
-      let names: Vec<String> = candidates.iter().map(|r| r.name()).collect();
-      Err(CliExit::new(
-        MODEL_NOT_FOUND,
-        format!(
-          "`{reference}` matches {} models: {}\nrefine the reference (full path or unique substring) and retry",
-          candidates.len(),
-          names.join(", ")
-        ),
-      ))
+  resolve_model_with_candidates(rows, reference).map_err(|e| model_miss(e, reference, rows.len()))
+}
+
+/// The CLI error for a catalog miss. It names every candidate when more
+/// than one row matched, so the caller can re-issue a tighter reference.
+pub fn model_miss(miss: ResolveError, reference: &str, known: usize) -> CliExit {
+  let message = match miss {
+    ResolveError::Empty => {
+      "empty model reference; supply a name substring, absolute path, or short id".to_string()
     }
-  }
+    ResolveError::None => format!("no model matches `{reference}` ({known} known)"),
+    ResolveError::Many(candidates) => {
+      let names: Vec<String> = candidates.iter().map(|r| r.name()).collect();
+      format!(
+        "`{reference}` matches {} models: {}\nrefine the reference (full path or unique substring) and retry",
+        candidates.len(),
+        names.join(", ")
+      )
+    }
+  };
+  CliExit::new(MODEL_NOT_FOUND, message)
 }
 
 /// Index running rows by canonical model path, **every** row per path in the
@@ -570,29 +567,27 @@ pub fn resolve_running(rows: &[RunningRow], reference: &str) -> Result<RunningRo
       rows
         .iter()
         .filter(|r| {
-          crate::launch::resolve::name_matches(r.name.as_deref(), name_ref) && {
-            let path = std::path::Path::new(&r.model_path);
-            let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            let parent = path.parent().and_then(|p| p.to_str()).unwrap_or("");
-            fname.to_lowercase().contains(&model_ref.to_lowercase())
-              || parent.to_lowercase().contains(&model_ref.to_lowercase())
-          }
+          crate::launch::resolve::name_matches(r.name.as_deref(), name_ref)
+            && path_contains(r, &model_ref.to_lowercase())
         })
         .collect(),
     );
     return single_or_error(by_named, reference);
   }
   // Fall back to a name / parent-dir substring against the running rows.
-  let by_name: Vec<&RunningRow> = rows
-    .iter()
-    .filter(|r| {
-      let path = std::path::Path::new(&r.model_path);
-      let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-      let parent = path.parent().and_then(|p| p.to_str()).unwrap_or("");
-      name.to_lowercase().contains(&lower) || parent.to_lowercase().contains(&lower)
-    })
-    .collect();
+  let by_name: Vec<&RunningRow> = rows.iter().filter(|r| path_contains(r, &lower)).collect();
   single_or_error(by_name, reference)
+}
+
+/// Whether the launch's model file name or its parent directory contains
+/// `lower`, which the caller has already lower-cased.
+fn path_contains(row: &RunningRow, lower: &str) -> bool {
+  let path = std::path::Path::new(&row.model_path);
+  let part = |s: Option<&std::ffi::OsStr>| {
+    s.and_then(|s| s.to_str())
+      .is_some_and(|s| s.to_lowercase().contains(lower))
+  };
+  part(path.file_name()) || part(path.parent().map(std::path::Path::as_os_str))
 }
 
 /// Resolve a reference that may name a model or a live launch to the

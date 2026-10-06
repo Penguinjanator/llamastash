@@ -232,3 +232,35 @@ pub fn backend_declaring(knob_id: &str) -> &'static str {
     .map(|b| b.id())
     .unwrap_or_else(|| panic!("no backend declares knob `{knob_id}`"))
 }
+
+/// The newest request-log row once it satisfies `done`. The proxy finishes
+/// a row when hyper drops the response body, which can trail the client's
+/// read by a scheduler tick.
+pub async fn newest_request_when(
+  log: &crate::proxy::request_log::RequestLog,
+  done: impl Fn(&crate::proxy::request_log::RequestRow) -> bool,
+) -> crate::proxy::request_log::RequestRow {
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+  loop {
+    match log.tail(None, 1).rows.into_iter().next() {
+      Some(row) if done(&row) => return row,
+      other => {
+        assert!(
+          std::time::Instant::now() < deadline,
+          "log row never reached the expected state; last seen: {other:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+      }
+    }
+  }
+}
+
+/// The newest request-log row once its response has ended.
+pub async fn finished_request(
+  log: &crate::proxy::request_log::RequestLog,
+) -> crate::proxy::request_log::RequestRow {
+  newest_request_when(log, |r| {
+    r.state != crate::proxy::request_log::RequestState::InFlight
+  })
+  .await
+}

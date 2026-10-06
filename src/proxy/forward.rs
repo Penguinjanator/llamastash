@@ -241,11 +241,8 @@ pub(crate) async fn forward_to_upstream(
 
 /// The 502 for an upstream that is gone, logged on `record` when there is one.
 fn unreachable_response(record: Option<RequestRecord>, message: &str) -> ProxyResponse {
-  let response = Ok(error_envelope(
-    StatusCode::BAD_GATEWAY,
-    "upstream_unreachable",
-    message,
-  ));
+  let response =
+    super::router::error_response(StatusCode::BAD_GATEWAY, "upstream_unreachable", message);
   match record {
     Some(record) => super::router::answered(record, response),
     None => response,
@@ -609,17 +606,6 @@ fn sanitize_header_value(input: &str) -> String {
     .collect()
 }
 
-/// Construct an OpenAI-shaped error response for the forwarding arm's
-/// upstream-unreachable (502) cases, sharing the router's
-/// `error_json` builder so the envelope shape stays identical.
-fn error_envelope(
-  status: StatusCode,
-  kind: &str,
-  message: &str,
-) -> Response<BoxBody<Bytes, BodyError>> {
-  super::router::error_json(status, super::openai::ErrorObject::new(kind, message))
-}
-
 /// Helper to massage a hyper::Request<Incoming> into the parts the
 /// forwarding fn wants. Pulled out so the router's match arms stay
 /// short.
@@ -766,14 +752,11 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn error_envelope_builds_openai_shaped_body() {
+  async fn unreachable_response_builds_openai_shaped_body() {
     // The 502 forwarding-arm error must carry the OpenAI `{error:{...}}`
     // envelope shape so SDK clients surface it as a structured error.
-    let resp = error_envelope(
-      StatusCode::BAD_GATEWAY,
-      "upstream_unreachable",
-      "model exited before forwarding could begin",
-    );
+    let resp =
+      unreachable_response(None, "model exited before forwarding could begin").expect("infallible");
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     let body = resp
       .into_body()

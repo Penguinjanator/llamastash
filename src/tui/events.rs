@@ -878,10 +878,10 @@ fn apply_action(app: &mut App, action: Action, writer: Option<&mpsc::Sender<Writ
       }
       app.focus = Focus::RightPane;
     }
-    Action::FocusLogsTab => apply_focus_logs_tab(app),
+    Action::FocusLogsTab => apply_focus_launch_tab(app, RightTab::Logs),
     Action::FocusChatTab => apply_focus_chat_tab(app),
     Action::FocusSettingsTab => apply_focus_settings_tab(app),
-    Action::FocusRequestsTab => apply_focus_requests_tab(app),
+    Action::FocusRequestsTab => apply_focus_launch_tab(app, RightTab::Requests),
     Action::InsertNewline => {
       // Force-insert a newline into whichever modal field is in
       // focus. Skips the input component's modifier filter so
@@ -1120,16 +1120,19 @@ fn running_view_is_locked(app: &App) -> bool {
     && app.focused_managed().is_some()
 }
 
-/// `L` quick-jump: park focus on the Logs tab when it's reachable.
-/// Every managed row has a log buffer — including a stopped or
+/// `L` / `Q` quick-jump: park focus on `tab`, Logs or Requests, when
+/// it's reachable. Every managed row has both — including a stopped or
 /// errored one — so the toast is for a selection with no launch at
 /// all.
-fn apply_focus_logs_tab(app: &mut App) {
-  if app.available_right_tabs().contains(&RightTab::Logs) {
-    app.right_tab = RightTab::Logs;
+fn apply_focus_launch_tab(app: &mut App, tab: RightTab) {
+  if app.available_right_tabs().contains(&tab) {
+    app.right_tab = tab;
     app.focus = Focus::RightPane;
   } else {
-    app.show_toast("Logs unavailable — this model has no launch");
+    app.show_toast(format!(
+      "{} unavailable — this model has no launch",
+      tab.label()
+    ));
   }
 }
 
@@ -1148,17 +1151,6 @@ fn apply_focus_chat_tab(app: &mut App) {
       app.focus = Focus::RightPane;
     }
     None => app.show_toast("Chat/Embed/Rerank unavailable — focus a running model"),
-  }
-}
-
-/// `Q` quick-jump: park focus on the Requests tab when it's reachable,
-/// which is for any model that has a launch.
-fn apply_focus_requests_tab(app: &mut App) {
-  if app.available_right_tabs().contains(&RightTab::Requests) {
-    app.right_tab = RightTab::Requests;
-    app.focus = Focus::RightPane;
-  } else {
-    app.show_toast("Requests unavailable — this model has no launch");
   }
 }
 
@@ -2606,12 +2598,9 @@ fn apply_refresh(app: &mut App, tick: RefreshTick) {
       // Same race as Logs: keep the result only while the model it is
       // for is still the focused one.
       if requests_poll_target(app).as_deref() == Some(model_path.as_str()) {
-        let field = |key: &str| body.get(key).cloned().unwrap_or(Value::Null);
-        app.requests.set(
-          model_path,
-          serde_json::from_value(field("summary")).unwrap_or_default(),
-          serde_json::from_value(field("requests")).unwrap_or_default(),
-        );
+        let tail: crate::proxy::request_log::Tail =
+          serde_json::from_value(body).unwrap_or_default();
+        app.requests.set(model_path, tail.summary, tail.rows);
       }
     }
     RefreshTick::Disconnected => {

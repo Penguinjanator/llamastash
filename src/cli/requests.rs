@@ -4,6 +4,7 @@
 //! summary above the table on a terminal. `--json` emits the daemon's
 //! `requests_tail` body unchanged.
 
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::cli::cli_args::{Cli, RequestsArgs};
@@ -13,7 +14,7 @@ use crate::cli::output::pretty_json;
 use crate::cli::resolve::{fetch_catalog, fetch_status, resolve_model_or_launch};
 use crate::cli::{colors, format};
 use crate::config::Config;
-use crate::proxy::request_log::{RequestRow, RequestSummary};
+use crate::proxy::request_log::{RequestRow, Tail};
 
 /// Cell text for a value the log does not have.
 const NONE: &str = "-";
@@ -46,9 +47,7 @@ pub async fn handle(args: RequestsArgs, cli: &Cli, config: &Config) -> CliResult
 /// stays one header line plus one line per request. `one_model` drops the
 /// MODEL column, which a model filter makes the same on every line.
 fn requests_human(body: &Value, one_model: bool) -> String {
-  let field = |key: &str| body.get(key).cloned().unwrap_or(Value::Null);
-  let rows: Vec<RequestRow> = serde_json::from_value(field("requests")).unwrap_or_default();
-  let summary: RequestSummary = serde_json::from_value(field("summary")).unwrap_or_default();
+  let Tail { summary, rows } = Tail::deserialize(body).unwrap_or_default();
 
   let mut out = String::new();
   if console::colors_enabled() {
@@ -135,7 +134,10 @@ mod tests {
 
   /// Piped rendering, restoring the process-wide color flag afterwards.
   fn piped(rows: &[RequestRow], one_model: bool) -> String {
-    let body = json!({"summary": RequestSummary::default(), "requests": rows});
+    let body = json!(Tail {
+      rows: rows.to_vec(),
+      ..Tail::default()
+    });
     let prior = console::colors_enabled();
     console::set_colors_enabled(false);
     let out = requests_human(&body, one_model);

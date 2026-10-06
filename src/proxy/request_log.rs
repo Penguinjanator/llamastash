@@ -396,11 +396,14 @@ impl Inner {
   }
 }
 
-/// What `requests_tail` returns.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// What `requests_tail` returns. It is the method's JSON body, so the
+/// daemon writes it and the CLI and the TUI read it through this type.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Tail {
   pub summary: RequestSummary,
   /// Newest first.
+  #[serde(rename = "requests")]
   pub rows: Vec<RequestRow>,
 }
 

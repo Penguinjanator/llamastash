@@ -29,10 +29,11 @@ use llamastash::daemon::shutdown::ShutdownToken;
 use llamastash::discovery::{DiscoveredModel, ModelCatalog, ModelSource};
 use llamastash::gguf::metadata::{ModeHint, ModelMetadata, Quant};
 use llamastash::gguf::test_fixtures::build_minimal_gguf;
-use llamastash::proxy::request_log::{RequestRow, RequestState};
+use llamastash::proxy::request_log::RequestState;
 use llamastash::proxy::server::{loopback_addr, new_status_cell, serve, ProxyStatus, StatusCell};
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
+use llamastash::test_support::{finished_request, newest_request_when};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -269,29 +270,6 @@ fn parse_response(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
   (status, headers, body)
 }
 
-/// The newest request-log row once it satisfies `ready`.
-async fn newest_row_when<P: Fn(&RequestRow) -> bool>(ctx: &MethodContext, ready: P) -> RequestRow {
-  let deadline = std::time::Instant::now() + Duration::from_secs(5);
-  loop {
-    match ctx.requests.tail(None, 1).rows.into_iter().next() {
-      Some(row) if ready(&row) => return row,
-      other => {
-        assert!(
-          std::time::Instant::now() < deadline,
-          "log row never reached the expected state; last seen: {other:?}"
-        );
-        sleep(Duration::from_millis(10)).await;
-      }
-    }
-  }
-}
-
-/// The newest row once its response has ended. The proxy finishes a row
-/// when hyper drops the body, which can trail the client's read.
-async fn finished_row(ctx: &MethodContext) -> RequestRow {
-  newest_row_when(ctx, |r| r.state != RequestState::InFlight).await
-}
-
 async fn stop_all(ctx: &MethodContext) {
   let snap = ctx.supervisors.snapshot().await;
   for (_, m) in snap {
@@ -337,7 +315,7 @@ async fn dormant_model_auto_starts_and_forwards_without_fallback_headers() {
   assert_eq!(snap.len(), 1, "exactly one supervisor was launched");
 
   // The request log marks this request as the one that started the model.
-  let row = finished_row(&ctx).await;
+  let row = finished_request(&ctx.requests).await;
   assert!(row.auto_start);
   assert_eq!(row.launch_id.as_deref(), Some(snap[0].0.as_str()));
   assert_eq!((row.state, row.status), (RequestState::Done, Some(200)));
@@ -570,7 +548,7 @@ async fn request_during_load_window_attaches_instead_of_duplicating() {
     "proxy must attach to the in-flight launch, not start a second one"
   );
   // It waited on a launch someone else started, so it is not an auto-start.
-  let row = finished_row(&ctx).await;
+  let row = finished_request(&ctx.requests).await;
   assert!(!row.auto_start);
   assert_eq!(row.status, Some(200));
 
@@ -889,7 +867,7 @@ async fn auto_start_refusal_unloads_the_idle_model_and_retries_once() {
   );
 
   // The request's log row names what it unloaded.
-  let row = finished_row(&ctx).await;
+  let row = finished_request(&ctx.requests).await;
   assert!(row.auto_start);
   assert_eq!(row.evicted, vec![first_launch]);
   let summary = ctx
@@ -941,12 +919,12 @@ async fn a_client_that_hangs_up_during_make_room_still_logs_the_unload() {
   sock.write_all(raw.as_bytes()).await.expect("write");
 
   // The unload is on the row while the request is still in flight.
-  let waiting = newest_row_when(&ctx, |r| !r.evicted.is_empty()).await;
+  let waiting = newest_request_when(&ctx.requests, |r| !r.evicted.is_empty()).await;
   assert_eq!(waiting.state, RequestState::InFlight);
   assert_eq!(waiting.evicted, vec![first_launch.clone()]);
 
   drop(sock);
-  let row = newest_row_when(&ctx, |r| r.state != RequestState::InFlight).await;
+  let row = finished_request(&ctx.requests).await;
   assert_eq!(row.state, RequestState::ClientClosed);
   assert_eq!(row.status, None);
   // It unloaded a model, but gave up before the retry spawned anything.
