@@ -204,6 +204,40 @@ async fn proxy_state_with_models(models: Vec<DiscoveredModel>) -> Arc<ProxyState
   proxy_state_with_models_compat(models, false).await
 }
 
+/// One build seam for every state in this file: the catalog, the optional
+/// supervisor registry, Ollama drop-in mode, and the `proxy.aliases` table the
+/// daemon hands `from_context_with_auth` in production. The wrappers below are
+/// what the tests call.
+async fn build_state(
+  models: Vec<DiscoveredModel>,
+  registry: Option<SupervisorRegistry>,
+  ollama_compat: bool,
+  aliases: &[(&str, &str)],
+) -> Arc<ProxyState> {
+  let catalog = ModelCatalog::new();
+  for m in models {
+    catalog.upsert(m).await;
+  }
+  let ctx = MethodContext::with_catalog(ShutdownToken::new(), catalog);
+  let ctx = match registry {
+    Some(registry) => ctx.with_supervisors(registry),
+    None => ctx,
+  };
+  let aliases = llamastash::config::ProxyAliases::from_pairs(
+    aliases
+      .iter()
+      .map(|(name, target)| (name.to_string(), target.to_string())),
+  );
+  ProxyState::from_context_with_auth(
+    &ctx,
+    ollama_compat,
+    true,
+    None,
+    DEFAULT_BODY_LIMIT_BYTES,
+    &aliases,
+  )
+}
+
 /// Like [`proxy_state_with_models`] with a `proxy.aliases` entry.
 async fn proxy_state_with_alias(
   models: Vec<DiscoveredModel>,
@@ -216,29 +250,14 @@ async fn proxy_state_with_aliases(
   models: Vec<DiscoveredModel>,
   aliases: Vec<(&str, &str)>,
 ) -> Arc<ProxyState> {
-  let catalog = ModelCatalog::new();
-  for m in models {
-    catalog.upsert(m).await;
-  }
-  let ctx = MethodContext::with_catalog(ShutdownToken::new(), catalog);
-  let aliases = llamastash::config::ProxyAliases::from_pairs(
-    aliases
-      .into_iter()
-      .map(|(name, target)| (name.to_string(), target.to_string())),
-  );
-  ProxyState::from_context_with_auth(&ctx, false, true, None, DEFAULT_BODY_LIMIT_BYTES, &aliases)
+  build_state(models, None, false, &aliases).await
 }
 
 async fn proxy_state_with_models_compat(
   models: Vec<DiscoveredModel>,
   ollama_compat: bool,
 ) -> Arc<ProxyState> {
-  let catalog = ModelCatalog::new();
-  for m in models {
-    catalog.upsert(m).await;
-  }
-  let ctx = MethodContext::with_catalog(ShutdownToken::new(), catalog);
-  ProxyState::from_context(&ctx, ollama_compat, true, DEFAULT_BODY_LIMIT_BYTES)
+  build_state(models, None, ollama_compat, &[]).await
 }
 
 #[allow(dead_code)]
@@ -924,12 +943,7 @@ async fn proxy_state_with_models_and_registry(
   models: Vec<DiscoveredModel>,
   registry: SupervisorRegistry,
 ) -> Arc<ProxyState> {
-  let catalog = ModelCatalog::new();
-  for m in models {
-    catalog.upsert(m).await;
-  }
-  let ctx = MethodContext::with_catalog(ShutdownToken::new(), catalog).with_supervisors(registry);
-  ProxyState::from_context(&ctx, false, true, DEFAULT_BODY_LIMIT_BYTES)
+  build_state(models, Some(registry), false, &[]).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

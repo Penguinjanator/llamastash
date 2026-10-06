@@ -215,28 +215,14 @@ async fn proxy_state_with(
   proxy_state_with_cap(models, supervisors, DEFAULT_BODY_LIMIT_BYTES).await
 }
 
-/// Like [`proxy_state_with`] but with an explicit body cap — the
-/// `proxy.max_body_size` seam the daemon passes through
-/// `from_context_with_auth` in production.
-async fn proxy_state_with_cap(
+/// One build seam for every state in this file: the catalog, the registry it is
+/// served from, the `proxy.max_body_size` cap, and the `proxy.aliases` table. The
+/// daemon hands all of these to `from_context_with_auth`; the wrappers below are
+/// what the tests call.
+async fn build_state(
   models: Vec<DiscoveredModel>,
   supervisors: SupervisorRegistry,
   max_body_size: usize,
-) -> Arc<ProxyState> {
-  let catalog = ModelCatalog::new();
-  for m in models {
-    catalog.upsert(m).await;
-  }
-  let ctx =
-    MethodContext::with_catalog(ShutdownToken::new(), catalog).with_supervisors(supervisors);
-  ProxyState::from_context(&ctx, false, true, max_body_size)
-}
-
-/// Like [`proxy_state_with`] but with a `proxy.aliases` map, which the daemon
-/// passes through `from_context_with_auth` in production.
-async fn proxy_state_with_aliases(
-  models: Vec<DiscoveredModel>,
-  supervisors: SupervisorRegistry,
   aliases: &[(&str, &str)],
 ) -> Arc<ProxyState> {
   let catalog = ModelCatalog::new();
@@ -246,9 +232,32 @@ async fn proxy_state_with_aliases(
   let ctx =
     MethodContext::with_catalog(ShutdownToken::new(), catalog).with_supervisors(supervisors);
   let aliases = llamastash::config::ProxyAliases::from_pairs(
-    aliases.iter().map(|(k, v)| (k.to_string(), v.to_string())),
+    aliases
+      .iter()
+      .map(|(name, target)| (name.to_string(), target.to_string())),
   );
-  ProxyState::from_context_with_auth(&ctx, false, true, None, DEFAULT_BODY_LIMIT_BYTES, &aliases)
+  ProxyState::from_context_with_auth(&ctx, false, true, None, max_body_size, &aliases)
+}
+
+/// Like [`proxy_state_with`] but with an explicit body cap — the
+/// `proxy.max_body_size` seam the daemon passes through
+/// `from_context_with_auth` in production.
+async fn proxy_state_with_cap(
+  models: Vec<DiscoveredModel>,
+  supervisors: SupervisorRegistry,
+  max_body_size: usize,
+) -> Arc<ProxyState> {
+  build_state(models, supervisors, max_body_size, &[]).await
+}
+
+/// Like [`proxy_state_with`] but with a `proxy.aliases` map, which the daemon
+/// passes through `from_context_with_auth` in production.
+async fn proxy_state_with_aliases(
+  models: Vec<DiscoveredModel>,
+  supervisors: SupervisorRegistry,
+  aliases: &[(&str, &str)],
+) -> Arc<ProxyState> {
+  build_state(models, supervisors, DEFAULT_BODY_LIMIT_BYTES, aliases).await
 }
 
 /// Send an HTTP GET and read the response head + body. Returns

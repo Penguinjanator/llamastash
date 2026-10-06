@@ -33,15 +33,26 @@ pub(crate) struct AliasTable {
   warned: RwLock<HashSet<String>>,
 }
 
-/// One spelling for every stored alias name: model references already resolve
+/// One spelling for a stored alias name: model references already resolve
 /// case-insensitively, so one config entry has to answer to any client casing.
+/// Reads fold case in place against these keys instead of calling this per
+/// request.
 fn normalize(name: &str) -> String {
   name.trim().to_ascii_lowercase()
 }
 
-/// The `kind` tag `note_overrides_partial` claims, so a caller can check
-/// [`AliasTable::report_pending`] before paying for the resolve that feeds it.
-pub(crate) const REPORT_PARTIAL: &str = "partial";
+// The kinds a report can be, and therefore the ways one alias name can be
+// reported about without swallowing itself.
+const KIND_SHADOW: &str = "shadow";
+const KIND_PARTIAL: &str = "partial";
+const KIND_AMBIGUOUS: &str = "ambiguous";
+const KIND_DEAD: &str = "dead";
+const KIND_CHAIN: &str = "chain";
+
+/// The `KIND_PARTIAL` tag, exported so a caller can ask
+/// [`AliasTable::report_pending`] before paying for the catalog pass that feeds
+/// the report.
+pub(crate) const REPORT_PARTIAL: &str = KIND_PARTIAL;
 
 impl AliasTable {
   /// The table behind `proxy.aliases`, in the order the file lists the entries.
@@ -80,50 +91,84 @@ impl AliasTable {
   /// The model reference `requested` stands in for, or `None` when it is not an
   /// alias.
   pub(crate) fn target(&self, requested: &str) -> Option<&str> {
+    self.lookup(requested).map(|(_, target)| target.as_str())
+  }
+
+  /// The entry a client's string means, if it means one at all. Nearly every
+  /// request asks and gets "no", so the comparison folds case in place instead of
+  /// building a lowercased copy of the name first.
+  fn lookup(&self, requested: &str) -> Option<&(String, String)> {
     if self.targets.is_empty() {
       return None;
     }
-    let key = normalize(requested);
+    let name = requested.trim();
     self
       .targets
       .iter()
-      .find(|(name, _)| *name == key)
-      .map(|(_, target)| target.as_str())
+      .find(|(key, _)| key.eq_ignore_ascii_case(name))
   }
 
-  /// Note that `requested` reached a real model even though it is also an alias
-  /// name. Returns `true` on the first such report, which is the only one worth
-  /// logging.
-  pub(crate) fn note_shadowed(&self, requested: &str) -> bool {
-    self.note_as_alias(requested, "shadow")
+  /// A real model owns `requested`, so the alias of that name never answers. The
+  /// client gets the model it named, which is right, so this is a note about the
+  /// config rather than about the request.
+  pub(crate) fn warn_shadowed(&self, requested: &str) -> bool {
+    let first = self.note_as_alias(requested, KIND_SHADOW);
+    if first {
+      log::warn!(
+        "proxy.aliases: `{requested}` names a model that exists, so that model is used and the alias is not"
+      );
+    }
+    first
   }
 
-  /// Note that the alias `requested` also reaches a model on its own by partial
-  /// match, so adding it moved clients that were already working. Returns `true`
-  /// on the first such report.
-  pub(crate) fn note_overrides_partial(&self, requested: &str) -> bool {
-    self.note_as_alias(requested, "partial")
+  /// The alias won, but `requested` also reached `other` on its own - a longer
+  /// file name that contains it - so clients that were already being served move
+  /// to another model. Worth saying, because nothing in a response shows it.
+  pub(crate) fn warn_moved_partial(&self, requested: &str, target: &str, other: &str) -> bool {
+    let first = self.note_as_alias(requested, KIND_PARTIAL);
+    if first {
+      log::warn!(
+        "proxy.aliases: `{requested}` names `{target}`, but it also matched `{other}` on its own; the alias is used"
+      );
+    }
+    first
   }
 
-  /// Note that an alias target matches more than one model, which is a mistake
-  /// only the operator can fix: the client sending that name cannot refine it.
-  /// Returns `true` on the first such report.
-  pub(crate) fn note_ambiguous_target(&self, requested: &str) -> bool {
-    self.note_as_alias(requested, "ambiguous")
+  /// Two or more models answer to the alias's value. Naming one is the operator's
+  /// call, and the client sending the alias name has no way to settle it.
+  pub(crate) fn warn_ambiguous_target(&self, requested: &str, target: &str) -> bool {
+    let first = self.note_as_alias(requested, KIND_AMBIGUOUS);
+    if first {
+      log::warn!(
+        "proxy.aliases: `{requested}` points at `{target}`, which matches more than one model; name one of them"
+      );
+    }
+    first
   }
 
-  /// Note that the alias `requested` points at a reference the catalog has no
-  /// model for under its own name, so every request under that alias name is
-  /// going to 404. Returns `true` on the first such report.
-  pub(crate) fn note_dead_target(&self, requested: &str) -> bool {
-    self.note_as_alias(requested, "target")
+  /// The alias's value names no model, so every request under that name is going
+  /// to miss until the config changes.
+  pub(crate) fn warn_dead_target(&self, requested: &str, target: &str) -> bool {
+    let first = self.note_as_alias(requested, KIND_DEAD);
+    if first {
+      log::warn!(
+        "proxy.aliases: `{requested}` points at `{target}`, which names no model on its own; give a full name or a path"
+      );
+    }
+    first
   }
 
-  /// Note that the alias `requested` points at another alias name that names no
-  /// model, which is a chain nobody can follow. Returns `true` on the first such
-  /// report.
-  pub(crate) fn note_points_at_alias(&self, requested: &str) -> bool {
-    self.note_as_alias(requested, "chain")
+  /// The alias's value is another alias name, which is a chain that reaches no
+  /// model. When the same string is also a real model, that model answered
+  /// instead and this was never reached.
+  pub(crate) fn warn_points_at_alias(&self, requested: &str, target: &str) -> bool {
+    let first = self.note_as_alias(requested, KIND_CHAIN);
+    if first {
+      log::warn!(
+        "proxy.aliases: `{requested}` points at `{target}`, which is another alias name; name the model instead"
+      );
+    }
+    first
   }
 
   /// True when `kind` has not been reported for this alias name yet, without
@@ -149,19 +194,10 @@ impl AliasTable {
     }
   }
 
-  /// The warning key for `requested` if it names a configured alias. Keys are
-  /// stored normalized, so the comparison folds case in place: every routed
-  /// request asks this at least once, and building a lowercased copy per request
-  /// to answer "no" is the common case by far.
+  /// The warning key for `requested`, when it names a configured alias.
   fn report_key(&self, requested: &str, kind: &str) -> Option<String> {
-    if self.targets.is_empty() {
-      return None;
-    }
-    let name = requested.trim();
     self
-      .targets
-      .iter()
-      .find(|(key, _)| key.eq_ignore_ascii_case(name))
+      .lookup(requested)
       .map(|(key, _)| format!("{kind} {key}"))
   }
 
@@ -207,10 +243,13 @@ mod tests {
   #[test]
   fn shadow_is_reported_once_per_name() {
     let t = table(&[("gpt-4o-mini", "qwen3.8-27b")]);
-    assert!(!t.note_shadowed("some-real-model"), "not an alias name");
-    assert!(t.note_shadowed("gpt-4o-mini"));
     assert!(
-      !t.note_shadowed("GPT-4o-MINI"),
+      !t.report_pending("some-real-model", REPORT_PARTIAL),
+      "a name that is not an alias has nothing to report"
+    );
+    assert!(t.warn_shadowed("gpt-4o-mini"));
+    assert!(
+      !t.warn_shadowed("GPT-4o-MINI"),
       "the same name must not warn twice"
     );
   }
@@ -218,16 +257,16 @@ mod tests {
   #[test]
   fn a_dead_alias_target_is_reported_once_and_apart_from_a_shadow() {
     let t = table(&[("gpt-4o-mini", "qwen3.8-27b")]);
-    assert!(!t.note_dead_target("some-real-model"), "not an alias name");
-    assert!(t.note_dead_target("gpt-4o-mini"));
+    assert!(!t.report_pending("some-real-model", REPORT_PARTIAL));
+    assert!(t.warn_dead_target("gpt-4o-mini", "qwen3.8-27b"));
     assert!(
-      !t.note_dead_target("GPT-4o-Mini"),
+      !t.warn_dead_target("GPT-4o-Mini", "qwen3.8-27b"),
       "the same name must not warn twice"
     );
     // A name can be shadowed once and its dead target reported once: two
     // different problems, so neither swallows the other.
-    assert!(t.note_shadowed("gpt-4o-mini"));
-    assert!(!t.note_shadowed("gpt-4o-mini"), "the shadow warns once too");
+    assert!(t.warn_shadowed("gpt-4o-mini"));
+    assert!(!t.warn_shadowed("gpt-4o-mini"), "the shadow warns once too");
   }
 
   #[test]
@@ -251,10 +290,10 @@ mod tests {
   #[test]
   fn a_chain_is_reported_once_and_apart_from_a_dead_target() {
     let t = table(&[("a", "b")]);
-    assert!(t.note_points_at_alias("a"));
-    assert!(!t.note_points_at_alias("a"));
+    assert!(t.warn_points_at_alias("a", "b"));
+    assert!(!t.warn_points_at_alias("a", "b"));
     assert!(
-      t.note_dead_target("a"),
+      t.warn_dead_target("a", "b"),
       "a chain and a dead target are different problems"
     );
   }
@@ -262,10 +301,10 @@ mod tests {
   #[test]
   fn an_ambiguous_target_is_reported_once() {
     let t = table(&[("gpt-4o-mini", "qwen")]);
-    assert!(t.note_ambiguous_target("gpt-4o-mini"));
-    assert!(!t.note_ambiguous_target("gpt-4o-mini"));
+    assert!(t.warn_ambiguous_target("gpt-4o-mini", "qwen"));
+    assert!(!t.warn_ambiguous_target("gpt-4o-mini", "qwen"));
     assert!(
-      t.note_dead_target("gpt-4o-mini"),
+      t.warn_dead_target("gpt-4o-mini", "qwen"),
       "an ambiguous target and a dead one are different problems"
     );
   }
@@ -274,29 +313,29 @@ mod tests {
   fn every_kind_of_report_survives_an_alias_named_like_another_kind_of_key() {
     // The reports share one set, so they are keyed by kind as well as by name.
     let t = table(&[("target qwen", "alpha"), ("partial qwen", "alpha")]);
-    assert!(t.note_dead_target("target qwen"));
+    assert!(t.warn_dead_target("target qwen", "alpha"));
     assert!(
-      t.note_shadowed("target qwen"),
+      t.warn_shadowed("target qwen"),
       "the dead-target report must not spend the shadow one"
     );
-    assert!(t.note_overrides_partial("partial qwen"));
-    assert!(t.note_shadowed("partial qwen"));
+    assert!(t.warn_moved_partial("partial qwen", "alpha", "other.gguf"));
+    assert!(t.warn_shadowed("partial qwen"));
   }
 
   #[test]
   fn an_alias_overriding_a_working_partial_match_is_reported_once() {
     let t = table(&[("gpt-4o-mini", "qwen3.8-27b")]);
     assert!(
-      !t.note_overrides_partial("some-real-model"),
+      !t.warn_moved_partial("some-real-model", "qwen3.8-27b", "other.gguf"),
       "not an alias name"
     );
-    assert!(t.note_overrides_partial("gpt-4o-mini"));
+    assert!(t.warn_moved_partial("gpt-4o-mini", "qwen3.8-27b", "other.gguf"));
     assert!(
-      !t.note_overrides_partial("GPT-4o-Mini"),
+      !t.warn_moved_partial("GPT-4o-Mini", "qwen3.8-27b", "other.gguf"),
       "the same name must not warn twice"
     );
     assert!(
-      t.note_shadowed("gpt-4o-mini"),
+      t.warn_shadowed("gpt-4o-mini"),
       "a third kind of report is not swallowed by this one"
     );
   }
@@ -307,8 +346,8 @@ mod tests {
     // asks whether a name is one of them.
     let t = table(&[]);
     assert!(!t.report_pending("anything", REPORT_PARTIAL));
-    assert!(!t.note_shadowed("anything"));
-    assert!(!t.note_dead_target("anything"));
+    assert!(!t.warn_shadowed("anything"));
+    assert!(!t.warn_dead_target("anything", "wherever"));
   }
 
   #[test]
@@ -318,7 +357,7 @@ mod tests {
     let t = table(&[("gpt-4o-mini", "qwen3.8-27b")]);
     assert!(!t.report_pending("some-real-model", REPORT_PARTIAL));
     assert!(t.report_pending("gpt-4o-mini", REPORT_PARTIAL));
-    assert!(t.note_overrides_partial("gpt-4o-mini"));
+    assert!(t.warn_moved_partial("gpt-4o-mini", "qwen3.8-27b", "other.gguf"));
     assert!(
       !t.report_pending("gpt-4o-mini", REPORT_PARTIAL),
       "spent reports are not asked about again"
@@ -349,6 +388,6 @@ mod tests {
   fn an_empty_table_answers_nothing_and_never_warns() {
     let t = AliasTable::from_config(&crate::config::ProxyAliases::default());
     assert_eq!(t.target("anything"), None);
-    assert!(!t.note_shadowed("anything"));
+    assert!(!t.warn_shadowed("anything"));
   }
 }

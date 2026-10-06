@@ -433,14 +433,11 @@ fn resolve_reference(
 ) -> Result<CatalogRow, ClientRefMiss> {
   match crate::launch::resolve::resolve_exact_reference(rows, reference) {
     Ok(row) => {
-      if state.aliases.note_shadowed(reference) {
-        log::warn!(
-          "proxy.aliases: `{reference}` names a model that exists, so that model is used and the alias is not"
-        );
-      }
+      state.aliases.warn_shadowed(reference);
       return Ok(row);
     }
-    // No outright model under this name, so an alias of it is next.
+    // No outright model under this name, so an alias of it is next. A name two
+    // models share counts as no outright model: that is what the alias settles.
     Err(ResolveError::None) | Err(ResolveError::Many(_)) => {}
     Err(ResolveError::Empty) => return Err(ClientRefMiss::NotFound),
   }
@@ -449,11 +446,7 @@ fn resolve_reference(
     return resolve_aliased_reference(state, rows, reference, target);
   }
 
-  match resolve_model_with_candidates(rows, reference) {
-    Ok(row) => Ok(row),
-    Err(ResolveError::Many(candidates)) => Err(ambiguous(rows, candidates)),
-    Err(_) => Err(ClientRefMiss::NotFound),
-  }
+  resolve_model_with_candidates(rows, reference).map_err(|err| client_miss(rows, err))
 }
 
 /// The alias half of [`resolve_reference`]. The target has to name one model
@@ -472,31 +465,21 @@ fn resolve_aliased_reference(
       note_moved_partial(state, rows, reference, target, &row);
       Ok(row)
     }
-    // A target that names no model outright has three readings and each gets said
-    // rather than the generic line: several models answer to it, it is another
-    // alias name and the chain reaches nothing, or it matches only as a substring.
-    Err(ResolveError::Many(candidates)) => {
-      Err(ambiguous_target(state, rows, reference, target, candidates))
-    }
+    Err(err @ ResolveError::Many(_)) => Err(aliased_ambiguous(state, rows, reference, target, err)),
+    // The target named no model outright. Two readings are left and each gets
+    // said rather than the generic line: it is another alias name, so the chain
+    // reaches nothing, or several models answer to it once the rungs loosen.
     Err(ResolveError::None | ResolveError::Empty) => {
       if state.aliases.target(target).is_some() {
-        if state.aliases.note_points_at_alias(reference) {
-          log::warn!(
-            "proxy.aliases: `{reference}` points at `{target}`, which is another alias name; name the model instead"
-          );
-        }
+        state.aliases.warn_points_at_alias(reference, target);
         return Err(ClientRefMiss::NotFound);
       }
       match resolve_model_with_candidates(rows, target) {
-        Err(ResolveError::Many(candidates)) => {
-          Err(ambiguous_target(state, rows, reference, target, candidates))
+        Err(err @ ResolveError::Many(_)) => {
+          Err(aliased_ambiguous(state, rows, reference, target, err))
         }
         _ => {
-          if state.aliases.note_dead_target(reference) {
-            log::warn!(
-              "proxy.aliases: `{reference}` points at `{target}`, which names no model on its own; give a full name or a path"
-            );
-          }
+          state.aliases.warn_dead_target(reference, target);
           Err(ClientRefMiss::NotFound)
         }
       }
@@ -504,28 +487,36 @@ fn resolve_aliased_reference(
   }
 }
 
-/// A value two or more models answer to, reported the way any ambiguous reference
-/// is: the candidate list a client would have to send to settle it. Naming one is
-/// the operator's call, so the proxy does not make it.
-fn ambiguous_target(
+/// A value two or more models answer to, which is a mistake only the operator can
+/// fix: said as an ambiguous target and answered with the candidate list any
+/// ambiguous reference gets.
+fn aliased_ambiguous(
   state: &ProxyState,
   rows: &[CatalogRow],
   reference: &str,
   target: &str,
-  candidates: Vec<CatalogRow>,
+  error: ResolveError,
 ) -> ClientRefMiss {
-  if state.aliases.note_ambiguous_target(reference) {
-    log::warn!(
-      "proxy.aliases: `{reference}` points at `{target}`, which matches more than one model; name one of them"
-    );
+  state.aliases.warn_ambiguous_target(reference, target);
+  client_miss(rows, error)
+}
+
+/// What a failed resolve means to the client: a candidate list when several models
+/// answered, a plain miss when none did. Both tiers are consulted for a client's
+/// own name and for an alias's value, so this is decoded in one place.
+fn client_miss(rows: &[CatalogRow], error: ResolveError) -> ClientRefMiss {
+  match error {
+    ResolveError::Many(candidates) => {
+      ClientRefMiss::Ambiguous(crate::launch::resolve::published_ids_for(rows, &candidates))
+    }
+    _ => ClientRefMiss::NotFound,
   }
-  ambiguous(rows, candidates)
 }
 
 /// The alias won, but the same string also reached a model on its own - a longer
 /// file name that contains it - so clients that were already being served move to
-/// another model. Worth one line in the log, and asked only while that line is
-/// still unspent, because answering it costs a second pass over the catalog.
+/// another model. Asked only while that line is still unspent, because answering it
+/// costs the second pass over the catalog.
 fn note_moved_partial(
   state: &ProxyState,
   rows: &[CatalogRow],
@@ -540,19 +531,12 @@ fn note_moved_partial(
     return;
   }
   if let Ok(other) = resolve_model_with_candidates(rows, reference) {
-    if other.path != row.path && state.aliases.note_overrides_partial(reference) {
-      log::warn!(
-        "proxy.aliases: `{reference}` names `{target}`, but it also matched `{}` on its own; the alias is used",
-        other.name()
-      );
+    if other.path != row.path {
+      state
+        .aliases
+        .warn_moved_partial(reference, target, &other.name());
     }
   }
-}
-
-/// The published ids of a candidate set, which is what a client has to send to
-/// stop being ambiguous.
-fn ambiguous(rows: &[CatalogRow], candidates: Vec<CatalogRow>) -> ClientRefMiss {
-  ClientRefMiss::Ambiguous(crate::launch::resolve::published_ids_for(rows, &candidates))
 }
 
 /// Which of several Ready launches of one model a request goes to: an unnamed
