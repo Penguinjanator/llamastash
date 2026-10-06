@@ -26,13 +26,16 @@ use crate::launch::resolve::{CatalogRow, MtpCapability};
 /// rows (what the `list_models` IPC handler, which serialises them
 /// anyway, wants); the proxy hot path instead takes a shared [`Arc`] of a
 /// pre-built view, so a request costs one
-/// refcount bump instead of one allocation per row per request
-/// (R-08). The views are rebuilt on write, and the only production writer is
-/// the discovery task's per-scan [`ModelCatalog::replace_all`] — a write pays
-/// the rebuild so the hot read does not, and `rows` is a projection of the
-/// metadata the resolver reads, not a second copy of every row's templates.
-/// [`Self::upsert`] and [`Self::remove`] rebuild per call and so are for
-/// single-row test and dev use, not a per-model production path.
+/// refcount bump instead of one allocation per row per request. The views are
+/// rebuilt on write, and the only production writer is the discovery task's
+/// per-scan [`ModelCatalog::replace_all`] — a write pays the rebuild so the hot
+/// read does not, and `rows` is a projection of the metadata the resolver reads,
+/// not a second copy of every row's templates. [`Self::upsert`] and
+/// [`Self::remove`] rebuild per call and so are for single-row test and dev use,
+/// not a per-model production path. What a shared view costs is that a row sits
+/// in the map and in the view until the next rebuild: memory in proportion to how
+/// many models are on disk, never time on the request path. If that ever matters
+/// the fix is an `Arc` per row rather than a second `Vec`.
 #[derive(Debug, Clone, Default)]
 pub struct ModelCatalog {
   inner: Arc<RwLock<CatalogSlot>>,
@@ -109,7 +112,7 @@ impl ModelCatalog {
   }
 
   /// Shared, path-ordered row view. A clone is one refcount bump, so a
-  /// proxy request can read the whole catalog without copying it (R-08).
+  /// proxy request can read the whole catalog without copying it.
   pub async fn shared_view(&self) -> Arc<Vec<DiscoveredModel>> {
     self.inner.read().await.view.clone()
   }

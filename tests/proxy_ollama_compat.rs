@@ -588,9 +588,9 @@ async fn api_show_an_alias_may_name_a_path() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn api_show_an_alias_pointing_at_another_alias_is_refused_at_load() {
-  // `hardwired -> y` could only be resolved as a substring of some unrelated row,
-  // so the model the operator named through `y` is never reached.
+async fn api_show_an_alias_pointing_at_another_alias_is_refused() {
+  // `hardwired -> y` reaches no model of its own; following `y` would be a chain,
+  // and a chain names no model.
   let models = vec![
     make_model(
       "/m/realmodel.gguf",
@@ -609,7 +609,7 @@ async fn api_show_an_alias_pointing_at_another_alias_is_refused_at_load() {
   let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
 
   let (status, _) = http_post(addr, "/api/show", r#"{"model":"hardwired"}"#).await;
-  assert_eq!(status, 404, "the chain is dropped, not followed");
+  assert_eq!(status, 404, "the chain is refused, not followed");
   let (status, body) = http_post(addr, "/api/show", r#"{"model":"y"}"#).await;
   assert_eq!(
     status, 200,
@@ -617,6 +617,93 @@ async fn api_show_an_alias_pointing_at_another_alias_is_refused_at_load() {
   );
   let v: Value = serde_json::from_slice(&body).expect("json body");
   assert_eq!(v["details"]["family"], "llama");
+
+  shutdown_listener(shutdown, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_show_an_alias_is_consulted_for_a_launch_address() {
+  // `gpt-4o-mini@coder` is the aliased name plus a launch the client wants. The
+  // alias has to be consulted for the model half, or the string falls through to
+  // a partial match and reaches whichever longer file name contains it.
+  let models = vec![
+    make_model(
+      "/m/gpt-4o-mini-Q4_K_M.gguf",
+      Some("gpt-4o-mini-Q4_K_M"),
+      "llama",
+      ModeHint::Chat,
+    ),
+    make_model(
+      "/m/qwen-coder.gguf",
+      Some("qwen-coder:7b"),
+      "qwen3",
+      ModeHint::Chat,
+    ),
+  ];
+  let state = proxy_state_with_alias(models, ("gpt-4o-mini", "qwen-coder:7b")).await;
+  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+
+  let (status, body) = http_post(addr, "/api/show", r#"{"model":"gpt-4o-mini@coder"}"#).await;
+  assert_eq!(
+    status, 200,
+    "the alias must answer its own address: {status} {body:?}"
+  );
+  let v: Value = serde_json::from_slice(&body).expect("json body");
+  assert_eq!(
+    v["details"]["family"], "qwen3",
+    "the alias target, not the longer file name that contains the name: {body:?}"
+  );
+
+  shutdown_listener(shutdown, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_show_an_alias_value_two_models_answer_to_names_its_candidates() {
+  // Two rows answer to `qwen3-32b`. Naming one is the operator's call, and the
+  // answer says so with the same candidate list a client gets when it sends an
+  // ambiguous name itself.
+  let models = vec![
+    make_model("/m/a/qwen3-32b.gguf", None, "qwen3", ModeHint::Chat),
+    make_model("/m/b/qwen3-32b.gguf", None, "qwen3", ModeHint::Chat),
+  ];
+  let state = proxy_state_with_alias(models, ("gpt-4o-mini", "qwen3-32b")).await;
+  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+
+  let (status, body) = http_post(addr, "/api/show", r#"{"model":"gpt-4o-mini"}"#).await;
+  assert_eq!(
+    status, 400,
+    "an ambiguous value is ambiguity, not a missing model: {status} {body:?}"
+  );
+  let v: Value = serde_json::from_slice(&body).expect("json body");
+  assert_eq!(v["error"]["type"], "ambiguous_model", "{body:?}");
+  assert_eq!(
+    v["error"]["matches"].as_array().map(|m| m.len()),
+    Some(2),
+    "both candidates are named: {body:?}"
+  );
+
+  shutdown_listener(shutdown, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_show_an_alias_value_that_is_a_real_model_wins_over_being_an_alias_name() {
+  // `demo` is both an alias of its own and the id of a real model. An entry that
+  // points at `demo` means the model, so this entry has to survive the table and
+  // resolve.
+  let models = vec![
+    make_model("/m/demo.gguf", Some("demo"), "phi", ModeHint::Chat),
+    make_model("/m/other.gguf", Some("other"), "llama", ModeHint::Chat),
+  ];
+  let state = proxy_state_with_aliases(models, vec![("fast", "demo"), ("demo", "other")]).await;
+  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+
+  let (status, body) = http_post(addr, "/api/show", r#"{"model":"fast"}"#).await;
+  assert_eq!(
+    status, 200,
+    "a value naming a real model resolves: {status} {body:?}"
+  );
+  let v: Value = serde_json::from_slice(&body).expect("json body");
+  assert_eq!(v["details"]["family"], "phi", "{body:?}");
 
   shutdown_listener(shutdown, handle).await;
 }

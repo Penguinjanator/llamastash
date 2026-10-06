@@ -1054,12 +1054,9 @@ mod tests {
     MethodContext::new(ShutdownToken::new())
   }
 
-  /// A config-declared row keys its `last_params` by a backend identity, which
-  /// has no GGUF path. `model_path` was null for it, so the TUI dropped the
-  /// entry from its Recent section and from the launch picker's seed.
-  /// The R-12 path: a header read for a model the catalog has no row for. It
-  /// went onto a blocking thread, so cover that it still answers (and answers
-  /// with the same tuple the sync resolver produced).
+  /// A header read for a model the catalog has no row for went onto a blocking
+  /// thread, so cover that it still answers, and answers with the same tuple the
+  /// sync resolver produced.
   #[tokio::test]
   async fn resolve_model_id_and_arch_reads_the_header_off_the_worker_thread() {
     let dir = crate::test_support::unique_temp_dir("ls-ipc", "header");
@@ -1095,6 +1092,9 @@ mod tests {
     );
   }
 
+  /// A config-declared row keys its `last_params` by a backend identity, which
+  /// has no GGUF path. `model_path` was null for it, so the TUI dropped the
+  /// entry from its Recent section and from the launch picker's seed.
   #[tokio::test]
   async fn last_params_list_names_a_backend_identity_by_its_launch_path() {
     use crate::backend::identity::{BackendModelId, ModelIdentity};

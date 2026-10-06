@@ -16,7 +16,8 @@
 //! - An alias names a model and nothing else. Its target is resolved whole, so
 //!   it cannot pin a launch name or a preset, and a target that only matches a
 //!   model as a substring is refused rather than guessed at. A target that names
-//!   another alias is refused the same way: it can never mean what it looks like.
+//!   another alias is an error, because a chain names no model; when the same
+//!   string is also a real model, that model answers.
 //! - Aliases are not published on `/v1/models` or `/api/tags`, so a listing
 //!   stays one row per model.
 
@@ -46,6 +47,20 @@ fn normalize(name: &str) -> String {
   name.trim().to_ascii_lowercase()
 }
 
+/// A report is about one configured alias name, and one kind of problem, so the
+/// two together are what a once-per-name line is keyed by.
+fn report_key(requested: &str, kind: &str, targets: &[(String, String)]) -> Option<String> {
+  let key = normalize(requested);
+  targets
+    .iter()
+    .any(|(name, _)| *name == key)
+    .then(|| format!("{kind} {key}"))
+}
+
+/// The `kind` tag `note_overrides_partial` claims, so a caller can check
+/// [`AliasTable::report_pending`] before paying for the resolve that feeds it.
+pub(crate) const REPORT_PARTIAL: &str = "partial";
+
 impl AliasTable {
   /// The table behind `proxy.aliases`, in the order the file lists the entries.
   pub(crate) fn from_config(raw: &crate::config::ProxyAliases) -> Self {
@@ -74,22 +89,6 @@ impl AliasTable {
       }
       targets.push((key, target));
     }
-    // A target is a model reference. One that names another alias can only be
-    // resolved as a substring of some unrelated row, so it is refused rather than
-    // sent down that path.
-    let names: Vec<String> = targets.iter().map(|(name, _)| name.clone()).collect();
-    let targets = targets
-      .into_iter()
-      .filter(|(name, target)| {
-        let points_at_alias = names.iter().any(|other| *other == normalize(target));
-        if points_at_alias {
-          log::warn!(
-            "proxy.aliases: ignoring `{name}` — it points at `{target}`, which is another alias name; name the model instead"
-          );
-        }
-        !points_at_alias
-      })
-      .collect();
     Self {
       targets,
       warned: RwLock::new(HashSet::new()),
@@ -138,17 +137,34 @@ impl AliasTable {
     self.note_as_alias(requested, "target")
   }
 
+  /// Note that the alias `requested` points at another alias name that names no
+  /// model, which is a chain nobody can follow. Returns `true` on the first such
+  /// report.
+  pub(crate) fn note_points_at_alias(&self, requested: &str) -> bool {
+    self.note_as_alias(requested, "chain")
+  }
+
+  /// True when `kind` has not been reported for this alias name yet, without
+  /// claiming the report. A caller uses this to skip work that only feeds the
+  /// once-per-name line.
+  pub(crate) fn report_pending(&self, requested: &str, kind: &str) -> bool {
+    match report_key(requested, kind, &self.targets) {
+      Some(key) => self
+        .warned
+        .read()
+        .map(|seen| !seen.contains(&key))
+        .unwrap_or(false),
+      None => false,
+    }
+  }
+
   /// Every report is about a configured alias name, and each kind gets its own
   /// prefix so two problems about one name cannot swallow each other.
   fn note_as_alias(&self, requested: &str, kind: &str) -> bool {
-    if self.targets.is_empty() {
-      return false;
+    match report_key(requested, kind, &self.targets) {
+      Some(key) => self.note_once(key),
+      None => false,
     }
-    let key = normalize(requested);
-    if !self.targets.iter().any(|(name, _)| *name == key) {
-      return false;
-    }
-    self.note_once(format!("{kind} {key}"))
   }
 
   /// First call for this key wins, for the whole daemon.
@@ -225,16 +241,24 @@ mod tests {
   }
 
   #[test]
-  fn an_alias_pointing_at_another_alias_is_refused() {
-    // `hardwired -> y` could only ever be resolved as a substring of some
-    // unrelated row, so the model named by `y` never gets reached.
+  fn an_alias_pointing_at_another_alias_stays_in_the_table() {
+    // The refusal belongs to resolution, not to the table: `hardwired -> y` names
+    // no model, but `y` may still be a name a real model answers to, and dropping
+    // the entry here would take that away too.
     let t = table(&[("hardwired", "y"), ("y", "realmodel")]);
-    assert_eq!(t.target("hardwired"), None);
+    assert_eq!(t.target("hardwired"), Some("y"));
     assert_eq!(t.target("y"), Some("realmodel"));
-    // Forward and backward references are both chains.
-    let cycle = table(&[("a", "b"), ("b", "a")]);
-    assert_eq!(cycle.target("a"), None);
-    assert_eq!(cycle.target("b"), None);
+  }
+
+  #[test]
+  fn a_chain_is_reported_once_and_apart_from_a_dead_target() {
+    let t = table(&[("a", "b")]);
+    assert!(t.note_points_at_alias("a"));
+    assert!(!t.note_points_at_alias("a"));
+    assert!(
+      t.note_dead_target("a"),
+      "a chain and a dead target are different problems"
+    );
   }
 
   #[test]
@@ -276,6 +300,20 @@ mod tests {
     assert!(
       t.note_shadowed("gpt-4o-mini"),
       "a third kind of report is not swallowed by this one"
+    );
+  }
+
+  #[test]
+  fn a_report_is_pending_until_it_is_made() {
+    // The caller pays a catalog pass to answer the override question, so it asks
+    // first whether the line is still unspent.
+    let t = table(&[("gpt-4o-mini", "qwen3.8-27b")]);
+    assert!(!t.report_pending("some-real-model", REPORT_PARTIAL));
+    assert!(t.report_pending("gpt-4o-mini", REPORT_PARTIAL));
+    assert!(t.note_overrides_partial("gpt-4o-mini"));
+    assert!(
+      !t.report_pending("gpt-4o-mini", REPORT_PARTIAL),
+      "spent reports are not asked about again"
     );
   }
 
