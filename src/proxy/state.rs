@@ -100,9 +100,9 @@ pub struct ProxyState {
   pub(crate) max_body_size: usize,
   /// `proxy.aliases`: client names that stand in for a local model. Built
   /// once at daemon startup from `config.yaml`; read-only thereafter. See
-  /// [`super::alias`].
-  /// Behind an `Arc` like the rest of this struct's fields: the table is
-  /// per-daemon and immutable, and a connection clones this struct.
+  /// [`super::alias`]. Behind an `Arc`, like the other per-daemon fields here,
+  /// so a `ProxyState` clone shares one table and one warn set rather than
+  /// starting a fresh one.
   pub(crate) aliases: Arc<super::alias::AliasTable>,
 }
 

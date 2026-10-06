@@ -68,8 +68,10 @@ impl ModelCatalog {
     Self::default()
   }
 
-  /// Insert or replace a model by its canonical path. Used by the
-  /// discovery task as each `DiscoveredModel` streams in.
+  /// Insert or replace a model by its canonical path, rebuilding the shared
+  /// views. A single row costs a whole rebuild, so this is test surface; the
+  /// discovery task writes the whole set at once with [`Self::replace_all`],
+  /// including on a watcher event and on the periodic backstop rescan.
   pub async fn upsert(&self, model: DiscoveredModel) {
     let key = model.path.clone();
     let mut slot = self.inner.write().await;
@@ -77,8 +79,9 @@ impl ModelCatalog {
     slot.rebuild();
   }
 
-  /// Drop a model by canonical path. Called by the watcher path when
-  /// a `.gguf` is deleted under a watched root.
+  /// Drop a model by canonical path, rebuilding the shared views. No production
+  /// path calls this: a file that disappears simply stops appearing in the next
+  /// rescan. Same per-call cost as [`Self::upsert`].
   pub async fn remove(&self, path: &Path) {
     let mut slot = self.inner.write().await;
     slot.models.remove(path);

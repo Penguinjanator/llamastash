@@ -362,24 +362,15 @@ pub struct ProxyConfig {
   /// Names that stand in for a local model, so a tool with a hard-coded model
   /// name needs no edit of its own config: `gpt-4o-mini: qwen3.8-27b-q8` answers
   /// a request for `gpt-4o-mini` with that model. A value is any model reference
-  /// `llamastash list` shows — a plain name, a repo-qualified id, or a full path
-  /// — resolved exactly as a reference a person types is resolved.
+  /// `llamastash list` shows, resolved exactly as a client's reference is
+  /// resolved. `docs/usage.md` (Model ids on the proxy) is the copy a user reads;
+  /// in short, an alias is consulted only when the name the client sent names no
+  /// model outright, and its value has to name exactly one model.
   ///
-  /// Written either as a map of `name: target` or as a list of
-  /// `- name:` / `target:` entries, which is the form that keeps comments next to
-  /// each entry. Both spellings decode to [`ProxyAliases`], and both keep the
-  /// order they appear in, so a repeated name resolves to the last entry.
-  ///
-  /// Three rules, all so an alias can never surprise a client:
-  /// - A reference that names a model outright wins over an alias of the same
-  ///   name, so an alias can never hide a model that really claims that name. A
-  ///   name that only *contains* the alias, or that two models share, does not
-  ///   own it: there the alias is the tie-break. The daemon logs one warning the
-  ///   first time an alias is shadowed this way.
-  /// - An alias names a model, nothing else. It cannot pin a launch name or a
-  ///   preset, so a client that wants one sends `<model>@<name>` itself.
-  /// - Aliases are not listed on `/v1/models` or `/api/tags`, which stay one row
-  ///   per model.
+  /// Written either as a map of `name: target` or as a list of `- name:` /
+  /// `target:` entries, which is the spelling that carries a comment per entry.
+  /// Both decode to [`ProxyAliases`] and keep the order they appear in, so a
+  /// repeated name resolves to the last entry. Names match case-insensitively.
   ///
   /// Sources — CLI: (none) · Env: (none).
   #[serde(default)]

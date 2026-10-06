@@ -1,34 +1,26 @@
 //! `proxy.aliases`: a name a client is hard-wired to, standing in for a local
 //! model. A tool that ships `gpt-4o-mini` in its own config can reach a local
-//! model without a config edit.
+//! model without a config edit. `docs/usage.md` (Model ids on the proxy) is the
+//! copy a user reads; this module is what enforces it, together with
+//! [`crate::proxy::route::resolve_client_reference`], where the table is
+//! consulted.
 //!
 //! The table is built once at daemon start from `config.yaml` and never changes
-//! while the daemon runs, so lookups are read-only. The rules the config page
-//! documents:
-//!
-//! - A reference that names a model outright wins. An alias is consulted when the
-//!   string the client sent does not name a model on its own (see
-//!   [`crate::proxy::route::resolve_client_reference`]), so an alias can never
-//!   hide a model that really claims that name — but it does beat a partial match
-//!   and a name two models share, which is why it was written. A shadowed alias
-//!   logs one warning the first time it is shadowed, and an alias pointing at
-//!   nothing logs once the first time a request hits it.
-//! - An alias names a model and nothing else. Its target is resolved whole, so
-//!   it cannot pin a launch name or a preset, and a target that only matches a
-//!   model as a substring is refused rather than guessed at. A target that names
-//!   another alias is an error, because a chain names no model; when the same
-//!   string is also a real model, that model answers.
-//! - Aliases are not published on `/v1/models` or `/api/tags`, so a listing
-//!   stays one row per model.
+//! while the daemon runs, so lookups are read-only. Every problem it can report
+//! — a name a real model owns, a value that names no model, a value that is
+//! another alias name, an alias that moves a working partial match — is logged
+//! once per name through [`AliasTable::note_once`], keyed by kind so two problems
+//! about one name cannot swallow each other.
 
 use std::collections::HashSet;
 use std::sync::RwLock;
 
 /// Client name → model reference, plus the warnings already logged about it.
 ///
-/// One table per daemon, held behind an `Arc` on `ProxyState` so a connection
-/// cloning that struct shares it. That sharing is what makes "one line per
-/// problem" true: a table copied per connection would warn again for each copy.
+/// One table per daemon, held behind an `Arc` because `ProxyState` derives
+/// `Clone` and every per-daemon field on it is shared rather than copied. The
+/// warn set has to be one object process-wide for "one line per problem" to hold,
+/// which a by-value field on a cloneable struct would not give.
 #[derive(Debug, Default)]
 pub(crate) struct AliasTable {
   /// `(name, model reference)` in config order, names already through
@@ -41,20 +33,10 @@ pub(crate) struct AliasTable {
   warned: RwLock<HashSet<String>>,
 }
 
-/// One spelling for every alias name: model references already resolve
+/// One spelling for every stored alias name: model references already resolve
 /// case-insensitively, so one config entry has to answer to any client casing.
 fn normalize(name: &str) -> String {
   name.trim().to_ascii_lowercase()
-}
-
-/// A report is about one configured alias name, and one kind of problem, so the
-/// two together are what a once-per-name line is keyed by.
-fn report_key(requested: &str, kind: &str, targets: &[(String, String)]) -> Option<String> {
-  let key = normalize(requested);
-  targets
-    .iter()
-    .any(|(name, _)| *name == key)
-    .then(|| format!("{kind} {key}"))
 }
 
 /// The `kind` tag `note_overrides_partial` claims, so a caller can check
@@ -148,7 +130,7 @@ impl AliasTable {
   /// claiming the report. A caller uses this to skip work that only feeds the
   /// once-per-name line.
   pub(crate) fn report_pending(&self, requested: &str, kind: &str) -> bool {
-    match report_key(requested, kind, &self.targets) {
+    match self.report_key(requested, kind) {
       Some(key) => self
         .warned
         .read()
@@ -161,10 +143,26 @@ impl AliasTable {
   /// Every report is about a configured alias name, and each kind gets its own
   /// prefix so two problems about one name cannot swallow each other.
   fn note_as_alias(&self, requested: &str, kind: &str) -> bool {
-    match report_key(requested, kind, &self.targets) {
+    match self.report_key(requested, kind) {
       Some(key) => self.note_once(key),
       None => false,
     }
+  }
+
+  /// The warning key for `requested` if it names a configured alias. Keys are
+  /// stored normalized, so the comparison folds case in place: every routed
+  /// request asks this at least once, and building a lowercased copy per request
+  /// to answer "no" is the common case by far.
+  fn report_key(&self, requested: &str, kind: &str) -> Option<String> {
+    if self.targets.is_empty() {
+      return None;
+    }
+    let name = requested.trim();
+    self
+      .targets
+      .iter()
+      .find(|(key, _)| key.eq_ignore_ascii_case(name))
+      .map(|(key, _)| format!("{kind} {key}"))
   }
 
   /// First call for this key wins, for the whole daemon.
@@ -301,6 +299,16 @@ mod tests {
       t.note_shadowed("gpt-4o-mini"),
       "a third kind of report is not swallowed by this one"
     );
+  }
+
+  #[test]
+  fn an_empty_table_has_nothing_to_report() {
+    // The common case: no aliases configured, and every routed request still
+    // asks whether a name is one of them.
+    let t = table(&[]);
+    assert!(!t.report_pending("anything", REPORT_PARTIAL));
+    assert!(!t.note_shadowed("anything"));
+    assert!(!t.note_dead_target("anything"));
   }
 
   #[test]

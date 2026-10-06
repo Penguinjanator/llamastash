@@ -431,12 +431,6 @@ fn resolve_reference(
   rows: &[CatalogRow],
   reference: &str,
 ) -> Result<CatalogRow, ClientRefMiss> {
-  // The published ids of a candidate set, which is what a client has to send to
-  // stop being ambiguous.
-  let ambiguous = |candidates: Vec<CatalogRow>| {
-    ClientRefMiss::Ambiguous(crate::launch::resolve::published_ids_for(rows, &candidates))
-  };
-
   match crate::launch::resolve::resolve_exact_reference(rows, reference) {
     Ok(row) => {
       if state.aliases.note_shadowed(reference) {
@@ -447,88 +441,118 @@ fn resolve_reference(
       return Ok(row);
     }
     // No outright model under this name, so an alias of it is next.
-    Err(ResolveError::None) => {}
-    Err(ResolveError::Many(_)) => {}
+    Err(ResolveError::None) | Err(ResolveError::Many(_)) => {}
     Err(ResolveError::Empty) => return Err(ClientRefMiss::NotFound),
   }
 
   if let Some(target) = state.aliases.target(reference) {
-    // An alias is written once and never looked at again, and the client sending
-    // its name cannot refine it, so the target has to name one model outright: a
-    // path, a file name, a published id or a repo-qualified id. Answering a loose
-    // target with a substring match would auto-start whichever row happened to
-    // contain it, and nothing downstream could tell that was not the model named.
-    return match crate::launch::resolve::resolve_exact_reference(rows, target) {
-      Ok(row) => {
-        // The alias won. If the same string also reached a model on its own — a
-        // longer file name that contains it — clients that were already being
-        // served move to another model, which is worth one line in the log.
-        // Asked only while that line is still unspent, because answering it costs
-        // a second pass over the catalog.
-        if state
-          .aliases
-          .report_pending(reference, super::alias::REPORT_PARTIAL)
-        {
-          if let Ok(other) = resolve_model_with_candidates(rows, reference) {
-            if other.path != row.path && state.aliases.note_overrides_partial(reference) {
-              log::warn!(
-                "proxy.aliases: `{reference}` names `{target}`, but it also matched `{}` on its own; the alias is used",
-                other.name()
-              );
-            }
-          }
-        }
-        Ok(row)
-      }
-      Err(ResolveError::Many(candidates)) => {
-        if state.aliases.note_ambiguous_target(reference) {
-          log::warn!(
-            "proxy.aliases: `{reference}` points at `{target}`, which matches more than one model; name one of them"
-          );
-        }
-        Err(ambiguous(candidates))
-      }
-      Err(_) => {
-        // The target named no model outright. Three things can still be true of
-        // it, and each gets said rather than the generic line: it is another
-        // alias name, which is a chain that reaches nothing, or several models
-        // answer to it, which the client is told about the same way as any other
-        // ambiguous reference.
-        if state.aliases.target(target).is_some() {
-          if state.aliases.note_points_at_alias(reference) {
-            log::warn!(
-              "proxy.aliases: `{reference}` points at `{target}`, which is another alias name; name the model instead"
-            );
-          }
-          return Err(ClientRefMiss::NotFound);
-        }
-        return match resolve_model_with_candidates(rows, target) {
-          Err(ResolveError::Many(candidates)) => {
-            if state.aliases.note_ambiguous_target(reference) {
-              log::warn!(
-                "proxy.aliases: `{reference}` points at `{target}`, which matches more than one model; name one of them"
-              );
-            }
-            Err(ambiguous(candidates))
-          }
-          _ => {
-            if state.aliases.note_dead_target(reference) {
-              log::warn!(
-                "proxy.aliases: `{reference}` points at `{target}`, which names no model on its own; give a full name or a path"
-              );
-            }
-            Err(ClientRefMiss::NotFound)
-          }
-        };
-      }
-    };
+    return resolve_aliased_reference(state, rows, reference, target);
   }
 
   match resolve_model_with_candidates(rows, reference) {
     Ok(row) => Ok(row),
-    Err(ResolveError::Many(candidates)) => Err(ambiguous(candidates)),
+    Err(ResolveError::Many(candidates)) => Err(ambiguous(rows, candidates)),
     Err(_) => Err(ClientRefMiss::NotFound),
   }
+}
+
+/// The alias half of [`resolve_reference`]. The target has to name one model
+/// outright: a path, a file name, a published id or a repo-qualified id. An alias
+/// is written once and the client sending its name cannot refine it, so answering
+/// a loose target with a substring match would auto-start whichever row happened
+/// to contain it, and nothing downstream could tell that was not the model named.
+fn resolve_aliased_reference(
+  state: &ProxyState,
+  rows: &[CatalogRow],
+  reference: &str,
+  target: &str,
+) -> Result<CatalogRow, ClientRefMiss> {
+  match crate::launch::resolve::resolve_exact_reference(rows, target) {
+    Ok(row) => {
+      note_moved_partial(state, rows, reference, target, &row);
+      Ok(row)
+    }
+    // A target that names no model outright has three readings and each gets said
+    // rather than the generic line: several models answer to it, it is another
+    // alias name and the chain reaches nothing, or it matches only as a substring.
+    Err(ResolveError::Many(candidates)) => {
+      Err(ambiguous_target(state, rows, reference, target, candidates))
+    }
+    Err(ResolveError::None | ResolveError::Empty) => {
+      if state.aliases.target(target).is_some() {
+        if state.aliases.note_points_at_alias(reference) {
+          log::warn!(
+            "proxy.aliases: `{reference}` points at `{target}`, which is another alias name; name the model instead"
+          );
+        }
+        return Err(ClientRefMiss::NotFound);
+      }
+      match resolve_model_with_candidates(rows, target) {
+        Err(ResolveError::Many(candidates)) => {
+          Err(ambiguous_target(state, rows, reference, target, candidates))
+        }
+        _ => {
+          if state.aliases.note_dead_target(reference) {
+            log::warn!(
+              "proxy.aliases: `{reference}` points at `{target}`, which names no model on its own; give a full name or a path"
+            );
+          }
+          Err(ClientRefMiss::NotFound)
+        }
+      }
+    }
+  }
+}
+
+/// A value two or more models answer to, reported the way any ambiguous reference
+/// is: the candidate list a client would have to send to settle it. Naming one is
+/// the operator's call, so the proxy does not make it.
+fn ambiguous_target(
+  state: &ProxyState,
+  rows: &[CatalogRow],
+  reference: &str,
+  target: &str,
+  candidates: Vec<CatalogRow>,
+) -> ClientRefMiss {
+  if state.aliases.note_ambiguous_target(reference) {
+    log::warn!(
+      "proxy.aliases: `{reference}` points at `{target}`, which matches more than one model; name one of them"
+    );
+  }
+  ambiguous(rows, candidates)
+}
+
+/// The alias won, but the same string also reached a model on its own - a longer
+/// file name that contains it - so clients that were already being served move to
+/// another model. Worth one line in the log, and asked only while that line is
+/// still unspent, because answering it costs a second pass over the catalog.
+fn note_moved_partial(
+  state: &ProxyState,
+  rows: &[CatalogRow],
+  reference: &str,
+  target: &str,
+  row: &CatalogRow,
+) {
+  if !state
+    .aliases
+    .report_pending(reference, super::alias::REPORT_PARTIAL)
+  {
+    return;
+  }
+  if let Ok(other) = resolve_model_with_candidates(rows, reference) {
+    if other.path != row.path && state.aliases.note_overrides_partial(reference) {
+      log::warn!(
+        "proxy.aliases: `{reference}` names `{target}`, but it also matched `{}` on its own; the alias is used",
+        other.name()
+      );
+    }
+  }
+}
+
+/// The published ids of a candidate set, which is what a client has to send to
+/// stop being ambiguous.
+fn ambiguous(rows: &[CatalogRow], candidates: Vec<CatalogRow>) -> ClientRefMiss {
+  ClientRefMiss::Ambiguous(crate::launch::resolve::published_ids_for(rows, &candidates))
 }
 
 /// Which of several Ready launches of one model a request goes to: an unnamed

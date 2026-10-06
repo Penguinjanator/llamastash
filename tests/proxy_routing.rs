@@ -251,9 +251,8 @@ async fn proxy_state_with_aliases(
   ProxyState::from_context_with_auth(&ctx, false, true, None, DEFAULT_BODY_LIMIT_BYTES, &aliases)
 }
 
-/// Send an HTTP POST and read the response head + body. Returns
+/// Send an HTTP GET and read the response head + body. Returns
 /// `(status, headers, body_bytes)`. Closes the connection after.
-/// Send an HTTP GET and read the response head + body.
 async fn http_get(addr: SocketAddr, path: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
   let mut sock = TcpStream::connect(addr).await.expect("connect");
   sock
@@ -267,6 +266,8 @@ async fn http_get(addr: SocketAddr, path: &str) -> (u16, Vec<(String, String)>, 
   parse_response(&buf)
 }
 
+/// Send an HTTP POST and read the response head + body. Returns
+/// `(status, headers, body_bytes)`. Closes the connection after.
 async fn http_post(
   addr: SocketAddr,
   path: &str,
@@ -492,6 +493,47 @@ async fn anthropic_messages_endpoint_forwards() {
   assert_eq!(ct_status, 200);
   let ct: Value = serde_json::from_slice(&ct_body).expect("json body");
   assert!(ct["input_tokens"].is_number());
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, listener_handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anthropic_messages_endpoint_resolves_an_alias() {
+  // `/v1/messages` routes through the same reference rule as the OpenAI
+  // surfaces, so a name the client is hard-wired to has to reach the local model
+  // here too, and the body the upstream sees keeps the name the client sent.
+  let dir = unique_temp("messages-alias");
+  let catalog_path = "/fixture/qwen-chat.gguf";
+  let registry = SupervisorRegistry::new();
+  let (model, _port, _id) = spawn_fake_supervisor(catalog_path, &dir, LaunchMode::Chat).await;
+  let launch_id = registry.next_id();
+  registry.insert(launch_id, model.clone()).await;
+
+  let state = proxy_state_with_aliases(
+    vec![discovered(catalog_path, Some("qwen-chat"), "qwen3")],
+    registry,
+    &[("claude-haiku", "qwen-chat")],
+  )
+  .await;
+  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+
+  let body = serde_json::json!({
+    "model": "claude-haiku",
+    "max_tokens": 16,
+    "messages": [{"role": "user", "content": "hi"}],
+  })
+  .to_string();
+
+  let (status, _headers, response_body) = http_post(addr, "/v1/messages", &body, &[]).await;
+  assert_eq!(
+    status, 200,
+    "an alias resolves on the Anthropic surface too: {status}"
+  );
+  let parsed: Value = serde_json::from_slice(&response_body).expect("json body");
+  assert_eq!(parsed["type"], "message");
+  assert_eq!(parsed["model"], "claude-haiku");
 
   let _ = model.stop(Duration::from_secs(3)).await;
   shutdown_listener(shutdown, listener_handle).await;
