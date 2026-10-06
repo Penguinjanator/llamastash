@@ -1785,7 +1785,7 @@ The last tab of every model that has a launch. It shows that model's proxy reque
 
 - The top lines are the model's summary: requests, errors, average total time and time to first byte, tok/s (average and last), tokens in and out, auto-starts, and launches unloaded to make room.
 - Below is the table, newest request first. `↑` / `↓` scroll it.
-- Columns drop out as the pane narrows, in this order: `Client`, `Route`, `Out`, `In`, `TTFB`, `Tok/s`, `Total`, then `Time` and `Code`. `Note` takes whatever width is left.
+- The columns are `Time`, `Code`, `Tok/s`, `Total`, `In`, `Out`, `TTFB`, `Route`, `Client` and `Note`. As the pane narrows they drop out in this order: `Client`, `Note`, `Route`, `TTFB`, `Out`, `In`, `Total`, `Tok/s`, `Code`, `Time`. When `Note` shows it takes whatever width is left.
 
 ### Chat tab (`Focus::ChatInput`)
 

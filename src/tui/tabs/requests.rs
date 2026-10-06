@@ -1,9 +1,9 @@
 //! Requests tab — the proxy requests of the focused model.
 //!
 //! A summary strip on top (totals and averages the daemon computed) and
-//! below it a table of requests, newest first. Table columns have a fixed
-//! width and a rank; as the pane narrows the higher-rank ones drop out,
-//! and whatever width is left goes to the trailing `Note` column.
+//! below it a table of requests, newest first. Table columns have a width
+//! and a rank; as the pane narrows the higher-rank ones drop out. `Note`
+//! is ranked like the rest and, when it shows, takes the width left over.
 
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -22,7 +22,8 @@ pub const POLL_ROWS: usize = 200;
 /// Cell text for a value the log does not have.
 const NONE: &str = "—";
 const COL_SEP_W: usize = 1;
-/// Cells kept for the `Note` column before any other column is admitted.
+/// The least `Note` is worth showing at. It grows into whatever the other
+/// columns leave.
 const MIN_NOTE_W: usize = 12;
 /// Gap between two figures on the summary strip.
 const SUMMARY_GAP: usize = 3;
@@ -31,25 +32,22 @@ const SUMMARY_GAP: usize = 3;
 enum ColumnId {
   Time,
   Status,
-  Total,
   Speed,
-  Ttfb,
+  Total,
   In,
   Out,
+  Ttfb,
   Route,
   Client,
+  Note,
 }
 
-/// Table columns in display order. Lower rank stays longer:
-///
-/// - `Time`, `Status` (10): what happened and when. Never dropped while
-///   the pane has room for them at all.
-/// - `Total` (20): how long the request took.
-/// - `Tok/s` (30): generation speed.
-/// - `TTFB` (40): time to the first response byte.
-/// - `In` (50), `Out` (55): prompt and generated tokens.
-/// - `Route` (60): the same for most of one model's requests.
-/// - `Client` (70): loopback for most setups, so the first to go.
+/// Table columns in display order, which is also the order they are
+/// worth keeping in: as the pane narrows they go from the right, `Note`
+/// first and `Time` last. `Client` is the exception. It is loopback for
+/// most setups, so it ranks below `Note` and is the first to go, but it
+/// sits before `Note` on screen so that `Note` stays the last column and
+/// can take the leftover width.
 const COLUMNS: &[Column<ColumnId>] = &[
   Column {
     id: ColumnId::Time,
@@ -61,12 +59,6 @@ const COLUMNS: &[Column<ColumnId>] = &[
     id: ColumnId::Status,
     label: "Code",
     width: 4,
-    rank: 10,
-  },
-  Column {
-    id: ColumnId::Total,
-    label: "Total",
-    width: 7,
     rank: 20,
   },
   Column {
@@ -76,8 +68,8 @@ const COLUMNS: &[Column<ColumnId>] = &[
     rank: 30,
   },
   Column {
-    id: ColumnId::Ttfb,
-    label: "TTFB",
+    id: ColumnId::Total,
+    label: "Total",
     width: 7,
     rank: 40,
   },
@@ -91,20 +83,32 @@ const COLUMNS: &[Column<ColumnId>] = &[
     id: ColumnId::Out,
     label: "Out",
     width: 6,
-    rank: 55,
+    rank: 60,
+  },
+  Column {
+    id: ColumnId::Ttfb,
+    label: "TTFB",
+    width: 7,
+    rank: 70,
   },
   Column {
     id: ColumnId::Route,
     label: "Route",
     // Fits `chat/completions`, the longest of the common routes.
     width: 16,
-    rank: 60,
+    rank: 80,
   },
   Column {
     id: ColumnId::Client,
     label: "Client",
     width: 21,
-    rank: 70,
+    rank: 100,
+  },
+  Column {
+    id: ColumnId::Note,
+    label: "Note",
+    width: MIN_NOTE_W,
+    rank: 90,
   },
 ];
 
@@ -220,52 +224,59 @@ fn summary_lines(summary: &RequestSummary, width: usize, palette: &Palette) -> V
   lines
 }
 
-/// The columns one render pass shows and the cells left for `Note`.
+/// The columns one render pass shows, and the width `Note` gets: its
+/// minimum plus what the others leave, or `0` when it does not show.
 struct ColumnLayout {
   visible: Vec<&'static Column<ColumnId>>,
   note_w: usize,
 }
 
-fn layout_columns(content_w: usize) -> ColumnLayout {
-  // `Note` is the last column, so it needs a separator before it only
-  // when a fixed column precedes it.
-  let budget = content_w.saturating_sub(MIN_NOTE_W + COL_SEP_W);
-  let (visible, spent) = columns::fit(COLUMNS, budget, COL_SEP_W);
-  ColumnLayout {
-    visible,
-    note_w: content_w.saturating_sub(spent),
+impl ColumnLayout {
+  fn width_of(&self, column: &Column<ColumnId>) -> usize {
+    match column.id {
+      ColumnId::Note => self.note_w,
+      _ => column.width,
+    }
   }
 }
 
+fn layout_columns(content_w: usize) -> ColumnLayout {
+  let (visible, spent) = columns::fit(COLUMNS, content_w, COL_SEP_W);
+  let note_w = if visible.iter().any(|c| c.id == ColumnId::Note) {
+    // It is the last column, so the separator counted after it is its
+    // to use too.
+    MIN_NOTE_W + COL_SEP_W + content_w.saturating_sub(spent)
+  } else {
+    0
+  };
+  ColumnLayout { visible, note_w }
+}
+
 fn header_line(layout: &ColumnLayout, palette: &Palette) -> Line<'static> {
-  let mut text = String::new();
-  for c in &layout.visible {
-    text.push_str(&cell(c.label, c.width));
-    text.push(' ');
-  }
-  text.push_str(&cell("Note", layout.note_w));
+  let labels: Vec<String> = layout
+    .visible
+    .iter()
+    .map(|c| cell(c.label, layout.width_of(c)))
+    .collect();
   Line::from(Span::styled(
-    text,
+    labels.join(" "),
     palette.muted_style().add_modifier(Modifier::BOLD),
   ))
 }
 
 fn row_line(row: &RequestRow, layout: &ColumnLayout, palette: &Palette) -> Line<'static> {
   let cells = row.cells(NONE);
-  let mut spans: Vec<Span<'static>> = Vec::with_capacity(layout.visible.len() + 1);
+  let mut spans: Vec<Span<'static>> = Vec::with_capacity(layout.visible.len());
   for c in &layout.visible {
-    let text = format!("{} ", cell(column_value(c.id, &cells), c.width));
+    let text = format!("{} ", cell(column_value(c.id, &cells), layout.width_of(c)));
     let style = match c.id {
       ColumnId::Status if row.is_error() => palette.error_style(),
       ColumnId::Status if row.status.is_some() => palette.success_style(),
+      ColumnId::Note => palette.muted_style(),
       _ => palette.text_style(),
     };
     spans.push(Span::styled(text, style));
   }
-  spans.push(Span::styled(
-    cell(&cells.note, layout.note_w),
-    palette.muted_style(),
-  ));
   Line::from(spans)
 }
 
@@ -273,13 +284,14 @@ fn column_value(id: ColumnId, cells: &RequestCells) -> &str {
   match id {
     ColumnId::Time => &cells.time,
     ColumnId::Status => &cells.status,
-    ColumnId::Total => &cells.total,
     ColumnId::Speed => &cells.speed,
-    ColumnId::Ttfb => &cells.ttfb,
+    ColumnId::Total => &cells.total,
     ColumnId::In => &cells.tokens_in,
     ColumnId::Out => &cells.tokens_out,
+    ColumnId::Ttfb => &cells.ttfb,
     ColumnId::Route => &cells.route,
     ColumnId::Client => &cells.client,
+    ColumnId::Note => &cells.note,
   }
 }
 
@@ -339,36 +351,53 @@ mod tests {
 
   #[test]
   fn columns_drop_by_rank_as_the_pane_narrows() {
+    // Each column costs its width plus one separator. Running totals in
+    // rank order: Time 9, Code 14, Tok/s 21, Total 29, In 36, Out 43,
+    // TTFB 51, Route 68, Note 81, Client 103.
     assert_eq!(
-      labels(120),
-      vec!["Time", "Code", "Total", "Tok/s", "TTFB", "In", "Out", "Route", "Client"]
+      labels(103),
+      vec!["Time", "Code", "Tok/s", "Total", "In", "Out", "TTFB", "Route", "Client", "Note"]
     );
-    // 13 for Note and 68 for everything up to Route: Client is gone.
+    // Client ranks below Note, so it is the first to go.
     assert_eq!(
-      labels(100),
-      vec!["Time", "Code", "Total", "Tok/s", "TTFB", "In", "Out", "Route"]
+      labels(102),
+      vec!["Time", "Code", "Tok/s", "Total", "In", "Out", "TTFB", "Route", "Note"]
     );
     assert_eq!(
       labels(80),
-      vec!["Time", "Code", "Total", "Tok/s", "TTFB", "In", "Out"]
+      vec!["Time", "Code", "Tok/s", "Total", "In", "Out", "TTFB", "Route"]
     );
     assert_eq!(
-      labels(60),
-      vec!["Time", "Code", "Total", "Tok/s", "TTFB", "In"]
+      labels(67),
+      vec!["Time", "Code", "Tok/s", "Total", "In", "Out", "TTFB"]
     );
-    assert_eq!(labels(40), vec!["Time", "Code", "Total"]);
-    assert_eq!(labels(27), vec!["Time", "Code"]);
-    assert_eq!(labels(20), Vec::<&str>::new());
+    assert_eq!(
+      labels(50),
+      vec!["Time", "Code", "Tok/s", "Total", "In", "Out"]
+    );
+    assert_eq!(labels(40), vec!["Time", "Code", "Tok/s", "Total", "In"]);
+    assert_eq!(labels(30), vec!["Time", "Code", "Tok/s", "Total"]);
+    assert_eq!(labels(21), vec!["Time", "Code", "Tok/s"]);
+    assert_eq!(labels(14), vec!["Time", "Code"]);
+    assert_eq!(labels(9), vec!["Time"]);
+    assert_eq!(labels(8), Vec::<&str>::new());
   }
 
   #[test]
-  fn note_takes_the_width_the_columns_leave() {
-    for width in [20usize, 40, 60, 80, 120, 200] {
+  fn note_takes_the_width_the_other_columns_leave() {
+    for width in [81usize, 90, 102, 103, 120, 200] {
       let layout = layout_columns(width);
-      let fixed: usize = layout.visible.iter().map(|c| c.width + COL_SEP_W).sum();
-      assert_eq!(fixed + layout.note_w, width, "width {width}");
-      assert!(layout.note_w >= MIN_NOTE_W, "width {width}");
+      let others: usize = layout
+        .visible
+        .iter()
+        .filter(|c| c.id != ColumnId::Note)
+        .map(|c| c.width + COL_SEP_W)
+        .sum();
+      assert_eq!(others + layout.note_w, width, "width {width}");
+      assert!(layout.note_w > MIN_NOTE_W, "width {width}");
     }
+    // Too narrow for `Note`: it gets nothing and the row ends earlier.
+    assert_eq!(layout_columns(80).note_w, 0);
   }
 
   #[test]
@@ -414,11 +443,11 @@ mod tests {
     // one blank line under it.
     let header = lines
       .iter()
-      .position(|l| l.starts_with("Time     Code Total"))
+      .position(|l| l.starts_with("Time     Code Tok/s  Total"))
       .expect("header row");
     assert_eq!(lines[header - 1], "");
     assert!(lines[header].ends_with("Note"), "{lines:?}");
-    assert!(lines[header + 1].contains("200  1.2s"), "{lines:?}");
+    assert!(lines[header + 1].contains("200  39.6   1.2s"), "{lines:?}");
     assert!(lines[header + 1].contains("chat/completions"), "{lines:?}");
     // Two rows, newest (`seq` 2, one second later) first.
     assert_eq!(&lines[header + 1][..8], row(2).cells(NONE).time);

@@ -19,12 +19,12 @@
 │   phi-3                                  phi         Q4_K    8.0k    3.9G  ││ Tokens in 36.9k   Tokens out 328       │
 │                                                                            ││ Auto-starts 2   Unloaded 1             │
 │                                                                            ││                                        │
-│                                                                            ││ Time     Code Total   Note             │
-│                                                                            ││ HH:MM:SS 200  —       in flight        │
-│                                                                            ││ HH:MM:SS 200  4.3s    client closed    │
-│                                                                            ││ HH:MM:SS 503  96ms    auto-start, lau… │
-│                                                                            ││ HH:MM:SS 200  36.0s   auto-start, unl… │
-│                                                                            ││ HH:MM:SS 200  4.3s                     │
+│                                                                            ││ Time     Code Tok/s  Total   In        │
+│                                                                            ││ HH:MM:SS 200  —      —       —         │
+│                                                                            ││ HH:MM:SS 200  —      4.3s    —         │
+│                                                                            ││ HH:MM:SS 503  —      96ms    —         │
+│                                                                            ││ HH:MM:SS 200  41.3   36.0s   18.4k     │
+│                                                                            ││ HH:MM:SS 200  41.3   4.3s    18.4k     │
 │                                                                            ││                                        │
 │                                                                            ││                                        │
 └ ◌ launching · ◐ loading · ● ready · ▲ error · ○ stopped · ⇪ external ──────┘└────────────────────────────────────────┘

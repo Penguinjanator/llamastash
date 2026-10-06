@@ -71,22 +71,22 @@ session, in order. Tick an item here and in `TODO.md` in the same change.
 - **Data.** Poll `requests_tail` with the focused model through the same loop the Logs tab uses (`spawn_tab_poller`), and only while the tab is open. One call returns the summary and the rows.
 - **Top strip: summary.** Requests, errors (4xx / 5xx), average total time, average time to first byte, tok/s (average and last), prompt tokens, generated tokens, auto-starts and evictions triggered. The TUI renders the daemon's summary and does not recompute it from the visible rows. The summary counts finished requests since the daemon started, so it keeps counting after a row leaves the ring.
 - **Table.** Below the strip, newest first, scrolled with the existing right-pane scroll actions. Key labels come from `KeyMap`. Empty state: one line saying the model has no requests yet.
-- **Ranked columns.** Each column has a fixed width and a rank; lower rank stays longer as the pane narrows. Lift the picker out of `src/tui/list_pane.rs` (`Column { label, width, rank }` plus the strict rank-tail drop in `layout_columns`) into a shared helper and use it for both tables. Declaration order is display order. `Note` is the flexible column and takes the leftover width, like `Name` in the list pane.
+- **Ranked columns.** Each column has a fixed width and a rank; lower rank stays longer as the pane narrows. Lift the picker out of `src/tui/list_pane.rs` (`Column { label, width, rank }` plus the strict rank-tail drop in `layout_columns`) into a shared helper and use it for both tables. Declaration order is display order. `Note` is a ranked column like the others; when it shows it also takes the leftover width, like `Name` in the list pane.
 
   | Column | Width | Rank | Content |
   |---|---|---|---|
   | Time | 8 | 10 | `HH:MM:SS`, local |
-  | Code | 4 | 10 | HTTP status, coloured by class |
-  | Total | 7 | 20 | total time |
+  | Code | 4 | 20 | HTTP status, coloured by class |
   | Tok/s | 6 | 30 | generation speed |
-  | TTFB | 7 | 40 | time to first byte |
+  | Total | 7 | 40 | total time |
   | In | 6 | 50 | prompt tokens |
-  | Out | 6 | 55 | generated tokens |
-  | Route | 16 | 60 | the route without `/v1/`, e.g. `chat/completions` |
-  | Client | 21 | 70 | client address (`ip:port`) |
-  | Note | flex | n/a | auto-start, eviction, or the 503 cause |
+  | Out | 6 | 60 | generated tokens |
+  | TTFB | 7 | 70 | time to first byte |
+  | Route | 16 | 80 | the route without `/v1/`, e.g. `chat/completions` |
+  | Client | 21 | 100 | client address (`ip:port`) |
+  | Note | 12 + leftover | 90 | auto-start, eviction, or the 503 cause |
 
-  These are the shipped values. `In` and `Out` have different ranks because two columns of one rank do not leave together: the picker stops at the first column that does not fit.
+  These are the shipped values, re-ranked on 2026-10-06. Display order is the keep order, so columns go from the right as the pane narrows. `Client` ranks below `Note` and goes first, but sits before it on screen so `Note` stays last and can flex.
 - **Tests.** `tabs_for_mode` and `available_right_tabs` order, the column picker at three widths, and the golden snapshots.
 - **Docs.** `docs/usage.md` and `docs/architecture.md` § Right pane tabs. That table lists `Logs, Chat` for a ready chat model and omits `Settings`, which the code returns first; fix it in the same change.
 
