@@ -1,4 +1,4 @@
-//! `llamastash requests [<model>] [-n N]` — the proxy's request log.
+//! `llamastash requests [<model-or-launch>] [-n N]` — the proxy's request log.
 //!
 //! Prints the newest requests the proxy handled, newest first, with a
 //! summary above the table on a terminal. `--json` emits the daemon's
@@ -10,7 +10,7 @@ use crate::cli::cli_args::{Cli, RequestsArgs};
 use crate::cli::client::connect_or_spawn;
 use crate::cli::exit_codes::{CliExit, CliResult};
 use crate::cli::output::pretty_json;
-use crate::cli::resolve::{fetch_catalog, resolve_model};
+use crate::cli::resolve::{fetch_catalog, fetch_status, resolve_model_or_launch};
 use crate::cli::{colors, format};
 use crate::config::Config;
 use crate::proxy::request_log::{RequestRow, RequestSummary};
@@ -23,7 +23,9 @@ pub async fn handle(args: RequestsArgs, cli: &Cli, config: &Config) -> CliResult
   let mut params = json!({});
   if let Some(reference) = &args.model {
     let catalog = fetch_catalog(&mut client).await?;
-    params["model_path"] = json!(resolve_model(&catalog, reference)?.path);
+    let running = fetch_status(&mut client).await?.models;
+    let (model, _) = resolve_model_or_launch(&catalog, &running, reference)?;
+    params["model_path"] = json!(model.path);
   }
   if let Some(n) = args.lines {
     params["limit"] = json!(n);

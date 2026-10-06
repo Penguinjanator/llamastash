@@ -168,7 +168,7 @@ llamastash status --json | jq .proxy
 
 ```bash
 llamastash requests --json
-llamastash requests <model-name> --json
+llamastash requests <model-name> --json     # or a running launch: L3, its port, its name
 llamastash requests --json | jq -c '.requests[] | {route, status, state, error, cause, launch_id}'
 ```
 

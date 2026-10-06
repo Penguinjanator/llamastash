@@ -656,7 +656,8 @@ pub struct LogsArgs {
 #[derive(Args, Debug)]
 pub struct RequestsArgs {
   /// Only this model's requests: name substring, absolute path, or
-  /// canonical model id. Without it, every logged request.
+  /// canonical model id. A running launch's id (`L3`), port or name
+  /// selects the model it runs. Without it, every logged request.
   pub model: Option<String>,
   /// Number of requests to print, at least 1 (default 100; the log keeps
   /// 1000).

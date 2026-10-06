@@ -522,7 +522,7 @@ The requests the proxy handled, newest first. It answers "why did my agent get a
 llamastash requests [model-ref] [-n N] [--json]
 ```
 
-Without `model-ref` it lists every request; with one, only that model's. `-n` sets how many rows to print (default 100, at least 1).
+Without `model-ref` it lists every request; with one, only that model's. `model-ref` also takes what `stop` and `logs` take for a running launch: its id (`L3`), its port or its name. That selects the model the launch runs, so requests an earlier launch of the same model served are listed too. `-n` sets how many rows to print (default 100, at least 1).
 
 ```
 TIME      STATUS  TOTAL  TTFB   TOK/S  IN  OUT  ROUTE             MODEL                         LAUNCH  CLIENT           NOTE

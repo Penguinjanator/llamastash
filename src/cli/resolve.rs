@@ -7,6 +7,9 @@
 //! - a substring matched case-insensitively against the file name and
 //!   the parent directory.
 //!
+//! `show` and `requests` take a model reference or a running-launch
+//! reference ([`resolve_model_or_launch`]).
+//!
 //! Running-launch references (used by `stop`, `logs`) accept a
 //! `LaunchId` (e.g. `L3`), a port number, or a case-insensitive
 //! substring of the running model's file name / parent directory.
@@ -592,6 +595,47 @@ pub fn resolve_running(rows: &[RunningRow], reference: &str) -> Result<RunningRo
   single_or_error(by_name, reference)
 }
 
+/// Resolve a reference that may name a model or a live launch to the
+/// model's catalog row, plus the launch's name when the reference named a
+/// launch. For commands about a model that should also take what `stop`
+/// and `logs` take.
+///
+/// Three tiers, most specific first:
+/// 1. the whole reference against the catalog, so a model file whose own
+///    name contains `@` still resolves as a plain reference;
+/// 2. `<model>@<name>`, the address the proxy and `stop` take;
+/// 3. the reference against the live launches (`coder`, `L3`, `41100`),
+///    through [`resolve_running`].
+///
+/// The tier-1 error is what surfaces on a total miss: it names the whole
+/// reference the user typed rather than some half of it.
+pub fn resolve_model_or_launch(
+  catalog: &[CatalogRow],
+  running: &[RunningRow],
+  reference: &str,
+) -> Result<(CatalogRow, Option<String>), CliExit> {
+  let miss = match resolve_model(catalog, reference) {
+    Ok(row) => return Ok((row, None)),
+    Err(miss) => miss,
+  };
+  if let Some((model_ref, name)) = crate::launch::resolve::parse_named_reference(reference) {
+    if let Ok(row) = resolve_model(catalog, model_ref) {
+      return Ok((row, Some(name.to_string())));
+    }
+  }
+  match resolve_running(running, reference) {
+    Ok(live) => {
+      let row = catalog
+        .iter()
+        .find(|c| c.path == live.model_path)
+        .cloned()
+        .ok_or(miss)?;
+      Ok((row, live.name))
+    }
+    Err(_) => Err(miss),
+  }
+}
+
 /// [`resolve_running`], with a lazy catalog fallback for launches whose
 /// user-facing name never appears in their path — an Ollama alias like
 /// `gemma4:e2b` runs from a `sha256-…` blob, so the path-substring tier
@@ -807,6 +851,45 @@ mod tests {
     assert!(!multi_device(
       &serde_json::json!([{"id": "enginex", "devices": null}])
     ));
+  }
+
+  #[test]
+  fn resolve_model_or_launch_takes_a_model_a_named_address_or_a_live_launch() {
+    let catalog = vec![row("/m/qwen.gguf", "/m"), row("/m/gemma.gguf", "/m")];
+    let running = running_rows_in(&serde_json::json!({
+      "models": [{
+        "launch_id": "L3",
+        "id": {"path": "/m/qwen.gguf", "header_blake3": "deadbeef"},
+        "port": 41100,
+        "mode": "chat",
+        "state": "ready",
+        "name": "coder",
+      }],
+    }));
+
+    // Plain model reference: it names no launch.
+    let (model, name) = resolve_model_or_launch(&catalog, &running, "qwen").unwrap();
+    assert_eq!(model.path, "/m/qwen.gguf");
+    assert_eq!(name, None);
+
+    // The address the proxy and `stop` take, then a bare launch name, a
+    // launch id and a port: each reaches the launch's model and its name.
+    for reference in ["qwen@coder", "coder", "L3", "41100"] {
+      let (found, named) = resolve_model_or_launch(&catalog, &running, reference).unwrap();
+      assert_eq!(found.path, "/m/qwen.gguf", "`{reference}` resolves");
+      assert_eq!(
+        named.as_deref(),
+        Some("coder"),
+        "`{reference}` names the launch"
+      );
+    }
+
+    // A total miss reports the whole reference, not a half of it.
+    let err = resolve_model_or_launch(&catalog, &running, "nope@nothing").unwrap_err();
+    assert!(
+      err.message.unwrap_or_default().contains("nope@nothing"),
+      "the error names what the user typed"
+    );
   }
 
   fn row(path: &str, parent: &str) -> CatalogRow {

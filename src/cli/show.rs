@@ -16,7 +16,7 @@ use crate::cli::client::connect_or_spawn;
 use crate::cli::colors;
 use crate::cli::exit_codes::{CliExit, CliResult};
 use crate::cli::output::pretty_json;
-use crate::cli::resolve::{fetch_catalog, resolve_model, CatalogRow};
+use crate::cli::resolve::{fetch_catalog, resolve_model_or_launch, CatalogRow};
 use crate::config::Config;
 use crate::daemon::host_metrics::GpuFlavor;
 use crate::discovery::shard_sizes::{self, ShardSize};
@@ -59,7 +59,7 @@ async fn build_view(args: &ShowArgs, cli: &Cli, config: &Config) -> Result<ShowV
     .await
     .map_err(CliExit::from_client_error)?;
   let running_rows = crate::cli::resolve::running_rows_in(&status_body);
-  let (row, name_filter) = resolve_show_target(&catalog, &running_rows, &args.model)?;
+  let (row, name_filter) = resolve_model_or_launch(&catalog, &running_rows, &args.model)?;
 
   // Pull last-params for this model_path. The IPC handler keys by
   // ModelId; `model_path` is part of the JSON wire shape (`entry.id.path`)
@@ -201,46 +201,6 @@ fn launch_arch(row: &CatalogRow) -> Option<&str> {
   match crate::discovery::ModelSource::from_label(&row.source) {
     Some(crate::discovery::ModelSource::Config) => None,
     _ => row.arch.as_deref(),
-  }
-}
-
-/// Resolve `show`'s target to a catalog row, plus the launch name to scope the
-/// running block to when the reference named one.
-///
-/// Three tiers, most specific first:
-/// 1. the whole reference against the catalog — D2's fail-safe, so a model file
-///    whose own name contains `@` still resolves as a plain reference;
-/// 2. `<model>@<name>`, the address the proxy and `stop` take;
-/// 3. the reference against the *live launches* (`show coder`, `show L3`,
-///    `show 41100`), through the same resolver `stop` and `logs` use, so a
-///    reference that stops a launch also shows it.
-///
-/// The tier-1 error is what surfaces on a total miss: it names the whole
-/// reference the user typed rather than some half of it.
-fn resolve_show_target(
-  catalog: &[CatalogRow],
-  running: &[crate::cli::resolve::RunningRow],
-  reference: &str,
-) -> Result<(CatalogRow, Option<String>), CliExit> {
-  let miss = match resolve_model(catalog, reference) {
-    Ok(row) => return Ok((row, None)),
-    Err(miss) => miss,
-  };
-  if let Some((model_ref, name)) = crate::launch::resolve::parse_named_reference(reference) {
-    if let Ok(row) = resolve_model(catalog, model_ref) {
-      return Ok((row, Some(name.to_string())));
-    }
-  }
-  match crate::cli::resolve::resolve_running(running, reference) {
-    Ok(live) => {
-      let row = catalog
-        .iter()
-        .find(|c| c.path == live.model_path)
-        .cloned()
-        .ok_or(miss)?;
-      Ok((row, live.name))
-    }
-    Err(_) => Err(miss),
   }
 }
 
@@ -750,41 +710,6 @@ mod tests {
     assert!(
       rendered.contains("16384") && rendered.contains("clamped to fit-ctx floor"),
       "resolved ctx + clamp note missing:\n{rendered}"
-    );
-  }
-
-  #[test]
-  fn resolve_show_target_takes_a_model_a_named_address_or_a_live_launch() {
-    let catalog = vec![fake_row("/m/qwen.gguf"), fake_row("/m/gemma.gguf")];
-    let running = crate::cli::resolve::running_rows_in(&json!({
-      "models": [{
-        "launch_id": "L3",
-        "id": {"path": "/m/qwen.gguf", "header_blake3": "deadbeef"},
-        "port": 41100,
-        "mode": "chat",
-        "state": "ready",
-        "name": "coder",
-      }],
-    }));
-
-    // Plain model reference: no name to scope the running block with.
-    let (row, name) = resolve_show_target(&catalog, &running, "qwen").unwrap();
-    assert_eq!(row.path, "/m/qwen.gguf");
-    assert_eq!(name, None);
-
-    // The address the proxy and `stop` take, then a bare launch name, a
-    // launch id and a port — each reaches the launch's model and scopes to it.
-    for reference in ["qwen@coder", "coder", "L3", "41100"] {
-      let (found, scoped) = resolve_show_target(&catalog, &running, reference).unwrap();
-      assert_eq!(found.path, "/m/qwen.gguf", "`{reference}` resolves");
-      assert_eq!(scoped.as_deref(), Some("coder"), "`{reference}` scopes");
-    }
-
-    // A total miss reports the whole reference, not a half of it.
-    let err = resolve_show_target(&catalog, &running, "nope@nothing").unwrap_err();
-    assert!(
-      err.message.unwrap_or_default().contains("nope@nothing"),
-      "the error names what the user typed"
     );
   }
 
