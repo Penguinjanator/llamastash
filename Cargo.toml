@@ -363,6 +363,13 @@ test-fixtures = []
 # uat` is not passed.
 uat = []
 
+# Each test binary statically links the whole lib, so full debug info
+# costs ~270 MiB per binary and ~12 GiB per test build. Line tables keep
+# file:line in backtraces and cut that by about 70%. For a debugger
+# session, set `CARGO_PROFILE_DEV_DEBUG=full`.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -44,7 +44,8 @@ Read the relevant doc before non-trivial work in that area; don't re-derive from
 make build                                                 # release: cargo build --release
 make test                                                  # lint + nextest + doctests with test-fixtures, as CI runs them
 cargo nextest run --features test-fixtures                 # full suite without lint
-cargo nextest run --features test-fixtures --test <name>   # one integration binary
+cargo nextest run --features test-fixtures --test <name>   # one integration file (+ the 5 bins it spawns)
+cargo nextest run --features test-fixtures --lib <filter>  # unit tests only: builds 1 binary
 make lint                                                  # fmt --check + clippy -D warnings
 make audit                                                 # maintainer bundle → target/audit; make audit-summary for the headline
 ```
@@ -64,7 +65,7 @@ Inline `#[cfg(test)] mod tests` per file is the default; `tests/` for daemon-spa
 Every command's output lands in context. Don't pay twice for the same check.
 
 - **Git hooks run the gates.** pre-commit: `cargo fmt` + `make lint` + `make doc`. pre-push: the same plus `cargo nextest run` and doctests, with `test-fixtures`. Both skip when no Rust file changed. Don't run these by hand before a commit or push; read the hook output only when it fails.
-- **While coding, run the narrowest check:** `cargo check`, one test by name, or one `--test <name>` binary, through `cargo nextest run`. Batch edits, then check once. No full `make test` after each edit; pre-push runs it.
+- **While coding, run the narrowest check:** `cargo check`, or `cargo nextest run` with `--lib <filter>` (unit tests) or `--test <name> [<filter>]` (one integration file). A test-name filter without `--lib` / `--test` still builds and links every binary (52 on 2026-10-07). Batch edits, then check once. No full `make test` after each edit; pre-push runs it.
 - **Reviews start from CI.** `gh pr checks <n>` or `gh run list -c <sha>` for the head commit. Green: don't re-run fmt, clippy, or tests locally; review the diff. Red: `gh run view <id> --log-failed`, reproduce only that job. Pending: `gh pr checks <n> --watch`, don't race it locally.
 - **Filter output.** `2>&1 | tail -n 40` or `rg 'FAILED|panicked|^error'` on cargo runs; `gh ... --json <fields> --jq` instead of full dumps.
 - **Don't re-run a check whose inputs haven't changed** since it last passed.
