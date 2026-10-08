@@ -57,11 +57,28 @@ pub const STALE_SNAPSHOT_THRESHOLD_DAYS: u64 = 14;
 /// consecutive remote-fetch failures.
 pub const REMOTE_UNREACHABLE_THRESHOLD: u32 = 3;
 
-/// Ids of the mechanical repairs `doctor --fix` knows how to apply.
-/// Echoed on the finding (`fix`) and on its `fixes[]` entry, so an agent
+/// A mechanical repair `doctor --fix` knows how to apply, serialized as
+/// the id on the finding (`fix`) and on its `fixes[]` entry, so an agent
 /// can tell which findings are auto-repairable without a table of its own.
-pub const FIX_CONFIG_MODE: &str = "config_chmod_0600";
-pub const FIX_STALE_DAEMON_FILES: &str = "remove_stale_daemon_files";
+/// `apply_fixes` matches it exhaustively: a variant added here without a
+/// repair is a compile error, not a silent no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum FixId {
+  #[serde(rename = "config_chmod_0600")]
+  ConfigMode,
+  #[serde(rename = "remove_stale_daemon_files")]
+  StaleDaemonFiles,
+}
+
+impl FixId {
+  /// The repair's verb, for the human ledger line.
+  fn action(self) -> &'static str {
+    match self {
+      Self::ConfigMode => "chmod 0600",
+      Self::StaleDaemonFiles => "remove",
+    }
+  }
+}
 
 /// Stable finding ids. Agent consumers branch on these — never change
 /// a string here without bumping `DOCTOR_JSON_SCHEMA_VERSION`.
@@ -116,10 +133,13 @@ impl FindingId {
 
   /// The repair `doctor --fix` applies for this finding, or `None` when
   /// nothing mechanical fixes it.
-  pub fn fix_action(self) -> Option<&'static str> {
+  pub fn fix_action(self) -> Option<FixId> {
     match self {
-      Self::ConfigModeDrift => Some(FIX_CONFIG_MODE),
-      Self::StaleDaemonFiles => Some(FIX_STALE_DAEMON_FILES),
+      // The finding itself only exists on unix (POSIX file modes), so its
+      // repair is gated the same way.
+      #[cfg(unix)]
+      Self::ConfigModeDrift => Some(FixId::ConfigMode),
+      Self::StaleDaemonFiles => Some(FixId::StaleDaemonFiles),
       _ => None,
     }
   }
@@ -143,7 +163,7 @@ pub struct Finding {
   /// Set when `doctor --fix` repairs this finding mechanically. Absent
   /// when it does not, so the pre-`--fix` shape of a finding is unchanged.
   #[serde(skip_serializing_if = "Option::is_none")]
-  pub fix: Option<&'static str>,
+  pub fix: Option<FixId>,
 }
 
 impl Finding {
@@ -160,7 +180,7 @@ impl Finding {
     id: FindingId,
     severity: Severity,
     message: impl Into<String>,
-    fix: Option<&'static str>,
+    fix: Option<FixId>,
   ) -> Self {
     Self {
       fix,
@@ -310,7 +330,7 @@ pub enum FixOutcome {
 /// One line of the `--fix` ledger: what was targeted, and what happened.
 #[derive(Debug, Clone, Serialize)]
 pub struct FixReport {
-  pub fix: &'static str,
+  pub fix: FixId,
   /// Verb of the repair, for the human line (`chmod 0600`, `remove`).
   pub action: &'static str,
   pub target: String,
@@ -320,28 +340,22 @@ pub struct FixReport {
 
 impl FixReport {
   fn new(
-    fix: &'static str,
-    action: &'static str,
+    fix: FixId,
     target: impl Into<String>,
     outcome: FixOutcome,
     detail: impl Into<String>,
   ) -> Self {
     Self {
       fix,
-      action,
+      action: fix.action(),
       target: target.into(),
       outcome,
       detail: detail.into(),
     }
   }
 
-  fn skipped(
-    fix: &'static str,
-    action: &'static str,
-    target: impl Into<String>,
-    detail: impl Into<String>,
-  ) -> Self {
-    Self::new(fix, action, target, FixOutcome::Skipped, detail)
+  fn skipped(fix: FixId, target: impl Into<String>, detail: impl Into<String>) -> Self {
+    Self::new(fix, target, FixOutcome::Skipped, detail)
   }
 }
 
@@ -385,9 +399,7 @@ pub fn build_report(snapshot: Option<&InitSnapshot>, hardware: &HardwareSnapshot
   if let Some(finding) = check_snapshot_stale(snapshot) {
     findings.push(finding);
   }
-  if let Some(finding) = check_config_mode_drift() {
-    findings.push(finding);
-  }
+  findings.extend(check_config_mode_drift());
   if let Some(finding) = check_remote_snapshot_unreachable(snapshot) {
     findings.push(finding);
   }
@@ -659,47 +671,61 @@ fn check_snapshot_stale(snapshot: &InitSnapshot) -> Option<Finding> {
   ))
 }
 
-fn check_config_mode_drift() -> Option<Finding> {
-  let path = crate::util::paths::user_config_file()?;
+/// Config hardening: the file's own mode, and whether its parent dir is
+/// somewhere another user could swap files into. Both are reported; the
+/// mode drift only carries a repair when the parent is safe, because
+/// `chmod` follows a symlink and a swappable dir lets its writer pick what
+/// the automated repair touches.
+fn check_config_mode_drift() -> Vec<Finding> {
+  let Some(path) = crate::util::paths::user_config_file() else {
+    return Vec::new();
+  };
   if !path.exists() {
-    return None;
+    return Vec::new();
   }
   #[cfg(unix)]
   {
     use std::os::unix::fs::PermissionsExt;
-    let file_meta = std::fs::metadata(&path).ok()?;
-    let file_mode = file_meta.permissions().mode() & 0o777;
-    if file_mode != 0o600 {
-      return Some(Finding::new(
+    let our_uid = unsafe { libc::geteuid() };
+    let parent = path.parent().unwrap_or(path.as_ref());
+    let parent_surface = crate::util::file_security::dir_swap_surface(parent, our_uid);
+    let mut findings = Vec::new();
+    if let Some(surface) = &parent_surface {
+      // No repair here: replacing or re-owning a directory another user
+      // could swap into is not a mechanical repair.
+      findings.push(Finding::with_fix(
         FindingId::ConfigModeDrift,
         Severity::Warning,
         format!(
-          "`{}` is mode {file_mode:#o} (expected 0600) — \
-           re-run init or `chmod 600` to restore the hardening",
-          path.display()
+          "parent dir `{}` {}",
+          parent.display(),
+          surface.describe(our_uid)
         ),
+        None,
       ));
     }
-    if let Some(parent) = path.parent() {
-      let our_uid = unsafe { libc::geteuid() };
-      if let Some(surface) = crate::util::file_security::dir_swap_surface(parent, our_uid) {
-        // No `--fix` here: replacing or re-owning a directory another
-        // user could swap into is not a mechanical repair.
-        return Some(Finding::with_fix(
+    if let Ok(file_meta) = std::fs::metadata(&path) {
+      let file_mode = file_meta.permissions().mode() & 0o777;
+      if file_mode != 0o600 {
+        findings.push(Finding::with_fix(
           FindingId::ConfigModeDrift,
           Severity::Warning,
           format!(
-            "parent dir `{}` {}",
-            parent.display(),
-            surface.describe(our_uid)
+            "`{}` is mode {file_mode:#o} (expected 0600) — \
+             re-run init or `chmod 600` to restore the hardening",
+            path.display()
           ),
-          None,
+          parent_surface.is_none().then_some(FixId::ConfigMode),
         ));
       }
     }
+    findings
   }
-  let _ = path;
-  None
+  #[cfg(not(unix))]
+  {
+    let _ = path;
+    Vec::new()
+  }
 }
 
 /// `daemon.pid` with no flock holder is left over from a dead daemon by
@@ -750,80 +776,63 @@ fn apply_fixes(findings: &[Finding], dry_run: bool) -> Vec<FixReport> {
   let mut fixes = Vec::new();
   for f in findings.iter().filter_map(|f| f.fix) {
     match f {
-      FIX_CONFIG_MODE => {
+      FixId::ConfigMode => {
+        // The finding only exists on unix, so neither does the repair.
+        #[cfg(unix)]
         if let Some(path) = crate::util::paths::user_config_file() {
           fixes.push(fix_config_mode(&path, dry_run));
         }
       }
-      FIX_STALE_DAEMON_FILES => {
+      FixId::StaleDaemonFiles => {
         if let Some(dir) = crate::util::paths::state_dir() {
           fixes.extend(fix_stale_daemon_files(&dir, dry_run));
         }
       }
-      _ => {}
     }
   }
   fixes
 }
 
-/// Put the config file back to the `0600` it ships with. `set_permissions`
-/// follows a symlink, which is what `check_config_mode_drift` measured too,
-/// so a dotfiles-managed config has its real file chmodded, not the link.
+/// Put the config file back to the `0600` it ships with.
+///
+/// The target is the canonical path: `set_permissions` follows a symlink,
+/// so a dotfiles-managed config has its real file chmodded, and the ledger
+/// names the file that was actually written rather than the link. A
+/// swappable parent or a non-regular target stops the repair — in a
+/// directory someone else can write into, they would be choosing what an
+/// automated `chmod` hits, which is why `lockfile::acquire` refuses the same
+/// shape with `O_NOFOLLOW`.
 #[cfg(unix)]
 fn fix_config_mode(path: &Path, dry_run: bool) -> FixReport {
   use std::os::unix::fs::PermissionsExt;
-  let target = path.display().to_string();
-  let mode = match std::fs::metadata(path) {
-    Ok(meta) => meta.permissions().mode() & 0o777,
+  let real = crate::util::paths::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+  let target = real.display().to_string();
+  if let Some(dir) = path.parent() {
+    let our_uid = unsafe { libc::geteuid() };
+    if let Some(surface) = crate::util::file_security::dir_swap_surface(dir, our_uid) {
+      return FixReport::skipped(FixId::ConfigMode, target, surface.describe(our_uid));
+    }
+  }
+  let mode = match std::fs::metadata(&real) {
+    Ok(meta) if meta.is_file() => meta.permissions().mode() & 0o777,
+    Ok(_) => {
+      return FixReport::skipped(FixId::ConfigMode, target, "not a regular file");
+    }
     Err(e) => {
-      return FixReport::new(
-        FIX_CONFIG_MODE,
-        "chmod 0600",
-        target,
-        FixOutcome::Failed,
-        e.to_string(),
-      )
+      return FixReport::new(FixId::ConfigMode, target, FixOutcome::Failed, e.to_string());
     }
   };
   if mode == 0o600 {
-    return FixReport::skipped(FIX_CONFIG_MODE, "chmod 0600", target, "already 0600");
+    return FixReport::skipped(FixId::ConfigMode, target, "already 0600");
   }
   let detail = format!("mode {mode:#o} \u{2192} 0600");
   if dry_run {
-    return FixReport::new(
-      FIX_CONFIG_MODE,
-      "chmod 0600",
-      target,
-      FixOutcome::WouldApply,
-      detail,
-    );
+    return FixReport::new(FixId::ConfigMode, target, FixOutcome::WouldApply, detail);
   }
-  match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-    Ok(()) => FixReport::new(
-      FIX_CONFIG_MODE,
-      "chmod 0600",
-      target,
-      FixOutcome::Applied,
-      detail,
-    ),
-    Err(e) => FixReport::new(
-      FIX_CONFIG_MODE,
-      "chmod 0600",
-      target,
-      FixOutcome::Failed,
-      e.to_string(),
-    ),
+  match std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)) {
+    Ok(()) => FixReport::new(FixId::ConfigMode, target, FixOutcome::Applied, detail),
+    Err(e) => FixReport::new(FixId::ConfigMode, target, FixOutcome::Failed, e.to_string()),
   }
-}
-
-#[cfg(not(unix))]
-fn fix_config_mode(path: &Path, _dry_run: bool) -> FixReport {
-  FixReport::skipped(
-    FIX_CONFIG_MODE,
-    "chmod 0600",
-    path.display().to_string(),
-    "POSIX file modes do not apply on this platform",
-  )
 }
 
 /// Remove a leftover `runtime.json` / `daemon.pid`. `lockfile::acquire` is
@@ -837,8 +846,7 @@ fn fix_stale_daemon_files(state_dir: &Path, dry_run: bool) -> Vec<FixReport> {
   let dir = state_dir.display().to_string();
   if leftovers.is_empty() {
     return vec![FixReport::skipped(
-      FIX_STALE_DAEMON_FILES,
-      "remove",
+      FixId::StaleDaemonFiles,
       dir,
       "nothing left over",
     )];
@@ -848,8 +856,7 @@ fn fix_stale_daemon_files(state_dir: &Path, dry_run: bool) -> Vec<FixReport> {
       .iter()
       .map(|p| {
         FixReport::new(
-          FIX_STALE_DAEMON_FILES,
-          "remove",
+          FixId::StaleDaemonFiles,
           p.display().to_string(),
           FixOutcome::WouldApply,
           "no process owns the lock",
@@ -859,43 +866,49 @@ fn fix_stale_daemon_files(state_dir: &Path, dry_run: bool) -> Vec<FixReport> {
   }
   match acquire(state_dir) {
     Ok(AcquireOutcome::Acquired(guard)) => {
-      drop(guard);
+      let pidfile = guard.path().to_path_buf();
+      // Delete the handshake while the lock is still held. Releasing first
+      // would let a client that auto-spawns a daemon in that window write a
+      // fresh `runtime.json` for us to delete. The guard's `Drop` is what
+      // unlinks `daemon.pid`, so it goes last.
       crate::daemon::runtime_file::remove(state_dir);
+      let runtime_gone = !crate::daemon::runtime_file::path(state_dir).exists();
+      drop(guard);
+      let pidfile_gone = !pidfile.exists();
       leftovers
         .iter()
         .map(|p| {
           let target = p.display().to_string();
-          if p.exists() {
-            FixReport::new(
-              FIX_STALE_DAEMON_FILES,
-              "remove",
-              target,
-              FixOutcome::Failed,
-              "file is still there",
-            )
+          let gone = if *p == pidfile {
+            pidfile_gone
           } else {
+            runtime_gone
+          };
+          if gone {
             FixReport::new(
-              FIX_STALE_DAEMON_FILES,
-              "remove",
+              FixId::StaleDaemonFiles,
               target,
               FixOutcome::Applied,
               "handshake with no lock holder",
+            )
+          } else {
+            FixReport::new(
+              FixId::StaleDaemonFiles,
+              target,
+              FixOutcome::Failed,
+              "file is still there",
             )
           }
         })
         .collect()
     }
-    Ok(AcquireOutcome::AlreadyRunning { pid, .. }) => {
-      vec![FixReport::skipped(
-        FIX_STALE_DAEMON_FILES,
-        "remove",
-        dir,
-        format!("a daemon (pid {pid}) holds the lock; nothing was removed"),
-      )]
-    }
+    Ok(AcquireOutcome::AlreadyRunning { pid, .. }) => vec![FixReport::skipped(
+      FixId::StaleDaemonFiles,
+      dir,
+      format!("a daemon (pid {pid}) holds the lock; nothing was removed"),
+    )],
     Err(e) => vec![FixReport::new(
-      FIX_STALE_DAEMON_FILES,
-      "remove",
+      FixId::StaleDaemonFiles,
       dir,
       FixOutcome::Failed,
       e.to_string(),
@@ -1617,7 +1630,7 @@ mod tests {
     let path = config_with_mode(&dir, 0o644);
     let fix = fix_config_mode(&path, false);
     assert_eq!(fix.outcome, FixOutcome::Applied);
-    assert_eq!(fix.fix, FIX_CONFIG_MODE);
+    assert_eq!(fix.fix, FixId::ConfigMode);
     assert_eq!(mode_of(&path), 0o600);
     let again = fix_config_mode(&path, false);
     assert_eq!(again.outcome, FixOutcome::Skipped);
@@ -1637,6 +1650,75 @@ mod tests {
     std::fs::remove_dir_all(&dir).ok();
   }
 
+  #[cfg(unix)]
+  #[test]
+  fn fix_config_mode_chmods_the_link_target_and_names_it() {
+    // A dotfiles-managed config: the link sits in the config dir and the
+    // real file is elsewhere. The repair follows it, because that is what
+    // `chmod` does, and names the file it actually wrote.
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let dir = crate::test_support::unique_temp_dir("doctor-fix", "symlink");
+    let real_dir = dir.join("real");
+    let config_dir = dir.join("config");
+    std::fs::create_dir_all(&real_dir).unwrap();
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let real = real_dir.join("config.yaml");
+    std::fs::write(&real, b"proxy:\n  port: 11435\n").unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let link = config_dir.join("config.yaml");
+    symlink(&real, &link).unwrap();
+
+    let fix = fix_config_mode(&link, false);
+    assert_eq!(fix.outcome, FixOutcome::Applied, "{fix:?}");
+    assert_eq!(
+      fix.target,
+      crate::util::paths::canonicalize(&real)
+        .unwrap()
+        .display()
+        .to_string(),
+      "the ledger must name the file chmodded, not the link"
+    );
+    assert_eq!(mode_of(&real), 0o600);
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn fix_config_mode_refuses_a_swappable_parent() {
+    // In a world-writable dir, whoever can place files there picks what an
+    // automated chmod through a planted symlink would hit.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = crate::test_support::unique_temp_dir("doctor-fix", "swappable");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let path = config_with_mode(&dir, 0o644);
+    let fix = fix_config_mode(&path, false);
+    assert_eq!(fix.outcome, FixOutcome::Skipped, "{fix:?}");
+    assert!(fix.detail.contains("world-writable"), "{fix:?}");
+    assert_eq!(mode_of(&path), 0o644, "nothing may be chmodded");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn fix_config_mode_refuses_a_non_regular_target() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let dir = crate::test_support::unique_temp_dir("doctor-fix", "device");
+    std::fs::create_dir_all(&dir).unwrap();
+    let link = dir.join("config.yaml");
+    symlink("/dev/null", &link).unwrap();
+    let fix = fix_config_mode(&link, false);
+    assert_eq!(fix.outcome, FixOutcome::Skipped, "{fix:?}");
+    assert!(fix.detail.contains("not a regular file"), "{fix:?}");
+    assert_eq!(
+      std::fs::metadata("/dev/null").unwrap().permissions().mode() & 0o777,
+      0o666,
+      "/dev/null must be untouched"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
   #[test]
   fn leftover_daemon_files_are_found_then_removed() {
     let dir = crate::test_support::unique_temp_dir("doctor-fix", "stale");
@@ -1648,7 +1730,7 @@ mod tests {
 
     let finding = check_stale_daemon_files(&dir).expect("leftovers must be found");
     assert_eq!(finding.id, FindingId::StaleDaemonFiles.as_str());
-    assert_eq!(finding.fix, Some(FIX_STALE_DAEMON_FILES));
+    assert_eq!(finding.fix, Some(FixId::StaleDaemonFiles));
 
     let proposed = fix_stale_daemon_files(&dir, true);
     assert_eq!(proposed.len(), 2, "one entry per leftover: {proposed:?}");
@@ -1702,7 +1784,7 @@ mod tests {
   #[test]
   fn only_a_repairable_finding_carries_a_fix_id() {
     let mode_drift = Finding::new(FindingId::ConfigModeDrift, Severity::Warning, "mode 644");
-    assert_eq!(mode_drift.fix, Some(FIX_CONFIG_MODE));
+    assert_eq!(mode_drift.fix, Some(FixId::ConfigMode));
     // The same id covers a swappable parent dir, which has no safe repair.
     let parent_drift = Finding::with_fix(
       FindingId::ConfigModeDrift,
@@ -1740,15 +1822,13 @@ mod tests {
     ));
     report.fixes = vec![
       FixReport::new(
-        FIX_STALE_DAEMON_FILES,
-        "remove",
+        FixId::StaleDaemonFiles,
         "/state/runtime.json",
         FixOutcome::Applied,
         "handshake with no lock holder",
       ),
       FixReport::new(
-        FIX_CONFIG_MODE,
-        "chmod 0600",
+        FixId::ConfigMode,
         "/state/config.yaml",
         FixOutcome::WouldApply,
         "mode 0o644 → 0600",
