@@ -441,6 +441,9 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 - [ ] Terminal bell when a pull or a long model load finishes or fails
 - [ ] Document running the daemon as a login service
 - [ ] Duplication: the `ResolveError::Many` arm in `src/cli/resolve.rs` and the matching arm in `src/cli/start.rs` carry the same "matches N models, refine the reference" block, and every `tests/proxy_*.rs` binary keeps its own `unique_temp_dir`, `http_post`, `spawn_listener` and model-fixture helpers because there is no shared test module. Both want a change of their own.
+- [ ] `generic ✓ installed  rocm, vulkan` in LS status command out should show the name of the generic servers instead of rocm/vulkan. It should ideally show `<backendname> ✓ installed <cpu/rocm/cuda/vulkan/metal (name)>, ...`. Lets standardize this field. infer rocm/vulkan when no name?
+- `server  …/hip/bin/llama-server (rocm|vulkan) ·` section of TUI Daemon, needs a rehaul. Show names and arch instead of path `type (names|..) infer rocm/vulkan when no name?
+- Bundle the llamacpp UI for other engines with no UI? Start on first request.
 
 ## General Roadmap
 
