@@ -657,6 +657,89 @@ Without `llama-server`, `daemon start` refuses unless another backend is enabled
 
 `daemon status --json` emits the raw `version` IPC response (the same `{name, version, protocol_version, pid, uptime_seconds, connections}` object an agent would get by hitting the UDS directly). The plain form is a human key/value block and is not a stable machine contract — agents should always use `--json`.
 
+### Run the daemon as a login service
+
+`daemon start --foreground` keeps the daemon under a supervisor instead of detaching, so a service manager can own its lifecycle and read its stdout. Combine it with `daemon.preload` in `config.yaml` and the daemon — plus the models you want waiting — comes up when you log in.
+
+**Linux: a systemd user unit.** Write `~/.config/systemd/user/llamastash.service`:
+
+```ini
+[Unit]
+Description=LlamaStash daemon
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/llamastash daemon start --foreground
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HF_HOME=%h/.cache/huggingface
+TimeoutStopSec=90
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user start llamastash.service
+systemctl --user status llamastash.service      # Main PID + the daemon's own log lines
+systemctl --user enable llamastash.service      # start at login
+loginctl enable-linger $USER                    # start at boot with no login session
+```
+
+Check linger took with `loginctl show-user $USER -p Linger` (`Linger=yes`). Without it the user manager only exists while you are logged in.
+
+- **A unit gets no shell profile.** No `.zshrc`, no `.profile`, so anything your login shell sets has to be an `Environment=` line: `PATH` (wherever `llamastash` and `llama-server` live), `HF_HOME` if your weights cache is not the default, and `LLAMASTASH_CONFIG_DIR` / `LLAMASTASH_STATE_DIR` / `LLAMASTASH_CACHE_DIR` if you keep them somewhere non-default. `%h` expands to your home directory.
+- **A client has to be pointed at the same state dir.** `llamastash status` reads `runtime.json` from the default state dir. If the unit sets `LLAMASTASH_STATE_DIR`, export the same value in your shell, otherwise the CLI talks to a different daemon and reports it as not running.
+- **Second daemon on the same machine?** A running daemon already holds proxy port `11435`, so give the service its own with `--proxy-port` next to `--foreground`, and its own state dir.
+- **Keep the default `KillMode` (`control-group`).** On `systemctl --user stop` the daemon's SIGTERM handler stops every launch — each gets a 5 s grace, raised to whatever floor that backend declares (a `backend.generic` entry can ask for more) — and anything still in the unit's cgroup goes with the unit, so no `llama-server` is orphaned. `TimeoutStopSec=90` is systemd's own default and leaves room for the slowest child; raise it only if a generic entry declares a longer stop grace.
+- **`Restart=on-failure`** brings a crashed daemon back (and a `kill -9`'d one). A clean `systemctl --user stop` is not a failure, so it stays down.
+
+Checked on systemd 262 with an isolated `LLAMASTASH_STATE_DIR` and `--proxy-port 11599`: the unit came up with its preloaded model `ready` and the model's server as a child inside the unit's cgroup; `systemctl --user stop` returned in well under a second with that child gone and `runtime.json` / `daemon.pid` removed; `kill -9` on the main PID was restarted (`NRestarts=1`).
+
+**macOS: a launchd agent.** Untested — it has not been run on a Mac, so treat it as a starting point, not a verified recipe. Write `~/Library/LaunchAgents/com.llamastash.daemon.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.llamastash.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/llamastash</string>
+    <string>daemon</string>
+    <string>start</string>
+    <string>--foreground</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HF_HOME</key>
+    <string>/Users/you/.cache/huggingface</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/you/Library/Logs/llamastash-daemon.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/you/Library/Logs/llamastash-daemon.log</string>
+</dict>
+</plist>
+```
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.llamastash.daemon.plist
+launchctl print gui/$(id -u)/com.llamastash.daemon      # state, last exit, stdout path
+launchctl bootout gui/$(id -u)/com.llamastash.daemon    # stop and unload
+```
+
+Like a systemd user unit, launchd does not read your shell profile, so `EnvironmentVariables` carries `PATH` and `HF_HOME`. `KeepAlive` is what restarts a crashed daemon, which also means `bootout` is the way to stop it — a bare `kill` would just be re-launched.
+
 ## MTP speculative decoding
 
 **MTP (multi-token prediction)** speeds up decoding by letting the model guess several tokens ahead and verifying them in one forward pass — roughly a **2x decode speedup** at high draft acceptance. It is **output-equivalent** to normal decoding (the model still verifies every token), so it is safe to leave on.
