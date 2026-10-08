@@ -158,6 +158,24 @@ mod tests {
   }
 
   #[test]
+  fn local_hms_is_the_utc_clock_shifted_by_whole_quarter_hours() {
+    // Every zone offset in use is a multiple of 15 minutes, so the local
+    // clock keeps UTC's second and is a whole number of quarter hours away.
+    for epoch in [1_700_000_000u64, 1_700_003_661, 1_720_000_000] {
+      let (hour, min, sec) = local_hms(epoch);
+      let (_, _, _, utc_hour, utc_min, utc_sec) = secs_to_ymdhms(epoch);
+      assert!(hour < 24 && min < 60, "{hour}:{min}");
+      assert_eq!(sec, utc_sec);
+      let apart = i64::from(hour * 60 + min) - i64::from(utc_hour * 60 + utc_min);
+      assert_eq!(
+        apart.rem_euclid(15),
+        0,
+        "{hour}:{min} vs {utc_hour}:{utc_min}"
+      );
+    }
+  }
+
+  #[test]
   fn days_between_basic() {
     assert_eq!(days_between((2023, 11, 14), (2023, 11, 21)), Some(7));
     assert_eq!(days_between((2023, 11, 21), (2023, 11, 14)), None);

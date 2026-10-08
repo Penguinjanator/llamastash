@@ -133,11 +133,14 @@ mod tests {
   }
 
   /// Piped rendering, restoring the process-wide color flag afterwards.
+  /// The lock keeps the other CLI test modules, which flip the same flag,
+  /// out while it is changed.
   fn piped(rows: &[RequestRow], one_model: bool) -> String {
     let body = json!(Tail {
       rows: rows.to_vec(),
       ..Tail::default()
     });
+    let _lock = crate::cli::test_lock::serialize();
     let prior = console::colors_enabled();
     console::set_colors_enabled(false);
     let out = requests_human(&body, one_model);

@@ -771,4 +771,41 @@ mod tests {
       "model exited before forwarding could begin"
     );
   }
+
+  /// The tok/s estimated for a response that reported 100 generated
+  /// tokens and no speed, and whose request went upstream ten seconds
+  /// before its body's first byte.
+  fn estimated_speed(streamed: bool) -> f64 {
+    let log = crate::proxy::request_log::RequestLog::new();
+    let mut logged = LoggedResponse {
+      record: log.begin("/v1/chat/completions", None),
+      tap: Some(ResponseTap::default()),
+      content_length: None,
+      seen: 0,
+      ended: false,
+      errored: false,
+      streamed,
+      generating_since: Instant::now()
+        .checked_sub(std::time::Duration::from_secs(10))
+        .expect("the clock has run for ten seconds"),
+    };
+    let body = Bytes::from_static(br#"{"usage":{"prompt_tokens":5,"completion_tokens":100}}"#);
+    logged.observe(&Some(Ok(Frame::data(body))));
+    logged.observe(&None);
+    drop(logged);
+    let row = log.tail(None, 1).rows.into_iter().next().expect("a row");
+    assert!(row.tokens_per_second_estimated);
+    row.tokens_per_second.expect("an estimate")
+  }
+
+  #[test]
+  fn the_speed_estimate_times_a_stream_from_its_first_byte() {
+    // Timed from the send, 100 tokens in ten seconds is 10 tok/s at most.
+    // A stream is timed from its first byte, which arrived just now.
+    let stream = estimated_speed(true);
+    assert!(stream > 100.0, "{stream}");
+    // A response that arrives whole is timed from the send.
+    let whole = estimated_speed(false);
+    assert!((9.0..=10.0).contains(&whole), "{whole}");
+  }
 }

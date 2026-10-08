@@ -53,11 +53,19 @@ pub struct FileStatus {
 }
 
 /// Append every line from `rx` to the rotating file at `path`, until the
-/// file cannot be opened or written.
-async fn write_lines(path: &Path, rx: &mut mpsc::Receiver<String>) -> std::io::Result<()> {
+/// file cannot be opened or written. A line taken off the queue and not
+/// written is added to `lost`.
+async fn write_lines(
+  path: &Path,
+  rx: &mut mpsc::Receiver<String>,
+  lost: &mut u64,
+) -> std::io::Result<()> {
   let mut writer = crate::daemon::supervisor::LogWriter::open(path.to_path_buf()).await?;
   while let Some(line) = rx.recv().await {
-    writer.write_line(line.as_bytes()).await?;
+    if let Err(e) = writer.write_line(line.as_bytes()).await {
+      *lost += 1;
+      return Err(e);
+    }
   }
   Ok(())
 }
@@ -235,9 +243,11 @@ impl RequestRow {
 
 /// A token count for a table cell: `9999`, `12.3k`, `1.2M`.
 fn fmt_count(n: u64) -> String {
+  // One decimal of thousands rounds to `1000.0k` from here up.
+  const MILLIONS_FROM: u64 = 999_950;
   if n < 10_000 {
     n.to_string()
-  } else if n < 1_000_000 {
+  } else if n < MILLIONS_FROM {
     format!("{:.1}k", n as f64 / 1_000.0)
   } else {
     format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -446,7 +456,8 @@ impl RequestLog {
     }
     let file = Arc::clone(&self.file);
     tokio::spawn(async move {
-      if let Err(e) = write_lines(&path, &mut rx).await {
+      let mut lost = 0;
+      if let Err(e) = write_lines(&path, &mut rx, &mut lost).await {
         log::warn!(
           "proxy: request log file {} failed: {e}; writing to it stopped (the in-memory log continues, `status` counts the rows dropped)",
           path.display()
@@ -455,12 +466,11 @@ impl RequestLog {
       // Closing the queue makes every later row count as dropped at the
       // sender. The rows still in it will never be written either.
       rx.close();
-      let mut stranded = 0;
       while rx.try_recv().is_ok() {
-        stranded += 1;
+        lost += 1;
       }
       if let Some(installed) = file.get() {
-        installed.dropped.fetch_add(stranded, Ordering::Relaxed);
+        installed.dropped.fetch_add(lost, Ordering::Relaxed);
       }
     });
   }
@@ -477,6 +487,9 @@ impl RequestLog {
   /// Start a row for a request the proxy just received. The returned
   /// record finishes the row when it is dropped, so every exit path is
   /// logged, including a client that hangs up while a model loads.
+  ///
+  /// `route` is stored uncut: the router logs only the fixed paths it
+  /// matches exactly, so a client cannot make it long.
   pub fn begin(&self, route: &str, client: Option<SocketAddr>) -> RequestRecord {
     let started_at_ms = SystemTime::now()
       .duration_since(UNIX_EPOCH)
@@ -927,6 +940,26 @@ mod tests {
   }
 
   #[test]
+  fn the_time_cell_is_the_local_clock_time_the_request_started() {
+    // 22:13:20 UTC. A zone's offset is a whole number of quarter hours,
+    // so in any zone the minute is 13, 28, 43 or 58 and the second is 20.
+    let row = RequestRow {
+      started_at_ms: 1_700_000_000_000,
+      ..RequestRow::default()
+    };
+    let time = row.cells("-").time;
+    let parts: Vec<u32> = time
+      .split(':')
+      .map(|part| part.parse().expect("digits"))
+      .collect();
+    assert_eq!(time.len(), 8, "{time}");
+    assert_eq!(parts.len(), 3, "{time}");
+    assert!(parts[0] < 24, "{time}");
+    assert_eq!(parts[1] % 15, 13, "{time}");
+    assert_eq!(parts[2], 20, "{time}");
+  }
+
+  #[test]
   fn cells_format_each_field_and_fall_back_to_the_placeholder() {
     let row = RequestRow {
       route: ROUTE.to_string(),
@@ -1011,6 +1044,9 @@ mod tests {
     assert_eq!(fmt_count(0), "0");
     assert_eq!(fmt_count(9_999), "9999");
     assert_eq!(fmt_count(12_345), "12.3k");
+    assert_eq!(fmt_count(999_949), "999.9k");
+    assert_eq!(fmt_count(999_950), "1.0M");
+    assert_eq!(fmt_count(999_999), "1.0M");
     assert_eq!(fmt_count(1_234_567), "1.2M");
   }
 
@@ -1109,19 +1145,28 @@ mod tests {
     log.write_to(PathBuf::from("/dev/full"));
     // The writer gives up on the first row it cannot write. Rows keep
     // being finished meanwhile; none of them reaches a file.
-    let mut dropped = 0;
+    let dropped = || log.file_status().expect("file status").dropped;
+    let mut finished = 0;
     for _ in 0..200 {
       served(&log, "/m/a.gguf", "L1", Usage::default());
+      finished += 1;
       tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-      dropped = log.file_status().expect("file status").dropped;
-      if dropped > 0 {
+      if dropped() > 0 {
         break;
       }
     }
-    assert!(dropped > 0, "the writer never stopped");
-    // Once it has stopped, every further row is counted at once.
+    assert!(dropped() > 0, "the writer never stopped");
     served(&log, "/m/a.gguf", "L1", Usage::default());
-    assert_eq!(log.file_status().expect("file status").dropped, dropped + 1);
+    finished += 1;
+    // Every row is counted: the one whose write failed, the ones queued
+    // behind it, and the ones finished after the writer stopped.
+    for _ in 0..200 {
+      if dropped() == finished {
+        break;
+      }
+      tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(dropped(), finished);
   }
 
   #[test]
