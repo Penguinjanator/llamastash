@@ -1503,15 +1503,26 @@ Non-interactive contract: when stdout isn't a terminal and `--recommended` is no
 
 ### `llamastash doctor`
 
-Read-only diagnostic (its one write is the memory-drift baseline refresh). Re-runs hardware detection, diffs against `_init_snapshot.json`, and emits findings with stable ids agents can branch on: `binary_missing`, `binary_digest_drift` (skipped on brew installs — routine `brew upgrade` legitimately rotates the digest), `hardware_drift`, `memory_drift`, `gtt_hint`, `snapshot_stale`, `config_mode_drift`, `remote_snapshot_unreachable`, plus two configured-server advisories — `server_binary_missing` (Warning: a `backend.<id>.servers[].binary` path no longer resolves) and `servers_configured` (Info: a summary of the resolvable servers and their device counts; silent when no `servers:` are configured). All of these ids are additive, so `schema_version` stays `2`; readers refuse only versions above their max. When the local benchmark snapshot looks stale, `doctor` probes the latest remote (the same one the recommender prefers) before judging `snapshot_stale`, so it only fires when no fresher snapshot is actually reachable; `LLAMASTASH_OFFLINE` skips that probe.
+Diagnoses the setup; read-only unless you ask for `--fix` (its one always-on write is the memory-drift baseline refresh). Re-runs hardware detection, diffs against `_init_snapshot.json`, and emits findings with stable ids agents can branch on: `binary_missing`, `binary_digest_drift` (skipped on brew installs — routine `brew upgrade` legitimately rotates the digest), `hardware_drift`, `memory_drift`, `gtt_hint`, `snapshot_stale`, `config_mode_drift`, `stale_daemon_files` (a `runtime.json` / `daemon.pid` pair with no process holding the lock), `remote_snapshot_unreachable`, plus two configured-server advisories — `server_binary_missing` (Warning: a `backend.<id>.servers[].binary` path no longer resolves) and `servers_configured` (Info: a summary of the resolvable servers and their device counts; silent when no `servers:` are configured). All of these ids are additive, so `schema_version` stays `2`; readers refuse only versions above their max. When the local benchmark snapshot looks stale, `doctor` probes the latest remote (the same one the recommender prefers) before judging `snapshot_stale`, so it only fires when no fresher snapshot is actually reachable; `LLAMASTASH_OFFLINE` skips that probe.
+
+Everything past the `hardware` section is a diff against the baseline, so those findings — including `config_mode_drift` and `stale_daemon_files` — only appear once `init` has written `_init_snapshot.json`.
 
 ```
-llamastash doctor [--json]
+llamastash doctor [--json] [--fix] [--dry-run]
 ```
 
 `doctor` **always exits 0** — findings are informative, not a failure signal. Branch on a non-empty `findings` array (or filter for `severity == "error"`) to escalate, not on the exit code. This makes `doctor` safe to run unconditionally from health-check loops without `set -e` blowing up.
 
-Each `--json` finding carries `{id, severity, message, fix_hint, safe_to_log}`. `safe_to_log: true` on every finding means the output is safe to paste into a public issue.
+Each `--json` finding carries `{id, severity, message, fix_hint, safe_to_log}`, plus `fix` when `--fix` can repair it. `safe_to_log: true` on every finding means the output is safe to paste into a public issue.
+
+**`--fix` applies the repairs that are safe to automate**; `--dry-run` prints the same list and changes nothing.
+
+| Repair id | Fixes | What it does |
+| --- | --- | --- |
+| `config_chmod_0600` | `config_mode_drift` | `chmod 0600` on the config file, following a symlink so a dotfiles-managed config has its real file fixed. The swappable-parent-dir form of that finding has no repair. |
+| `remove_stale_daemon_files` | `stale_daemon_files` | Removes `runtime.json` and `daemon.pid`, but only after taking the lock — which succeeds only when no daemon holds it. A running daemon's files are never touched. |
+
+Nothing else gets repaired: no daemon is stopped, no model is deleted, no live state rewritten. A repair that fails is reported and `doctor` still exits `0`. `--json` carries a top-level `fixes` array of `{fix, action, target, outcome, detail}`, where `outcome` is `applied`, `would_apply`, `skipped` or `failed`; a read-only run carries `"fixes": []`.
 
 `--json` (schema `2`) also carries a `hardware` section — the same live snapshot the init banner and `status` render: `cpu_brand`, `cpu_cores`, `mem_total_bytes`, `disk_free_bytes`, `gpu_backend`, `unified`, `uma_class_source` (how the unified-vs-discrete verdict was reached), `gpu_pool_total_bytes` (raw GPU memory ceiling — carve-out + GTT on a UMA APU), and the `uma_carve_bytes` / `uma_shared_bytes` composition. Two of the findings read this section: `memory_drift` fires when the GPU pool grows (info) or shrinks (warning) past `max(5%, 512 MiB)` versus the recorded baseline (doctor re-stamps the baseline after it fires); `gtt_hint` fires on Linux unified hosts whose GTT is still at the amdgpu default (~half of RAM), pointing at the `amdgpu.gttsize` ceiling.
 

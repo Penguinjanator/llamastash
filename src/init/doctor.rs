@@ -1,4 +1,4 @@
-//! `llamastash doctor` read-only diagnostic.
+//! `llamastash doctor` diagnostic.
 //!
 //! Re-runs hardware + binary detection, loads `_init_snapshot.json`,
 //! compares the two, emits 0-N findings. Every finding carries a
@@ -6,13 +6,17 @@
 //! `fix_hint = "llamastash init --only X"` that maps to the wizard
 //! step that resolves it.
 //!
+//! Read-only unless asked: `--fix` applies the mechanical repair a finding
+//! carries (its `fix` id) and `--dry-run` previews that list. Neither
+//! stops a daemon nor deletes a model.
+//!
 //! Output is always safe to paste into a public issue — see the
 //! Security Contract addendum's redaction rule in the v2 plan.
 //! `safe_to_log` is unconditionally `true` for v2 findings; a future
 //! finding that legitimately needs differentiated redaction lands
 //! the per-finding flag *then*, not preemptively.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -53,6 +57,12 @@ pub const STALE_SNAPSHOT_THRESHOLD_DAYS: u64 = 14;
 /// consecutive remote-fetch failures.
 pub const REMOTE_UNREACHABLE_THRESHOLD: u32 = 3;
 
+/// Ids of the mechanical repairs `doctor --fix` knows how to apply.
+/// Echoed on the finding (`fix`) and on its `fixes[]` entry, so an agent
+/// can tell which findings are auto-repairable without a table of its own.
+pub const FIX_CONFIG_MODE: &str = "config_chmod_0600";
+pub const FIX_STALE_DAEMON_FILES: &str = "remove_stale_daemon_files";
+
 /// Stable finding ids. Agent consumers branch on these — never change
 /// a string here without bumping `DOCTOR_JSON_SCHEMA_VERSION`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -65,6 +75,7 @@ pub enum FindingId {
   GttHint,
   SnapshotStale,
   ConfigModeDrift,
+  StaleDaemonFiles,
   RemoteSnapshotUnreachable,
 }
 
@@ -78,6 +89,7 @@ impl FindingId {
       Self::GttHint => "gtt_hint",
       Self::SnapshotStale => "snapshot_stale",
       Self::ConfigModeDrift => "config_mode_drift",
+      Self::StaleDaemonFiles => "stale_daemon_files",
       Self::RemoteSnapshotUnreachable => "remote_snapshot_unreachable",
     }
   }
@@ -97,7 +109,18 @@ impl FindingId {
       Self::RemoteSnapshotUnreachable => {
         "the remote snapshot fetch keeps failing — check network / egress; the recommender falls back to the bundled snapshot until it recovers"
       }
-      Self::ConfigModeDrift => "llamastash init --only config",
+      Self::ConfigModeDrift => "llamastash doctor --fix (or `llamastash init --only config`)",
+      Self::StaleDaemonFiles => "llamastash doctor --fix",
+    }
+  }
+
+  /// The repair `doctor --fix` applies for this finding, or `None` when
+  /// nothing mechanical fixes it.
+  pub fn fix_action(self) -> Option<&'static str> {
+    match self {
+      Self::ConfigModeDrift => Some(FIX_CONFIG_MODE),
+      Self::StaleDaemonFiles => Some(FIX_STALE_DAEMON_FILES),
+      _ => None,
     }
   }
 }
@@ -117,11 +140,32 @@ pub struct Finding {
   pub message: String,
   pub fix_hint: &'static str,
   pub safe_to_log: bool,
+  /// Set when `doctor --fix` repairs this finding mechanically. Absent
+  /// when it does not, so the pre-`--fix` shape of a finding is unchanged.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub fix: Option<&'static str>,
 }
 
 impl Finding {
   fn new(id: FindingId, severity: Severity, message: impl Into<String>) -> Self {
-    Self::from_parts(id.as_str(), severity, message, id.fix_hint())
+    Self {
+      fix: id.fix_action(),
+      ..Self::from_parts(id.as_str(), severity, message, id.fix_hint())
+    }
+  }
+
+  /// Same as [`Finding::new`] with the repair overridden — used where one
+  /// finding id covers a case `--fix` cannot act on.
+  fn with_fix(
+    id: FindingId,
+    severity: Severity,
+    message: impl Into<String>,
+    fix: Option<&'static str>,
+  ) -> Self {
+    Self {
+      fix,
+      ..Self::new(id, severity, message)
+    }
   }
 
   /// Construct a finding from a stable string `id` + verbatim `fix_hint` — the
@@ -140,6 +184,7 @@ impl Finding {
       message: message.into(),
       fix_hint,
       safe_to_log: true,
+      fix: None,
     }
   }
 }
@@ -244,6 +289,60 @@ pub struct DoctorReport {
   pub findings: Vec<Finding>,
   pub baseline: Baseline,
   pub hardware: HardwareSection,
+  /// Repairs applied (or, under `--dry-run`, proposed) for the findings
+  /// that carry a `fix`. Empty — and therefore an empty JSON array —
+  /// whenever `doctor` ran read-only.
+  #[serde(default)]
+  pub fixes: Vec<FixReport>,
+}
+
+/// How one `--fix` repair ended. `WouldApply` is the `--dry-run` answer
+/// for the same repair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FixOutcome {
+  Applied,
+  WouldApply,
+  Skipped,
+  Failed,
+}
+
+/// One line of the `--fix` ledger: what was targeted, and what happened.
+#[derive(Debug, Clone, Serialize)]
+pub struct FixReport {
+  pub fix: &'static str,
+  /// Verb of the repair, for the human line (`chmod 0600`, `remove`).
+  pub action: &'static str,
+  pub target: String,
+  pub outcome: FixOutcome,
+  pub detail: String,
+}
+
+impl FixReport {
+  fn new(
+    fix: &'static str,
+    action: &'static str,
+    target: impl Into<String>,
+    outcome: FixOutcome,
+    detail: impl Into<String>,
+  ) -> Self {
+    Self {
+      fix,
+      action,
+      target: target.into(),
+      outcome,
+      detail: detail.into(),
+    }
+  }
+
+  fn skipped(
+    fix: &'static str,
+    action: &'static str,
+    target: impl Into<String>,
+    detail: impl Into<String>,
+  ) -> Self {
+    Self::new(fix, action, target, FixOutcome::Skipped, detail)
+  }
 }
 
 /// Build the report. Pure-ish: reads the on-disk snapshot + re-detects
@@ -267,6 +366,7 @@ pub fn build_report(snapshot: Option<&InitSnapshot>, hardware: &HardwareSnapshot
       findings,
       baseline,
       hardware: hardware_section,
+      fixes: Vec::new(),
     };
   };
 
@@ -296,6 +396,7 @@ pub fn build_report(snapshot: Option<&InitSnapshot>, hardware: &HardwareSnapshot
     findings,
     baseline,
     hardware: hardware_section,
+    fixes: Vec::new(),
   }
 }
 
@@ -582,7 +683,9 @@ fn check_config_mode_drift() -> Option<Finding> {
     if let Some(parent) = path.parent() {
       let our_uid = unsafe { libc::geteuid() };
       if let Some(surface) = crate::util::file_security::dir_swap_surface(parent, our_uid) {
-        return Some(Finding::new(
+        // No `--fix` here: replacing or re-owning a directory another
+        // user could swap into is not a mechanical repair.
+        return Some(Finding::with_fix(
           FindingId::ConfigModeDrift,
           Severity::Warning,
           format!(
@@ -590,12 +693,214 @@ fn check_config_mode_drift() -> Option<Finding> {
             parent.display(),
             surface.describe(our_uid)
           ),
+          None,
         ));
       }
     }
   }
   let _ = path;
   None
+}
+
+/// `daemon.pid` with no flock holder is left over from a dead daemon by
+/// construction (see [`crate::daemon::lockfile`]), and the `runtime.json`
+/// beside it is a handshake pointing at a control-plane URL nothing
+/// listens on. `daemon start` rebinds both, so this is untidiness rather
+/// than breakage — but a client that reads `runtime.json` first aims at
+/// the dead URL until it does.
+fn check_stale_daemon_files(state_dir: &Path) -> Option<Finding> {
+  if crate::daemon::existing_daemon_pid(state_dir).is_some() {
+    return None;
+  }
+  let leftovers = stale_daemon_files(state_dir);
+  if leftovers.is_empty() {
+    return None;
+  }
+  let names = leftovers
+    .iter()
+    .filter_map(|p| p.file_name())
+    .map(|n| n.to_string_lossy())
+    .collect::<Vec<_>>()
+    .join(", ");
+  Some(Finding::new(
+    FindingId::StaleDaemonFiles,
+    Severity::Warning,
+    format!(
+      "`{}` still holds {names} from a daemon that is not running — no process owns the lock",
+      state_dir.display()
+    ),
+  ))
+}
+
+fn stale_daemon_files(state_dir: &Path) -> Vec<PathBuf> {
+  [
+    crate::daemon::runtime_file::path(state_dir),
+    state_dir.join("daemon.pid"),
+  ]
+  .into_iter()
+  .filter(|p| p.exists())
+  .collect()
+}
+
+/// Apply every repair the report marks fixable, in finding order. Under
+/// `dry_run` nothing is touched and every entry comes back `would_apply`.
+/// The set is bounded on purpose: no daemon is signalled, no model is
+/// deleted, and daemon state is only removed once nothing holds the lock.
+fn apply_fixes(findings: &[Finding], dry_run: bool) -> Vec<FixReport> {
+  let mut fixes = Vec::new();
+  for f in findings.iter().filter_map(|f| f.fix) {
+    match f {
+      FIX_CONFIG_MODE => {
+        if let Some(path) = crate::util::paths::user_config_file() {
+          fixes.push(fix_config_mode(&path, dry_run));
+        }
+      }
+      FIX_STALE_DAEMON_FILES => {
+        if let Some(dir) = crate::util::paths::state_dir() {
+          fixes.extend(fix_stale_daemon_files(&dir, dry_run));
+        }
+      }
+      _ => {}
+    }
+  }
+  fixes
+}
+
+/// Put the config file back to the `0600` it ships with. `set_permissions`
+/// follows a symlink, which is what `check_config_mode_drift` measured too,
+/// so a dotfiles-managed config has its real file chmodded, not the link.
+#[cfg(unix)]
+fn fix_config_mode(path: &Path, dry_run: bool) -> FixReport {
+  use std::os::unix::fs::PermissionsExt;
+  let target = path.display().to_string();
+  let mode = match std::fs::metadata(path) {
+    Ok(meta) => meta.permissions().mode() & 0o777,
+    Err(e) => {
+      return FixReport::new(
+        FIX_CONFIG_MODE,
+        "chmod 0600",
+        target,
+        FixOutcome::Failed,
+        e.to_string(),
+      )
+    }
+  };
+  if mode == 0o600 {
+    return FixReport::skipped(FIX_CONFIG_MODE, "chmod 0600", target, "already 0600");
+  }
+  let detail = format!("mode {mode:#o} \u{2192} 0600");
+  if dry_run {
+    return FixReport::new(
+      FIX_CONFIG_MODE,
+      "chmod 0600",
+      target,
+      FixOutcome::WouldApply,
+      detail,
+    );
+  }
+  match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+    Ok(()) => FixReport::new(
+      FIX_CONFIG_MODE,
+      "chmod 0600",
+      target,
+      FixOutcome::Applied,
+      detail,
+    ),
+    Err(e) => FixReport::new(
+      FIX_CONFIG_MODE,
+      "chmod 0600",
+      target,
+      FixOutcome::Failed,
+      e.to_string(),
+    ),
+  }
+}
+
+#[cfg(not(unix))]
+fn fix_config_mode(path: &Path, _dry_run: bool) -> FixReport {
+  FixReport::skipped(
+    FIX_CONFIG_MODE,
+    "chmod 0600",
+    path.display().to_string(),
+    "POSIX file modes do not apply on this platform",
+  )
+}
+
+/// Remove a leftover `runtime.json` / `daemon.pid`. `lockfile::acquire` is
+/// what makes this safe to automate: it succeeds only when no daemon holds
+/// the flock, so a daemon that started after the check answers
+/// `AlreadyRunning` instead of losing a live pidfile. Acquiring also claims
+/// the pidfile, and the guard's `Drop` unlinks it.
+fn fix_stale_daemon_files(state_dir: &Path, dry_run: bool) -> Vec<FixReport> {
+  use crate::daemon::lockfile::{acquire, AcquireOutcome};
+  let leftovers = stale_daemon_files(state_dir);
+  let dir = state_dir.display().to_string();
+  if leftovers.is_empty() {
+    return vec![FixReport::skipped(
+      FIX_STALE_DAEMON_FILES,
+      "remove",
+      dir,
+      "nothing left over",
+    )];
+  }
+  if dry_run {
+    return leftovers
+      .iter()
+      .map(|p| {
+        FixReport::new(
+          FIX_STALE_DAEMON_FILES,
+          "remove",
+          p.display().to_string(),
+          FixOutcome::WouldApply,
+          "no process owns the lock",
+        )
+      })
+      .collect();
+  }
+  match acquire(state_dir) {
+    Ok(AcquireOutcome::Acquired(guard)) => {
+      drop(guard);
+      crate::daemon::runtime_file::remove(state_dir);
+      leftovers
+        .iter()
+        .map(|p| {
+          let target = p.display().to_string();
+          if p.exists() {
+            FixReport::new(
+              FIX_STALE_DAEMON_FILES,
+              "remove",
+              target,
+              FixOutcome::Failed,
+              "file is still there",
+            )
+          } else {
+            FixReport::new(
+              FIX_STALE_DAEMON_FILES,
+              "remove",
+              target,
+              FixOutcome::Applied,
+              "handshake with no lock holder",
+            )
+          }
+        })
+        .collect()
+    }
+    Ok(AcquireOutcome::AlreadyRunning { pid, .. }) => {
+      vec![FixReport::skipped(
+        FIX_STALE_DAEMON_FILES,
+        "remove",
+        dir,
+        format!("a daemon (pid {pid}) holds the lock; nothing was removed"),
+      )]
+    }
+    Err(e) => vec![FixReport::new(
+      FIX_STALE_DAEMON_FILES,
+      "remove",
+      dir,
+      FixOutcome::Failed,
+      e.to_string(),
+    )],
+  }
 }
 
 fn check_remote_snapshot_unreachable(snapshot: &InitSnapshot) -> Option<Finding> {
@@ -740,6 +1045,19 @@ pub async fn run(args: DoctorArgs, _cli: &Cli, config: &Config) -> CliResult {
   // Server-catalog advisory: configured `servers:` health across backends.
   report.findings.extend(check_servers(config));
 
+  if let Some(dir) = state_dir.as_ref() {
+    if let Some(finding) = check_stale_daemon_files(dir) {
+      report.findings.push(finding);
+    }
+  }
+
+  // `--fix` acts on what the report found; `--dry-run` previews the same
+  // list without touching anything. Either way `doctor` still exits 0: a
+  // repair that failed is a reported outcome, not a failed diagnostic.
+  if args.fix || args.dry_run {
+    report.fixes = apply_fixes(&report.findings, args.dry_run);
+  }
+
   if args.json {
     println!(
       "{}",
@@ -804,6 +1122,31 @@ fn format_human(report: &DoctorReport) -> String {
       colors::dim("→ fix with:"),
       console::style(f.fix_hint).bold(),
     );
+  }
+  if !report.fixes.is_empty() {
+    out.push('\n');
+    out.push_str(&format::section_header(
+      "fixes",
+      Some((report.fixes.len(), "actions")),
+    ));
+    for fix in &report.fixes {
+      let line = match fix.outcome {
+        FixOutcome::Applied => format!("{} {} ({})", fix.action, fix.target, fix.detail),
+        FixOutcome::WouldApply => format!("would {} {} ({})", fix.action, fix.target, fix.detail),
+        FixOutcome::Skipped => {
+          format!("{} {} — skipped: {}", fix.action, fix.target, fix.detail)
+        }
+        FixOutcome::Failed => {
+          format!("{} {} failed: {}", fix.action, fix.target, fix.detail)
+        }
+      };
+      let line = match fix.outcome {
+        FixOutcome::Applied => colors::success(&line),
+        FixOutcome::Failed => colors::error(&line),
+        _ => colors::dim(&line),
+      };
+      let _ = writeln!(out, "  {line}");
+    }
   }
   out
 }
@@ -1249,5 +1592,181 @@ mod tests {
     assert!(info.message.contains("configured server"));
     assert!(info.safe_to_log);
     std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[cfg(unix)]
+  fn config_with_mode(dir: &Path, mode: u32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("config.yaml");
+    std::fs::write(&path, b"proxy:\n  port: 11435\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    path
+  }
+
+  #[cfg(unix)]
+  fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn fix_config_mode_restores_0600_and_then_has_nothing_to_do() {
+    let dir = crate::test_support::unique_temp_dir("doctor-fix", "chmod");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = config_with_mode(&dir, 0o644);
+    let fix = fix_config_mode(&path, false);
+    assert_eq!(fix.outcome, FixOutcome::Applied);
+    assert_eq!(fix.fix, FIX_CONFIG_MODE);
+    assert_eq!(mode_of(&path), 0o600);
+    let again = fix_config_mode(&path, false);
+    assert_eq!(again.outcome, FixOutcome::Skipped);
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn dry_run_names_the_chmod_without_applying_it() {
+    let dir = crate::test_support::unique_temp_dir("doctor-fix", "chmod-dry");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = config_with_mode(&dir, 0o640);
+    let fix = fix_config_mode(&path, true);
+    assert_eq!(fix.outcome, FixOutcome::WouldApply);
+    assert!(fix.detail.contains("640"), "detail names the mode: {fix:?}");
+    assert_eq!(mode_of(&path), 0o640, "--dry-run must not chmod");
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn leftover_daemon_files_are_found_then_removed() {
+    let dir = crate::test_support::unique_temp_dir("doctor-fix", "stale");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pidfile = dir.join("daemon.pid");
+    let runtime = crate::daemon::runtime_file::path(&dir);
+    std::fs::write(&pidfile, b"4242\n").unwrap();
+    std::fs::write(&runtime, b"{}\n").unwrap();
+
+    let finding = check_stale_daemon_files(&dir).expect("leftovers must be found");
+    assert_eq!(finding.id, FindingId::StaleDaemonFiles.as_str());
+    assert_eq!(finding.fix, Some(FIX_STALE_DAEMON_FILES));
+
+    let proposed = fix_stale_daemon_files(&dir, true);
+    assert_eq!(proposed.len(), 2, "one entry per leftover: {proposed:?}");
+    assert!(
+      proposed.iter().all(|f| f.outcome == FixOutcome::WouldApply),
+      "{proposed:?}"
+    );
+    assert!(
+      pidfile.exists() && runtime.exists(),
+      "--dry-run removes nothing"
+    );
+
+    for fix in fix_stale_daemon_files(&dir, false) {
+      assert_eq!(fix.outcome, FixOutcome::Applied, "{fix:?}");
+    }
+    assert!(!pidfile.exists() && !runtime.exists());
+    assert!(
+      check_stale_daemon_files(&dir).is_none(),
+      "a clean state dir has nothing to report"
+    );
+    assert_eq!(
+      fix_stale_daemon_files(&dir, false)[0].outcome,
+      FixOutcome::Skipped
+    );
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn a_daemon_that_holds_the_lock_is_left_alone() {
+    // Our own flock answers the way a running daemon does: the probe uses a
+    // separate open file description, so its non-blocking lock contends.
+    let dir = crate::test_support::unique_temp_dir("doctor-fix", "live");
+    let guard = crate::daemon::lockfile::acquire(&dir).expect("acquire");
+    let runtime = crate::daemon::runtime_file::path(&dir);
+    std::fs::write(&runtime, b"{}\n").unwrap();
+
+    assert!(
+      check_stale_daemon_files(&dir).is_none(),
+      "a live holder is not a leftover"
+    );
+    let fixes = fix_stale_daemon_files(&dir, false);
+    assert_eq!(fixes[0].outcome, FixOutcome::Skipped, "{fixes:?}");
+    assert!(
+      runtime.exists(),
+      "never delete a running daemon's handshake"
+    );
+    drop(guard);
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn only_a_repairable_finding_carries_a_fix_id() {
+    let mode_drift = Finding::new(FindingId::ConfigModeDrift, Severity::Warning, "mode 644");
+    assert_eq!(mode_drift.fix, Some(FIX_CONFIG_MODE));
+    // The same id covers a swappable parent dir, which has no safe repair.
+    let parent_drift = Finding::with_fix(
+      FindingId::ConfigModeDrift,
+      Severity::Warning,
+      "swappable",
+      None,
+    );
+    assert_eq!(parent_drift.fix, None);
+    assert!(
+      !serde_json::to_string(&parent_drift)
+        .unwrap()
+        .contains("\"fix\""),
+      "an unrepairable finding must not gain the key"
+    );
+    assert!(serde_json::to_string(&mode_drift)
+      .unwrap()
+      .contains("\"fix\":\"config_chmod_0600\""));
+    // Backend-contributed findings have no repair either.
+    assert_eq!(
+      Finding::from_parts("server_binary_missing", Severity::Warning, "m", "hint").fix,
+      None
+    );
+  }
+
+  #[test]
+  fn format_human_lists_every_fix_outcome() {
+    let _g = crate::cli::test_lock::serialize();
+    let prior_colors = console::colors_enabled();
+    console::set_colors_enabled(false);
+    let mut report = build_report(None, &cpu_hw());
+    report.findings.push(Finding::new(
+      FindingId::StaleDaemonFiles,
+      Severity::Warning,
+      "leftovers",
+    ));
+    report.fixes = vec![
+      FixReport::new(
+        FIX_STALE_DAEMON_FILES,
+        "remove",
+        "/state/runtime.json",
+        FixOutcome::Applied,
+        "handshake with no lock holder",
+      ),
+      FixReport::new(
+        FIX_CONFIG_MODE,
+        "chmod 0600",
+        "/state/config.yaml",
+        FixOutcome::WouldApply,
+        "mode 0o644 → 0600",
+      ),
+    ];
+    let out = format_human(&report);
+    console::set_colors_enabled(prior_colors);
+    assert!(
+      out.contains("fixes (2 actions)\n"),
+      "fixes section header drift: {out:?}"
+    );
+    assert!(
+      out.contains("✓ remove /state/runtime.json (handshake with no lock holder)"),
+      "{out:?}"
+    );
+    assert!(
+      out.contains("would chmod 0600 /state/config.yaml (mode 0o644 → 0600)"),
+      "{out:?}"
+    );
   }
 }

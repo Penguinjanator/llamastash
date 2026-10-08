@@ -239,8 +239,9 @@ pub enum Command {
   Completions(CompletionsArgs),
   /// Run the first-time setup / maintenance wizard.
   Init(InitArgs),
-  /// Read-only diagnostic — compares current detection against the
-  /// recorded `init_snapshot` baseline.
+  /// Diagnose the setup against the recorded `init_snapshot` baseline.
+  /// Read-only unless `--fix` applies a finding's mechanical repair;
+  /// `--dry-run` shows what `--fix` would change.
   Doctor(DoctorArgs),
   /// Mark, unmark, and list favorite models.
   Favorites(FavoritesArgs),
@@ -1158,7 +1159,10 @@ pub struct DoctorArgs {
   /// Emit structured JSON findings instead of the human-readable
   /// list. Stable shape:
   /// `{schema_version, findings: [{id, severity, message, fix_hint,
-  /// safe_to_log}], baseline: {snapshot_bundle_date, init_date}}`.
+  /// safe_to_log, fix?}], baseline: {snapshot_bundle_date, init_date},
+  /// fixes: []}`. `fix` names the repair `--fix` applies and is absent
+  /// when nothing repairs that finding; `fixes` reports each repair the
+  /// run applied (empty when `doctor` ran read-only).
   ///
   /// `doctor` always exits `0` — findings are informative, not a
   /// failure signal. Agents should branch on a non-empty `findings`
@@ -1167,6 +1171,18 @@ pub struct DoctorArgs {
   /// from health-check loops without `set -e` blowing up.
   #[arg(long)]
   pub json: bool,
+
+  /// Apply the repairs that are safe to automate: `chmod 0600` on the
+  /// config, and removing a `runtime.json` / `daemon.pid` pair left by a
+  /// daemon that no longer holds the lock. Every change is printed. Never
+  /// stops a daemon, deletes a model, or rewrites live state; a finding
+  /// with no repair is left alone.
+  #[arg(long)]
+  pub fix: bool,
+
+  /// Print the repair list `--fix` would apply, applying nothing.
+  #[arg(long)]
+  pub dry_run: bool,
 }
 
 /// One of the wizard's optional steps. Detection (step 1) and handoff

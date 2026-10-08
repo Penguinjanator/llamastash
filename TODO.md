@@ -434,7 +434,8 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 ### Batch 5: CLI setup commands ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-5-cli-setup-commands))
 
 - [x] ~~Shell completions~~
-- [ ] `doctor --fix` for findings with a safe mechanical repair
+- [x] ~~`doctor --fix` for findings with a safe mechanical repair~~
+- [ ] A `doctor --fix` repair for a tool config whose proxy URL names a port the proxy no longer listens on — needs that check first
 
 ### Batch 6: small standalone items ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-6-small-standalone-items))
 
