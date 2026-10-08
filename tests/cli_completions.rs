@@ -117,6 +117,24 @@ fn json_is_not_accepted() {
   assert_eq!(out.status.code(), Some(64), "--json must be refused");
 }
 
+/// The buffered render has to stay byte-identical to the streaming one it
+/// replaced: same script, only a failure mode that reports instead of
+/// panicking.
+#[test]
+fn the_buffered_script_matches_the_plain_generator() {
+  use clap::CommandFactory;
+  for name in ["bash", "zsh", "fish"] {
+    let shell: clap_complete::Shell = name.parse().unwrap();
+    let mut cmd = llamastash::cli::cli_args::Cli::command();
+    let bin_name = cmd.get_name().to_string();
+    let mut expected = Vec::new();
+    clap_complete::generate(shell, &mut cmd, bin_name, &mut expected);
+    let out = bin().args(["completions", name]).output().expect("run");
+    assert!(out.status.success(), "{name}");
+    assert_eq!(out.stdout, expected, "{name} script differs");
+  }
+}
+
 /// `completions bash | head -1` closes the pipe mid-write. That is an error
 /// to report, not a panic.
 #[test]

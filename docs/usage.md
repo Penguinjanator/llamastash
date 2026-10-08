@@ -1653,7 +1653,7 @@ llamastash completions zsh > ~/.zsh/completions/_llamastash
 llamastash completions fish > ~/.config/fish/completions/llamastash.fish
 ```
 
-For the current shell only: `source <(llamastash completions bash)` in bash or zsh, `llamastash completions fish | source` in fish.
+For the current shell only: `source <(llamastash completions bash)` in bash or zsh, `llamastash completions fish | source` in fish. The script is written in one piece, so a closed or failing stdout (`llamastash completions bash | head -1`, a full disk) exits `71` with an error on stderr instead of ending in a panic.
 
 ## Exit codes
 
