@@ -680,6 +680,7 @@ WantedBy=default.target
 ```
 
 ```bash
+llamastash daemon stop                            # any daemon you started by hand first
 systemctl --user daemon-reload
 systemctl --user start llamastash.service
 systemctl --user status llamastash.service      # Main PID + the daemon's own log lines
@@ -688,6 +689,8 @@ loginctl enable-linger $USER                    # start at boot with no login se
 ```
 
 Check linger took with `loginctl show-user $USER -p Linger` (`Linger=yes`). Without it the user manager only exists while you are logged in.
+
+- **Stop the daemon you started by hand before starting the unit.** Any client command (`status`, `list`, the TUI) auto-spawns a daemon, so one normally runs in the default state dir already. `daemon start --foreground` there prints `daemon: already running (pid N)` and exits 0. That is not a failure, so `Restart=on-failure` does not fire: the unit goes `active` then `inactive (dead)` at once, `preload` never runs, and `status` shows no Main PID. Stop the running daemon and start the unit again.
 
 - **A unit gets no shell profile.** No `.zshrc`, no `.profile`, so anything your login shell sets has to be an `Environment=` line: `PATH` (wherever `llamastash` and `llama-server` live), `HF_HOME` if your weights cache is not the default, and `LLAMASTASH_CONFIG_DIR` / `LLAMASTASH_STATE_DIR` / `LLAMASTASH_CACHE_DIR` if you keep them somewhere non-default. `%h` expands to your home directory.
 - **A client has to be pointed at the same state dir.** `llamastash status` reads `runtime.json` from the default state dir. If the unit sets `LLAMASTASH_STATE_DIR`, export the same value in your shell, otherwise the CLI talks to a different daemon and reports it as not running.
@@ -1773,7 +1776,7 @@ One terminal bell — a bare `\a` on stderr — when something you are waiting o
 - A TUI download finishes or fails.
 - A launch you started in the TUI turns ready or fails. One bell per launch, on the first status tick that reports the end.
 
-Nothing else rings: `preload` models, launches started from the CLI or the proxy, and cache hits, where there was nothing to wait for. The bell never reaches a non-terminal stream, so piped and `--json` output stays clean. Set `bell: false` in `config.yaml` for silence.
+Nothing else rings: `preload` models, launches started from the CLI or the proxy, and a TUI pull that finds every shard already cached, where there was nothing to wait for. A `llamastash pull` of a repo you already downloaded does ring, because the command you ran has to end either way. The bell never reaches a non-terminal stream, so piped and `--json` output stays clean. Set `bell: false` in `config.yaml` for silence.
 
 ### Mouse focus (opt-in)
 
