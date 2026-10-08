@@ -19,7 +19,7 @@ pub async fn handle(args: PullArgs, cli: &Cli, config: &Config) -> CliResult {
   // A pull is long enough to walk away from, on both outcomes.
   // `bell::ring` stays quiet when stderr is not a terminal; `--json` is
   // the machine contract, so it gets the exit code and no control byte.
-  if config.bell && !cli.json {
+  if crate::util::bell::command_rings(config.bell, cli.json) {
     crate::util::bell::ring();
   }
   result

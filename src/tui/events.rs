@@ -1874,17 +1874,19 @@ fn dispatch_launch(
 ) {
   let mut pending_bell: Option<std::path::PathBuf> = None;
   if let (true, WriterCmd::StartModel(args)) = (app.options.bell, &cmd) {
-    // Watched by path: the daemon assigns the launch id, and the TUI learns
-    // it only from the next `status` tick. `ingest_status` rings and drops it.
-    // Only a command the writer actually took earns a watch, so a refused send
-    // cannot leave a path waiting for a launch that never started.
+    // One watch per launch, keyed by path: the daemon assigns the launch id, and
+    // the TUI learns it only from the next `status` tick. `ingest_status` rings
+    // and drops it. Only a command the writer actually took earns a watch, so a
+    // refused send cannot leave a path waiting for a launch that never started.
     pending_bell = Some(args.model_path.clone());
   }
   match writer {
     Some(tx) => match tx.try_send(cmd) {
       Ok(()) => {
         if let Some(path) = pending_bell {
-          app.bell_watch.push(path);
+          app
+            .bell_watch
+            .push(crate::tui::app::BellWatch::waiting(path));
         }
         app.show_toast(format!("launching {name}…"));
         app.close_launch_picker();
@@ -2618,12 +2620,10 @@ fn apply_refresh(app: &mut App, tick: RefreshTick) {
       app.daemon_connected = false;
     }
     RefreshTick::WriterError { method, message } => {
-      if method == "start_model" {
-        // A refused start never produces a row to watch, so drop the pending
-        // bells instead of ringing later for an unrelated launch of the same
-        // model. The error carries no path, so this clears every pending one.
-        app.bell_watch.clear();
-      }
+      // A refused start produces no row to watch, so its bell watch would hang
+      // around. The error carries no path, so nothing is dropped here: the watch
+      // ages out in `App::bell_tick` while launches from the same batch that did
+      // start keep theirs.
       app.show_error_toast(writer_error_toast(method, &message));
     }
     RefreshTick::WriterInfo { message } => {
@@ -3591,11 +3591,64 @@ mod tests {
     );
     assert_eq!(
       app.bell_watch,
-      vec![std::path::PathBuf::from("/m/qwen.gguf")]
+      vec![crate::tui::app::BellWatch::waiting("/m/qwen.gguf")]
     );
     assert!(
       matches!(rx.try_recv(), Ok(WriterCmd::StartModel(_))),
       "the command still goes out"
+    );
+  }
+
+  #[test]
+  fn a_launch_queued_with_the_bell_off_is_never_watched() {
+    use crate::tui::app::{AppOptions, BellWatch, StartModelArgs};
+    let args = Box::new(StartModelArgs {
+      model_path: "/m/qwen.gguf".into(),
+      ctx: None,
+      reasoning: None,
+      knobs: Default::default(),
+      extras: Vec::new(),
+      mode: None,
+      prefer_port: None,
+      backend: Default::default(),
+      selection: "explicit",
+      server: None,
+      name: None,
+      preset: None,
+    });
+    let mut app = App::new(AppOptions {
+      bell: false,
+      ..AppOptions::default()
+    });
+    let (tx, _rx) = mpsc::channel(4);
+    dispatch_launch(
+      &mut app,
+      Some(&tx),
+      WriterCmd::StartModel(args),
+      "qwen".into(),
+    );
+    assert_eq!(app.bell_watch, Vec::<BellWatch>::new(), "bell: false");
+  }
+
+  #[test]
+  fn a_refused_start_leaves_the_other_launches_bells_alone() {
+    // The error names no path, so clearing everything would silence the bells
+    // of launches from the same batch that did start. The watch that has no row
+    // ages out in `App::bell_tick` instead.
+    use crate::tui::app::BellWatch;
+    let mut app = App::new(crate::tui::app::AppOptions::default());
+    app.bell_watch = vec![BellWatch::waiting("/m/qwen.gguf")];
+    apply_refresh(
+      &mut app,
+      RefreshTick::WriterError {
+        method: "start_model",
+        message: "no ports left".into(),
+      },
+    );
+    assert_eq!(
+      app.bell_watch,
+      vec![BellWatch::waiting("/m/qwen.gguf")],
+      "the toast is the report; the watch ages out on its own"
     );
   }
 
