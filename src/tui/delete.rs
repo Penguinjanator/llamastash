@@ -503,6 +503,35 @@ mod tests {
   }
 
   #[test]
+  fn plan_keeps_a_nameless_projector_another_model_pairs_with() {
+    // A nameless file is only a leftover when the paired companion is nameless
+    // too. Here alpha pairs with its own named projector, and the nameless
+    // mmproj.gguf is what beta pairs with — deleting alpha must not take it.
+    let dir = tempdir("named-plus-nameless");
+    let a = dir.join("alpha-Q4_K_M.gguf");
+    let b = dir.join("beta-Q4_K_M.gguf");
+    let named = dir.join("mmproj-alpha-BF16.gguf");
+    let nameless = dir.join("mmproj.gguf");
+    for p in [&a, &b, &named, &nameless] {
+      fs::write(p, b"weights").unwrap();
+    }
+    let target = model(&a);
+    let catalog = vec![target.clone(), model(&b)];
+
+    let plan = plan(&target, &catalog, None);
+    assert_eq!(plan.projector.as_deref(), Some(named.as_path()));
+    assert!(
+      plan.orphan_companions.is_empty(),
+      "beta pairs with {:?}, so it is no leftover",
+      plan.orphan_companions
+    );
+    execute(&plan).expect("delete must succeed");
+    assert!(nameless.exists(), "the surviving model keeps its projector");
+    assert!(b.exists());
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  #[test]
   fn plan_keeps_a_companion_another_model_still_pairs_with() {
     // Two models sharing one anonymous projector: `find_mmproj`'s catch-all
     // rule hands the same file to both, so deleting one must leave it.

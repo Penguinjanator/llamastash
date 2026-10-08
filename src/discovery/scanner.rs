@@ -636,8 +636,9 @@ fn best_companion(candidates: &[PathBuf]) -> Option<PathBuf> {
 /// carries a dtype and no model, so it pairs with nothing on its own. A delete
 /// uses this to take those leftovers with the model instead of orphaning them.
 ///
-/// Returns an empty list for a companion whose name does name a model, and for a
-/// path that is no companion at all.
+/// Returns an empty list for a companion whose own name does name a model — then a
+/// nameless sibling is another model's projector, not a leftover — and for a path
+/// that is no companion at all.
 pub fn companion_precisions(companion_path: &Path) -> Vec<PathBuf> {
   if is_projector_companion(companion_path) {
     anonymous_companions_beside(companion_path, is_projector_companion, strip_mmproj_markers)
@@ -653,6 +654,20 @@ fn anonymous_companions_beside(
   is_companion: fn(&Path) -> bool,
   strip_markers: fn(&str) -> String,
 ) -> Vec<PathBuf> {
+  // The guard is on the paired companion itself. When its name carries a model,
+  // a nameless sibling is what *another* model in the folder pairs with, so
+  // taking it would strip that model's vision. When the paired name is nameless,
+  // every model reaching the nameless tier took this best-ranked file, so its
+  // siblings belong to nobody.
+  let nameless_here = |path: &Path| {
+    path
+      .file_name()
+      .and_then(|n| n.to_str())
+      .is_some_and(|name| canonical_base(&strip_markers(name)).is_empty())
+  };
+  if !nameless_here(companion_path) {
+    return Vec::new();
+  }
   let dir = match companion_path.parent() {
     Some(dir) => dir,
     None => return Vec::new(),
@@ -664,12 +679,7 @@ fn anonymous_companions_beside(
     .flatten()
     .map(|e| e.path())
     .filter(|path| path.is_file() && path != companion_path && is_companion(path))
-    .filter(|path| {
-      path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|name| canonical_base(&strip_markers(name)).is_empty())
-    })
+    .filter(|path| nameless_here(path))
     .collect();
   out.sort();
   out
@@ -2478,6 +2488,34 @@ mod tests {
       std::cmp::Ordering::Greater,
       "the directory name must not outrank the file's own precision"
     );
+  }
+
+  #[test]
+  fn companion_precisions_skips_a_companion_that_names_the_model() {
+    // A nameless file beside a named projector belongs to whichever model takes
+    // the nameless tier, so it is never a leftover of this companion.
+    let dir = temp_dir("companion-precisions-named");
+    fs::write(
+      dir.join("gemma-4-31B-it-Q4_K_M.gguf"),
+      build_minimal_gguf("llama"),
+    )
+    .unwrap();
+    let named = dir.join("mmproj-gemma-4-31B-it-BF16.gguf");
+    fs::write(&named, build_minimal_gguf("llama")).unwrap();
+    fs::write(dir.join("mmproj.gguf"), build_minimal_gguf("llama")).unwrap();
+    assert!(companion_precisions(&named).is_empty());
+
+    // Nameless siblings of a nameless companion are leftovers: the paired file is
+    // the best-ranked of them, the rest belong to nobody.
+    let paired = dir.join("mmproj-F16.gguf");
+    fs::write(&paired, build_minimal_gguf("llama")).unwrap();
+    let plain = dir.join("mmproj.gguf");
+    assert_eq!(
+      companion_precisions(&paired),
+      vec![plain.clone()],
+      "the other precisions beside the paired file"
+    );
+    fs::remove_dir_all(&dir).ok();
   }
 
   #[test]
