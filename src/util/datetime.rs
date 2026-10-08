@@ -84,6 +84,23 @@ pub fn secs_to_ymdhms(total_secs: u64) -> (i32, u32, u32, u32, u32, u32) {
   (y, mo, d, h, mi, s)
 }
 
+/// Wall-clock `(hour, minute, second)` of a Unix timestamp in the machine's
+/// local time zone. UTC on a platform without `localtime_r`.
+pub fn local_hms(epoch_secs: u64) -> (u32, u32, u32) {
+  #[cfg(unix)]
+  {
+    let t = epoch_secs as libc::time_t;
+    // SAFETY: `tm` is plain integers (and a pointer `localtime_r` sets), so
+    // the zeroed value is valid; both pointers outlive the call.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if !unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+      return (tm.tm_hour as u32, tm.tm_min as u32, tm.tm_sec as u32);
+    }
+  }
+  let (_, _, _, h, m, s) = secs_to_ymdhms(epoch_secs);
+  (h, m, s)
+}
+
 /// Howard Hinnant's `civil_from_days` (public domain).
 pub fn civil_from_days(z: i64) -> (i32, u32, u32) {
   let z = z + 719_468;
@@ -138,6 +155,24 @@ mod tests {
     assert!(parse_yyyymmdd("nope").is_none());
     assert!(parse_yyyymmdd("2023-13-01").is_none());
     assert!(parse_yyyymmdd("2023-12-32").is_none());
+  }
+
+  #[test]
+  fn local_hms_is_the_utc_clock_shifted_by_whole_quarter_hours() {
+    // Every zone offset in use is a multiple of 15 minutes, so the local
+    // clock keeps UTC's second and is a whole number of quarter hours away.
+    for epoch in [1_700_000_000u64, 1_700_003_661, 1_720_000_000] {
+      let (hour, min, sec) = local_hms(epoch);
+      let (_, _, _, utc_hour, utc_min, utc_sec) = secs_to_ymdhms(epoch);
+      assert!(hour < 24 && min < 60, "{hour}:{min}");
+      assert_eq!(sec, utc_sec);
+      let apart = i64::from(hour * 60 + min) - i64::from(utc_hour * 60 + utc_min);
+      assert_eq!(
+        apart.rem_euclid(15),
+        0,
+        "{hour}:{min} vs {utc_hour}:{utc_min}"
+      );
+    }
   }
 
   #[test]

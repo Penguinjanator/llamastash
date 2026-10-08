@@ -290,6 +290,9 @@ pub enum Action {
   /// Jump focus to the Settings tab in the right pane. Always
   /// available because Settings exists for every selection.
   FocusSettingsTab,
+  /// Jump focus to the Requests tab in the right pane. No-op (with a
+  /// toast) when the focused model has no launch.
+  FocusRequestsTab,
   /// Insert a literal newline into the active text-input buffer
   /// (Chat / Embed / Rerank). Bound to `Shift+Enter` so plain
   /// `Enter` keeps its submit semantics. Only fires on terminals
@@ -728,6 +731,13 @@ fn build_default_bindings() -> Vec<Binding> {
     action: Action::FocusSettingsTab, scopes: FocusSet::NAV,
     hint: "settings", description: Some("settings tab"),
     chords: [(KeyCode::Char('S'), KeyModifiers::SHIFT, "S", CAT_GLOBAL)],
+  });
+  // `R` belongs to the Rerank tab, so Requests takes the `q` its label
+  // underlines.
+  v.extend_from_slice(&binds! {
+    action: Action::FocusRequestsTab, scopes: FocusSet::NAV,
+    hint: "requests", description: Some("requests tab"),
+    chords: [(KeyCode::Char('Q'), KeyModifiers::SHIFT, "Q", CAT_GLOBAL)],
   });
   v.extend_from_slice(&binds! {
     action: Action::OpenHfDialog, scopes: FocusSet::NAV,
@@ -1201,6 +1211,7 @@ impl Action {
     ("focus_logs_tab", Action::FocusLogsTab),
     ("focus_chat_tab", Action::FocusChatTab),
     ("focus_settings_tab", Action::FocusSettingsTab),
+    ("focus_requests_tab", Action::FocusRequestsTab),
     ("insert_newline", Action::InsertNewline),
     ("next_field", Action::NextField),
     ("prev_field", Action::PrevField),
@@ -1551,6 +1562,26 @@ mod tests {
     assert_eq!(
       action_for(Focus::List, KeyCode::Char('L'), KeyModifiers::SHIFT),
       Some(Action::FocusLogsTab)
+    );
+  }
+
+  #[test]
+  fn shift_q_jumps_to_the_requests_tab_and_plain_q_still_quits() {
+    for focus in [Focus::List, Focus::RightPane] {
+      assert_eq!(
+        action_for(focus, KeyCode::Char('Q'), KeyModifiers::SHIFT),
+        Some(Action::FocusRequestsTab),
+        "{focus:?}"
+      );
+    }
+    assert_eq!(
+      action_for(Focus::List, KeyCode::Char('q'), KeyModifiers::NONE),
+      Some(Action::Quit)
+    );
+    // The Rerank jump keeps its key.
+    assert_eq!(
+      action_for(Focus::List, KeyCode::Char('R'), KeyModifiers::SHIFT),
+      Some(Action::FocusChatTab)
     );
   }
 

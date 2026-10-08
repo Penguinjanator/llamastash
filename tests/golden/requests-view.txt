@@ -13,18 +13,18 @@
 │★ Favorites                                                                 ││                                        │
 │ ★ mistral-7b                             llama       Q4_K    8.0k    4.0G  ││ ID:L1  :41100  ● ready · 4.2G RAM · 31 │
 │────────────────────────────────────────────────────────────────────────────││ ────────────────────────────────────── │
-│m/x                                                                         ││ Running launch                         │
-│ ★ mistral-7b                             llama       Q4_K    8.0k    4.0G  ││   launch            L1                 │
-│m/y                                                                         ││   ── Context                           │
-│   phi-3                                  phi         Q4_K    8.0k    3.9G  ││   ctx-size          inherited          │
-│                                                                            ││   reasoning         inherited          │
-│                                                                            ││   mode              inherited          │
-│                                                                            ││   ── GPU / CPU offload                 │
-│                                                                            ││   n-gpu-layers      inherited          │
-│                                                                            ││   n-cpu-moe         inherited          │
-│                                                                            ││   ── Attention & KV cache              │
-│                                                                            ││   cache-type-k      inherited          │
-│                                                                            ││   cache-type-v      inherited          │
-│                                                                            ││   flash-attn        inherited          │
-│                                                                            ││   ── Throughput                        │
-└ ◌ launching · ◐ loading · ● ready · ▲ error · ○ stopped · ⇪ external ──────┘└ e:edit for launch · s:stop · p:path ───┘
+│m/x                                                                         ││ Requests 4   Errors 1                  │
+│ ★ mistral-7b                             llama       Q4_K    8.0k    4.0G  ││ Avg total 20.2s   Avg TTFB 16.0s       │
+│m/y                                                                         ││ Tok/s avg 41.3   Tok/s last 41.3       │
+│   phi-3                                  phi         Q4_K    8.0k    3.9G  ││ Tokens in 36.9k   Tokens out 328       │
+│                                                                            ││ Auto-starts 2   Unloaded 1             │
+│                                                                            ││                                        │
+│                                                                            ││ Time     Code Tok/s  Total   In        │
+│                                                                            ││ HH:MM:SS 200  —      —       —         │
+│                                                                            ││ HH:MM:SS 200  —      4.3s    —         │
+│                                                                            ││ HH:MM:SS 503  —      96ms    —         │
+│                                                                            ││ HH:MM:SS 200  41.3   36.0s   18.4k     │
+│                                                                            ││ HH:MM:SS 200  41.3   4.3s    18.4k     │
+│                                                                            ││                                        │
+│                                                                            ││                                        │
+└ ◌ launching · ◐ loading · ● ready · ▲ error · ○ stopped · ⇪ external ──────┘└────────────────────────────────────────┘

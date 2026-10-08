@@ -41,6 +41,7 @@ use crate::launch::mode::LaunchMode;
 use crate::launch::resolve::CatalogRow;
 
 use super::coalesce::{AcquireOutcome, SharedOutcome};
+use super::request_log::RequestRecord;
 use super::state::ProxyState;
 
 /// Outcome of [`auto_start`]. The proxy's caller branches on this:
@@ -86,6 +87,11 @@ impl From<LaunchOutcome> for SharedOutcome {
 /// (`/v1/embeddings` → embedding, `/v1/rerank` → rerank, `None` for
 /// the chat-shaped routes) — see [`resolve_auto_start_mode`].
 ///
+/// `record` is the request's log row. The request whose spawn succeeds is
+/// marked as the auto-start, and what make-room unloads for it is written
+/// to the row before the stops begin. A request that waits on a
+/// launch someone else started is marked with neither.
+///
 /// The proxy must hold `Arc<ProxyState>` for the duration so the
 /// coalesce + supervisor handles stay alive across the await
 /// points.
@@ -94,6 +100,7 @@ pub(crate) async fn auto_start(
   resolved: &CatalogRow,
   endpoint_mode: Option<LaunchMode>,
   name: Option<String>,
+  record: &mut RequestRecord,
 ) -> LaunchOutcome {
   // Compute the canonical ModelId from the resolved row. Resolved here rather
   // than from any in-process cache so the single-flight key matches what
@@ -136,8 +143,15 @@ pub(crate) async fn auto_start(
     .await
   {
     AcquireOutcome::Leader(leader) => {
-      let outcome =
-        drive_launch_as_leader(state, resolved, &model_id, endpoint_mode, name.clone()).await;
+      let outcome = drive_launch_as_leader(
+        state,
+        resolved,
+        &model_id,
+        endpoint_mode,
+        name.clone(),
+        record,
+      )
+      .await;
       // Record outcome against the failure tracker before publishing
       // to followers so a follower that wakes up immediately and asks
       // `over_limit` sees a coherent count.
@@ -193,6 +207,7 @@ async fn drive_launch_as_leader(
   model_id: &ModelId,
   endpoint_mode: Option<LaunchMode>,
   name: Option<String>,
+  record: &mut RequestRecord,
 ) -> LaunchOutcome {
   // A launch for this file may already be underway from another
   // surface — CLI `start`, the TUI, a boot-time restore — and the
@@ -240,7 +255,12 @@ async fn drive_launch_as_leader(
       let Some(refusal) = admission_refusal(&e) else {
         return failed(e);
       };
-      if !super::eviction::make_room(state, &refusal).await {
+      let made_room = super::eviction::make_room(state, &refusal, |unloading| {
+        record.set_evicted(unloading.iter().map(|id| id.as_str().to_string()).collect());
+        record.publish();
+      })
+      .await;
+      if !made_room {
         return failed(e);
       }
       match compose_and_spawn(
@@ -255,6 +275,10 @@ async fn drive_launch_as_leader(
       }
     }
   };
+  // Only now is this request the one that started the model: a spawn that
+  // was refused, or one the client did not wait for, started nothing.
+  record.set_auto_start();
+  record.publish();
   // No human watches an auto-start; log any advisories (dropped knobs,
   // deepseek4 KV-blind note, ssd_streaming bypass) to the daemon log.
   for w in &started.warnings {

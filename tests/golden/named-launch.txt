@@ -6,7 +6,7 @@
 │VRAM ████░░░ 14/24G    ││models  3 found · 1 ready · 2 ★                                                  ││ ██ ◡◡ ██ │
 │backend  NVIDIA · 1 GPU││running 1 (qwen-7b :41100)                                                       ││  ▀████▀  │
 └───────────────────────┘└─────────────────────────────────────────────────────────────────────────────────┘└──────────┘
-┌ Models [3] · /:filter · ⏎:launch · Ctrl+s:stop · f:fav · p:path · u:url ───┐┌ Settings │ Logs │ Chat ────────────────┐
+┌ Models [3] · /:filter · ⏎:launch · Ctrl+s:stop · f:fav · p:path · u:url ───┐┌ Settings │ Logs │ Chat │ Requests ─────┐
 │   Name                                   Arch        Quant   Ctx     Size  ││                                        │
 │▶ Running                                                                   ││ qwen-7b                                │
 │ ● qwen-7b@coder                          qwen3       Q4_K    32k     4.2G  ││ /m/x/qwen-7b.gguf                      │

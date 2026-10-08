@@ -72,6 +72,8 @@ If `llamastash` is missing or not configured yet, bring it up in this order:
 - The agent needs the discovered model list before selecting a model
 - The agent needs to start or stop a model and verify the result
 - The agent needs daemon, host, GPU, or proxy state from `status --json`
+- The agent needs to know why a launch failed (`logs --json`) or why a proxy
+  request got an error or hangs (`requests --json`)
 - The agent needs to pull a GGUF from HuggingFace with `llamastash pull`
 - The agent needs the local OpenAI-compatible base URL from `proxy.listen`
 - The user wants LlamaStash installed or repaired on their machine

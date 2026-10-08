@@ -495,6 +495,7 @@ async fn make_room_stops_nothing_when_the_shortfall_exceeds_every_candidate() {
       effective_free_bytes: 100,
       reserved_bytes: 0,
     },
+    |_| {},
   )
   .await;
   assert!(!fits, "800 needed against 100 freeable must refuse");
@@ -531,6 +532,7 @@ async fn make_room_unloads_the_least_recently_used_and_stops_there() {
       effective_free_bytes: 100,
       reserved_bytes: 0,
     },
+    |_| {},
   )
   .await;
   assert!(fits, "300 needed, 1000 idle freeable");
@@ -579,6 +581,7 @@ async fn make_room_never_picks_a_manual_or_never_unload_launch() {
         effective_free_bytes: 0,
         reserved_bytes: 0,
       },
+      |_| {},
     )
     .await;
     assert!(
@@ -626,6 +629,7 @@ async fn make_room_skips_a_candidate_that_took_a_request() {
       effective_free_bytes: 100,
       reserved_bytes: 0,
     },
+    |_| {},
   )
   .await;
   assert!(fits, "450 needed, the idle launch alone covers 500");

@@ -169,7 +169,11 @@ const SKIP_ROWS: &[usize] = &[0];
 /// and the platform-specific key glyphs, both of which churn
 /// independently of the structural layout these goldens defend.
 fn assert_golden(app: &mut App, rel_path: &str) {
-  let rendered = render_to_lines(app).join("\n") + "\n";
+  assert_golden_text(render_to_lines(app).join("\n") + "\n", rel_path);
+}
+
+/// [`assert_golden`] for a frame that is already rendered.
+fn assert_golden_text(rendered: String, rel_path: &str) {
   let manifest = env!("CARGO_MANIFEST_DIR");
   let fixture_path = std::path::Path::new(manifest).join(rel_path);
 
@@ -253,6 +257,37 @@ fn logs_view_golden_render_matches_fixture() {
 #[test]
 fn chat_view_golden_render_matches_fixture() {
   assert_golden(&mut seeded_chat_view_app(), "tests/golden/chat-view.txt");
+}
+
+#[cfg_attr(target_os = "macos", ignore = "fixture uses Linux key glyphs")]
+#[test]
+fn requests_view_golden_render_matches_fixture() {
+  // The Time column is local wall-clock time, which depends on the
+  // machine's zone, so the fixture holds `HH:MM:SS` in its place.
+  let rendered = mask_clock_times(&render_to_lines(&mut seeded_requests_view_app()).join("\n"));
+  assert_golden_text(rendered + "\n", "tests/golden/requests-view.txt");
+}
+
+/// `text` with every `dd:dd:dd` clock time replaced by `HH:MM:SS`.
+fn mask_clock_times(text: &str) -> String {
+  const MASK: &str = "HH:MM:SS";
+  let mut chars: Vec<char> = text.chars().collect();
+  let is_time = |w: &[char]| {
+    w.iter().zip(MASK.chars()).all(|(c, m)| match m {
+      ':' => *c == ':',
+      _ => c.is_ascii_digit(),
+    })
+  };
+  let mut i = 0;
+  while i + MASK.len() <= chars.len() {
+    if is_time(&chars[i..i + MASK.len()]) {
+      chars.splice(i..i + MASK.len(), MASK.chars());
+      i += MASK.len();
+    } else {
+      i += 1;
+    }
+  }
+  chars.into_iter().collect()
 }
 
 #[cfg_attr(target_os = "macos", ignore = "fixture uses Linux key glyphs")]
@@ -387,6 +422,92 @@ fn seeded_logs_view_app() -> App {
     "main: server listening on 127.0.0.1:41100".into(),
     "srv  update_slots: all slots are idle".into(),
   ];
+  app
+}
+
+/// Dashboard with the right pane focused on the Requests tab of the
+/// running launch: a served request, one that auto-started the model and
+/// unloaded another for it, a failed auto-start, a client that hung up,
+/// and one still streaming.
+fn seeded_requests_view_app() -> App {
+  use llamastash::proxy::request_log::{RequestRow, RequestState, RequestSummary};
+  let mut app = seeded_dashboard_app();
+  app.focus = Focus::RightPane;
+  app.right_tab = RightTab::Requests;
+  let row = |seq: u64| RequestRow {
+    seq,
+    // 2023-11-14T22:13:20Z plus one minute per row.
+    started_at_ms: 1_700_000_000_000 + seq * 60_000,
+    client: Some("127.0.0.1:53412".into()),
+    route: "/v1/chat/completions".into(),
+    requested_model: Some("qwen-7b".into()),
+    model: Some("qwen-7b".into()),
+    model_path: Some("/m/x/qwen-7b.gguf".into()),
+    launch_id: Some("L1".into()),
+    state: RequestState::Done,
+    status: Some(200),
+    ttfb_ms: Some(182),
+    duration_ms: Some(4_310),
+    prompt_tokens: Some(18_432),
+    completion_tokens: Some(164),
+    tokens_per_second: Some(41.27),
+    ..RequestRow::default()
+  };
+  let rows = vec![
+    RequestRow {
+      state: RequestState::InFlight,
+      duration_ms: None,
+      prompt_tokens: None,
+      completion_tokens: None,
+      tokens_per_second: None,
+      ..row(5)
+    },
+    RequestRow {
+      state: RequestState::ClientClosed,
+      prompt_tokens: None,
+      completion_tokens: None,
+      tokens_per_second: None,
+      route: "/v1/messages".into(),
+      ..row(4)
+    },
+    RequestRow {
+      status: Some(503),
+      launch_id: None,
+      auto_start: true,
+      error: Some("launch_failed".into()),
+      cause: Some("compose_and_spawn: not enough memory".into()),
+      ttfb_ms: None,
+      duration_ms: Some(96),
+      prompt_tokens: None,
+      completion_tokens: None,
+      tokens_per_second: None,
+      ..row(3)
+    },
+    RequestRow {
+      auto_start: true,
+      evicted: vec!["L7".into()],
+      ttfb_ms: Some(31_870),
+      duration_ms: Some(36_020),
+      ..row(2)
+    },
+    row(1),
+  ];
+  app.requests.set(
+    "/m/x/qwen-7b.gguf".into(),
+    RequestSummary {
+      requests: 4,
+      errors: 1,
+      avg_duration_ms: Some(20_165),
+      avg_ttfb_ms: Some(16_026),
+      tokens_per_second_avg: Some(41.27),
+      tokens_per_second_last: Some(41.27),
+      prompt_tokens: 36_864,
+      completion_tokens: 328,
+      auto_starts: 2,
+      evictions: 1,
+    },
+    rows,
+  );
   app
 }
 

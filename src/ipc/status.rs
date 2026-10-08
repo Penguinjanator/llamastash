@@ -150,6 +150,9 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
       // default name (config-only). The full set lives in `presets_list`.
       "preset_count": preset_count,
       "default": preset_default,
+      // Totals of the proxy requests this launch served: counts, average
+      // latency, tokens and tok/s. Zeros until the first request.
+      "request_stats": ctx.requests.launch_summary(launch_id.as_str()),
     });
     // Omitted when unset — the same convention `state.json` and the CLI's
     // `launch_status_json` use — so the unnamed-row shape stays byte-stable
@@ -272,6 +275,12 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
         "latest_cpu_pct": u_cpu,
         "preset_count": preset_count,
         "default": preset_default,
+        // A delegated model's requests are served by the umbrella launch,
+        // so its totals are the ones filed under the model itself.
+        "request_stats": ctx
+          .requests
+          .tail(Some(&running_snap.params.model_path.to_string_lossy()), 0)
+          .summary,
       });
       // Same only-when-set `preset` the managed branch stamps, so a
       // delegated row is shape-identical to a process row.
@@ -354,7 +363,13 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
   //   "bind_error": "permission denied" | null,
   // }
   // ```
-  let proxy = ctx.proxy_status.as_ref().map(project_proxy_status);
+  let proxy = ctx.proxy_status.as_ref().map(|cell| {
+    let mut block = project_proxy_status(cell);
+    // Where the request log is also written and how many finished rows
+    // did not get there. `null` unless `proxy.request_log_file` is on.
+    block["request_log_file"] = json!(ctx.requests.file_status());
+    block
+  });
   // Neutral server catalog: every backend's build/binary variants, each with
   // its probed devices + derived id. The single launch-device surface the TUI
   // picker and CLI read — each server carries the `--device` selectors its own

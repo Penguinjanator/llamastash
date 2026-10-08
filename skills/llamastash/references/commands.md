@@ -100,6 +100,22 @@ Important exit codes:
 - `67`: launch failed
 - `68`: stop failed
 
+### Read a launch's log
+
+```bash
+llamastash logs <launch-id-or-model-name> --json
+llamastash logs <launch-id-or-model-name> -n 50 --json | jq -r '.lines[]'
+```
+
+The target is a launch id from `status --json` (for example `L3`), a port, a
+launch name, or part of a running model's name. `--json` returns
+`{"launch_id": "...", "lines": [...]}` with the last 200 lines, or `-n` lines.
+
+Use it when a launch is in the `error` state or a model answers with errors: a
+launch that died stays in `status` until it is stopped, and its log has the
+cause. Do not pass `-f` from an agent, it follows the log and does not return.
+An ambiguous name exits `66`.
+
 ## Discovery and downloads
 
 ### Recommend models
@@ -147,6 +163,29 @@ If a client gets connection refused, first check:
 ```bash
 llamastash status --json | jq .proxy
 ```
+
+### Find out why a request failed or hangs
+
+```bash
+llamastash requests --json
+llamastash requests <model-name> --json     # or a running launch: L3, its port, its name
+llamastash requests --json | jq -c '.requests[] | {route, status, state, error, cause, launch_id}'
+```
+
+The proxy keeps its last 1000 requests in memory, newest first. `-n` sets how
+many to return (default 100). Read per request:
+
+- `status`, with `error` and `cause` when the proxy answered itself
+  (`model_not_found`, `launch_failed`, `upstream_unreachable`). A status with a
+  `null` `error` came from the model's own server, so read that launch's log.
+- `state`: `in_flight`, `done`, `client_closed`, or `upstream_error`
+- `auto_start`, `evicted`, `fallback`: whether the request started the model,
+  which launches it unloaded to make room, and why another model answered
+- `ttfb_ms`, `duration_ms`, `prompt_tokens`, `completion_tokens`,
+  `tokens_per_second`
+
+`summary` holds the totals for the same scope. The log is empty after a daemon
+restart, and it has no prompt or response text.
 
 ## References
 

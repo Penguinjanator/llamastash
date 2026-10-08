@@ -335,6 +335,9 @@ pub struct App {
   /// Logs-tab buffer for the focused launch. Refreshed from the
   /// daemon's `logs_tail` IPC method on each tick.
   pub logs_state: crate::tui::tabs::logs::LogsTabState,
+  /// Requests-tab data for the focused model. Refreshed from the
+  /// daemon's `requests_tail` IPC method while the tab is open.
+  pub requests: crate::tui::tabs::requests::RequestsTabState,
   /// Cursor index into the rendered row list (which mixes headers
   /// and models). Header rows are skipped during `move_*`.
   pub list_cursor: usize,
@@ -593,6 +596,7 @@ impl App {
       embed: Default::default(),
       rerank: Default::default(),
       logs_state: Default::default(),
+      requests: Default::default(),
       list_cursor: 0,
       filter_input: crate::tui::input_field::InputField::new(),
       launch_picker: None,
@@ -2122,7 +2126,9 @@ impl App {
     // honors no launch knobs, so Settings is dropped; the mode surface
     // (Chat / Embed / Rerank) stays — requests ride the umbrella's
     // OpenAI-compat port directly — and Logs tails the shared umbrella log. A
-    // model with no mode surface (hint `Unknown`) gets Logs alone. Keys on the
+    // model with no mode surface (hint `Unknown`), or one that is not Ready,
+    // gets Logs and Requests: the 503s of a failed load are filed under the
+    // model, and Requests is where they show. Keys on the
     // resolved `backend`'s lifecycle (the umbrella row is already dropped at
     // ingest), since the launch id is a plain `L#` shared with every backend.
     if managed
@@ -2131,7 +2137,7 @@ impl App {
       .is_some_and(crate::backend::is_managed_multiplexer)
     {
       if managed.state != SurfaceState::Ready {
-        return vec![RightTab::Logs];
+        return vec![RightTab::Logs, RightTab::Requests];
       }
       return tabs_for_mode(self.mode_hint_for(&managed.path))
         .into_iter()
@@ -2143,9 +2149,10 @@ impl App {
       // Process alive but not yet serving — Settings stays the
       // canonical first stop so the user can still tweak relaunch
       // params, Logs sits next so the startup pipeline is one
-      // Tab away.
+      // Tab away. Requests shows the request that is waiting on
+      // this load.
       SurfaceState::Launching | SurfaceState::Loading => {
-        vec![RightTab::Settings, RightTab::Logs]
+        vec![RightTab::Settings, RightTab::Logs, RightTab::Requests]
       }
       // Error / Stopped: the daemon holds the ring buffer for as long as
       // the registry entry lives, and `status` only reports rows that are
@@ -2154,9 +2161,10 @@ impl App {
       // post-Ready death (external kill, OOM) is recorded as plain
       // `Stopped` with no cause, so the log is the whole story. A clean
       // `stop` deregisters the launch, so a `Stopped` row the TUI can see
-      // is always an unexpected exit.
+      // is always an unexpected exit. Requests stays too: the 503s a
+      // failed auto-start answered with are filed under this model.
       SurfaceState::Error | SurfaceState::Stopped => {
-        vec![RightTab::Settings, RightTab::Logs]
+        vec![RightTab::Settings, RightTab::Logs, RightTab::Requests]
       }
       _ => vec![RightTab::Settings],
     }
@@ -3516,8 +3524,8 @@ mod tests {
     );
     assert_eq!(
       app.available_right_tabs(),
-      vec![RightTab::Settings, RightTab::Logs],
-      "stopped rows must expose the Logs tab alongside Settings"
+      vec![RightTab::Settings, RightTab::Logs, RightTab::Requests],
+      "stopped rows must expose the Logs and Requests tabs alongside Settings"
     );
   }
 
@@ -3710,7 +3718,12 @@ mod tests {
     app.list_cursor = 2;
     assert_eq!(
       app.available_right_tabs(),
-      vec![RightTab::Settings, RightTab::Logs, RightTab::Chat],
+      vec![
+        RightTab::Settings,
+        RightTab::Logs,
+        RightTab::Chat,
+        RightTab::Requests
+      ],
       "Running-row selection exposes mode-appropriate tabs (Settings first)"
     );
     assert!(app.right_pane_focus().is_some());
@@ -3754,7 +3767,7 @@ mod tests {
     app.list_cursor = 2;
     assert_eq!(
       app.available_right_tabs(),
-      vec![RightTab::Settings, RightTab::Logs]
+      vec![RightTab::Settings, RightTab::Logs, RightTab::Requests]
     );
   }
 
@@ -3873,16 +3886,28 @@ mod tests {
     app.list_cursor = 2;
     assert_eq!(
       app.available_right_tabs(),
-      vec![RightTab::Logs, RightTab::Chat],
+      vec![RightTab::Logs, RightTab::Chat, RightTab::Requests],
       "chat-mode delegated row: mode surface without Settings"
     );
     app.list_cursor = 3;
     app.clear_rows_cache();
     assert_eq!(
       app.available_right_tabs(),
-      vec![RightTab::Logs],
-      "transcription model has no mode surface: logs only"
+      vec![RightTab::Logs, RightTab::Requests],
+      "transcription model has no mode surface: logs and requests"
     );
+    // Not Ready (loading, or a failed load): no mode surface yet, but the
+    // requests that waited on it or got a 503 still show.
+    for state in [SurfaceState::Loading, SurfaceState::Error] {
+      app.managed[0].state = state;
+      app.list_cursor = 2;
+      app.clear_rows_cache();
+      assert_eq!(
+        app.available_right_tabs(),
+        vec![RightTab::Logs, RightTab::Requests],
+        "{state:?}"
+      );
+    }
   }
 
   #[test]

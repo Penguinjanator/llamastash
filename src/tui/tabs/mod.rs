@@ -9,6 +9,7 @@ pub mod chat;
 pub mod embed;
 pub mod input_pane;
 pub mod logs;
+pub mod requests;
 pub mod rerank;
 pub mod settings;
 
@@ -18,7 +19,8 @@ use crate::gguf::metadata::ModeHint;
 /// reachable; the mode-specific tabs become reachable when the
 /// focused model is `Ready` and its `ModeHint` matches. Variant
 /// order matches the user-facing tab strip: Settings is the
-/// canonical first stop, Logs follows, then the mode tab.
+/// canonical first stop, Logs follows, then the mode tab, then
+/// Requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RightTab {
   /// Launch-parameter form. Editable for not-yet-launched models;
@@ -28,6 +30,8 @@ pub enum RightTab {
   Chat,
   Embed,
   Rerank,
+  /// The proxy requests of the focused model.
+  Requests,
 }
 
 impl RightTab {
@@ -38,6 +42,17 @@ impl RightTab {
       RightTab::Chat => "Chat",
       RightTab::Embed => "Embed",
       RightTab::Rerank => "Rerank",
+      RightTab::Requests => "Requests",
+    }
+  }
+
+  /// Index in [`Self::label`] of the letter underlined as the tab's
+  /// Shift quick-jump key. The first letter, except for `Requests`:
+  /// `R` already jumps to Rerank, so it takes its `q`.
+  pub fn mnemonic_index(&self) -> usize {
+    match self {
+      RightTab::Requests => 2,
+      _ => 0,
     }
   }
 }
@@ -64,13 +79,16 @@ pub fn tabs_for_mode(mode: ModeHint) -> Vec<RightTab> {
   // Settings leads (it's always present and the home for launch
   // params); Logs follows so a running model's process pipeline
   // is one Tab away; the mode-specific surface (Chat / Embed /
-  // Rerank) trails as the third tab.
+  // Rerank) is third, and Requests closes the strip.
+  let mut tabs = vec![RightTab::Settings, RightTab::Logs];
   match mode {
-    ModeHint::Chat => vec![RightTab::Settings, RightTab::Logs, RightTab::Chat],
-    ModeHint::Embedding => vec![RightTab::Settings, RightTab::Logs, RightTab::Embed],
-    ModeHint::Rerank => vec![RightTab::Settings, RightTab::Logs, RightTab::Rerank],
-    ModeHint::Unknown => vec![RightTab::Settings, RightTab::Logs],
+    ModeHint::Chat => tabs.push(RightTab::Chat),
+    ModeHint::Embedding => tabs.push(RightTab::Embed),
+    ModeHint::Rerank => tabs.push(RightTab::Rerank),
+    ModeHint::Unknown => {}
   }
+  tabs.push(RightTab::Requests);
+  tabs
 }
 
 #[cfg(test)]
@@ -78,26 +96,48 @@ mod tests {
   use super::*;
 
   #[test]
-  fn unknown_mode_exposes_settings_and_logs() {
-    assert_eq!(
-      tabs_for_mode(ModeHint::Unknown),
-      vec![RightTab::Settings, RightTab::Logs]
-    );
-  }
-
-  #[test]
-  fn chat_mode_orders_settings_logs_chat() {
+  fn requests_closes_the_strip_after_the_mode_tab() {
+    use RightTab::{Chat, Embed, Logs, Requests, Rerank, Settings};
     assert_eq!(
       tabs_for_mode(ModeHint::Chat),
-      vec![RightTab::Settings, RightTab::Logs, RightTab::Chat]
+      vec![Settings, Logs, Chat, Requests]
+    );
+    assert_eq!(
+      tabs_for_mode(ModeHint::Embedding),
+      vec![Settings, Logs, Embed, Requests]
+    );
+    assert_eq!(
+      tabs_for_mode(ModeHint::Rerank),
+      vec![Settings, Logs, Rerank, Requests]
+    );
+    assert_eq!(
+      tabs_for_mode(ModeHint::Unknown),
+      vec![Settings, Logs, Requests]
     );
   }
 
   #[test]
-  fn embedding_mode_orders_settings_logs_embed() {
-    assert_eq!(
-      tabs_for_mode(ModeHint::Embedding),
-      vec![RightTab::Settings, RightTab::Logs, RightTab::Embed]
-    );
+  fn every_visible_tab_set_has_distinct_mnemonic_letters() {
+    for mode in [
+      ModeHint::Chat,
+      ModeHint::Embedding,
+      ModeHint::Rerank,
+      ModeHint::Unknown,
+    ] {
+      let mut letters: Vec<char> = tabs_for_mode(mode)
+        .iter()
+        .map(|t| {
+          t.label()
+            .chars()
+            .nth(t.mnemonic_index())
+            .unwrap()
+            .to_ascii_uppercase()
+        })
+        .collect();
+      let total = letters.len();
+      letters.sort_unstable();
+      letters.dedup();
+      assert_eq!(letters.len(), total, "{mode:?}: {letters:?}");
+    }
   }
 }

@@ -30,6 +30,7 @@ use ratatui::Frame;
 
 use crate::discovery::DiscoveredModel;
 use crate::theme::Palette;
+use crate::tui::columns::cell;
 use crate::tui::fmt::{format_bytes, format_tokens};
 use crate::tui::status_icons::{colour_for, glyph_for, SurfaceState};
 
@@ -530,19 +531,10 @@ enum ColumnId {
   Port,
 }
 
-/// One data column in the right-side strip. `rank` decides which
-/// columns survive under width pressure (lower = stickier — see
-/// [`layout_columns`]); the declaration order in [`COLUMNS`] is the
-/// canonical left-to-right display order, so visible columns keep
-/// their familiar positions as the terminal resizes — only the
-/// less-important ones drop out.
-#[derive(Debug, Clone, Copy)]
-struct Column {
-  id: ColumnId,
-  label: &'static str,
-  width: usize,
-  rank: u8,
-}
+/// One data column in the right-side strip. The declaration order in
+/// [`COLUMNS`] is the display order; `rank` decides which columns
+/// [`layout_columns`] keeps under width pressure.
+type Column = crate::tui::columns::Column<ColumnId>;
 
 /// Right-side data columns, ordered left-to-right as they appear in
 /// the rendered list. Ranks are explicit (lower = stickier):
@@ -674,36 +666,14 @@ fn layout_columns(content_w: usize, show_device: bool, show_backend: bool) -> Co
   // The Device column only exists on multi-GPU hosts; on single-GPU /
   // CPU-only hosts it's filtered out entirely so it never competes for
   // the width budget or appears in the header.
-  let mut by_rank: Vec<(usize, &'static Column)> = COLUMNS
-    .iter()
-    .enumerate()
-    .filter(|(_, c)| show_device || c.id != ColumnId::Device)
-    .filter(|(_, c)| show_backend || c.id != ColumnId::Backend)
-    .collect();
-  by_rank.sort_by_key(|(_, c)| c.rank);
-
-  let mut taken: Vec<(usize, &'static Column)> = Vec::with_capacity(COLUMNS.len());
-  let mut spent = 0usize;
-  // Strict rank-tail drop: once a lower-rank column refuses to fit,
-  // stop trying to admit any higher-rank columns. The alternative
-  // (greedy: skip the big one, keep checking smaller ones) gives a
-  // tighter information density but produces non-contiguous
-  // visibility — a Port column slotting in where Arch can't makes
-  // it look like the data jumped a slot as the pane resizes. The
-  // cutoff is what users intuit from "rank = min-width threshold".
-  for (idx, c) in by_rank {
-    let cost = c.width + COL_SEP_W;
-    if spent + cost > budget {
-      break;
-    }
-    spent += cost;
-    taken.push((idx, c));
-  }
-  // Restore declaration order so columns disappear from less-
-  // important slots while the survivors keep their familiar
-  // positions on screen.
-  taken.sort_by_key(|(idx, _)| *idx);
-  let visible: Vec<&'static Column> = taken.into_iter().map(|(_, c)| c).collect();
+  let (visible, spent) = crate::tui::columns::fit(
+    COLUMNS
+      .iter()
+      .filter(|c| show_device || c.id != ColumnId::Device)
+      .filter(|c| show_backend || c.id != ColumnId::Backend),
+    budget,
+    COL_SEP_W,
+  );
 
   let name_w = content_w.saturating_sub(MARKER_W + spent).max(MIN_NAME_W);
   ColumnLayout { visible, name_w }
@@ -986,29 +956,6 @@ pub(crate) fn build_block_title(
   spans.push(Span::raw(" "));
 
   Line::from(spans)
-}
-
-/// Left-aligned pad/truncate to `w` display columns. Truncated
-/// strings end with `…` so overflow is visible.
-fn cell(s: &str, w: usize) -> String {
-  if w == 0 {
-    return String::new();
-  }
-  let count = s.chars().count();
-  if count <= w {
-    let mut out = String::with_capacity(w);
-    out.push_str(s);
-    for _ in count..w {
-      out.push(' ');
-    }
-    out
-  } else {
-    let ellipsis = crate::tui::glyphs::active().ellipsis();
-    let keep = w.saturating_sub(ellipsis.chars().count());
-    let mut out: String = s.chars().take(keep).collect();
-    out.push_str(ellipsis);
-    out
-  }
 }
 
 /// Foreground colour for a model row, encoding launch state into the

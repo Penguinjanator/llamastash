@@ -364,6 +364,11 @@ struct RoomCandidate {
 /// shortfall, nothing is stopped and this returns `false`, because unloading
 /// models for a launch that still will not fit is a pure loss.
 ///
+/// `unloading` is called once with the launches about to be stopped, before
+/// the first stop. The caller is usually a request future, which is dropped
+/// if its client disconnects during the stops or the wait that follows, and
+/// it should have recorded what it unloaded by then.
+///
 /// Eligible: `Ready`, zero in-flight, `LaunchOrigin::AutoStart` (manual and
 /// preloaded launches are durable user intent, the same exemption the sweep
 /// applies) and not pinned to `idle_ttl_secs: 0`. Inside a managed multiplexer
@@ -374,6 +379,7 @@ struct RoomCandidate {
 pub async fn make_room(
   state: &Arc<ProxyState>,
   refusal: &crate::launch::admission::Refusal,
+  unloading: impl FnOnce(&[LaunchId]),
 ) -> bool {
   let short = refusal
     .demand_bytes
@@ -434,7 +440,9 @@ pub async fn make_room(
     return false;
   }
   let ctx = &state.ctx;
-  let unloaded: usize = go.iter().map(|c| c.targets.len()).sum();
+  let targets: Vec<LaunchId> = go.iter().flat_map(|c| c.targets.iter().cloned()).collect();
+  unloading(&targets);
+  let unloaded = targets.len();
   // Candidates stop together, the way the sweep unloads: the re-check above is
   // only honest if nothing else runs before the stops, and stopping one after
   // another would stretch the request's wait to N x the stop grace. The models

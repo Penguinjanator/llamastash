@@ -6,7 +6,7 @@
 │VRAM ██┌ HuggingFace — Confirm · ⏎:pull · Esc:back ───────────────────────────────────────────────────────────┐ ◡◡ ██ │
 │backend│ search: qwen                                                                                         │████▀  │
 └───────│ sort: ↓ downloads  ·  page 1                                                                         │───────┘
-┌ Models│ repo:  Qwen/Qwen3-7B-GGUF                                                                            │───────┐
+┌ Models│ repo:  Qwen/Qwen3-7B-GGUF                                                                            │s ─────┐
 │   Name│ file:  qwen3-7b-q4_k_m.gguf                                                                          │       │
 │▶ Runni│ size:  4.2G                                                                                          │       │
 │ ● qwen│                                                                                                      │       │

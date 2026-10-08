@@ -1533,9 +1533,15 @@ pub(crate) async fn stop_supervised(
 /// The `port` fallback covers a row adopted before launch ids were stamped.
 /// Keyed per launch, so a second launch of the same model on another port keeps
 /// its own row either way.
+///
+/// Runs after every removal from the supervisor registry, so it is also
+/// where a stopped launch's request totals are dropped.
 pub(crate) async fn drop_running_snapshots(ctx: &MethodContext, stopped: &[(LaunchId, u16)]) {
   if stopped.is_empty() {
     return;
+  }
+  for (launch_id, _) in stopped {
+    ctx.requests.forget_launch(launch_id.as_str());
   }
   let stopped = stopped.to_vec();
   ctx

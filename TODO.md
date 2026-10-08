@@ -428,8 +428,8 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 
 ### Batch 3: proxy request log and speed stats ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-3-proxy-request-log-and-speed-stats))
 
-- [ ] Proxy request log
-- [ ] Live speed stats per model
+- [x] ~~Proxy request log~~
+- [x] ~~Live speed stats per model~~
 
 ### Batch 4: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
 
@@ -493,6 +493,7 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 
 ### Low priority
 
+- [ ] **Consider a standard metrics endpoint on the proxy. Research first.** The request log ([`src/proxy/request_log.rs`](src/proxy/request_log.rs)) already holds per-model and per-launch request counts, errors, latency, tokens and tok/s, but only `requests_tail` and `status` read them. A `/metrics` route in the Prometheus / OpenMetrics text format would let Grafana and similar tools scrape them. Research before deciding: the metric names the engines already export (`llamacpp:*`, `vllm:*`, `sglang:*`, see the speed-stats item in the [R14 plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-3-proxy-request-log-and-speed-stats)), the OpenTelemetry GenAI semantic conventions, what Ollama and LM Studio expose, label cardinality per model and launch, histograms against averages, and whether the route sits behind `proxy.api_key` on a LAN bind. No `/metrics` route exists on either listener today.
 - [ ] **Measure `load-mode`, then keep or drop it from the presets.** (Was `no-mmap`; llama.cpp folded that flag into `--load-mode` on 2026-09-09 and the presets migrated to `load-mode: none`. The measurement below is unchanged — substitute `load-mode: none` for `no-mmap: true` and `--load-mode none` for `-- --no-mmap`.)
       Original:
       [ ] **Measure `no-mmap`, then keep or drop it from the presets.** [`src/launch/CLAUDE.md`](src/launch/CLAUDE.md) calls `no-mmap` a folklore-only flag that "stays unset until measurement supports them", yet all three `Qwen3.8-27B-*` presets pin `no-mmap: true` unmeasured. Two arms per model, preset otherwise untouched, same prompt back to back: `Qwen3.8-Flash-Next-UD-Q4_K_XL` / `coding-fast` (which does **not** set it) with and without `-- --no-mmap`, and `Qwen3.8-27B-ROCmFP4-FAST` / `pi-fast` (which does) with and without. Record decode t/s, prefill t/s, cold load time, and peak resident from `/sys/class/drm/card1/device/mem_info_gtt_used` — not RSS, which omits GTT entirely. Prediction to falsify: inert for Flash-Next decode and slower to load. Under `-ngl 99` every non-lazy tensor is copied into GTT at load, so inference never reads the file; and the one tensor that _is_ read per token, the 26.8 GiB `per_layer_token_embd`, stays on the mapping either way because `init_mappings` maps whenever `lazy.any()` (llama.cpp `e750b887a`). With mmap off the rest takes the `seek`+read branch into non-reclaimable anonymous memory instead of reclaimable page cache. The 27B has no lazy tensor, so mmap governs its whole weight load there and the result may differ — which is the point of measuring both. Per [`scripts/bench/README.md`](scripts/bench/README.md): `z13ctl tdp --set 45`, charged battery on AC, and record battery percentage + `platform_profile` beside every number (a low battery halved throughput once). Wipe `state.json` between launches or use [`scripts/bench/local/preset-ab.sh`](scripts/bench/local/preset-ab.sh), since a named preset still inherits `last_used`. Outcome: either the presets keep the flag with numbers attached, or it comes out of all three.

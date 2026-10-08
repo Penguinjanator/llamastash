@@ -184,6 +184,19 @@ llamastash status --json | jq .proxy
 
 If `status` is `"disabled"` instead of `"listening"`, your config has `proxy.enabled: false` — flip it back and restart the daemon. If `status` is `"port_in_use"`, see the previous section.
 
+## An agent got an error from the proxy, or a request hangs
+
+**Symptom:** a client reports a 400, 404, 502 or 503 from the proxy, or a request does not come back.
+
+**Fix:** list what the proxy did with the last requests, newest first:
+
+```bash
+llamastash requests            # every model
+llamastash requests <model>    # one model
+```
+
+The `NOTE` column says what happened beyond the status code: the proxy's own error and its message (`model_not_found: ...`, `launch_failed: ...`, `upstream_unreachable: ...`), `auto-start` or `loading model` for a request that waited on a model load, `unloaded L3` when another launch was unloaded to make room, and `client closed` when the client gave up first. An error status with an empty `NOTE` came from the model's own server, so read `llamastash logs <launch-id>`. The TUI shows the same rows on the model's Requests tab (`Shift+Q`). See [`usage.md` § `llamastash requests`](usage.md#llamastash-requests-model-ref).
+
 ## Proxy returned a different model than I asked for
 
 **Symptom:** an agent gets a plausible response but the answer style doesn't match the requested model; response headers carry `x-llamastash-served-by: <other-model>` and `x-llamastash-fallback-reason: launch_failed` or `family_mismatch`.

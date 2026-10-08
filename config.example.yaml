@@ -423,6 +423,19 @@ proxy:
   # Sources — CLI: (none) · Env: (none).
   max_body_size: 16777216
 
+  # Also write the proxy's request log to a file. Default `false`: the
+  # log (`llamastash requests`, the TUI Requests tab) lives in memory
+  # only and is empty after a daemon restart. `true` appends every
+  # finished request to `requests.jsonl` in the daemon's log directory
+  # (`<cache dir>/logs`), one JSON object per line with the same keys as
+  # `llamastash requests --json`. No prompt or response text is written.
+  # The file rotates at 10 MiB and keeps 5 older segments. Restart the
+  # daemon to apply. `status --json` reports the path and how many rows
+  # could not be written under `proxy.request_log_file`.
+  #
+  # Sources — CLI: (none) · Env: (none).
+  request_log_file: false
+
   # Names that stand in for a local model, for a tool that will only ever
   # ask for a fixed one. The key is the name the client sends; the value is any
   # reference `llamastash list` shows — a plain name, a repo-qualified id, or a
@@ -792,6 +805,7 @@ keybindings:
   focus_logs_tab: L
   focus_chat_tab: C # also: E, R (mnemonic aliases)
   focus_settings_tab: S
+  focus_requests_tab: Q # i.e. shift+q, the `q` underlined in the tab label; R is Rerank
   open_hf_dialog: P # i.e. shift+p — "Pull"
 
   # ── Models list local actions ─────────────────────────────

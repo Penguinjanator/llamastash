@@ -20,11 +20,13 @@ pub(crate) mod launch;
 pub(crate) mod mru;
 pub(crate) mod ollama_compat;
 pub(crate) mod openai;
+pub mod request_log;
 pub(crate) mod route;
 pub(crate) mod router;
 pub mod server;
 pub mod state;
 pub(crate) mod ui;
+pub mod usage_tap;
 
 pub use auth::{ProxyApiKey, ProxyAuth};
 pub use route::DEFAULT_BODY_LIMIT_BYTES;

@@ -23,6 +23,7 @@
 //!   family-MRU fallback path.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::TryStreamExt;
 use http_body_util::{combinators::BoxBody, BodyExt, StreamBody};
@@ -30,8 +31,10 @@ use hyper::body::{Bytes, Frame};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 
+use super::request_log::{RequestRecord, RequestState};
 use super::router::{BodyError, ProxyResponse};
 use super::state::ProxyState;
+use super::usage_tap::ResponseTap;
 
 /// Hop-by-hop header set — RFC 7230 §6.1. Stripped on both the
 /// outbound request (so we don't leak the inbound peer's keep-alive
@@ -89,10 +92,14 @@ pub(crate) struct Target<'a> {
 /// inbound body; the caller has run
 /// [`super::route::buffer_and_extract`] so we don't repeat the cap
 /// enforcement here.
+///
+/// `record` is the request's log row. `None` for traffic that is not
+/// logged (the `/ui` reverse proxy).
 pub(crate) async fn forward_to_upstream(
   state: &Arc<ProxyState>,
   inbound: InboundRequest,
   target: Target<'_>,
+  mut record: Option<RequestRecord>,
 ) -> ProxyResponse {
   let InboundRequest {
     method: inbound_method,
@@ -115,17 +122,17 @@ pub(crate) async fn forward_to_upstream(
   // guard's `Drop` decrements the inflight counter — covers happy-
   // path body completion, abandoned client connections, and upstream
   // errors uniformly because the response body owns the guard.
-  let (inflight_guard, request_model, backend) =
+  let (inflight_guard, launch_id, request_model, backend) =
     match acquire_inflight_guard(state, port, served_model_key).await {
       Some(g) => g,
       None => {
-        return Ok(error_envelope(
-          StatusCode::BAD_GATEWAY,
-          "upstream_unreachable",
-          "model exited before forwarding could begin",
-        ));
+        return unreachable_response(record, "model exited before forwarding could begin");
       }
     };
+  if let Some(record) = record.as_mut() {
+    record.set_launch(launch_id.as_str());
+    record.publish();
+  }
   // Compose upstream URL: path + query from the original request,
   // host always 127.0.0.1 (loopback only — see plan §Scope Boundaries).
   let path_and_query = inbound_uri
@@ -206,6 +213,7 @@ pub(crate) async fn forward_to_upstream(
     .headers(outbound_headers)
     .body(body);
 
+  let sent = Instant::now();
   let upstream = match request.send().await {
     Ok(r) => r,
     Err(err) => {
@@ -213,11 +221,10 @@ pub(crate) async fn forward_to_upstream(
       // status line came back. The model was Ready a moment ago but
       // the kernel disagrees — surface as 502 with a recognisable
       // OpenAI body so clients can branch on it.
-      return Ok(error_envelope(
-        StatusCode::BAD_GATEWAY,
-        "upstream_unreachable",
+      return unreachable_response(
+        record,
         &format!("failed to reach upstream llama-server: {err}"),
-      ));
+      );
     }
   };
 
@@ -227,7 +234,19 @@ pub(crate) async fn forward_to_upstream(
     fallback,
     fallback_reason,
     inflight_guard,
+    record,
+    sent,
   )
+}
+
+/// The 502 for an upstream that is gone, logged on `record` when there is one.
+fn unreachable_response(record: Option<RequestRecord>, message: &str) -> ProxyResponse {
+  let response =
+    super::router::error_response(StatusCode::BAD_GATEWAY, "upstream_unreachable", message);
+  match record {
+    Some(record) => super::router::answered(record, response),
+    None => response,
+  }
 }
 
 /// Find the supervisor that owns `expected_id` on `port`, take an
@@ -242,11 +261,12 @@ async fn acquire_inflight_guard(
   expected_id: &crate::gguf::identity::ModelId,
 ) -> Option<(
   crate::daemon::supervisor::InflightGuard,
+  crate::daemon::registry::LaunchId,
   Option<String>,
   crate::backend::Backends,
 )> {
   let snap = state.ctx.supervisors.snapshot().await;
-  for (_lid, model) in snap {
+  for (launch_id, model) in snap {
     if model.port() != port {
       continue;
     }
@@ -266,6 +286,7 @@ async fn acquire_inflight_guard(
       .cloned();
     return Some((
       model.inflight_guard(),
+      launch_id,
       request_model,
       model.backend().clone(),
     ));
@@ -332,9 +353,30 @@ fn build_streaming_response(
   fallback: bool,
   fallback_reason: Option<&str>,
   inflight_guard: crate::daemon::supervisor::InflightGuard,
+  record: Option<RequestRecord>,
+  sent: Instant,
 ) -> ProxyResponse {
   let status = upstream.status();
   let inbound_headers = upstream.headers().clone();
+  let logged = record.map(|mut record| {
+    record.set_status(status.as_u16());
+    record.publish();
+    LoggedResponse {
+      record,
+      // A compressed body cannot be read for token counts.
+      tap: (!inbound_headers.contains_key(reqwest::header::CONTENT_ENCODING))
+        .then(ResponseTap::default),
+      content_length: upstream.content_length(),
+      seen: 0,
+      ended: false,
+      errored: false,
+      streamed: inbound_headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/event-stream")),
+      generating_since: sent,
+    }
+  });
 
   // `bytes_stream()` yields `Result<Bytes, reqwest::Error>`. Wrap
   // each `Bytes` in a `Frame::data` and box the reqwest error into
@@ -359,6 +401,7 @@ fn build_streaming_response(
   let body: BoxBody<Bytes, BodyError> = GuardedBody {
     inner: inner_body,
     _guard: inflight_guard,
+    logged,
   }
   .boxed();
 
@@ -413,9 +456,86 @@ fn build_streaming_response(
 /// the single ownership chain that ties "request is being served" to
 /// "supervisor is not idle"; the idle-TTL sweeper reads `inflight`
 /// straight off the supervisor and skips eviction while it's > 0.
+///
+/// It is also where the request log learns how the response went: every
+/// frame passes through [`LoggedResponse::observe`], and the drop that
+/// releases the guard finishes the log row.
 struct GuardedBody {
   inner: BoxBody<Bytes, BodyError>,
   _guard: crate::daemon::supervisor::InflightGuard,
+  logged: Option<LoggedResponse>,
+}
+
+/// The log row of a response that is streaming, and what has been seen of
+/// the body so far.
+struct LoggedResponse {
+  record: RequestRecord,
+  tap: Option<ResponseTap>,
+  /// Upstream `Content-Length`, when it sent one.
+  content_length: Option<u64>,
+  seen: u64,
+  ended: bool,
+  errored: bool,
+  /// The response is an event stream.
+  streamed: bool,
+  /// Where the proxy's clock starts timing generation, for the tok/s
+  /// estimate: the first byte of a stream, or the moment the request went
+  /// upstream for a response that arrives whole. The second includes
+  /// prompt processing, so that estimate reads low.
+  generating_since: Instant,
+}
+
+impl LoggedResponse {
+  fn observe(&mut self, polled: &Option<Result<Frame<Bytes>, BodyError>>) {
+    match polled {
+      Some(Ok(frame)) => {
+        let Some(data) = frame.data_ref().filter(|d| !d.is_empty()) else {
+          return;
+        };
+        if self.seen == 0 {
+          self.record.mark_first_byte();
+          self.record.publish();
+          if self.streamed {
+            self.generating_since = Instant::now();
+          }
+        }
+        self.seen += data.len() as u64;
+        if let Some(tap) = self.tap.as_mut() {
+          tap.push(data);
+        }
+      }
+      Some(Err(_)) => self.errored = true,
+      None => self.ended = true,
+    }
+  }
+}
+
+impl Drop for LoggedResponse {
+  fn drop(&mut self) {
+    // hyper stops polling a body with a `Content-Length` once it has
+    // written that many bytes, so such a body never yields its final
+    // `None`. Having seen every byte counts as complete.
+    let complete = self.ended || self.content_length == Some(self.seen);
+    let state = if self.errored {
+      RequestState::UpstreamError
+    } else if complete {
+      RequestState::Done
+    } else {
+      RequestState::ClientClosed
+    };
+    // Read whatever the tap holds, however the response ended: a client
+    // that closes on `data: [DONE]` can beat the upstream's end of body,
+    // and its final chunk is already here.
+    let mut usage = self
+      .tap
+      .as_ref()
+      .map(ResponseTap::usage)
+      .unwrap_or_default();
+    if state == RequestState::Done {
+      usage.estimate_speed(self.generating_since.elapsed());
+    }
+    self.record.finish(state, usage);
+  }
 }
 
 impl hyper::body::Body for GuardedBody {
@@ -426,12 +546,16 @@ impl hyper::body::Body for GuardedBody {
     self: std::pin::Pin<&mut Self>,
     cx: &mut std::task::Context<'_>,
   ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-    // `GuardedBody` is `Unpin` (both fields are: `BoxBody` is a
-    // `Pin<Box<…>>` wrapper, `InflightGuard` holds only an `Arc`), so
-    // `get_mut` is safe and `Pin::new(inner)` re-pins for the inner
-    // body's `poll_frame` contract.
-    let inner = &mut self.get_mut().inner;
-    std::pin::Pin::new(inner).poll_frame(cx)
+    // `GuardedBody` is `Unpin` (every field is: `BoxBody` is a
+    // `Pin<Box<…>>` wrapper, `InflightGuard` holds only an `Arc`,
+    // `LoggedResponse` is plain data), so `get_mut` is safe and
+    // `Pin::new(inner)` re-pins for the inner body's `poll_frame` contract.
+    let this = self.get_mut();
+    let polled = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+    if let (Some(logged), std::task::Poll::Ready(item)) = (this.logged.as_mut(), &polled) {
+      logged.observe(item);
+    }
+    polled
   }
 
   fn is_end_stream(&self) -> bool {
@@ -480,21 +604,6 @@ fn sanitize_header_value(input: &str) -> String {
       }
     })
     .collect()
-}
-
-/// Construct an OpenAI-shaped error response for the forwarding arm's
-/// upstream-unreachable (502) cases, sharing the router's
-/// `json_response` builder so the envelope shape stays identical.
-fn error_envelope(
-  status: StatusCode,
-  kind: &str,
-  message: &str,
-) -> Response<BoxBody<Bytes, BodyError>> {
-  let envelope = super::openai::ErrorResponse {
-    error: super::openai::ErrorObject::new(kind, message),
-  };
-  let bytes = serde_json::to_vec(&envelope).expect("json encoding of fixed shape");
-  super::router::json_response(status, bytes)
 }
 
 /// Helper to massage a hyper::Request<Incoming> into the parts the
@@ -643,14 +752,11 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn error_envelope_builds_openai_shaped_body() {
+  async fn unreachable_response_builds_openai_shaped_body() {
     // The 502 forwarding-arm error must carry the OpenAI `{error:{...}}`
     // envelope shape so SDK clients surface it as a structured error.
-    let resp = error_envelope(
-      StatusCode::BAD_GATEWAY,
-      "upstream_unreachable",
-      "model exited before forwarding could begin",
-    );
+    let resp =
+      unreachable_response(None, "model exited before forwarding could begin").expect("infallible");
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     let body = resp
       .into_body()
@@ -664,5 +770,42 @@ mod tests {
       v["error"]["message"],
       "model exited before forwarding could begin"
     );
+  }
+
+  /// The tok/s estimated for a response that reported 100 generated
+  /// tokens and no speed, and whose request went upstream ten seconds
+  /// before its body's first byte.
+  fn estimated_speed(streamed: bool) -> f64 {
+    let log = crate::proxy::request_log::RequestLog::new();
+    let mut logged = LoggedResponse {
+      record: log.begin("/v1/chat/completions", None),
+      tap: Some(ResponseTap::default()),
+      content_length: None,
+      seen: 0,
+      ended: false,
+      errored: false,
+      streamed,
+      generating_since: Instant::now()
+        .checked_sub(std::time::Duration::from_secs(10))
+        .expect("the clock has run for ten seconds"),
+    };
+    let body = Bytes::from_static(br#"{"usage":{"prompt_tokens":5,"completion_tokens":100}}"#);
+    logged.observe(&Some(Ok(Frame::data(body))));
+    logged.observe(&None);
+    drop(logged);
+    let row = log.tail(None, 1).rows.into_iter().next().expect("a row");
+    assert!(row.tokens_per_second_estimated);
+    row.tokens_per_second.expect("an estimate")
+  }
+
+  #[test]
+  fn the_speed_estimate_times_a_stream_from_its_first_byte() {
+    // Timed from the send, 100 tokens in ten seconds is 10 tok/s at most.
+    // A stream is timed from its first byte, which arrived just now.
+    let stream = estimated_speed(true);
+    assert!(stream > 100.0, "{stream}");
+    // A response that arrives whole is timed from the send.
+    let whole = estimated_speed(false);
+    assert!((9.0..=10.0).contains(&whole), "{whole}");
   }
 }

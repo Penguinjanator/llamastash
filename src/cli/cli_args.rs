@@ -215,6 +215,8 @@ pub enum Command {
   Status(StatusArgs),
   /// Tail or follow a running model's log.
   Logs(LogsArgs),
+  /// Show the requests the proxy handled, newest first.
+  Requests(RequestsArgs),
   /// Manage named launch presets for a model.
   Presets(PresetsArgs),
   /// Pull a model from `HuggingFace`.
@@ -647,6 +649,22 @@ pub struct LogsArgs {
   /// One-shot `logs` emits a single `{ "launch_id": "...", "lines":
   /// [...] }` object; `--follow --json` emits one object per
   /// refresh containing only the newly-arrived lines.
+  #[arg(long)]
+  pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct RequestsArgs {
+  /// Only this model's requests: name substring, absolute path, or
+  /// canonical model id. A running launch's id (`L3`), port or name
+  /// selects the model it runs. Without it, every logged request.
+  pub model: Option<String>,
+  /// Number of requests to print, at least 1 (default 100; the log keeps
+  /// 1000).
+  #[arg(short = 'n', long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+  pub lines: Option<u32>,
+  /// Emit `{ "summary", "requests" }` as JSON. Every key of a request row
+  /// is always present; an unknown value is `null`.
   #[arg(long)]
   pub json: bool,
 }

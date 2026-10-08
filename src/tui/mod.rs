@@ -9,6 +9,7 @@
 //!   widgets and helpers.
 
 pub mod app;
+pub(crate) mod columns;
 pub mod confirm_overlay;
 pub mod delete;
 pub mod download_strip;

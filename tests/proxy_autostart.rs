@@ -29,9 +29,11 @@ use llamastash::daemon::shutdown::ShutdownToken;
 use llamastash::discovery::{DiscoveredModel, ModelCatalog, ModelSource};
 use llamastash::gguf::metadata::{ModeHint, ModelMetadata, Quant};
 use llamastash::gguf::test_fixtures::build_minimal_gguf;
+use llamastash::proxy::request_log::RequestState;
 use llamastash::proxy::server::{loopback_addr, new_status_cell, serve, ProxyStatus, StatusCell};
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
+use llamastash::test_support::{finished_request, newest_request_when};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -327,6 +329,12 @@ async fn dormant_model_auto_starts_and_forwards_without_fallback_headers() {
   let snap = ctx.supervisors.snapshot().await;
   assert_eq!(snap.len(), 1, "exactly one supervisor was launched");
 
+  // The request log marks this request as the one that started the model.
+  let row = finished_request(&ctx.requests).await;
+  assert!(row.auto_start);
+  assert_eq!(row.launch_id.as_deref(), Some(snap[0].0.as_str()));
+  assert_eq!((row.state, row.status), (RequestState::Done, Some(200)));
+
   stop_all(&ctx).await;
   shutdown_listener(shutdown, listener_handle).await;
   std::fs::remove_dir_all(&dir).ok();
@@ -554,6 +562,10 @@ async fn request_during_load_window_attaches_instead_of_duplicating() {
     1,
     "proxy must attach to the in-flight launch, not start a second one"
   );
+  // It waited on a launch someone else started, so it is not an auto-start.
+  let row = finished_request(&ctx.requests).await;
+  assert!(!row.auto_start);
+  assert_eq!(row.status, Some(200));
 
   stop_all(&ctx).await;
   shutdown_listener(shutdown, listener_handle).await;
@@ -877,6 +889,8 @@ async fn auto_start_refusal_unloads_the_idle_model_and_retries_once() {
     String::from_utf8_lossy(&resp)
   );
 
+  let first_launch = ctx.supervisors.snapshot().await[0].0.as_str().to_string();
+
   // Clamp the sampled pool below one launch's demand. The gate must refuse the
   // second model, and make-room has to give the first back to fit it.
   set_free_bytes(&metrics, GIB).await;
@@ -911,6 +925,76 @@ async fn auto_start_refusal_unloads_the_idle_model_and_retries_once() {
     vec![second.clone()],
     "the idle first launch is gone and the refused one is resident"
   );
+
+  // The request's log row names what it unloaded.
+  let row = finished_request(&ctx.requests).await;
+  assert!(row.auto_start);
+  assert_eq!(row.evicted, vec![first_launch]);
+  let summary = ctx
+    .requests
+    .tail(Some(&second.to_string_lossy()), 0)
+    .summary;
+  assert_eq!((summary.auto_starts, summary.evictions), (1, 1));
+
+  stop_all(&ctx).await;
+  shutdown_listener(token, handle).await;
+}
+
+/// A client that gives up while make-room is still waiting for the memory
+/// to land. The unload already happened, so the row has to say so even
+/// though the request never got an answer.
+#[tokio::test]
+async fn a_client_that_hangs_up_during_make_room_still_logs_the_unload() {
+  let dir = unique_temp("make-room-hangup");
+  let log_dir = dir.join("logs");
+  std::fs::create_dir_all(&log_dir).expect("mkdir logs");
+  let first = write_gguf(&dir, "first-Q4_K_M.gguf", "qwen2");
+  let second = write_gguf(&dir, "second-Q4_K_M.gguf", "qwen2");
+  let (state, ctx) = build_state(
+    vec![
+      discovered(&first, None, "qwen2"),
+      discovered(&second, None, "qwen2"),
+    ],
+    &log_dir,
+    allocate_wide_port_range(),
+  )
+  .await;
+  let metrics = ctx.host_metrics.clone().expect("test sampler attached");
+  let (addr, token, handle) = spawn_listener(state).await;
+
+  let body = |model: &str| format!(r#"{{"model":"{model}","messages":[]}}"#);
+  let (status, _, _) = http_post(addr, "/v1/chat/completions", &body("first-Q4_K_M.gguf")).await;
+  assert_eq!(status, 200);
+  let first_launch = ctx.supervisors.snapshot().await[0].0.as_str().to_string();
+
+  // Clamp the pool and leave it clamped: make-room unloads the first model,
+  // then sits in its wait for the memory, which never lands.
+  set_free_bytes(&metrics, GIB).await;
+  let request = body("second-Q4_K_M.gguf");
+  let mut sock = TcpStream::connect(addr).await.expect("connect");
+  let raw = format!(
+    "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{request}",
+    request.len()
+  );
+  sock.write_all(raw.as_bytes()).await.expect("write");
+
+  // The unload is on the row while the request is still in flight.
+  let waiting = newest_request_when(&ctx.requests, |r| !r.evicted.is_empty()).await;
+  assert_eq!(waiting.state, RequestState::InFlight);
+  assert_eq!(waiting.evicted, vec![first_launch.clone()]);
+
+  drop(sock);
+  let row = finished_request(&ctx.requests).await;
+  assert_eq!(row.state, RequestState::ClientClosed);
+  assert_eq!(row.status, None);
+  // It unloaded a model, but gave up before the retry spawned anything.
+  assert!(!row.auto_start);
+  assert_eq!(row.evicted, vec![first_launch]);
+  let summary = ctx
+    .requests
+    .tail(Some(&second.to_string_lossy()), 0)
+    .summary;
+  assert_eq!((summary.evictions, summary.errors), (1, 0));
 
   stop_all(&ctx).await;
   shutdown_listener(token, handle).await;
