@@ -19,6 +19,15 @@ session, in order. Tick an item here and in `TODO.md` in the same change.
 
 **Context:** `src/discovery/scanner.rs`, `src/discovery/metadata_cache.rs`. The cause is not known: reproduce on the real cache and add the regression test before the fix.
 
+**Result (2026-10-08):** Cause was neither suspect listed below. `mmproj-BF16.gguf` /
+`mmproj-F16.gguf` strip to a bare dtype, `canonical_base` counts `bf16`/`f16` as a quant
+(`QUANT_PATTERN`), so both land in the nameless tier, which accepted only a lone catch-all.
+An empty cache dir reproduced it, and the daemon already logged the ambiguity: `2 mmproj
+candidates found but none match …`. `pick`'s nameless tier now ranks by
+`scanner::companion_precision_rank` — the order `pull` already used in
+`download::pick_one_companion`, so pull and discovery agree on the file. Cross-directory
+pairing takes the same rank, which is what the shard-subdir rows needed.
+
 ### Plan
 
 1. Reproduce with the working tree against the real cache, in an isolated state dir: `list --json` for the two unsloth rows and for the gufo row that works.
@@ -29,7 +38,7 @@ session, in order. Tick an item here and in `TODO.md` in the same change.
 
 ### Items
 
-- [ ] **Vision not detected on unsloth's Qwen3.8 rows, so `integrations` drops their image input.** On 0.6.0 (2026-10-02), `list --json` shows `multimodal: null` for `Qwen3.8-27B-UD-Q6_K.gguf` and `Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf`, though both snapshots hold `mmproj-BF16.gguf` and `mmproj-F16.gguf` (27B beside the model, Flash-Next one level above its `UD-Q4_K_XL/` shards). `vmlinux/Qwen3.8-Flash-Next-Uncensored-Gufo-Q4Mix-GGUF`, with one `mmproj-BF16.gguf` beside the model, shows `vision: true`. Re-running `integrations pi` replaced the 4 pi entries and dropped their hand-added `"input": ["text", "image"]`. Cause not found yet; suspects are two projectors in one folder and a stale metadata cache.
+- [x] **Vision not detected on unsloth's Qwen3.8 rows, so `integrations` drops their image input.** On 0.6.0 (2026-10-02), `list --json` shows `multimodal: null` for `Qwen3.8-27B-UD-Q6_K.gguf` and `Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf`, though both snapshots hold `mmproj-BF16.gguf` and `mmproj-F16.gguf` (27B beside the model, Flash-Next one level above its `UD-Q4_K_XL/` shards). `vmlinux/Qwen3.8-Flash-Next-Uncensored-Gufo-Q4Mix-GGUF`, with one `mmproj-BF16.gguf` beside the model, shows `vision: true`. Re-running `integrations pi` replaced the 4 pi entries and dropped their hand-added `"input": ["text", "image"]`. Cause not found yet; suspects are two projectors in one folder and a stale metadata cache.
 
 ## Batch 2: proxy model resolution and listing
 

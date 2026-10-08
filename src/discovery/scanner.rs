@@ -397,8 +397,9 @@ fn detect_multimodal(model_path: &Path) -> Option<Multimodal> {
 ///    so it still pairs in a folder holding several quants of the same model;
 /// 1. else an MTP head whose quant-stripped base equals the model's;
 /// 2. else, a lone model + lone head in the directory pair regardless of name;
-/// 3. else, a single anonymous `mtp.gguf` catch-all is used; anything more
-///    ambiguous yields `None` (the user can pair a head explicitly).
+/// 3. else the closest-ranked anonymous companion (`mtp.gguf`, `mtp-f32.gguf`),
+///    by the precision order `pull` uses; a companion with no usable name at all
+///    yields `None` (the user can pair a head explicitly).
 pub fn find_mtp_head(model_path: &Path, model_arch: Option<&str>) -> Option<PathBuf> {
   // The arch a head must declare to draft for this model (`deepseek4` →
   // `deepseek4_mtp_support`).
@@ -417,8 +418,10 @@ struct CompanionKind<'a> {
   label: &'static str,
 }
 
-/// The `mmproj` projector paired with `model_path`. `None` when there is none,
-/// or when several are equally plausible and the user should pass `--mmproj`.
+/// The `mmproj` projector paired with `model_path`. `None` when there is none.
+/// Several projectors that carry no model name — one projector at two precisions,
+/// which is what unsloth publishes — resolve by that precision order; a caller
+/// can still pin one with `--mmproj`.
 pub fn find_mmproj(model_path: &Path) -> Option<PathBuf> {
   // Launching a projector directly has no projector of its own.
   if is_projector_companion(model_path) {
@@ -583,6 +586,41 @@ fn dir_model_labels(dir: &Path) -> std::collections::BTreeSet<String> {
   out
 }
 
+/// Precision order for a companion named only by its dtype: `f16` > `bf16` >
+/// `f32` > anything else. One rule for the pull pick and the pairing pick, so
+/// `pull` and discovery never disagree about which precision a model gets.
+pub(crate) fn companion_precision_rank(name: &str) -> u8 {
+  let l = name.to_ascii_lowercase();
+  // `bf16` also contains `f16`, so test it first.
+  if l.contains("bf16") {
+    1
+  } else if l.contains("f16") {
+    0
+  } else if l.contains("f32") {
+    2
+  } else {
+    3
+  }
+}
+
+/// Choose among companions that carry no model name (`mmproj-F16.gguf`). Same
+/// order [`companion_precision_rank`] gives `pull`, so several precisions of one
+/// projector resolve to the file `pull` would have fetched.
+fn best_companion(candidates: &[PathBuf]) -> Option<PathBuf> {
+  let mut keyed: Vec<(u8, usize, String, PathBuf)> = candidates
+    .iter()
+    .map(|p| {
+      let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+      (companion_precision_rank(&name), name.len(), name, p.clone())
+    })
+    .collect();
+  keyed.sort();
+  keyed.into_iter().next().map(|(_, _, _, p)| p)
+}
+
 /// Choose from classified candidates. `own_dir` enables the two unnamed tiers:
 /// they rest on "the only model beside the only companion", which a companion
 /// directory cannot show, and across directories would pair on nothing but
@@ -621,15 +659,27 @@ fn pick(
   if !own_dir {
     // Cross-directory: a lone companion in the snapshot, now that every model
     // in it is known to be the same one.
-    return (c.all.len() == 1).then(|| c.all[0].clone());
-  }
-  // 2. The only model beside the only companion.
-  if c.model_labels.len() == 1 && c.all.len() == 1 {
+    if c.all.len() == 1 {
+      return Some(c.all[0].clone());
+    }
+  } else if c.model_labels.len() == 1 && c.all.len() == 1 {
+    // 2. The only model beside the only companion.
     return first(&c.all);
   }
-  // 3. A lone anonymous catch-all, else genuinely ambiguous.
-  if c.anonymous.len() == 1 {
-    return first(&c.anonymous);
+  // 3. Companions named only by dtype. Several precisions of one projector are
+  //    the same companion, so rank them instead of reporting nothing.
+  if let Some(best) = best_companion(&c.anonymous) {
+    if c.anonymous.len() > 1 {
+      log::warn!(
+        "{}: {} {} candidates share no name with the model; using {:?}: {:?}",
+        model_path.display(),
+        c.anonymous.len(),
+        kind.label,
+        best.file_name().unwrap_or_default().to_string_lossy(),
+        companion_names(&c.anonymous),
+      );
+    }
+    return Some(best);
   }
   None
 }
@@ -2149,19 +2199,20 @@ mod tests {
   }
 
   #[test]
-  fn find_mmproj_ignores_ambiguous_anonymous() {
+  fn find_mmproj_ranks_anonymous_projectors_by_precision() {
     let dir = temp_dir("mmproj-ambiguous");
     fs::write(dir.join("qwen.gguf"), build_minimal_gguf("llama")).unwrap();
     fs::write(dir.join("mmproj.gguf"), build_minimal_gguf("llama")).unwrap();
     fs::write(dir.join("mmproj-f16.gguf"), build_minimal_gguf("llama")).unwrap();
 
     let found = find_mmproj(&dir.join("qwen.gguf"));
-    assert!(
-      found.is_none(),
-      "should ignore all anonymous projectors when multiple exist to avoid ambiguity"
+    assert_eq!(
+      found.and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
+      Some("mmproj-f16.gguf".to_string()),
+      "an unnamed projector loses to one naming a preferred precision"
     );
 
-    // If a base name match is added, it should still be found
+    // A base name match still outranks the precision order
     fs::write(dir.join("qwen-mmproj.gguf"), build_minimal_gguf("llama")).unwrap();
     let found_named = find_mmproj(&dir.join("qwen.gguf"));
     assert_eq!(
@@ -2301,6 +2352,60 @@ mod tests {
       found.and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
       Some("mmproj-F16.gguf".to_string()),
       "a projector at the snapshot root must pair with a model in a quant subdir"
+    );
+    fs::remove_dir_all(&root).ok();
+  }
+
+  #[test]
+  fn find_mmproj_pairs_dtype_only_projector_names() {
+    // unsloth ships the same projector at two precisions (`mmproj-BF16.gguf`
+    // and `mmproj-F16.gguf`) beside the weights. Neither name carries the model
+    // name, so the pair has to come from the precision order, not from silence.
+    let dir = temp_dir("mmproj-two-precisions");
+    fs::write(
+      dir.join("Qwen3.8-27B-UD-Q6_K.gguf"),
+      build_minimal_gguf("llama"),
+    )
+    .unwrap();
+    fs::write(dir.join("mmproj-BF16.gguf"), build_minimal_gguf("llama")).unwrap();
+    fs::write(dir.join("mmproj-F16.gguf"), build_minimal_gguf("llama")).unwrap();
+
+    let found = find_mmproj(&dir.join("Qwen3.8-27B-UD-Q6_K.gguf"));
+    assert_eq!(
+      found.and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
+      Some("mmproj-F16.gguf".to_string()),
+      "two projector precisions must resolve through the same order pull uses"
+    );
+    fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn find_mmproj_pairs_two_projectors_from_the_snapshot_root() {
+    // The same pair one level above a per-quant shard directory.
+    let root = temp_dir("mmproj-two-precisions-snapshot");
+    let snap = root
+      .join("models--org--repo")
+      .join("snapshots")
+      .join("abc123");
+    let quant = snap.join("UD-Q4_K_XL");
+    fs::create_dir_all(&quant).unwrap();
+    for i in 1..=2 {
+      fs::write(
+        quant.join(format!(
+          "Qwen3.8-Flash-Next-UD-Q4_K_XL-0000{i}-of-00002.gguf"
+        )),
+        build_minimal_gguf("llama"),
+      )
+      .unwrap();
+    }
+    fs::write(snap.join("mmproj-BF16.gguf"), build_minimal_gguf("llama")).unwrap();
+    fs::write(snap.join("mmproj-F16.gguf"), build_minimal_gguf("llama")).unwrap();
+
+    let found = find_mmproj(&quant.join("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00002.gguf"));
+    assert_eq!(
+      found.and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
+      Some("mmproj-F16.gguf".to_string()),
+      "the precision order must also apply across the snapshot"
     );
     fs::remove_dir_all(&root).ok();
   }

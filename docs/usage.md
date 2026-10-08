@@ -714,6 +714,14 @@ llamastash pull owner/repo:model.gguf --no-companions # base file only
 llamastash pull owner/repo:model.gguf --all-companions # every projector precision / head
 ```
 
+Several precisions can end up beside one model — an `--all-companions` pull, a repo that
+ships them (unsloth's Qwen3.8 rows carry `mmproj-BF16.gguf` and `mmproj-F16.gguf`), or a
+hand copy. Those names say nothing about which model they serve, so the pair is settled by
+precision: `f16` before `bf16` before `f32`, then the shortest name. That is the same order
+`pull` uses to choose the one companion it fetches, so a launch picks the file `pull` would
+have downloaded. Pin a different one with `start -- --mmproj <path>`, or keep the model
+text-only with `start -- --no-mmproj`.
+
 ## vLLM backend
 
 **Experimental.** vLLM serves **safetensors HuggingFace repos** — the non-GGUF half of your cache. A GGUF still binds llama.cpp; vLLM claims repos the GGUF scanner does not. Setup, the ROCm container recipe, and the full knob table are in **[vLLM setup](vllm-setup.md)**.

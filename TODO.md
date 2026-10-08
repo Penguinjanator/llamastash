@@ -412,7 +412,7 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 
 ### Batch 1: vision detection bug ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-1-vision-detection-bug))
 
-- [ ] Vision not detected on unsloth's Qwen3.8 rows, so `integrations` drops their image input
+- [x] ~~Vision not detected on unsloth's Qwen3.8 rows, so `integrations` drops their image input~~ — both names strip to a bare dtype (`bf16`, `f16`), which `canonical_base` counts as a quant, so neither matched the model and two anonymous candidates refused the lone-catch-all tier. `pick` now ranks nameless companions by the precision order `pull` uses (`f16` > `bf16` > `f32`, then shortest name) and logs the pick.
 
 ### Batch 2: proxy model resolution and listing ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-2-proxy-model-resolution-and-listing))
 

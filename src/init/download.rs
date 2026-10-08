@@ -782,24 +782,12 @@ pub(crate) fn select_companions(
 /// default precision (`f16` > `bf16` > `f32` > other), tie-broken by the
 /// shortest name (the plain form over `-variant` suffixes), then alphabetical.
 fn pick_one_companion(candidates: &[&String]) -> Option<String> {
-  fn precision_rank(name: &str) -> u8 {
-    let l = name.to_ascii_lowercase();
-    // `bf16` also contains `f16`, so test it first.
-    if l.contains("bf16") {
-      1
-    } else if l.contains("f16") {
-      0
-    } else if l.contains("f32") {
-      2
-    } else {
-      3
-    }
-  }
+  use crate::discovery::scanner::companion_precision_rank;
   candidates
     .iter()
     .min_by(|a, b| {
-      precision_rank(a)
-        .cmp(&precision_rank(b))
+      companion_precision_rank(a)
+        .cmp(&companion_precision_rank(b))
         .then(a.len().cmp(&b.len()))
         .then(a.cmp(b))
     })

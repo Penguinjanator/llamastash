@@ -16,6 +16,10 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 - `/api/show` reads `<model>@<launch>` the way the chat surfaces do: the launch name is a pointer to a running launch, and a name that does not exist falls back to that model's unnamed launch. It used to answer `404` for anything containing an `@`. ([#99](https://github.com/llamastash/llamastash/pull/99))
 - The proxy reads the model catalog through one shared snapshot instead of copying every row for every request, so routing a request no longer allocates in proportion to how many models are on disk. ([#99](https://github.com/llamastash/llamastash/pull/99))
 
+### Fixed
+
+- A model whose projector folder holds two precisions (`mmproj-BF16.gguf` beside `mmproj-F16.gguf`, as unsloth's Qwen3.8 repos publish them) is vision again. Neither name matches the model, so nothing paired: the row read `multimodal: null`, the launch carried no projector, and `integrations` wrote the model without image input. The projector now pairs by the precision order `pull` already uses.
+
 ## [0.6.1] — 2026-10-02
 
 A patch release for `integrations`. It keeps the key order of the tool configs it edits instead of sorting them, and a generic entry like Halogen can now declare the image input and reasoning effort levels it accepts, so pi, OpenCode, Zed and Codex get them like they do for a GGUF model.
