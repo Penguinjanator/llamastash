@@ -38,10 +38,9 @@ use llamastash::gguf::identity::ModelId;
 use llamastash::gguf::metadata::{ModeHint, ModelMetadata, Quant};
 use llamastash::launch::mode::LaunchMode;
 use llamastash::launch::params::LaunchParams;
-use llamastash::proxy::server::{loopback_addr, new_status_cell, serve, StatusCell};
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
-use llamastash::test_support::{shutdown_listener, wait_for_listening, write_gguf};
+use llamastash::test_support::{shutdown_listener, spawn_listener, write_gguf};
 use serde_json::Value;
 use tokio::time::sleep;
 
@@ -60,25 +59,6 @@ fn unique_temp_dir(label: &str) -> PathBuf {
 fn pick_free_port() -> u16 {
   let l = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral");
   l.local_addr().expect("local_addr").port()
-}
-
-async fn spawn_listener_with_state(
-  state: Arc<ProxyState>,
-) -> (SocketAddr, ShutdownToken, tokio::task::JoinHandle<()>) {
-  let token = ShutdownToken::new();
-  let status: StatusCell = new_status_cell();
-  let bind_addr = loopback_addr(0);
-  let token_for_task = token.clone();
-  let status_for_task = Arc::clone(&status);
-  let handle = tokio::spawn(async move {
-    serve(state, bind_addr, token_for_task, status_for_task)
-      .await
-      .expect("proxy serve returns Ok");
-  });
-  let bound = wait_for_listening(&status, Duration::from_secs(2))
-    .await
-    .expect("listener reaches Listening");
-  (bound, token, handle)
 }
 
 async fn http_get(addr: SocketAddr, path: &str) -> (u16, Vec<u8>) {
@@ -219,7 +199,7 @@ async fn proxy_state_with_models_compat(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_version_returns_cargo_pkg_version() {
   let state = proxy_state_with_models(Vec::new()).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_get(addr, "/api/version").await;
   assert_eq!(status, 200);
@@ -253,7 +233,7 @@ async fn api_tags_returns_alphabetical_models_with_documented_fields() {
     make_model("/m/gemma.gguf", Some("gemma:2b"), "gemma", ModeHint::Chat),
   ];
   let state = proxy_state_with_models(models).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_get(addr, "/api/tags").await;
   assert_eq!(status, 200);
@@ -294,7 +274,7 @@ async fn api_tags_returns_alphabetical_models_with_documented_fields() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_tags_empty_catalog_returns_empty_models_list() {
   let state = proxy_state_with_models(Vec::new()).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_get(addr, "/api/tags").await;
   assert_eq!(status, 200);
@@ -317,7 +297,7 @@ async fn api_tags_tolerates_parse_error_rows() {
     make_parse_error_model("/m/broken.gguf"),
   ];
   let state = proxy_state_with_models(models).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_get(addr, "/api/tags").await;
   assert_eq!(status, 200);
@@ -344,7 +324,7 @@ async fn api_ps_with_no_running_supervisors_returns_empty_list() {
   // /api/ps lists loaded models.
   let models = vec![make_model("/m/dormant.gguf", None, "llama", ModeHint::Chat)];
   let state = proxy_state_with_models(models).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_get(addr, "/api/ps").await;
   assert_eq!(status, 200);
@@ -366,7 +346,7 @@ async fn api_show_returns_metadata_for_known_model() {
     ModeHint::Chat,
   )];
   let state = proxy_state_with_models(models).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_post(addr, "/api/show", r#"{"model":"qwen-coder:7b"}"#).await;
   assert_eq!(status, 200);
@@ -406,7 +386,7 @@ async fn api_show_accepts_legacy_name_field() {
   // must accept either.
   let models = vec![make_model("/m/legacy.gguf", None, "llama", ModeHint::Chat)];
   let state = proxy_state_with_models(models).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_post(addr, "/api/show", r#"{"name":"legacy"}"#).await;
   assert_eq!(status, 200);
@@ -427,7 +407,7 @@ async fn api_show_resolves_a_proxy_alias() {
     ModeHint::Chat,
   )];
   let state = proxy_state_with_alias(models, ("gpt-4o-mini", "qwen-coder:7b")).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_post(addr, "/api/show", r#"{"model":"gpt-4o-mini"}"#).await;
   assert_eq!(
@@ -460,7 +440,7 @@ async fn api_show_an_alias_beats_a_model_that_merely_contains_the_name() {
     ),
   ];
   let state = proxy_state_with_alias(models, ("gpt-4o-mini", "qwen-coder:7b")).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_post(addr, "/api/show", r#"{"model":"gpt-4o-mini"}"#).await;
   let v: Value = serde_json::from_slice(&body).expect("json body");
@@ -492,7 +472,7 @@ async fn api_show_an_alias_resolves_what_is_ambiguous_without_it() {
     ),
   ];
   let state = proxy_state_with_alias(models, ("gpt-oss", "gpt-oss-20b")).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_post(addr, "/api/show", r#"{"model":"gpt-oss"}"#).await;
   assert_eq!(
@@ -517,7 +497,7 @@ async fn api_show_an_alias_target_has_to_name_a_model_on_its_own() {
     ModeHint::Chat,
   )];
   let state = proxy_state_with_alias(models, ("gpt-4o-mini", "qwen")).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_post(addr, "/api/show", r#"{"model":"gpt-4o-mini"}"#).await;
   assert_eq!(
@@ -539,7 +519,7 @@ async fn api_show_an_alias_may_name_a_path() {
     ModeHint::Chat,
   )];
   let state = proxy_state_with_alias(models, ("gpt-4o-mini", "/m/qwen-coder.gguf")).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_post(addr, "/api/show", r#"{"model":"gpt-4o-mini"}"#).await;
   assert_eq!(status, 200, "a path target resolves: {status} {body:?}");
@@ -568,7 +548,7 @@ async fn api_show_an_alias_pointing_at_another_alias_is_refused() {
     ),
   ];
   let state = proxy_state_with_aliases(models, vec![("hardwired", "y"), ("y", "realmodel")]).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, _) = http_post(addr, "/api/show", r#"{"model":"hardwired"}"#).await;
   assert_eq!(status, 404, "the chain is refused, not followed");
@@ -603,7 +583,7 @@ async fn api_show_an_alias_is_consulted_for_a_launch_address() {
     ),
   ];
   let state = proxy_state_with_alias(models, ("gpt-4o-mini", "qwen-coder:7b")).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_post(addr, "/api/show", r#"{"model":"gpt-4o-mini@coder"}"#).await;
   assert_eq!(
@@ -629,7 +609,7 @@ async fn api_show_an_alias_value_two_models_answer_to_names_its_candidates() {
     make_model("/m/b/qwen3-32b.gguf", None, "qwen3", ModeHint::Chat),
   ];
   let state = proxy_state_with_alias(models, ("gpt-4o-mini", "qwen3-32b")).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_post(addr, "/api/show", r#"{"model":"gpt-4o-mini"}"#).await;
   assert_eq!(
@@ -657,7 +637,7 @@ async fn api_show_an_alias_value_that_is_a_real_model_wins_over_being_an_alias_n
     make_model("/m/other.gguf", Some("other"), "llama", ModeHint::Chat),
   ];
   let state = proxy_state_with_aliases(models, vec![("fast", "demo"), ("demo", "other")]).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_post(addr, "/api/show", r#"{"model":"fast"}"#).await;
   assert_eq!(
@@ -689,7 +669,7 @@ async fn api_show_without_the_alias_still_calls_that_name_ambiguous() {
     ),
   ];
   let state = proxy_state_with_models(models).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_post(addr, "/api/show", r#"{"model":"gpt-oss"}"#).await;
   assert_eq!(
@@ -703,7 +683,7 @@ async fn api_show_without_the_alias_still_calls_that_name_ambiguous() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_show_missing_model_returns_404_model_not_found() {
   let state = proxy_state_with_models(Vec::new()).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_post(addr, "/api/show", r#"{"model":"nonexistent"}"#).await;
   assert_eq!(status, 404);
@@ -716,7 +696,7 @@ async fn api_show_missing_model_returns_404_model_not_found() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_show_without_model_field_returns_400_model_required() {
   let state = proxy_state_with_models(Vec::new()).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_post(addr, "/api/show", r#"{}"#).await;
   assert_eq!(status, 400);
@@ -746,7 +726,7 @@ async fn api_show_ambiguous_reference_returns_400_with_matches() {
     ),
   ];
   let state = proxy_state_with_models(models).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_post(addr, "/api/show", r#"{"model":"qwen3"}"#).await;
   assert_eq!(status, 400);
@@ -775,7 +755,7 @@ async fn api_show_capabilities_reflect_mode_hint() {
     ),
   ];
   let state = proxy_state_with_models(models).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_post(addr, "/api/show", r#"{"model":"embed-mini"}"#).await;
   assert_eq!(status, 200);
@@ -904,7 +884,7 @@ async fn api_ps_returns_ready_supervisor_with_documented_fields() {
   );
   discovered.path = qwen3.clone();
   let state = proxy_state_with_models_and_registry(vec![discovered], registry).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_get(addr, "/api/ps").await;
   assert_eq!(status, 200);
@@ -969,7 +949,7 @@ async fn api_ps_excludes_the_lemonade_umbrella_supervisor() {
   );
   servable_row.path = servable.clone();
   let state = proxy_state_with_models_and_registry(vec![servable_row], registry).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_get(addr, "/api/ps").await;
   assert_eq!(status, 200);
@@ -1012,7 +992,7 @@ async fn digest_is_stable_across_tags_and_ps_for_same_model() {
   );
   discovered.path = qwen3.clone();
   let state = proxy_state_with_models_and_registry(vec![discovered], registry).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (s_tags, b_tags) = http_get(addr, "/api/tags").await;
   assert_eq!(s_tags, 200);
@@ -1050,7 +1030,7 @@ async fn digest_is_stable_across_tags_and_ps_for_same_model() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn root_get_default_mode_identifies_as_llamastash() {
   let state = proxy_state_with_models_compat(Vec::new(), false).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_get(addr, "/").await;
   assert_eq!(status, 200);
@@ -1067,7 +1047,7 @@ async fn root_get_default_mode_identifies_as_llamastash() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn root_get_ollama_compat_mode_identifies_as_ollama() {
   let state = proxy_state_with_models_compat(Vec::new(), true).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, body) = http_get(addr, "/").await;
   assert_eq!(status, 200);
@@ -1086,7 +1066,7 @@ async fn root_head_returns_200_with_no_body_in_either_mode() {
   // motivated the whole root-route addition.
   for compat in [false, true] {
     let state = proxy_state_with_models_compat(Vec::new(), compat).await;
-    let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+    let (addr, shutdown, handle) = spawn_listener(state).await;
     let (status, body_len) = http_head(addr, "/").await;
     assert_eq!(status, 200, "HEAD / must succeed in {compat:?} mode");
     assert_eq!(

@@ -363,7 +363,16 @@ async fn http_round_trip(
   let mut sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
   sock.write_all(request.as_bytes()).await.expect("write");
   let mut buf = Vec::new();
-  sock.read_to_end(&mut buf).await.expect("read");
+  // Bound the read: a server that accepts and never answers should fail the
+  // test, not hang the suite until the runner's own timeout. Kept generous so
+  // a request that waits on a real model load still finishes on a loaded CI box.
+  let read = tokio::time::timeout(
+    std::time::Duration::from_secs(60),
+    sock.read_to_end(&mut buf),
+  )
+  .await
+  .expect("response within 60s");
+  read.expect("read");
   let needle = b"\r\n\r\n";
   let split = buf
     .windows(needle.len())

@@ -37,10 +37,9 @@ use llamastash::daemon::{run_foreground, DaemonOptions};
 use llamastash::discovery::{DiscoveredModel, ModelCatalog, ModelSource};
 use llamastash::gguf::test_fixtures::build_minimal_gguf;
 use llamastash::ipc::Client;
-use llamastash::proxy::server::{loopback_addr, new_status_cell, serve, StatusCell};
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
-use llamastash::test_support::{fake_metadata, shutdown_listener, wait_for_listening};
+use llamastash::test_support::{fake_metadata, shutdown_listener, spawn_listener};
 use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -54,27 +53,6 @@ fn unique_temp_dir(label: &str) -> PathBuf {
 fn pick_free_port() -> u16 {
   let l = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral");
   l.local_addr().expect("local_addr").port()
-}
-
-/// Spin up the proxy listener on an ephemeral port, backed by the
-/// given `ProxyState`. Returns the bound address + shutdown token.
-async fn spawn_listener_with_state(
-  state: Arc<ProxyState>,
-) -> (SocketAddr, ShutdownToken, tokio::task::JoinHandle<()>) {
-  let token = ShutdownToken::new();
-  let status: StatusCell = new_status_cell();
-  let bind_addr = loopback_addr(0);
-  let token_for_task = token.clone();
-  let status_for_task = Arc::clone(&status);
-  let handle = tokio::spawn(async move {
-    serve(state, bind_addr, token_for_task, status_for_task)
-      .await
-      .expect("proxy serve returns Ok");
-  });
-  let bound = wait_for_listening(&status, Duration::from_secs(2))
-    .await
-    .expect("listener reaches Listening");
-  (bound, token, handle)
 }
 
 /// A bare `GET` against the test proxy, `(status, body)`.
@@ -126,7 +104,7 @@ async fn three_models_return_in_alphabetical_order() {
     make_model("/m/gemma.gguf", Some("gemma:2b")),
   ];
   let state = proxy_state_with_models(models).await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let (status, body) = http_get(addr, "/v1/models").await;
   assert_eq!(status, 200);
@@ -166,7 +144,7 @@ async fn two_models_sharing_a_basename_publish_two_reachable_ids() {
     make_model("/m/llama.gguf", None),
   ];
   let state = proxy_state_with_models(models).await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let (status, body) = http_get(addr, "/v1/models").await;
   assert_eq!(status, 200);
@@ -208,7 +186,7 @@ async fn one_repo_cached_by_two_tools_publishes_source_qualified_ids() {
   lms.source = ModelSource::LmStudio;
 
   let state = proxy_state_with_models(vec![hf, lms]).await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let (status, body) = http_get(addr, "/v1/models").await;
   assert_eq!(status, 200);
@@ -240,7 +218,7 @@ async fn one_repo_cached_by_two_tools_publishes_source_qualified_ids() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_catalog_returns_empty_data_not_error() {
   let state = proxy_state_with_models(Vec::new()).await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
   let (status, body) = http_get(addr, "/v1/models").await;
   assert_eq!(
     status, 200,
@@ -272,7 +250,7 @@ async fn parse_error_row_still_appears_with_file_stem_id() {
     mtp_head: None,
   };
   let state = proxy_state_with_models(vec![bad]).await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let (status, body) = http_get(addr, "/v1/models").await;
   assert_eq!(status, 200);
@@ -301,7 +279,7 @@ async fn two_hundred_models_stay_under_one_mib_and_sort_is_stable() {
   // doesn't matter — but we still want the response sort to be the
   // *handler's* sort, not the BTreeMap's.
   let state = proxy_state_with_models(models).await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   // Two back-to-back calls; the second must be byte-identical to the
   // first (stable sort, no time-dependent fields beyond `created`
@@ -336,7 +314,7 @@ async fn schema_parity_with_documented_openai_shape() {
   // the four-field shape inline is enough to lock the contract that
   // OpenAI's Python/Node SDKs deserialize against.
   let state = proxy_state_with_models(vec![make_model("/m/x.gguf", Some("x:1"))]).await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
   let (_status, body) = http_get(addr, "/v1/models").await;
   let v: Value = serde_json::from_slice(&body).expect("json body");
   assert_eq!(v["object"].as_str(), Some("list"));
@@ -362,7 +340,7 @@ async fn health_reports_zero_when_catalog_and_supervisors_are_empty() {
   // Default MethodContext has an empty catalog and zero supervisors;
   // /health must report 0/0 rather than the wire-shape stand-in.
   let state = proxy_state_with_models(Vec::new()).await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
   let (status, body) = http_get(addr, "/health").await;
   assert_eq!(status, 200);
   let v: Value = serde_json::from_slice(&body).expect("json body");
@@ -383,7 +361,7 @@ async fn health_models_discovered_matches_catalog_length() {
     make_model("/m/c.gguf", None),
   ];
   let state = proxy_state_with_models(models).await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
   let (status, body) = http_get(addr, "/health").await;
   assert_eq!(status, 200);
   let v: Value = serde_json::from_slice(&body).expect("json body");

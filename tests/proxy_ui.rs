@@ -11,7 +11,6 @@
 #![cfg(feature = "test-fixtures")]
 
 use std::{
-  net::SocketAddr,
   path::{Path, PathBuf},
   sync::Arc,
   time::Duration,
@@ -27,11 +26,10 @@ use llamastash::discovery::{DiscoveredModel, ModelCatalog, ModelSource};
 use llamastash::gguf::identity::ModelId;
 use llamastash::launch::mode::LaunchMode;
 use llamastash::launch::params::LaunchParams;
-use llamastash::proxy::server::{loopback_addr, new_status_cell, serve, StatusCell};
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
 use llamastash::test_support::{
-  fake_metadata, header_value, http_get, http_post, shutdown_listener, wait_for_listening,
+  fake_metadata, header_value, http_get, http_post, shutdown_listener, spawn_listener,
 };
 use serde_json::Value;
 use tokio::time::sleep;
@@ -131,25 +129,6 @@ async fn spawn_fake(
   model
 }
 
-async fn spawn_listener_with_state(
-  state: Arc<ProxyState>,
-) -> (SocketAddr, ShutdownToken, tokio::task::JoinHandle<()>) {
-  let token = ShutdownToken::new();
-  let status: StatusCell = new_status_cell();
-  let bind_addr = loopback_addr(0);
-  let token_for_task = token.clone();
-  let status_for_task = Arc::clone(&status);
-  let handle = tokio::spawn(async move {
-    serve(state, bind_addr, token_for_task, status_for_task)
-      .await
-      .expect("proxy serve returns Ok");
-  });
-  let bound = wait_for_listening(&status, Duration::from_secs(2))
-    .await
-    .expect("listener reaches Listening");
-  (bound, token, handle)
-}
-
 async fn build_state(
   models: Vec<DiscoveredModel>,
   supervisors: SupervisorRegistry,
@@ -223,7 +202,7 @@ async fn get_ui_redirects_to_slash() {
     None,
   )
   .await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, headers, _body) = http_get(addr, "/ui", &[]).await;
   assert_eq!(status, 302, "GET /ui must 302 to the trailing-slash form");
@@ -246,7 +225,7 @@ async fn single_running_serves_ui_and_forwards_paths() {
     None,
   )
   .await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   // `/ui/` strips to `/` → the backend's web-UI index.
   let (status, _h, body) = http_get(addr, "/ui/", &[]).await;
@@ -289,7 +268,7 @@ async fn ui_post_body_over_cap_returns_413() {
     1024,
   )
   .await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   // A body just over the cap: `forward_ui` buffers it under the cap
   // before forwarding, so the 413 fires here, not upstream.
@@ -330,7 +309,7 @@ async fn two_running_shows_chooser_then_cookie_pins() {
     None,
   )
   .await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   // Two running, no cookie → the chooser, linking each backend.
   let (status, _h, body) = http_get(addr, "/ui/", &[]).await;
@@ -388,7 +367,7 @@ async fn zero_running_serves_no_model_page() {
   let dir = unique_temp("empty");
   let registry = SupervisorRegistry::new();
   let state = build_state(Vec::new(), registry, None).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, headers, body) = http_get(addr, "/ui/", &[]).await;
   assert_eq!(status, 200, "zero running must be a page, not a 500");
@@ -415,7 +394,7 @@ async fn auth_enforced_ui_challenges_basic_and_accepts_credentials() {
     Some(key),
   )
   .await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   // No credential → 401 carrying a *Basic* challenge so a browser prompts.
   let (status, headers, _b) = http_get(addr, "/ui/", &[]).await;
