@@ -79,46 +79,14 @@ async fn wait_for_proxy(socket_path: &std::path::Path) -> SocketAddr {
   }
 }
 
-/// Send `GET <path>` with `Connection: close` and return
-/// `(status_code, body_bytes)`.
+/// One bare-socket request against the daemon's own proxy, `(status, body)`.
 async fn http_get(addr: SocketAddr, path: &str) -> (u16, Vec<u8>) {
-  let mut sock = TcpStream::connect(addr).await.expect("connect");
-  let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-  sock.write_all(req.as_bytes()).await.expect("write");
-  let mut buf = Vec::new();
-  sock.read_to_end(&mut buf).await.expect("read");
-  parse(&buf)
+  let (status, _, body) = llamastash::test_support::http_get(addr, path, &[]).await;
+  (status, body)
 }
 
 async fn http_post(addr: SocketAddr, path: &str, body: &str) -> (u16, Vec<u8>) {
-  let mut sock = TcpStream::connect(addr).await.expect("connect");
-  let req = format!(
-    "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
-    body.len()
-  );
-  sock.write_all(req.as_bytes()).await.expect("write");
-  let mut buf = Vec::new();
-  sock.read_to_end(&mut buf).await.expect("read");
-  parse(&buf)
-}
-
-fn parse(buf: &[u8]) -> (u16, Vec<u8>) {
-  let needle = b"\r\n\r\n";
-  let split = buf
-    .windows(needle.len())
-    .position(|w| w == needle)
-    .expect("CRLFCRLF terminator");
-  let head = std::str::from_utf8(&buf[..split]).expect("utf8 headers");
-  let status: u16 = head
-    .lines()
-    .next()
-    .expect("status line")
-    .split_whitespace()
-    .nth(1)
-    .expect("status code")
-    .parse()
-    .expect("parse status");
-  let body = buf[split + needle.len()..].to_vec();
+  let (status, _, body) = llamastash::test_support::http_post(addr, path, body, &[]).await;
   (status, body)
 }
 

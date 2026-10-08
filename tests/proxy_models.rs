@@ -35,14 +35,13 @@ use llamastash::daemon::context::MethodContext;
 use llamastash::daemon::shutdown::ShutdownToken;
 use llamastash::daemon::{run_foreground, DaemonOptions};
 use llamastash::discovery::{DiscoveredModel, ModelCatalog, ModelSource};
-use llamastash::gguf::metadata::{ModeHint, ModelMetadata, Quant};
 use llamastash::gguf::test_fixtures::build_minimal_gguf;
 use llamastash::ipc::Client;
-use llamastash::proxy::server::{loopback_addr, new_status_cell, serve, ProxyStatus, StatusCell};
+use llamastash::proxy::server::{loopback_addr, new_status_cell, serve, StatusCell};
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
+use llamastash::test_support::{fake_metadata, shutdown_listener, wait_for_listening};
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
@@ -78,74 +77,10 @@ async fn spawn_listener_with_state(
   (bound, token, handle)
 }
 
-/// Trigger shutdown and join the serve task; catches a hung serve loop.
-async fn shutdown_listener(shutdown: ShutdownToken, handle: tokio::task::JoinHandle<()>) {
-  shutdown.trigger();
-  tokio::time::timeout(Duration::from_secs(5), handle)
-    .await
-    .expect("proxy serve loop must exit after shutdown.trigger()")
-    .expect("proxy serve task must not panic");
-}
-
-async fn wait_for_listening(status: &StatusCell, budget: Duration) -> Option<SocketAddr> {
-  let deadline = std::time::Instant::now() + budget;
-  while std::time::Instant::now() < deadline {
-    if let ProxyStatus::Listening { addr, .. } = status.read().unwrap().clone() {
-      return Some(addr);
-    }
-    sleep(Duration::from_millis(10)).await;
-  }
-  None
-}
-
+/// A bare `GET` against the test proxy, `(status, body)`.
 async fn http_get(addr: SocketAddr, path: &str) -> (u16, Vec<u8>) {
-  let mut sock = TcpStream::connect(addr).await.expect("connect");
-  let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-  sock.write_all(req.as_bytes()).await.expect("write");
-  let mut buf = Vec::new();
-  sock.read_to_end(&mut buf).await.expect("read");
-  parse_response(&buf)
-}
-
-fn parse_response(buf: &[u8]) -> (u16, Vec<u8>) {
-  let needle = b"\r\n\r\n";
-  let split = buf
-    .windows(needle.len())
-    .position(|w| w == needle)
-    .expect("CRLFCRLF terminator");
-  let head = std::str::from_utf8(&buf[..split]).expect("utf8 headers");
-  let status: u16 = head
-    .lines()
-    .next()
-    .expect("status line")
-    .split_whitespace()
-    .nth(1)
-    .expect("status code")
-    .parse()
-    .expect("parse status");
-  // We always emit `Content-Length`, so the body is `buf` from
-  // `split + 4` to EOF (we asked for Connection: close, so the
-  // server closes after writing).
-  let body = buf[split + needle.len()..].to_vec();
+  let (status, _, body) = llamastash::test_support::http_get(addr, path, &[]).await;
   (status, body)
-}
-
-fn fake_metadata(arch: &str) -> ModelMetadata {
-  ModelMetadata {
-    arch: Some(arch.to_string()),
-    total_parameters: Some(7_000_000_000),
-    parameter_label: Some("7B".to_string()),
-    quant: Quant::Q4_K,
-    quant_label: None,
-    native_ctx: Some(8192),
-    chat_template: None,
-    tokenizer_kind: Some("llama".to_string()),
-    reasoning_hint: false,
-    mode_hint: ModeHint::Chat,
-    weights_bytes: Some(4_000_000_000),
-    lazy_tensor_bytes: Vec::new(),
-    mtp: None,
-  }
 }
 
 fn make_model(path: &str, display_label: Option<&str>) -> DiscoveredModel {

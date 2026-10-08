@@ -32,17 +32,19 @@ use llamastash::daemon::shutdown::ShutdownToken;
 use llamastash::daemon::supervisor::{spawn as supervisor_spawn, ManagedSpawn, ManagedState};
 use llamastash::discovery::{DiscoveredModel, ModelCatalog, ModelSource};
 use llamastash::gguf::identity::ModelId;
-use llamastash::gguf::metadata::{ModeHint, ModelMetadata, Quant};
 use llamastash::ipc::{dispatch_request, Request};
 use llamastash::launch::mode::LaunchMode;
 use llamastash::launch::params::LaunchParams;
 use llamastash::proxy::request_log::RequestState;
 use llamastash::proxy::server::{
-  loopback_addr, new_status_cell, serve_with_options, ProxyStatus, ServeOptions, StatusCell,
+  loopback_addr, new_status_cell, serve_with_options, ServeOptions, StatusCell,
 };
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
-use llamastash::test_support::{finished_request, newest_request_when};
+use llamastash::test_support::{
+  fake_metadata, finished_request, http_post, newest_request_when, shutdown_listener,
+  wait_for_listening,
+};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -67,24 +69,6 @@ fn fast_probe() -> ProbeOptions {
   ProbeOptions {
     interval: Duration::from_millis(30),
     timeout: Duration::from_secs(5),
-  }
-}
-
-fn fake_metadata(arch: &str) -> ModelMetadata {
-  ModelMetadata {
-    arch: Some(arch.to_string()),
-    total_parameters: Some(7_000_000_000),
-    parameter_label: Some("7B".to_string()),
-    quant: Quant::Q4_K,
-    quant_label: None,
-    native_ctx: Some(8192),
-    chat_template: None,
-    tokenizer_kind: Some("llama".to_string()),
-    reasoning_hint: false,
-    mode_hint: ModeHint::Chat,
-    weights_bytes: Some(4_000_000_000),
-    lazy_tensor_bytes: Vec::new(),
-    mtp: None,
   }
 }
 
@@ -188,26 +172,6 @@ async fn spawn_listener_with_options(
   (bound, token, handle)
 }
 
-/// Trigger shutdown and join the serve task; catches a hung serve loop.
-async fn shutdown_listener(shutdown: ShutdownToken, handle: tokio::task::JoinHandle<()>) {
-  shutdown.trigger();
-  tokio::time::timeout(Duration::from_secs(5), handle)
-    .await
-    .expect("proxy serve loop must exit after shutdown.trigger()")
-    .expect("proxy serve task must not panic");
-}
-
-async fn wait_for_listening(status: &StatusCell, budget: Duration) -> Option<SocketAddr> {
-  let deadline = std::time::Instant::now() + budget;
-  while std::time::Instant::now() < deadline {
-    if let ProxyStatus::Listening { addr, .. } = status.read().unwrap().clone() {
-      return Some(addr);
-    }
-    sleep(Duration::from_millis(10)).await;
-  }
-  None
-}
-
 /// Build a ProxyState whose catalog has the supplied discovered
 /// models and whose supervisor registry is the provided one (default
 /// body cap).
@@ -268,71 +232,12 @@ async fn proxy_state_with_aliases(
     .0
 }
 
-/// Send an HTTP GET and read the response head + body. Returns
-/// `(status, headers, body_bytes)`. Closes the connection after.
-async fn http_get(addr: SocketAddr, path: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
-  let mut sock = TcpStream::connect(addr).await.expect("connect");
-  sock
-    .write_all(
-      format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
-    )
-    .await
-    .expect("write");
-  let mut buf = Vec::new();
-  sock.read_to_end(&mut buf).await.expect("read");
-  parse_response(&buf)
-}
-
-/// Send an HTTP POST and read the response head + body. Returns
-/// `(status, headers, body_bytes)`. Closes the connection after.
-async fn http_post(
-  addr: SocketAddr,
-  path: &str,
-  body: &str,
-  extra_headers: &[(&str, &str)],
-) -> (u16, Vec<(String, String)>, Vec<u8>) {
-  let mut sock = TcpStream::connect(addr).await.expect("connect");
-  let mut req = format!(
-    "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n",
-    body.len()
-  );
-  for (k, v) in extra_headers {
-    req.push_str(&format!("{k}: {v}\r\n"));
-  }
-  req.push_str("\r\n");
-  req.push_str(body);
-  sock.write_all(req.as_bytes()).await.expect("write");
-  let mut buf = Vec::new();
-  sock.read_to_end(&mut buf).await.expect("read");
-  parse_response(&buf)
-}
-
-fn parse_response(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
-  let needle = b"\r\n\r\n";
-  let split = buf
-    .windows(needle.len())
-    .position(|w| w == needle)
-    .expect("CRLFCRLF terminator");
-  let head = std::str::from_utf8(&buf[..split]).expect("utf8 headers");
-  let mut lines = head.split("\r\n");
-  let status_line = lines.next().expect("status line");
-  let status: u16 = status_line
-    .split_whitespace()
-    .nth(1)
-    .expect("status code")
-    .parse()
-    .expect("parse status");
-  let mut headers = Vec::new();
-  for l in lines {
-    if let Some((k, v)) = l.split_once(':') {
-      headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
-    }
-  }
-  let body = buf[split + needle.len()..].to_vec();
-  (status, headers, body)
-}
-
 // --- happy paths --------------------------------------------------------
+
+/// A bare `GET` against the test proxy, `(status, headers, body)`.
+async fn http_get(addr: SocketAddr, path: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
+  llamastash::test_support::http_get(addr, path, &[]).await
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chat_completion_streams_back_byte_identical() {

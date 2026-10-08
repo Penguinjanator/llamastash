@@ -36,15 +36,13 @@ use llamastash::daemon::supervisor::{
 use llamastash::discovery::{DiscoveredModel, ModelCatalog, ModelSource};
 use llamastash::gguf::identity::ModelId;
 use llamastash::gguf::metadata::{ModeHint, ModelMetadata, Quant};
-use llamastash::gguf::test_fixtures::build_minimal_gguf;
 use llamastash::launch::mode::LaunchMode;
 use llamastash::launch::params::LaunchParams;
-use llamastash::proxy::server::{loopback_addr, new_status_cell, serve, ProxyStatus, StatusCell};
+use llamastash::proxy::server::{loopback_addr, new_status_cell, serve, StatusCell};
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
+use llamastash::test_support::{shutdown_listener, wait_for_listening, write_gguf};
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::sleep;
 
 // --- shared helpers ------------------------------------------------------
@@ -83,64 +81,20 @@ async fn spawn_listener_with_state(
   (bound, token, handle)
 }
 
-async fn shutdown_listener(shutdown: ShutdownToken, handle: tokio::task::JoinHandle<()>) {
-  shutdown.trigger();
-  tokio::time::timeout(Duration::from_secs(5), handle)
-    .await
-    .expect("proxy serve loop must exit after shutdown.trigger()")
-    .expect("proxy serve task must not panic");
-}
-
-async fn wait_for_listening(status: &StatusCell, budget: Duration) -> Option<SocketAddr> {
-  let deadline = std::time::Instant::now() + budget;
-  while std::time::Instant::now() < deadline {
-    if let ProxyStatus::Listening { addr, .. } = status.read().unwrap().clone() {
-      return Some(addr);
-    }
-    sleep(Duration::from_millis(10)).await;
-  }
-  None
-}
-
 async fn http_get(addr: SocketAddr, path: &str) -> (u16, Vec<u8>) {
-  let mut sock = TcpStream::connect(addr).await.expect("connect");
-  let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-  sock.write_all(req.as_bytes()).await.expect("write");
-  let mut buf = Vec::new();
-  sock.read_to_end(&mut buf).await.expect("read");
-  parse_response(&buf)
+  let (status, _, body) = llamastash::test_support::http_get(addr, path, &[]).await;
+  (status, body)
 }
 
 async fn http_post(addr: SocketAddr, path: &str, body: &str) -> (u16, Vec<u8>) {
-  let mut sock = TcpStream::connect(addr).await.expect("connect");
-  let req = format!(
-    "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {len}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
-    len = body.len()
-  );
-  sock.write_all(req.as_bytes()).await.expect("write");
-  let mut buf = Vec::new();
-  sock.read_to_end(&mut buf).await.expect("read");
-  parse_response(&buf)
+  let (status, _, body) = llamastash::test_support::http_post(addr, path, body, &[]).await;
+  (status, body)
 }
 
-fn parse_response(buf: &[u8]) -> (u16, Vec<u8>) {
-  let needle = b"\r\n\r\n";
-  let split = buf
-    .windows(needle.len())
-    .position(|w| w == needle)
-    .expect("CRLFCRLF terminator");
-  let head = std::str::from_utf8(&buf[..split]).expect("utf8 headers");
-  let status: u16 = head
-    .lines()
-    .next()
-    .expect("status line")
-    .split_whitespace()
-    .nth(1)
-    .expect("status code")
-    .parse()
-    .expect("parse status");
-  let body = buf[split + needle.len()..].to_vec();
-  (status, body)
+/// `HEAD` plus the body length the server would have sent.
+async fn http_head(addr: SocketAddr, path: &str) -> (u16, usize) {
+  let (status, _, body) = llamastash::test_support::http_head(addr, path, &[]).await;
+  (status, body.len())
 }
 
 fn fake_metadata(arch: &str, mode: ModeHint) -> ModelMetadata {
@@ -261,18 +215,7 @@ async fn proxy_state_with_models_compat(
 }
 
 #[allow(dead_code)]
-async fn http_head(addr: SocketAddr, path: &str) -> (u16, usize) {
-  let mut sock = TcpStream::connect(addr).await.expect("connect");
-  let req = format!("HEAD {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-  sock.write_all(req.as_bytes()).await.expect("write");
-  let mut buf = Vec::new();
-  sock.read_to_end(&mut buf).await.expect("read");
-  let (status, body) = parse_response(&buf);
-  (status, body.len())
-}
-
 // --- /api/version --------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_version_returns_cargo_pkg_version() {
   let state = proxy_state_with_models(Vec::new()).await;
@@ -876,12 +819,6 @@ fn fast_probe() -> ProbeOptions {
     interval: Duration::from_millis(30),
     timeout: Duration::from_secs(15),
   }
-}
-
-fn write_gguf(dir: &Path, name: &str, arch: &str) -> PathBuf {
-  let path = dir.join(name);
-  std::fs::write(&path, build_minimal_gguf(arch)).expect("write gguf");
-  llamastash::util::paths::canonicalize(&path).expect("canonicalize")
 }
 
 async fn wait_for_ready(model: &ManagedModel) {

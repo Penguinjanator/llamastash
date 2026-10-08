@@ -27,15 +27,16 @@ use llamastash::daemon::registry::SupervisorRegistry;
 const GIB: u64 = 1024 * 1024 * 1024;
 use llamastash::daemon::shutdown::ShutdownToken;
 use llamastash::discovery::{DiscoveredModel, ModelCatalog, ModelSource};
-use llamastash::gguf::metadata::{ModeHint, ModelMetadata, Quant};
-use llamastash::gguf::test_fixtures::build_minimal_gguf;
+use llamastash::gguf::metadata::{ModeHint, ModelMetadata};
 use llamastash::proxy::request_log::RequestState;
-use llamastash::proxy::server::{loopback_addr, new_status_cell, serve, ProxyStatus, StatusCell};
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
-use llamastash::test_support::{finished_request, newest_request_when};
+use llamastash::test_support::{
+  fake_metadata, finished_request, newest_request_when, shutdown_listener, spawn_listener,
+  write_gguf,
+};
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::sleep;
 
@@ -79,32 +80,6 @@ fn allocate_wide_port_range() -> PortRange {
   PortRange {
     start: lo,
     end: lo.saturating_add(31),
-  }
-}
-
-/// Write a synthetic GGUF with the requested architecture under
-/// `dir`, return its canonical absolute path.
-fn write_gguf(dir: &Path, name: &str, arch: &str) -> PathBuf {
-  let path = dir.join(name);
-  std::fs::write(&path, build_minimal_gguf(arch)).expect("write gguf");
-  llamastash::util::paths::canonicalize(&path).expect("canonicalize")
-}
-
-fn fake_metadata(arch: &str) -> ModelMetadata {
-  ModelMetadata {
-    arch: Some(arch.to_string()),
-    total_parameters: Some(7_000_000_000),
-    parameter_label: Some("7B".to_string()),
-    quant: Quant::Q4_K,
-    quant_label: None,
-    native_ctx: Some(8192),
-    chat_template: None,
-    tokenizer_kind: Some("llama".to_string()),
-    reasoning_hint: false,
-    mode_hint: ModeHint::Chat,
-    weights_bytes: Some(4_000_000_000),
-    lazy_tensor_bytes: Vec::new(),
-    mtp: None,
   }
 }
 
@@ -203,86 +178,12 @@ async fn build_state_with_aliases(
   (state, ctx)
 }
 
-async fn spawn_listener(
-  state: Arc<ProxyState>,
-) -> (SocketAddr, ShutdownToken, tokio::task::JoinHandle<()>) {
-  let token = ShutdownToken::new();
-  let status: StatusCell = new_status_cell();
-  let bind_addr = loopback_addr(0);
-  let token_for_task = token.clone();
-  let status_for_task = Arc::clone(&status);
-  let handle = tokio::spawn(async move {
-    serve(state, bind_addr, token_for_task, status_for_task)
-      .await
-      .expect("proxy serve returns Ok");
-  });
-  let bound = wait_for_listening(&status, Duration::from_secs(2))
-    .await
-    .expect("listener reaches Listening");
-  (bound, token, handle)
-}
-
-/// Trigger shutdown and join the serve task with a generous budget.
-/// Catches a hung serve loop instead of leaving a detached task that
-/// would otherwise be silently torn down at runtime exit.
-async fn shutdown_listener(shutdown: ShutdownToken, handle: tokio::task::JoinHandle<()>) {
-  shutdown.trigger();
-  tokio::time::timeout(Duration::from_secs(5), handle)
-    .await
-    .expect("proxy serve loop must exit after shutdown.trigger()")
-    .expect("proxy serve task must not panic");
-}
-
-async fn wait_for_listening(status: &StatusCell, budget: Duration) -> Option<SocketAddr> {
-  let deadline = std::time::Instant::now() + budget;
-  while std::time::Instant::now() < deadline {
-    if let ProxyStatus::Listening { addr, .. } = status.read().unwrap().clone() {
-      return Some(addr);
-    }
-    sleep(Duration::from_millis(10)).await;
-  }
-  None
-}
-
 async fn http_post(
   addr: SocketAddr,
   path: &str,
   body: &str,
 ) -> (u16, Vec<(String, String)>, Vec<u8>) {
-  let mut sock = TcpStream::connect(addr).await.expect("connect");
-  let req = format!(
-    "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
-    body.len()
-  );
-  sock.write_all(req.as_bytes()).await.expect("write");
-  let mut buf = Vec::new();
-  sock.read_to_end(&mut buf).await.expect("read");
-  parse_response(&buf)
-}
-
-fn parse_response(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
-  let needle = b"\r\n\r\n";
-  let split = buf
-    .windows(needle.len())
-    .position(|w| w == needle)
-    .expect("CRLFCRLF");
-  let head = std::str::from_utf8(&buf[..split]).expect("utf8");
-  let mut lines = head.split("\r\n");
-  let status_line = lines.next().expect("status");
-  let status: u16 = status_line
-    .split_whitespace()
-    .nth(1)
-    .expect("code")
-    .parse()
-    .expect("u16");
-  let mut headers = Vec::new();
-  for l in lines {
-    if let Some((k, v)) = l.split_once(':') {
-      headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
-    }
-  }
-  let body = buf[split + needle.len()..].to_vec();
-  (status, headers, body)
+  llamastash::test_support::http_post(addr, path, body, &[]).await
 }
 
 async fn stop_all(ctx: &MethodContext) {

@@ -264,3 +264,185 @@ pub async fn finished_request(
   })
   .await
 }
+
+/// A `ModelMetadata` for a 7B chat GGUF of architecture `arch`, for proxy and
+/// supervisor tests that need a row rather than a parsed file.
+pub fn fake_metadata(arch: &str) -> crate::gguf::metadata::ModelMetadata {
+  use crate::gguf::metadata::{ModeHint, ModelMetadata, Quant};
+  ModelMetadata {
+    arch: Some(arch.to_string()),
+    total_parameters: Some(7_000_000_000),
+    parameter_label: Some("7B".to_string()),
+    quant: Quant::Q4_K,
+    quant_label: None,
+    native_ctx: Some(8192),
+    chat_template: None,
+    tokenizer_kind: Some("llama".to_string()),
+    reasoning_hint: false,
+    mode_hint: ModeHint::Chat,
+    weights_bytes: Some(4_000_000_000),
+    lazy_tensor_bytes: Vec::new(),
+    mtp: None,
+  }
+}
+
+/// Write a minimal parseable GGUF of `arch` into `dir` under `name` and return
+/// its canonical path, the shape a discovery row expects.
+pub fn write_gguf(dir: &std::path::Path, name: &str, arch: &str) -> PathBuf {
+  let path = dir.join(name);
+  std::fs::write(&path, crate::gguf::test_fixtures::build_minimal_gguf(arch)).expect("write gguf");
+  crate::util::paths::canonicalize(&path).expect("canonicalize")
+}
+
+/// Start the proxy serve loop on an ephemeral loopback port, wait until it
+/// reports `Listening`, and hand back the bound address with the pieces the
+/// caller needs to stop it ([`shutdown_listener`]).
+pub async fn spawn_listener(
+  state: std::sync::Arc<crate::proxy::state::ProxyState>,
+) -> (
+  std::net::SocketAddr,
+  crate::daemon::shutdown::ShutdownToken,
+  tokio::task::JoinHandle<()>,
+) {
+  use crate::proxy::server::{loopback_addr, new_status_cell, serve};
+  let token = crate::daemon::shutdown::ShutdownToken::new();
+  let status = new_status_cell();
+  let bind_addr = loopback_addr(0);
+  let token_for_task = token.clone();
+  let status_for_task = std::sync::Arc::clone(&status);
+  let handle = tokio::spawn(async move {
+    serve(state, bind_addr, token_for_task, status_for_task)
+      .await
+      .expect("proxy serve returns Ok");
+  });
+  let bound = wait_for_listening(&status, std::time::Duration::from_secs(2))
+    .await
+    .expect("listener reaches Listening");
+  (bound, token, handle)
+}
+
+/// Trigger shutdown and join the serve task with a generous budget. Catches a
+/// hung serve loop instead of leaving a detached task that would otherwise be
+/// silently torn down when the runtime exits.
+pub async fn shutdown_listener(
+  shutdown: crate::daemon::shutdown::ShutdownToken,
+  handle: tokio::task::JoinHandle<()>,
+) {
+  shutdown.trigger();
+  tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+    .await
+    .expect("proxy serve loop must exit after shutdown.trigger()")
+    .expect("proxy serve task must not panic");
+}
+
+/// Poll `status` for up to `budget` for the `Listening` address, or `None`.
+pub async fn wait_for_listening(
+  status: &crate::proxy::server::StatusCell,
+  budget: std::time::Duration,
+) -> Option<std::net::SocketAddr> {
+  use crate::proxy::server::ProxyStatus;
+  let deadline = std::time::Instant::now() + budget;
+  while std::time::Instant::now() < deadline {
+    if let ProxyStatus::Listening { addr, .. } = status.read().unwrap().clone() {
+      return Some(addr);
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+  }
+  None
+}
+
+/// One raw HTTP/1.1 exchange: connect, send `request`, read to EOF, split the
+/// reply into `(status, headers, body)` with header names lowercased.
+/// `Connection: close` keeps it one-shot, so a caller never has to frame a body
+/// to know the response ended.
+async fn http_round_trip(
+  addr: std::net::SocketAddr,
+  request: String,
+) -> (u16, Vec<(String, String)>, Vec<u8>) {
+  use tokio::io::{AsyncReadExt, AsyncWriteExt};
+  let mut sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
+  sock.write_all(request.as_bytes()).await.expect("write");
+  let mut buf = Vec::new();
+  sock.read_to_end(&mut buf).await.expect("read");
+  let needle = b"\r\n\r\n";
+  let split = buf
+    .windows(needle.len())
+    .position(|w| w == needle)
+    .expect("CRLFCRLF terminator");
+  let head = std::str::from_utf8(&buf[..split]).expect("utf8 headers");
+  let mut lines = head.split("\r\n");
+  let status: u16 = lines
+    .next()
+    .expect("status line")
+    .split_whitespace()
+    .nth(1)
+    .expect("status code")
+    .parse()
+    .expect("parse status");
+  let headers = lines
+    .filter_map(|line| line.split_once(':'))
+    .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+    .collect();
+  (status, headers, buf[split + needle.len()..].to_vec())
+}
+
+fn head_lines(host: std::net::SocketAddr, extra_headers: &[(&str, &str)]) -> String {
+  let mut req = format!("Host: {host}\r\nConnection: close\r\n");
+  for (k, v) in extra_headers {
+    req.push_str(&format!("{k}: {v}\r\n"));
+  }
+  req
+}
+
+/// A bare-socket `GET` with optional extra headers: `(status, headers, body)`.
+pub async fn http_get(
+  addr: std::net::SocketAddr,
+  path: &str,
+  extra_headers: &[(&str, &str)],
+) -> (u16, Vec<(String, String)>, Vec<u8>) {
+  let request = format!(
+    "GET {path} HTTP/1.1\r\n{}{}",
+    head_lines(addr, extra_headers),
+    "\r\n"
+  );
+  http_round_trip(addr, request).await
+}
+
+/// A bare-socket `HEAD` with optional extra headers: `(status, headers, body)`.
+pub async fn http_head(
+  addr: std::net::SocketAddr,
+  path: &str,
+  extra_headers: &[(&str, &str)],
+) -> (u16, Vec<(String, String)>, Vec<u8>) {
+  let request = format!(
+    "HEAD {path} HTTP/1.1\r\n{}{}",
+    head_lines(addr, extra_headers),
+    "\r\n"
+  );
+  http_round_trip(addr, request).await
+}
+
+/// A bare-socket JSON `POST` with optional extra headers:
+/// `(status, headers, body)`.
+pub async fn http_post(
+  addr: std::net::SocketAddr,
+  path: &str,
+  body: &str,
+  extra_headers: &[(&str, &str)],
+) -> (u16, Vec<(String, String)>, Vec<u8>) {
+  let request = format!(
+    "POST {path} HTTP/1.1\r\n{}Content-Length: {}\r\nContent-Type: application/json\r\n\r\n{body}",
+    head_lines(addr, extra_headers),
+    body.len()
+  );
+  http_round_trip(addr, request).await
+}
+
+/// One header value from an [`http_get`] / [`http_post`] reply; `name` is
+/// matched case-insensitively.
+pub fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+  headers
+    .iter()
+    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+    .map(|(_, v)| v.as_str())
+}
