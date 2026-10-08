@@ -1513,16 +1513,16 @@ llamastash doctor [--json] [--fix] [--dry-run]
 
 `doctor` **always exits 0** — findings are informative, not a failure signal. Branch on a non-empty `findings` array (or filter for `severity == "error"`) to escalate, not on the exit code. This makes `doctor` safe to run unconditionally from health-check loops without `set -e` blowing up.
 
-Each `--json` finding carries `{id, severity, message, fix_hint, safe_to_log}`, plus `fix` when `--fix` can repair it. `safe_to_log: true` on every finding means the output is safe to paste into a public issue.
+Each `--json` finding carries `{id, severity, message, fix_hint, safe_to_log}`, plus `fix` when `--fix` can repair it, and an id can repeat when one check has more than one cause (`config_mode_drift` reports the config dir and the config file separately). `fix_hint` names `doctor --fix` only for a finding it will actually act on; anything else carries the manual step. `safe_to_log: true` on every finding means the output is safe to paste into a public issue.
 
 **`--fix` applies the repairs that are safe to automate**; `--dry-run` prints the same list and changes nothing.
 
 | Repair id | Fixes | What it does |
 | --- | --- | --- |
-| `config_chmod_0600` | `config_mode_drift` | `chmod 0600` on the config file, following a symlink so a dotfiles-managed config has its real file fixed (the ledger names that file). Withheld when the config dir is world- or group-writable, or when the link resolves to something that is not a regular file — there, whoever writes that directory would be picking what the automated chmod hits. |
+| `config_chmod_0600` | `config_mode_drift` | `chmod 0600` on the config file, following a symlink so a dotfiles-managed config has its real file fixed (the ledger names that file). Withheld when the config dir is world- or group-writable or owned by another account, or when the link resolves to something that is not a regular file — there, whoever writes that directory would be picking what the automated chmod hits. |
 | `remove_stale_daemon_files` | `stale_daemon_files` | Removes `runtime.json` and `daemon.pid`, but only after taking the lock — which succeeds only when no daemon holds it. A running daemon's files are never touched. |
 
-Nothing else gets repaired: no daemon is stopped, no model is deleted, no live state rewritten. A repair that fails is reported and `doctor` still exits `0`. `--json` carries a top-level `fixes` array of `{fix, action, target, outcome, detail}`, where `outcome` is `applied`, `would_apply`, `skipped` or `failed`; a read-only run carries `"fixes": []`.
+Nothing else gets repaired: no daemon is stopped, no model is deleted, no live state rewritten. A repair that fails is reported and `doctor` still exits `0`. `--json` carries a top-level `fixes` array of `{fix, action, target, outcome, detail}`, where `outcome` is `applied`, `would_apply`, `skipped` or `failed`; a read-only run carries `"fixes": []`, and a repair withheld for safety shows up as `skipped` with the reason, so `--fix` is never silent about what it left alone.
 
 `--json` (schema `2`) also carries a `hardware` section — the same live snapshot the init banner and `status` render: `cpu_brand`, `cpu_cores`, `mem_total_bytes`, `disk_free_bytes`, `gpu_backend`, `unified`, `uma_class_source` (how the unified-vs-discrete verdict was reached), `gpu_pool_total_bytes` (raw GPU memory ceiling — carve-out + GTT on a UMA APU), and the `uma_carve_bytes` / `uma_shared_bytes` composition. Two of the findings read this section: `memory_drift` fires when the GPU pool grows (info) or shrinks (warning) past `max(5%, 512 MiB)` versus the recorded baseline (doctor re-stamps the baseline after it fires); `gtt_hint` fires on Linux unified hosts whose GTT is still at the amdgpu default (~half of RAM), pointing at the `amdgpu.gttsize` ceiling.
 

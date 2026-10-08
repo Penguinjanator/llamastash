@@ -2,6 +2,7 @@
 //! Run binary as a subprocess and assert clap accepts the surface,
 //! plus the stub emits a parseable JSON envelope under `--json`.
 
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -9,12 +10,14 @@ fn bin() -> Command {
   Command::new(env!("CARGO_BIN_EXE_llamastash"))
 }
 
+#[cfg(unix)]
 fn unique_temp_dir(label: &str) -> PathBuf {
   llamastash::test_support::unique_temp_dir("ls-doc", label)
 }
 
 /// A `doctor` run pointed at throwaway state + config dirs, so it can
 /// never touch a real daemon's files or the user's own config.
+#[cfg(unix)]
 fn isolated(dir: &std::path::Path) -> Command {
   let mut cmd = bin();
   cmd
@@ -125,6 +128,57 @@ fn dry_run_reports_the_repairs_and_changes_nothing() {
       .any(|f| f["id"] == "stale_daemon_files"),
     "the stale pair must be reported: {report:#?}"
   );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_config_no_repair_can_touch_is_reported_and_ledged() {
+  use std::os::unix::fs::PermissionsExt;
+  let dir = unique_temp_dir("withheld");
+  let config_dir = dir.join("config");
+  let state = dir.join("state");
+  std::fs::create_dir_all(&config_dir).unwrap();
+  std::fs::create_dir_all(&state).unwrap();
+  // A group-writable config dir is a swap surface, so neither the dir nor
+  // the mode behind it gets an automated chmod.
+  std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+  let config = config_dir.join("config.yaml");
+  std::fs::write(&config, "proxy:\n  port: 11435\n").unwrap();
+  std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o666)).unwrap();
+  llamastash::init::snapshot::save(&state, &llamastash::init::snapshot::InitSnapshot::default())
+    .unwrap();
+
+  let out = isolated(&dir)
+    .args(["doctor", "--fix", "--json"])
+    .output()
+    .unwrap();
+  assert!(out.status.success());
+  let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+  let drift: Vec<&serde_json::Value> = report["findings"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .filter(|f| f["id"] == "config_mode_drift")
+    .collect();
+  assert_eq!(drift.len(), 2, "one id covers dir + file: {report:#?}");
+  for f in &drift {
+    assert!(f.get("fix").is_none(), "no repair may be promised: {f:#?}");
+    assert!(
+      !f["fix_hint"].as_str().unwrap().contains("doctor --fix"),
+      "a finding --fix cannot act on must not point at --fix: {f:#?}"
+    );
+  }
+  let fixes = report["fixes"].as_array().unwrap();
+  assert_eq!(fixes.len(), 2, "each withheld repair is ledged: {fixes:#?}");
+  assert!(
+    fixes
+      .iter()
+      .all(|f| f["outcome"] == "skipped" && f["fix"] == "config_chmod_0600"),
+    "{fixes:#?}"
+  );
+  assert_eq!(mode_of(&config), 0o666, "nothing may be chmodded");
+  std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700)).ok();
+  std::fs::remove_dir_all(&dir).ok();
 }
 
 #[cfg(unix)]
