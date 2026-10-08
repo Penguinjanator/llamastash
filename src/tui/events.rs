@@ -1872,14 +1872,20 @@ fn dispatch_launch(
   cmd: WriterCmd,
   name: String,
 ) {
+  let mut pending_bell: Option<std::path::PathBuf> = None;
   if let (true, WriterCmd::StartModel(args)) = (app.options.bell, &cmd) {
     // Watched by path: the daemon assigns the launch id, and the TUI learns
     // it only from the next `status` tick. `ingest_status` rings and drops it.
-    app.bell_watch.push(args.model_path.clone());
+    // Only a command the writer actually took earns a watch, so a refused send
+    // cannot leave a path waiting for a launch that never started.
+    pending_bell = Some(args.model_path.clone());
   }
   match writer {
     Some(tx) => match tx.try_send(cmd) {
       Ok(()) => {
+        if let Some(path) = pending_bell {
+          app.bell_watch.push(path);
+        }
         app.show_toast(format!("launching {name}…"));
         app.close_launch_picker();
       }
@@ -3539,6 +3545,57 @@ mod tests {
     assert!(
       app.confirm_dialog.is_some(),
       "click must not dismiss the dialog"
+    );
+  }
+
+  #[test]
+  fn a_launch_that_never_reaches_the_writer_leaves_no_bell_watch() {
+    // A launch that never leaves the TUI has no launch to announce, so the
+    // bell watch must stay empty: a stale path would ring on some later,
+    // unrelated launch of the same model.
+    use crate::tui::app::{AppOptions, StartModelArgs};
+    let args = Box::new(StartModelArgs {
+      model_path: "/m/qwen.gguf".into(),
+      ctx: None,
+      reasoning: None,
+      knobs: Default::default(),
+      extras: Vec::new(),
+      mode: None,
+      prefer_port: None,
+      backend: Default::default(),
+      selection: "explicit",
+      server: None,
+      name: None,
+      preset: None,
+    });
+    let mut app = App::new(AppOptions::default());
+    dispatch_launch(
+      &mut app,
+      None,
+      WriterCmd::StartModel(args.clone()),
+      "qwen".into(),
+    );
+    assert!(
+      app.bell_watch.is_empty(),
+      "no writer means nothing was launched: {:?}",
+      app.bell_watch
+    );
+
+    // With a writer that takes the command, the path is watched.
+    let (tx, mut rx) = mpsc::channel(4);
+    dispatch_launch(
+      &mut app,
+      Some(&tx),
+      WriterCmd::StartModel(args),
+      "qwen".into(),
+    );
+    assert_eq!(
+      app.bell_watch,
+      vec![std::path::PathBuf::from("/m/qwen.gguf")]
+    );
+    assert!(
+      matches!(rx.try_recv(), Ok(WriterCmd::StartModel(_))),
+      "the command still goes out"
     );
   }
 
