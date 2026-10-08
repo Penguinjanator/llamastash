@@ -28,6 +28,10 @@ pub struct DeletePlan {
   pub projector: Option<PathBuf>,
   /// The separate MTP draft head, under the same exclusivity rule.
   pub mtp_head: Option<PathBuf>,
+  /// Other precisions of the companion taken above (`mmproj-BF16.gguf` beside the
+  /// paired `mmproj-F16.gguf`). Their names carry a dtype and no model, so nothing
+  /// pairs with them once this model is gone.
+  pub orphan_companions: Vec<PathBuf>,
   /// HuggingFace cache repo directory to remove wholesale, blobs and all.
   /// Set only when this row is the last model in that repo — with a second
   /// quant still there the per-file path runs instead so the survivor keeps
@@ -57,6 +61,7 @@ impl DeletePlan {
     out.extend(self.shards.iter().map(PathBuf::as_path));
     out.extend(self.projector.as_deref());
     out.extend(self.mtp_head.as_deref());
+    out.extend(self.orphan_companions.iter().map(PathBuf::as_path));
     out
   }
 
@@ -89,6 +94,17 @@ impl DeletePlan {
     }
     if self.mtp_head.is_some() {
       extras.push("its MTP draft head".to_string());
+    }
+    if !self.orphan_companions.is_empty() {
+      extras.push(format!(
+        "{} unpaired companion precision{}",
+        self.orphan_companions.len(),
+        if self.orphan_companions.len() == 1 {
+          ""
+        } else {
+          "s"
+        }
+      ));
     }
     let blobs = if self.in_hf_cache {
       " The HuggingFace cache blobs behind them are freed too."
@@ -154,6 +170,23 @@ pub fn plan(
         scanner::find_mtp_head(&m.path, neighbour_arch).as_deref() == Some(head.as_path())
       })
     });
+    // A companion folder can hold the same file at several precisions. Only the
+    // best-ranked one pairs, so the rest are orphans here and nowhere else — they
+    // go with this model rather than sitting next to nothing.
+    plan.orphan_companions = plan
+      .projector
+      .as_deref()
+      .map(scanner::companion_precisions)
+      .unwrap_or_default()
+      .into_iter()
+      .chain(
+        plan
+          .mtp_head
+          .as_deref()
+          .map(scanner::companion_precisions)
+          .unwrap_or_default(),
+      )
+      .collect();
   }
 
   // Whole-repo removal reclaims the non-GGUF cache cruft (refs, configs,
@@ -440,6 +473,30 @@ mod tests {
     assert_eq!(plan.mtp_head.as_deref(), Some(head.as_path()));
     execute(&plan).expect("delete must succeed");
     for p in [&gguf, &proj, &head] {
+      assert!(!p.exists(), "{} must be gone", p.display());
+    }
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn plan_takes_the_unpaired_projector_precisions_with_the_model() {
+    // unsloth ships one projector at two precisions. Only the ranked one pairs,
+    // so the other is orphaned the moment this model goes — it must not survive
+    // as an unreferenced file next to an empty folder.
+    let dir = tempdir("companions-two-precisions");
+    let gguf = dir.join("Qwen3.8-27B-UD-Q6_K.gguf");
+    let paired = dir.join("mmproj-F16.gguf");
+    let orphan = dir.join("mmproj-BF16.gguf");
+    for p in [&gguf, &paired, &orphan] {
+      fs::write(p, b"weights").unwrap();
+    }
+    let target = model(&gguf);
+
+    let plan = plan(&target, std::slice::from_ref(&target), None);
+    assert_eq!(plan.projector.as_deref(), Some(paired.as_path()));
+    assert_eq!(plan.orphan_companions, vec![orphan.clone()]);
+    execute(&plan).expect("delete must succeed");
+    for p in [&gguf, &paired, &orphan] {
       assert!(!p.exists(), "{} must be gone", p.display());
     }
     let _ = fs::remove_dir_all(&dir);

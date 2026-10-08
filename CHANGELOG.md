@@ -18,7 +18,8 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ### Fixed
 
-- A model whose projector folder holds two precisions (`mmproj-BF16.gguf` beside `mmproj-F16.gguf`, as unsloth's Qwen3.8 repos publish them) is vision again. Neither name matches the model, so nothing paired: the row read `multimodal: null`, the launch carried no projector, and `integrations` wrote the model without image input. The projector now pairs by the precision order `pull` already uses.
+- A model whose projector folder holds two precisions (`mmproj-BF16.gguf` beside `mmproj-F16.gguf`, as unsloth's Qwen3.8 repos publish them) is vision again. Neither name matches the model, so nothing paired: the row read `multimodal: null`, the launch carried no projector, and `integrations` wrote the model without image input. The projector now pairs by the precision order `pull` already uses, and one shared order settles both picks.
+- Deleting a model also removes the projector precisions beside it that pair with nothing, instead of leaving them on disk.
 
 ## [0.6.1] — 2026-10-02
 

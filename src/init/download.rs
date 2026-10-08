@@ -778,19 +778,16 @@ pub(crate) fn select_companions(
   out
 }
 
-/// Pick the single most-compatible companion from `candidates`: prefer a common
-/// default precision (`f16` > `bf16` > `f32` > other), tie-broken by the
-/// shortest name (the plain form over `-variant` suffixes), then alphabetical.
+/// Pick the single most-compatible companion from `candidates` by
+/// [`crate::discovery::scanner::companion_order`]: common default precision first
+/// (`f16` > `bf16` > `f32` > other), then the shortest basename (the plain form
+/// over `-variant` suffixes). One order with the pairing pick, so a launch gets
+/// the file this pick fetched.
 fn pick_one_companion(candidates: &[&String]) -> Option<String> {
-  use crate::discovery::scanner::companion_precision_rank;
+  use crate::discovery::scanner::companion_order;
   candidates
     .iter()
-    .min_by(|a, b| {
-      companion_precision_rank(a)
-        .cmp(&companion_precision_rank(b))
-        .then(a.len().cmp(&b.len()))
-        .then(a.cmp(b))
-    })
+    .min_by(|a, b| companion_order(Path::new(a), Path::new(b)))
     .map(|s| (*s).clone())
 }
 
@@ -2011,6 +2008,20 @@ mod tests {
         "mtp-gemma-4.gguf".to_string()
       ]
     );
+  }
+
+  #[test]
+  fn select_companions_ranks_the_file_not_its_directory() {
+    // Precision tokens in a directory name must not flip the pick, so `pull`
+    // fetches the same file discovery would have paired.
+    let all = vec![
+      "model-Q4_K_M.gguf".to_string(),
+      "f16/mmproj-f32.gguf".to_string(),
+      "mmproj-bf16.gguf".to_string(),
+    ];
+    let base = vec!["model-Q4_K_M.gguf".to_string()];
+    let picked = select_companions(&all, &base, CompanionPolicy::OnePerKind);
+    assert_eq!(picked, vec!["mmproj-bf16.gguf".to_string()]);
   }
 
   #[test]

@@ -398,8 +398,8 @@ fn detect_multimodal(model_path: &Path) -> Option<Multimodal> {
 /// 1. else an MTP head whose quant-stripped base equals the model's;
 /// 2. else, a lone model + lone head in the directory pair regardless of name;
 /// 3. else the closest-ranked anonymous companion (`mtp.gguf`, `mtp-f32.gguf`),
-///    by the precision order `pull` uses; a companion with no usable name at all
-///    yields `None` (the user can pair a head explicitly).
+///    by the precision order `pull` uses; with no anonymous head at all the
+///    search yields `None` (the user can pair a head explicitly).
 pub fn find_mtp_head(model_path: &Path, model_arch: Option<&str>) -> Option<PathBuf> {
   // The arch a head must declare to draft for this model (`deepseek4` →
   // `deepseek4_mtp_support`).
@@ -587,9 +587,8 @@ fn dir_model_labels(dir: &Path) -> std::collections::BTreeSet<String> {
 }
 
 /// Precision order for a companion named only by its dtype: `f16` > `bf16` >
-/// `f32` > anything else. One rule for the pull pick and the pairing pick, so
-/// `pull` and discovery never disagree about which precision a model gets.
-pub(crate) fn companion_precision_rank(name: &str) -> u8 {
+/// `f32` > anything else.
+fn companion_precision_rank(name: &str) -> u8 {
   let l = name.to_ascii_lowercase();
   // `bf16` also contains `f16`, so test it first.
   if l.contains("bf16") {
@@ -603,28 +602,84 @@ pub(crate) fn companion_precision_rank(name: &str) -> u8 {
   }
 }
 
-/// Choose among companions that carry no model name (`mmproj-F16.gguf`). Same
-/// order [`companion_precision_rank`] gives `pull`, so several precisions of one
-/// projector resolve to the file `pull` would have fetched.
-fn best_companion(candidates: &[PathBuf]) -> Option<PathBuf> {
-  let mut keyed: Vec<(u8, usize, String, PathBuf)> = candidates
-    .iter()
-    .map(|p| {
-      let name = p
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-      (companion_precision_rank(&name), name.len(), name, p.clone())
-    })
-    .collect();
-  keyed.sort();
-  keyed.into_iter().next().map(|(_, _, _, p)| p)
+/// The one companion ordering: precision first, then the shortest basename, then
+/// the basename, then the whole path for determinism. Both `pull`'s single-
+/// companion pick and the pairing pick below sort by this, so a launch gets the
+/// file `pull` would have fetched. Ranked on the basename: a precision token in a
+/// directory name (`BF16/mmproj-F32.gguf`) says nothing about the companion.
+pub(crate) fn companion_order(a: &Path, b: &Path) -> std::cmp::Ordering {
+  let base = |p: &Path| {
+    p.file_name()
+      .map(|n| n.to_string_lossy().into_owned())
+      .unwrap_or_default()
+  };
+  let (ka, kb) = (base(a), base(b));
+  companion_precision_rank(&ka)
+    .cmp(&companion_precision_rank(&kb))
+    .then_with(|| ka.len().cmp(&kb.len()))
+    .then_with(|| ka.cmp(&kb))
+    .then_with(|| a.cmp(b))
 }
 
-/// Choose from classified candidates. `own_dir` enables the two unnamed tiers:
-/// they rest on "the only model beside the only companion", which a companion
-/// directory cannot show, and across directories would pair on nothing but
-/// proximity.
+/// Choose among companions that carry no model name (`mmproj-F16.gguf`). Several
+/// precisions of one projector are the same companion, so they resolve by
+/// [`companion_order`] instead of reporting nothing.
+fn best_companion(candidates: &[PathBuf]) -> Option<PathBuf> {
+  candidates
+    .iter()
+    .min_by(|a, b| companion_order(a, b))
+    .cloned()
+}
+
+/// The other precisions of the companion at `companion_path` that sit in the same
+/// directory: `mmproj-BF16.gguf` beside the paired `mmproj-F16.gguf`. Such a name
+/// carries a dtype and no model, so it pairs with nothing on its own. A delete
+/// uses this to take those leftovers with the model instead of orphaning them.
+///
+/// Returns an empty list for a companion whose name does name a model, and for a
+/// path that is no companion at all.
+pub fn companion_precisions(companion_path: &Path) -> Vec<PathBuf> {
+  if is_projector_companion(companion_path) {
+    anonymous_companions_beside(companion_path, is_projector_companion, strip_mmproj_markers)
+  } else if is_mtp_head_file(companion_path) {
+    anonymous_companions_beside(companion_path, is_mtp_head_file, strip_mtp_markers)
+  } else {
+    Vec::new()
+  }
+}
+
+fn anonymous_companions_beside(
+  companion_path: &Path,
+  is_companion: fn(&Path) -> bool,
+  strip_markers: fn(&str) -> String,
+) -> Vec<PathBuf> {
+  let dir = match companion_path.parent() {
+    Some(dir) => dir,
+    None => return Vec::new(),
+  };
+  let Ok(entries) = std::fs::read_dir(dir) else {
+    return Vec::new();
+  };
+  let mut out: Vec<PathBuf> = entries
+    .flatten()
+    .map(|e| e.path())
+    .filter(|path| path.is_file() && path != companion_path && is_companion(path))
+    .filter(|path| {
+      path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| canonical_base(&strip_markers(name)).is_empty())
+    })
+    .collect();
+  out.sort();
+  out
+}
+
+/// Choose from classified candidates. Only tier 2 is own-directory: it rests on
+/// "the only model beside the only companion", which a companion directory cannot
+/// show. The nameless tier runs across directories too — a precision-named file
+/// says nothing about which model it serves, and [`find_companion`] widens only
+/// when every model in the snapshot shares one base.
 fn pick(
   c: &Candidates,
   own_dir: bool,
@@ -670,7 +725,9 @@ fn pick(
   //    the same companion, so rank them instead of reporting nothing.
   if let Some(best) = best_companion(&c.anonymous) {
     if c.anonymous.len() > 1 {
-      log::warn!(
+      // Several precisions of one projector is a shipped layout, not a problem
+      // to escalate: say which file won, at the level operators read by default.
+      log::info!(
         "{}: {} {} candidates share no name with the model; using {:?}: {:?}",
         model_path.display(),
         c.anonymous.len(),
@@ -2408,6 +2465,19 @@ mod tests {
       "the precision order must also apply across the snapshot"
     );
     fs::remove_dir_all(&root).ok();
+  }
+
+  #[test]
+  fn companion_order_ranks_the_file_not_its_directory() {
+    // A precision token in a directory name says nothing about the companion, so
+    // it must not flip the pick: the f32 file under an `f16/` dir still loses.
+    let worse = Path::new("f16/mmproj-f32.gguf");
+    let better = Path::new("mmproj-bf16.gguf");
+    assert_eq!(
+      companion_order(worse, better),
+      std::cmp::Ordering::Greater,
+      "the directory name must not outrank the file's own precision"
+    );
   }
 
   #[test]

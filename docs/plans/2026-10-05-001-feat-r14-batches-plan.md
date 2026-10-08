@@ -28,6 +28,10 @@ candidates found but none match …`. `pick`'s nameless tier now ranks by
 `download::pick_one_companion`, so pull and discovery agree on the file. Cross-directory
 pairing takes the same rank, which is what the shard-subdir rows needed.
 
+Follow-up (same day): the two picks now share one comparator, `scanner::companion_order`,
+ranked on the basename so a precision token in a directory name cannot pull them apart.
+A delete now takes the unpaired precisions with the model instead of leaving them behind.
+
 ### Plan
 
 1. Reproduce with the working tree against the real cache, in an isolated state dir: `list --json` for the two unsloth rows and for the gufo row that works.
