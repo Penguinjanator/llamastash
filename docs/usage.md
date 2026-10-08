@@ -1440,7 +1440,7 @@ Port collision (Ollama-compat mode against a running Ollama on `11434`, another 
 
 ## Setup subcommands
 
-These are the first-run and admin surfaces. They're separated from the runtime CLI above because they touch durable state on disk (the `llama-server` binary, the snapshot file, the user's config) and have their own exit-code contract. [`completions`](#shell-completions) is the one exception: it reads nothing and writes nothing.
+These are the first-run and admin surfaces. They're separated from the runtime CLI above because they touch durable state on disk (the `llama-server` binary, the snapshot file, the user's config) and have their own exit-code contract. [`llamastash completions`](#llamastash-completions-shell) is the one exception: it reads nothing and writes nothing.
 
 ### `llamastash init`
 
@@ -1626,7 +1626,7 @@ llamastash pull <repo> [--json] [--offline]
 
 On a terminal, `pull` paints one progress line on **stderr**, in the shape `⬇ <file> (2/4)  42%  1.2G / 4.1G · 85M/s`. The percent, bytes and rate cover the whole pull, not just the current file. The rate counts bytes off the wire, so files served from the HF cache advance the percent without inflating it. The line is trimmed to the terminal width — a long filename loses its middle, keeping the directory and the shard suffix — and it repaints in place and clears itself before the summary. Redirect stderr, or pipe it, and nothing is written: stdout (including `--json`) is identical either way.
 
-### Shell completions
+### `llamastash completions <shell>`
 
 ```
 llamastash completions <bash|elvish|fish|powershell|zsh>
@@ -1642,9 +1642,11 @@ Install once per machine:
 mkdir -p ~/.local/share/bash-completion/completions
 llamastash completions bash > ~/.local/share/bash-completion/completions/llamastash
 
-# zsh — any directory on $fpath, added before `compinit` runs.
+# zsh — the directory must be on $fpath *before* `compinit` runs, so add
+# `fpath+=(~/.zsh/completions)` above the `autoload -U compinit; compinit`
+# pair in ~/.zshrc (or into ~/.zshenv). Appending it at the end of the file
+# lands after compinit and does nothing.
 mkdir -p ~/.zsh/completions
-echo 'fpath+=(~/.zsh/completions)' >> ~/.zshrc
 llamastash completions zsh > ~/.zsh/completions/_llamastash
 
 # fish — autoloaded by file name, no config edit.

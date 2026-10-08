@@ -116,3 +116,26 @@ fn json_is_not_accepted() {
     .expect("run");
   assert_eq!(out.status.code(), Some(64), "--json must be refused");
 }
+
+/// `completions bash | head -1` closes the pipe mid-write. That is an error
+/// to report, not a panic.
+#[test]
+fn a_closed_stdout_reports_an_error_instead_of_panicking() {
+  use std::process::Stdio;
+  let mut child = bin()
+    .arg("completions")
+    .arg("bash")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("spawn");
+  drop(child.stdout.take());
+  let out = child.wait_with_output().expect("wait");
+  let stderr = String::from_utf8_lossy(&out.stderr);
+  assert!(!stderr.contains("panicked"), "must not panic: {stderr}");
+  assert!(
+    stderr.contains("could not write the completion script"),
+    "{stderr}"
+  );
+  assert_eq!(out.status.code(), Some(71), "{stderr}");
+}

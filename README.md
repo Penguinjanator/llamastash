@@ -126,8 +126,8 @@ Either source flips on click-to-focus for the Models list, the right pane, and t
 mkdir -p ~/.local/share/bash-completion/completions
 llamastash completions bash > ~/.local/share/bash-completion/completions/llamastash
 
-# zsh — the directory has to be on $fpath before `compinit`
-mkdir -p ~/.zsh/completions && echo 'fpath+=(~/.zsh/completions)' >> ~/.zshrc
+# zsh — put `fpath+=(~/.zsh/completions)` above `compinit` in ~/.zshrc
+mkdir -p ~/.zsh/completions
 llamastash completions zsh > ~/.zsh/completions/_llamastash
 
 # fish
