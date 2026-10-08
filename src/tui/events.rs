@@ -1872,6 +1872,11 @@ fn dispatch_launch(
   cmd: WriterCmd,
   name: String,
 ) {
+  if let (true, WriterCmd::StartModel(args)) = (app.options.bell, &cmd) {
+    // Watched by path: the daemon assigns the launch id, and the TUI learns
+    // it only from the next `status` tick. `ingest_status` rings and drops it.
+    app.bell_watch.push(args.model_path.clone());
+  }
   match writer {
     Some(tx) => match tx.try_send(cmd) {
       Ok(()) => {
@@ -2607,6 +2612,12 @@ fn apply_refresh(app: &mut App, tick: RefreshTick) {
       app.daemon_connected = false;
     }
     RefreshTick::WriterError { method, message } => {
+      if method == "start_model" {
+        // A refused start never produces a row to watch, so drop the pending
+        // bells instead of ringing later for an unrelated launch of the same
+        // model. The error carries no path, so this clears every pending one.
+        app.bell_watch.clear();
+      }
       app.show_error_toast(writer_error_toast(method, &message));
     }
     RefreshTick::WriterInfo { message } => {
@@ -2774,6 +2785,7 @@ pub async fn launch(
   keymap: crate::tui::keybindings::KeyMap,
   offline: bool,
   mouse_focus: bool,
+  bell: bool,
   left_pane_ratios: Vec<u16>,
   socket: &Path,
   daemon_opts: Option<crate::daemon::DaemonOptions>,
@@ -2785,6 +2797,7 @@ pub async fn launch(
     keymap,
     offline,
     mouse_focus,
+    bell,
     left_pane_ratios,
   });
   // Startup auto-spawn refused (backend fail-fast precheck) — the TUI

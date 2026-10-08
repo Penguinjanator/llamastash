@@ -543,9 +543,17 @@ pub fn apply_download_event(app: &mut App, evt: crate::tui::download_strip::Down
       if let Some(name) = label {
         app.show_toast(format!("downloaded {name}"));
       }
+      if app.options.bell {
+        crate::util::bell::ring();
+      }
       next
     }
-    DownloadEvent::Error { repo_id, message } => app.download_strip.apply_error(&repo_id, message),
+    DownloadEvent::Error { repo_id, message } => {
+      if app.options.bell {
+        crate::util::bell::ring();
+      }
+      app.download_strip.apply_error(&repo_id, message)
+    }
     DownloadEvent::AlreadyCached {
       repo_id,
       cached_path,

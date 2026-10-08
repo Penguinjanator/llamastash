@@ -267,6 +267,10 @@ pub struct AppOptions {
   /// off so the terminal keeps native click-and-drag text selection
   /// — see the long comment in [`super::events::run`] for the trade.
   pub mouse_focus: bool,
+  /// Ring the terminal bell on the ends the user is waiting for: TUI downloads
+  /// and launches this TUI started. From `bell: true` in `config.yaml`
+  /// (the factory). See [`crate::util::bell`].
+  pub bell: bool,
   /// Left (Models list) pane width percentages the `Alt+L` shortcut cycles
   /// through in wide mode. Already sanitized (≤5 slots, each `0..=100`, never
   /// empty) by [`crate::config::loader::sanitize_left_pane_ratios`]. Slot 0 is
@@ -282,6 +286,7 @@ impl Default for AppOptions {
       keymap: KeyMap::default(),
       offline: false,
       mouse_focus: false,
+      bell: true,
       left_pane_ratios: crate::config::loader::default_left_pane_ratios(),
     }
   }
@@ -416,6 +421,11 @@ pub struct App {
   /// renderer reserves a 1-line slot above the body only when
   /// `download_strip.is_active()` is true.
   pub download_strip: crate::tui::download_strip::DownloadStripState,
+  /// Model paths whose launch this TUI started, still waiting to reach a
+  /// terminal state. Each entry rings once — on Ready or Error — then drops.
+  /// Launches started elsewhere (CLI, `preload`) are never watched, so they
+  /// never ring here.
+  pub bell_watch: Vec<PathBuf>,
   /// Per-frame memo of `rendered_rows()`. Primed at the top of
   /// `render::render` and cleared at the bottom — the biggest single
   /// per-frame perf win. The same `Vec<ListRow>`
@@ -616,6 +626,7 @@ impl App {
       save_preset_dialog: None,
       launch_name_dialog: None,
       download_strip: crate::tui::download_strip::DownloadStripState::default(),
+      bell_watch: Vec::new(),
       rows_cache: None,
       right_tabs_cache: None,
       hit_rects: RefCell::new(MouseHitRects::default()),
@@ -893,6 +904,22 @@ impl App {
       .any(|b| b != crate::backend::DEFAULT_BACKEND_ID)
   }
 
+  /// Paths in `watch` whose row has reached a terminal load state (Ready or
+  /// Error). Each one rings once; the caller drops them after ringing.
+  fn fired_bell_paths(watch: &[PathBuf], rows: &[ManagedRow]) -> Vec<PathBuf> {
+    let mut fired: Vec<PathBuf> = watch
+      .iter()
+      .filter(|path| {
+        rows.iter().any(|row| {
+          row.path == **path && matches!(row.state, SurfaceState::Ready | SurfaceState::Error)
+        })
+      })
+      .cloned()
+      .collect();
+    fired.dedup();
+    fired
+  }
+
   /// Apply a `status` IPC response. Refreshes the supervisor's
   /// per-launch rows, the read-only external rows, the daemon-info
   /// block, and the host-metrics snapshot. Discovery rows survive
@@ -972,6 +999,12 @@ impl App {
           if newly_errored.contains(&focused.launch_id) {
             self.right_tab = RightTab::Logs;
           }
+        }
+      }
+      if self.options.bell {
+        for path in Self::fired_bell_paths(&self.bell_watch, &self.managed) {
+          crate::util::bell::ring();
+          self.bell_watch.retain(|p| p != &path);
         }
       }
     } else {
@@ -3455,6 +3488,113 @@ mod tests {
       cpu_pct: None,
       ..Default::default()
     }
+  }
+
+  #[test]
+  fn a_tui_started_launch_rings_once_on_its_terminal_state() {
+    // The bell is the "you can come back now" signal, so it fires on the
+    // first tick that reports Ready or Error and never again for that
+    // launch. Loading is in-flight: no ring, and the watch survives so the
+    // later Ready still rings.
+    let mut app = App::new(AppOptions::default());
+    app.bell_watch = vec![PathBuf::from("/m/qwen.gguf")];
+    let loading = serde_json::json!({
+      "models": [{
+        "launch_id": "L1",
+        "id": { "path": "/m/qwen.gguf", "header_hash": "h" },
+        "port": 41100,
+        "state": { "state": "loading" },
+      }]
+    });
+    app.ingest_status(&loading);
+    assert_eq!(
+      app.bell_watch,
+      vec![PathBuf::from("/m/qwen.gguf")],
+      "a load in flight must not consume the watch"
+    );
+    let ready = serde_json::json!({
+      "models": [{
+        "launch_id": "L1",
+        "id": { "path": "/m/qwen.gguf", "header_hash": "h" },
+        "port": 41100,
+        "state": { "state": "ready" },
+      }]
+    });
+    app.ingest_status(&ready);
+    assert!(
+      app.bell_watch.is_empty(),
+      "Ready consumes the watch so the launch rings exactly once"
+    );
+    // A second Ready tick has nothing left to ring for.
+    app.ingest_status(&ready);
+    assert!(app.bell_watch.is_empty());
+  }
+
+  #[test]
+  fn a_failed_tui_launch_rings_and_an_unwatched_one_never_rings() {
+    let errored = serde_json::json!({
+      "models": [{
+        "launch_id": "L1",
+        "id": { "path": "/m/qwen.gguf", "header_hash": "h" },
+        "port": 41100,
+        "state": { "state": "error", "cause": "probe timeout" },
+      }]
+    });
+    let mut app = App::new(AppOptions::default());
+    app.bell_watch = vec![PathBuf::from("/m/qwen.gguf")];
+    app.ingest_status(&errored);
+    assert!(
+      app.bell_watch.is_empty(),
+      "a failed load is the end the user is waiting for too"
+    );
+
+    // A launch started by the CLI or `preload` is not watched, so the TUI
+    // stays silent for it.
+    let mut other = App::new(AppOptions::default());
+    other.ingest_status(&serde_json::json!({
+      "models": [{
+        "launch_id": "L2",
+        "id": { "path": "/m/other.gguf", "header_hash": "h" },
+        "port": 41102,
+        "state": { "state": "ready" },
+      }]
+    }));
+    assert!(other.bell_watch.is_empty());
+  }
+
+  #[test]
+  fn a_watched_path_without_a_row_keeps_waiting() {
+    // The start request can still be in flight when a tick lands, so a
+    // missing row must not consume the watch.
+    let watch = vec![PathBuf::from("/m/qwen.gguf")];
+    assert!(App::fired_bell_paths(&watch, &[]).is_empty());
+    assert_eq!(
+      App::fired_bell_paths(
+        &watch,
+        &[ready_managed("/m/other.gguf", 41101, SurfaceState::Ready)]
+      ),
+      Vec::<PathBuf>::new()
+    );
+  }
+
+  #[test]
+  fn fired_bell_paths_lists_each_watched_terminal_state_once() {
+    let watch = vec![PathBuf::from("/m/a.gguf"), PathBuf::from("/m/b.gguf")];
+    let rows = vec![
+      ready_managed("/m/a.gguf", 41100, SurfaceState::Ready),
+      ready_managed("/m/b.gguf", 41101, SurfaceState::Error),
+      ready_managed("/m/c.gguf", 41102, SurfaceState::Ready),
+    ];
+    assert_eq!(
+      App::fired_bell_paths(&watch, &rows),
+      vec![PathBuf::from("/m/a.gguf"), PathBuf::from("/m/b.gguf")]
+    );
+    // Still-loading row: nothing fires.
+    assert!(App::fired_bell_paths(
+      &watch,
+      &[ready_managed("/m/a.gguf", 41100, SurfaceState::Loading)]
+    )
+    .is_empty());
   }
 
   #[test]

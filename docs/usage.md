@@ -112,6 +112,8 @@ daemon: # Launch ports, health probing, lifecycle. Config-only.
 
 mouse_focus: false # Opt into mouse capture for click-to-focus / click-to-tab. Default off keeps native terminal text selection.
 
+bell: true # Ring the terminal bell (`\a` on stderr) when a pull or a TUI-started launch ends. false for silence.
+
 ascii_glyphs: false # Render the TUI with the 7-bit ASCII glyph fallback (status dots, severity markers, box borders) for fonts that show the Unicode set as tofu. `LLAMASTASH_ASCII=1` wins over this.
 
 left_pane_ratios: [65, 100, 50, 35, 0] # Left (Models list) width % that `Alt+L` cycles through in wide mode; the right pane takes the remainder. 100 hides the right pane, 0 hides the list. Slot 0 is the startup default; the pick is session-only. At most 5 slots (extras ignored), each clamped 0..=100.
@@ -1679,6 +1681,16 @@ These are the defaults. Override any binding via the `keybindings:` block in `co
 An HF-shaped tree that is *not* under the configured cache root (an rsynced backup, a restored archive) never gets the recursive removal — it falls back to per-file unlinking.
 
 Refusals: a running, loading or errored launch (stop it first), and Lemonade registry models (delete those through Lemonade — there is no local GGUF).
+
+### Terminal bell (on by default)
+
+One terminal bell — a bare `\a` on stderr — when something you are waiting on ends:
+
+- `llamastash pull` finishes or fails.
+- A TUI download finishes or fails.
+- A launch you started in the TUI turns ready or fails. One bell per launch, on the first status tick that reports the end.
+
+Nothing else rings: `preload` models, launches started from the CLI or the proxy, and cache hits, where there was nothing to wait for. The bell never reaches a non-terminal stream, so piped and `--json` output stays clean. Set `bell: false` in `config.yaml` for silence.
 
 ### Mouse focus (opt-in)
 
