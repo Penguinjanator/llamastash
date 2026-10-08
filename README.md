@@ -119,6 +119,21 @@ mouse_focus: true
 
 Either source flips on click-to-focus for the Models list, the right pane, and the tab labels (`Settings`/`Logs`/`Chat`/`Embed`/`Rerank`). Most terminals still expose a bypass modifier (Shift on iTerm2 / Alacritty / foot / wezterm, Option on Apple Terminal) so ad-hoc selection stays reachable.
 
+**Tip — shell completions.** `llamastash completions <shell>` prints a completion script for bash, zsh, fish, PowerShell or Elvish. Subcommands, flags and fixed value lists complete; model names do not. Install it once:
+
+```bash
+# bash
+mkdir -p ~/.local/share/bash-completion/completions
+llamastash completions bash > ~/.local/share/bash-completion/completions/llamastash
+
+# zsh — the directory has to be on $fpath before `compinit`
+mkdir -p ~/.zsh/completions && echo 'fpath+=(~/.zsh/completions)' >> ~/.zshrc
+llamastash completions zsh > ~/.zsh/completions/_llamastash
+
+# fish
+llamastash completions fish > ~/.config/fish/completions/llamastash.fish
+```
+
 Full subcommand reference: [`docs/usage.md`](docs/usage.md). Proxy client setup (including an OpenCode example): [`docs/usage.md#opencode-setup`](docs/usage.md#opencode-setup). Prefer a Vulkan `llama-server` build on AMD/NVIDIA hosts: [`docs/usage.md#preferring-a-vulkan-llama-server-build`](docs/usage.md#preferring-a-vulkan-llama-server-build). Architecture and IPC contract: [`docs/architecture.md`](docs/architecture.md). When things go wrong: [`docs/troubleshooting.md`](docs/troubleshooting.md).
 
 ## Agent Skills

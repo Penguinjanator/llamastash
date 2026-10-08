@@ -1440,7 +1440,7 @@ Port collision (Ollama-compat mode against a running Ollama on `11434`, another 
 
 ## Setup subcommands
 
-These three are first-run and admin surfaces. They're separated from the runtime CLI above because they touch durable state on disk (the `llama-server` binary, the snapshot file, the user's config) and have their own exit-code contract.
+These are the first-run and admin surfaces. They're separated from the runtime CLI above because they touch durable state on disk (the `llama-server` binary, the snapshot file, the user's config) and have their own exit-code contract. [`completions`](#shell-completions) is the one exception: it reads nothing and writes nothing.
 
 ### `llamastash init`
 
@@ -1614,6 +1614,33 @@ llamastash pull <repo> [--json] [--offline]
 `pull` performs a disk-space precheck by HEADing each file before download, so an out-of-space failure surfaces before any bytes hit disk. It refuses to write the HF token to disk in cache-file modes that would persist it insecurely.
 
 On a terminal, `pull` paints one progress line on **stderr**, in the shape `⬇ <file> (2/4)  42%  1.2G / 4.1G · 85M/s`. The percent, bytes and rate cover the whole pull, not just the current file. The rate counts bytes off the wire, so files served from the HF cache advance the percent without inflating it. The line is trimmed to the terminal width — a long filename loses its middle, keeping the directory and the shard suffix — and it repaints in place and clears itself before the summary. Redirect stderr, or pipe it, and nothing is written: stdout (including `--json`) is identical either way.
+
+### Shell completions
+
+```
+llamastash completions <bash|elvish|fish|powershell|zsh>
+```
+
+Print a completion script for `llamastash` on stdout. It is built from the command spec, so it needs no daemon, does not read `config.yaml` (a broken one will not stop it), and writes nothing itself — `--json` is refused because the script is the whole stdout contract. Subcommands, flags and fixed value lists complete; a model reference does not, because those come off the daemon. The `powershell` and `elvish` scripts are generated too; put them wherever your own PowerShell `$PROFILE` or Elvish module path points.
+
+Install once per machine:
+
+```bash
+# bash — needs bash-completion, which reads $XDG_DATA_HOME/bash-completion
+# when that is set, and ~/.local/share/bash-completion otherwise.
+mkdir -p ~/.local/share/bash-completion/completions
+llamastash completions bash > ~/.local/share/bash-completion/completions/llamastash
+
+# zsh — any directory on $fpath, added before `compinit` runs.
+mkdir -p ~/.zsh/completions
+echo 'fpath+=(~/.zsh/completions)' >> ~/.zshrc
+llamastash completions zsh > ~/.zsh/completions/_llamastash
+
+# fish — autoloaded by file name, no config edit.
+llamastash completions fish > ~/.config/fish/completions/llamastash.fish
+```
+
+For the current shell only: `source <(llamastash completions bash)` in bash or zsh, `llamastash completions fish | source` in fish.
 
 ## Exit codes
 

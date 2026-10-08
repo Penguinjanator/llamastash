@@ -87,6 +87,9 @@ clap = { version = "4.6", default-features = false, features = [
     "std",
     "color",
 ] }
+# Completion-script generator behind `llamastash completions`. Its default
+# feature set is empty and it needs nothing beyond clap's `std` feature.
+clap_complete = "4.6"
 crossterm = "0.29"
 directories = "6"
 # Streaming bytes for the right-pane chat tab (Unit 7) without

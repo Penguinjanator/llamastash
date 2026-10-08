@@ -10,6 +10,7 @@ pub mod api_key;
 pub mod cli_args;
 pub mod client;
 pub(crate) mod colors;
+pub mod completions;
 pub mod config;
 pub mod daemon;
 pub mod doctor;
@@ -77,9 +78,12 @@ pub async fn dispatch(mut cli: Cli, config: LoadedConfig) -> Result<i32> {
     // is already up on the config it booted with, and refusing here left a
     // typo'd file with no way to stop it from the CLI at all. Stopping needs
     // no config beyond the runtime handle.
+    //
+    // `completions` is exempt for a different reason: it reads no config at
+    // all, so a broken file must not stop the script that makes the CLI usable.
     let repair = match &command {
       Some(Command::Config(args)) => args.action.is_none(),
-      Some(Command::Init(_)) | Some(Command::Doctor(_)) => true,
+      Some(Command::Init(_)) | Some(Command::Doctor(_)) | Some(Command::Completions(_)) => true,
       Some(Command::Daemon(cli_args::DaemonAction::Stop { .. })) => true,
       _ => false,
     };
@@ -105,6 +109,7 @@ pub async fn dispatch(mut cli: Cli, config: LoadedConfig) -> Result<i32> {
   let outcome: CliResult = match command {
     None => handle_tui(&cli, resolved_config).await,
     Some(Command::Config(args)) => config::handle(args.action, &cli, resolved_config),
+    Some(Command::Completions(args)) => completions::handle(args),
     Some(Command::Daemon(action)) => {
       map_anyhow(daemon::handle(action, &cli, resolved_config).await)
     }

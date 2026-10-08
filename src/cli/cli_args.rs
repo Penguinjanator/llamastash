@@ -230,6 +230,13 @@ pub enum Command {
   /// and tokenizer files an engine needs to load them. `--json` emits
   /// the summary; otherwise progress streams to stderr.
   Pull(PullArgs),
+  /// Print a shell completion script to stdout.
+  ///
+  /// The script is static, so it needs no daemon and writes nothing:
+  /// redirect it into your shell's completion path (see
+  /// `docs/usage.md` § Shell completions). Subcommands, flags and
+  /// enum values complete; model references stay uncompleted.
+  Completions(CompletionsArgs),
   /// Run the first-time setup / maintenance wizard.
   Init(InitArgs),
   /// Read-only diagnostic — compares current detection against the
@@ -1137,6 +1144,13 @@ pub fn parse_model_override(raw: &str) -> Result<ModelOverride, String> {
       Ok(ModelOverride::Paste(other.to_string()))
     }
   }
+}
+
+#[derive(Args, Debug)]
+pub struct CompletionsArgs {
+  /// Shell to emit a script for.
+  #[arg(value_enum)]
+  pub shell: clap_complete::Shell,
 }
 
 #[derive(Args, Debug)]

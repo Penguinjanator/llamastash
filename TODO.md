@@ -433,7 +433,7 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 
 ### Batch 5: CLI setup commands ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-5-cli-setup-commands))
 
-- [ ] Shell completions
+- [x] ~~Shell completions~~
 - [ ] `doctor --fix` for findings with a safe mechanical repair
 
 ### Batch 6: small standalone items ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-6-small-standalone-items))
