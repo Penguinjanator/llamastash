@@ -3651,6 +3651,20 @@ mod tests {
   }
 
   #[test]
+  fn replies_bind_to_the_watches_in_dispatch_order() {
+    // The whole binding rule rests on the writer answering in dispatch order:
+    // one task, sequential calls, so the oldest unbound watch is the launch
+    // this reply names.
+    let mut app = App::new(AppOptions::default());
+    app.queue_bell_watch("/m/a.gguf");
+    app.queue_bell_watch("/m/b.gguf");
+    app.bind_bell_watch("L-second");
+    app.bind_bell_watch("L-first");
+    assert_eq!(app.bell_watch[0].launch_id.as_deref(), Some("L-second"));
+    assert_eq!(app.bell_watch[1].launch_id.as_deref(), Some("L-first"));
+  }
+
+  #[test]
   fn a_watch_never_claims_a_row_that_predates_its_launch() {
     // The duplicate-launch case: the model is already Ready from an earlier
     // launch, and the user launches it again. A watch matched on path alone
