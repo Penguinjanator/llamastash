@@ -129,10 +129,15 @@ impl FindingId {
       Self::RemoteSnapshotUnreachable => {
         "the remote snapshot fetch keeps failing — check network / egress; the recommender falls back to the bundled snapshot until it recovers"
       }
+      // Repairable ids never reach a manual hint while the repair exists —
+      // `Finding::new` points them at `doctor --fix`. These arms are what
+      // they say if a repair is ever withheld or gated out, so no id can be
+      // left without advice, and they name the hand step rather than
+      // repeating the `--fix` line.
       Self::ConfigModeDrift => {
-        "`chmod 600` on the config file (or `llamastash init --only config`)"
+        "run `chmod 600` on the config file (or `llamastash init --only config`)"
       }
-      Self::StaleDaemonFiles => "llamastash doctor --fix",
+      Self::StaleDaemonFiles => "remove `runtime.json` and `daemon.pid` from the state dir",
     }
   }
 
@@ -169,6 +174,12 @@ pub struct Finding {
   /// when it does not, so the pre-`--fix` shape of a finding is unchanged.
   #[serde(skip_serializing_if = "Option::is_none")]
   pub fix: Option<FixId>,
+  /// The repair this finding wanted but `--fix` withheld, with the hand step
+  /// to take instead. Internal: it drives the ledger line for the blocked
+  /// repair, while `fix` stays absent so a pre-`--fix` consumer sees the
+  /// shape it already knows.
+  #[serde(skip)]
+  withheld: Option<(FixId, &'static str)>,
 }
 
 impl Finding {
@@ -187,18 +198,21 @@ impl Finding {
     }
   }
 
-  /// A finding whose id normally carries a repair that cannot run here, with
-  /// the manual step as its hint. `--fix` leaves these alone and says so.
+  /// A finding whose id carries a repair that cannot run here: `fix` stays
+  /// absent, and `hint` (the id's own hand step unless overridden) is what
+  /// the reader must do instead. `--fix` still reports the repair as
+  /// withheld, once per repair rather than once per finding.
   #[cfg(unix)]
   fn manual(
     id: FindingId,
     severity: Severity,
     message: impl Into<String>,
-    hint: &'static str,
+    hint: Option<&'static str>,
   ) -> Self {
+    let fix_hint = hint.unwrap_or_else(|| id.fix_hint());
     Self {
-      fix: None,
-      ..Self::from_parts(id.as_str(), severity, message, hint)
+      withheld: id.fix_action().map(|fix| (fix, fix_hint)),
+      ..Self::from_parts(id.as_str(), severity, message, fix_hint)
     }
   }
 
@@ -219,6 +233,7 @@ impl Finding {
       fix_hint,
       safe_to_log: true,
       fix: None,
+      withheld: None,
     }
   }
 }
@@ -715,7 +730,7 @@ fn check_config_mode_drift() -> Vec<Finding> {
           parent.display(),
           surface.describe(our_uid)
         ),
-        "run `chmod go-w` on the parent dir",
+        Some("run `chmod go-w` on the parent dir"),
       ));
     }
     if let Ok(file_meta) = std::fs::metadata(&path) {
@@ -727,12 +742,7 @@ fn check_config_mode_drift() -> Vec<Finding> {
           path.display()
         );
         findings.push(if parent_surface.is_some() {
-          Finding::manual(
-            FindingId::ConfigModeDrift,
-            Severity::Warning,
-            message,
-            "`chmod 600` on the config file, once its dir is safe",
-          )
+          Finding::manual(FindingId::ConfigModeDrift, Severity::Warning, message, None)
         } else {
           Finding::new(FindingId::ConfigModeDrift, Severity::Warning, message)
         });
@@ -787,31 +797,48 @@ fn stale_daemon_files(state_dir: &Path) -> Vec<PathBuf> {
   .collect()
 }
 
+/// The file a repair works on, for the ledger line of a repair that was
+/// withheld before it could run.
+fn fix_target(fix: FixId) -> Option<String> {
+  match fix {
+    FixId::ConfigMode => crate::util::paths::user_config_file().map(|p| p.display().to_string()),
+    FixId::StaleDaemonFiles => crate::util::paths::state_dir().map(|d| d.display().to_string()),
+  }
+}
+
 /// Apply every repair the report marks fixable, in finding order. Under
 /// `dry_run` nothing is touched and every entry comes back `would_apply`.
 /// The set is bounded on purpose: no daemon is signalled, no model is
 /// deleted, and daemon state is only removed once nothing holds the lock.
-/// A finding whose id carries a repair that cannot run gets a `skipped`
-/// line, so `--fix` is never silent about what it left alone.
+/// A repair a finding wanted but could not get is ledged once, with the hand
+/// steps in finding order, so `--fix` is never silent about what it left
+/// alone.
 fn apply_fixes(findings: &[Finding], dry_run: bool) -> Vec<FixReport> {
-  let mut fixes = Vec::new();
+  let mut fixes: Vec<FixReport> = Vec::new();
   for f in findings {
-    let Some(fix) = f.fix else {
-      // `config_mode_drift` covers both the swappable-parent case and the
-      // mode case whose repair that parent blocks. Answer `--fix` with the
-      // reason instead of silence.
-      if f.id == FindingId::ConfigModeDrift.as_str() {
-        let target = crate::util::paths::user_config_file()
-          .map(|p| p.display().to_string())
-          .unwrap_or_else(|| "config file".to_string());
-        fixes.push(FixReport::skipped(
-          FixId::ConfigMode,
+    if let Some((fix, step)) = f.withheld {
+      let Some(target) = fix_target(fix) else {
+        continue;
+      };
+      // Several findings can block one repair (the config dir and the mode
+      // behind it), so they share a line instead of repeating it.
+      match fixes
+        .iter_mut()
+        .find(|r| r.fix == fix && r.target == target && r.outcome == FixOutcome::Skipped)
+      {
+        Some(row) if !row.detail.contains(step) => {
+          row.detail = format!("{}, then {step}", row.detail)
+        }
+        Some(_) => {}
+        None => fixes.push(FixReport::skipped(
+          fix,
           target,
-          format!("withheld; manual step: {}", f.fix_hint),
-        ));
+          format!("withheld; manual step: {step}"),
+        )),
       }
       continue;
-    };
+    }
+    let Some(fix) = f.fix else { continue };
     match fix {
       FixId::ConfigMode => {
         // The finding only exists on unix, so neither does the repair.
@@ -902,20 +929,20 @@ fn fix_stale_daemon_files(state_dir: &Path, dry_run: bool) -> Vec<FixReport> {
       .collect();
   }
   match acquire(state_dir) {
-    Ok(AcquireOutcome::Acquired(guard)) => {
+    Ok(AcquireOutcome::Acquired(mut guard)) => {
       let pidfile = guard.path().to_path_buf();
       // Everything destructive happens while the lock is held, so no daemon
       // that starts afterwards can lose a file it just wrote. The pidfile is
       // unlinked here rather than by the guard's `Drop` so the verdict comes
       // from our own `remove_file` instead of a later `exists()` that a
-      // fresh daemon could have made true again, and `mem::forget` keeps
-      // that `Drop` from unlinking a pidfile a new daemon has meanwhile
-      // created at the same path. The flock is released when this process
-      // exits, a moment later.
+      // fresh daemon could have made true again, and `disarm` keeps that
+      // `Drop` from unlinking a pidfile a new daemon has meanwhile created
+      // at the same name.
       crate::daemon::runtime_file::remove(state_dir);
       let runtime_gone = !crate::daemon::runtime_file::path(state_dir).exists();
       let pidfile_gone = std::fs::remove_file(&pidfile).is_ok() || !pidfile.exists();
-      std::mem::forget(guard);
+      guard.disarm();
+      drop(guard);
       leftovers
         .iter()
         .map(|p| {
@@ -1384,10 +1411,17 @@ mod tests {
       FindingId::GttHint,
       FindingId::SnapshotStale,
       FindingId::ConfigModeDrift,
+      FindingId::StaleDaemonFiles,
       FindingId::RemoteSnapshotUnreachable,
     ];
     for id in ids {
       assert!(!id.fix_hint().is_empty(), "{id:?} must have a fix_hint");
+      // The id names the hand step; pointing at the fixer is `Finding::new`'s
+      // job, so naming it here too would be a second copy of that string.
+      assert!(
+        !id.fix_hint().contains("doctor --fix"),
+        "{id:?} must name a hand step, not the fixer"
+      );
       let f = Finding::new(id, Severity::Info, "test");
       assert!(f.safe_to_log, "v2 findings must all be safe_to_log");
     }
@@ -1862,7 +1896,7 @@ mod tests {
       FindingId::ConfigModeDrift,
       Severity::Warning,
       "parent dir is world-writable",
-      "run `chmod go-w` on the parent dir",
+      Some("run `chmod go-w` on the parent dir"),
     );
     assert_eq!(parent_drift.fix, None);
     assert!(
@@ -1883,17 +1917,31 @@ mod tests {
   fn a_withheld_repair_is_ledged_rather_than_dropped() {
     // `--fix` with nothing applicable still says so, instead of answering
     // with an empty ledger that looks like a broken `--fix`.
-    let withheld = Finding::manual(
+    let parent = Finding::manual(
       FindingId::ConfigModeDrift,
       Severity::Warning,
       "parent dir `/x` is world-writable",
-      "run `chmod go-w` on the parent dir",
+      Some("run `chmod go-w` on the parent dir"),
     );
-    let fixes = apply_fixes(std::slice::from_ref(&withheld), false);
+    let mode = Finding::manual(
+      FindingId::ConfigModeDrift,
+      Severity::Warning,
+      "`/x/config.yaml` is mode 0o666",
+      None,
+    );
+    assert_eq!(mode.fix_hint, FindingId::ConfigModeDrift.fix_hint());
+    let fixes = apply_fixes(&[parent, mode], false);
+    // Two findings, one blocked chmod: one line, both hand steps.
     assert_eq!(fixes.len(), 1, "{fixes:?}");
     assert_eq!(fixes[0].fix, FixId::ConfigMode);
     assert_eq!(fixes[0].outcome, FixOutcome::Skipped);
-    assert!(fixes[0].detail.starts_with("withheld"), "{fixes:?}");
+    assert!(
+      fixes[0]
+        .detail
+        .starts_with("withheld; manual step: run `chmod go-w`"),
+      "{fixes:?}"
+    );
+    assert!(fixes[0].detail.contains("then"), "{fixes:?}");
     assert!(apply_fixes(&[], false).is_empty());
   }
 

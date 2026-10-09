@@ -169,11 +169,15 @@ fn a_config_no_repair_can_touch_is_reported_and_ledged() {
     );
   }
   let fixes = report["fixes"].as_array().unwrap();
-  assert_eq!(fixes.len(), 2, "each withheld repair is ledged: {fixes:#?}");
+  assert_eq!(
+    fixes.len(),
+    1,
+    "two findings, one withheld chmod: {fixes:#?}"
+  );
+  assert_eq!(fixes[0]["outcome"], "skipped", "{fixes:#?}");
+  assert_eq!(fixes[0]["fix"], "config_chmod_0600", "{fixes:#?}");
   assert!(
-    fixes
-      .iter()
-      .all(|f| f["outcome"] == "skipped" && f["fix"] == "config_chmod_0600"),
+    fixes[0]["detail"].as_str().unwrap().contains("chmod go-w"),
     "{fixes:#?}"
   );
   assert_eq!(mode_of(&config), 0o666, "nothing may be chmodded");
