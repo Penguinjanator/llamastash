@@ -16,12 +16,9 @@ use crate::tui::fmt::{format_bytes, format_rate, percent_of, take_head_by_width,
 
 pub async fn handle(args: PullArgs, cli: &Cli, config: &Config) -> CliResult {
   let result = crate::init::download::run(args, cli, config).await;
-  // A pull is long enough to walk away from, on both outcomes.
-  // `bell::ring` stays quiet when stderr is not a terminal; `--json` is
-  // the machine contract, so it gets the exit code and no control byte.
-  if crate::util::bell::command_rings(config.bell, cli.json) {
-    crate::util::bell::ring();
-  }
+  // A pull is long enough to walk away from, on both outcomes. The sink is
+  // stderr, and only a live terminal gets through it.
+  crate::util::bell::ring_after_wait(config.bell, cli.json, &mut crate::util::bell::tty_sink());
   result
 }
 

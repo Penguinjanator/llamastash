@@ -210,6 +210,7 @@ pub async fn handle(args: StartArgs, cli: &Cli, config: &Config) -> CliResult {
       &resp,
       args.json,
       cli.quiet,
+      config.bell,
     )
     .await;
   }
@@ -229,6 +230,7 @@ async fn wait_and_emit(
   resp: &Value,
   json: bool,
   quiet: bool,
+  bell: bool,
 ) -> CliResult {
   use crate::cli::resolve::{fetch_status, running_index};
 
@@ -309,6 +311,9 @@ async fn wait_and_emit(
     emit_response(preset, row, resp, false, false);
     print_wait_followup(settled.as_ref());
   }
+  // The wait is what the user walked away from, so it ends with the bell like
+  // a pull does, whether the model came up or not.
+  crate::util::bell::ring_after_wait(bell, json, &mut crate::util::bell::tty_sink());
   if failed {
     // The launch was accepted but the model never came up; reflect that
     // in the exit code so scripts can branch on it.
