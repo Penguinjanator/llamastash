@@ -1773,7 +1773,7 @@ Refusals: a running, loading or errored launch (stop it first), and Lemonade reg
 One terminal bell — a bare `\a` on stderr — when something you are waiting on ends:
 
 - `llamastash pull` finishes or fails.
-- `llamastash start --wait` settles: ready, failed, or the wait budget ran out.
+- `llamastash start --wait` ends: ready, failed, the wait budget ran out, or the daemon went away.
 - A TUI download finishes or fails.
 - A launch you started in the TUI turns ready or fails. One bell per launch: the watch is bound to the id the daemon named, so a duplicate launch of a model that is already running rings when *its* instance comes up, not off the one already on screen.
 

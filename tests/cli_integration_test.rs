@@ -327,6 +327,39 @@ async fn run_dispatch_at(state_dir: Option<&Path>, model_dir: &Path, command: Co
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_wait_settles_and_ends_the_command() {
+  // `--wait` had no coverage at any level, and the wait loop, its exit codes and
+  // the bell that ends it all live in one function. A test runner's stderr is no
+  // terminal, so the bell discards here; what this pins is that `--wait --json`
+  // still runs the wait to its ready end and exits clean.
+  let h = spawn_daemon_with_model("wait", "m.gguf", "llama").await;
+  let code = run_dispatch_at(
+    Some(&h.socket),
+    &h.model_dir,
+    Command::Start(StartArgs {
+      model: Some("m.gguf".into()),
+      name: None,
+      preset: None,
+      ctx: None,
+      port: None,
+      reasoning: None,
+      mode: Some(CliLaunchMode::Chat),
+      knobs: llamastash::cli::knob_flags::KnobFlags::default(),
+      extra: vec![],
+      backend: None,
+      server: None,
+      mtp: None,
+      mtp_draft_n: None,
+      json: true,
+      wait: true,
+      force: false,
+    }),
+  )
+  .await;
+  assert_eq!(code, exit_codes::SUCCESS, "`--wait --json` settles ready");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_script_round_trip_list_start_status_logs_stop() {
   let h = spawn_daemon_with_model("happy", "m.gguf", "llama").await;
   let model_path = h.model_dir.join("m.gguf");

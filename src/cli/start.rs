@@ -247,8 +247,17 @@ async fn wait_and_emit(
   // actuals before settling — otherwise `--wait` prints `ctx=—`.
   let mut ready_since: Option<std::time::Instant> = None;
   let actuals_grace = std::time::Duration::from_secs(5);
+  // A daemon that dies mid-wait still ends the wait, so the bell still rings
+  // before the error surfaces.
+  let mut poll_error: Option<CliExit> = None;
   while std::time::Instant::now() < deadline {
-    let snap = fetch_status(client).await?;
+    let snap = match fetch_status(client).await {
+      Ok(snap) => snap,
+      Err(e) => {
+        poll_error = Some(e);
+        break;
+      }
+    };
     let index = running_index(&snap.models);
     // Prefer the launch_id match; fall back to the model path (a daemon
     // build without launch_id on the row still resolves by path).
@@ -314,6 +323,9 @@ async fn wait_and_emit(
   // The wait is what the user walked away from, so it ends with the bell like
   // a pull does, whether the model came up or not.
   crate::util::bell::ring_after_wait(bell, json, &mut crate::util::bell::tty_sink());
+  if let Some(e) = poll_error {
+    return Err(e);
+  }
   if failed {
     // The launch was accepted but the model never came up; reflect that
     // in the exit code so scripts can branch on it.
