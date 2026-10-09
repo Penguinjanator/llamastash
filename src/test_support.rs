@@ -349,7 +349,7 @@ pub async fn shutdown_listener(
 }
 
 /// Poll `status` for up to `budget` for the `Listening` address, or `None`.
-pub async fn wait_for_listening(
+async fn wait_for_listening(
   status: &crate::proxy::server::StatusCell,
   budget: std::time::Duration,
 ) -> Option<std::net::SocketAddr> {
