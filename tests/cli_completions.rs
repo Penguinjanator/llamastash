@@ -118,8 +118,8 @@ fn json_is_not_accepted() {
 }
 
 /// The buffered render has to stay byte-identical to the streaming one it
-/// replaced: same script, only a failure mode that reports instead of
-/// panicking.
+/// replaced. Both sides build the same spec, so this pins the write path: no
+/// truncation, no padding, nothing added around the script.
 #[test]
 fn the_buffered_script_matches_the_plain_generator() {
   use clap::CommandFactory;
@@ -132,6 +132,33 @@ fn the_buffered_script_matches_the_plain_generator() {
     let out = bin().args(["completions", name]).output().expect("run");
     assert!(out.status.success(), "{name}");
     assert_eq!(out.stdout, expected, "{name} script differs");
+  }
+}
+
+/// Completing is only useful if the commands people type are in the script.
+/// A spec that stopped registering subcommands would still emit a
+/// well-formed script, and the byte comparison above would match it, so pin
+/// the names themselves.
+#[test]
+fn the_script_names_the_commands_that_get_completed() {
+  let dir = unique_temp_dir("names");
+  for shell in ["bash", "zsh", "fish"] {
+    let out = completions(shell, &dir, None);
+    assert!(out.status.success(), "{shell}");
+    let script = String::from_utf8_lossy(&out.stdout);
+    for cmd in [
+      "daemon",
+      "start",
+      "stop",
+      "list",
+      "models",
+      "pull",
+      "doctor",
+      "completions",
+    ] {
+      assert!(script.contains(cmd), "{shell} lost `{cmd}`");
+    }
+    assert!(script.contains("--json"), "{shell} lost --json");
   }
 }
 
