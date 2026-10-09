@@ -332,6 +332,7 @@ pub(crate) async fn handle_tui(cli: &Cli, config: &crate::config::Config) -> Cli
     keymap,
     offline,
     mouse_focus,
+    config.bell,
     crate::config::loader::sanitize_left_pane_ratios(&config.left_pane_ratios),
     &socket,
     daemon_opts,
@@ -406,6 +407,7 @@ async fn render_snapshot(
     keymap: resolve_keymap(config),
     offline: crate::init::fetch::offline_requested(false),
     mouse_focus: cli.mouse_focus || config.mouse_focus,
+    bell: config.bell,
     left_pane_ratios: crate::config::loader::sanitize_left_pane_ratios(&config.left_pane_ratios),
   });
   // Auto-spawn refused (backend precheck) — snapshot the daemon-less

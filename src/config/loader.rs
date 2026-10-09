@@ -73,6 +73,11 @@ pub struct Config {
   /// expose a bypass modifier (Shift on iTerm2/Alacritty/foot/wezterm,
   /// Option on Apple Terminal) for ad-hoc selections.
   pub mouse_focus: bool,
+  /// Ring the terminal bell (`\x07` on stderr) when something the user is
+  /// waiting on ends: a `pull`, a TUI download, and a launch the TUI started
+  /// (on ready or failed load). Factory `true`; set `bell: false` for silence.
+  /// Never written to a non-TTY stream or with `--json`.
+  pub bell: bool,
   /// Per-architecture launch defaults — user escape hatch over the
   /// built-in `(arch, gpu_backend) → crate::launch::knobs::KnobSet` table. Map keys are
   /// GGUF `general.architecture` strings (`llama`, `qwen2`, `mistral`,
@@ -872,6 +877,7 @@ impl Default for Config {
       daemon: DaemonConfig::default(),
       disable_scan: false,
       mouse_focus: false,
+      bell: true,
       arch_defaults: BTreeMap::new(),
       proxy: ProxyConfig::default(),
       backend: Default::default(),

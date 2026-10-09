@@ -30,15 +30,13 @@ use llamastash::daemon::supervisor::{
 };
 use llamastash::discovery::{DiscoveredModel, ModelCatalog, ModelSource};
 use llamastash::gguf::identity::ModelId;
-use llamastash::gguf::metadata::{ModeHint, ModelMetadata, Quant};
-use llamastash::gguf::test_fixtures::build_minimal_gguf;
 use llamastash::launch::mode::LaunchMode;
 use llamastash::launch::params::LaunchParams;
-use llamastash::proxy::server::{loopback_addr, new_status_cell, serve, ProxyStatus, StatusCell};
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use llamastash::test_support::{
+  fake_metadata, header_value, shutdown_listener, spawn_listener, write_gguf,
+};
 use tokio::time::sleep;
 
 fn unique_temp(label: &str) -> PathBuf {
@@ -63,30 +61,6 @@ fn allocate_port() -> u16 {
 
 fn allocate_port_range() -> PortRange {
   llamastash::test_support::allocate_port_range(8)
-}
-
-fn write_gguf(dir: &Path, name: &str, arch: &str) -> PathBuf {
-  let path = dir.join(name);
-  std::fs::write(&path, build_minimal_gguf(arch)).expect("write gguf");
-  llamastash::util::paths::canonicalize(&path).expect("canonicalize")
-}
-
-fn fake_metadata(arch: &str) -> ModelMetadata {
-  ModelMetadata {
-    arch: Some(arch.to_string()),
-    total_parameters: Some(7_000_000_000),
-    parameter_label: Some("7B".to_string()),
-    quant: Quant::Q4_K,
-    quant_label: None,
-    native_ctx: Some(8192),
-    chat_template: None,
-    tokenizer_kind: Some("llama".to_string()),
-    reasoning_hint: false,
-    mode_hint: ModeHint::Chat,
-    weights_bytes: Some(4_000_000_000),
-    lazy_tensor_bytes: Vec::new(),
-    mtp: None,
-  }
 }
 
 fn discovered(path: &Path, display_label: Option<&str>, arch: Option<&str>) -> DiscoveredModel {
@@ -192,102 +166,16 @@ async fn build_state_with_fallback(
   (state, ctx)
 }
 
-async fn spawn_listener(
-  state: Arc<ProxyState>,
-) -> (SocketAddr, ShutdownToken, tokio::task::JoinHandle<()>) {
-  let token = ShutdownToken::new();
-  let status: StatusCell = new_status_cell();
-  let bind_addr = loopback_addr(0);
-  let token_for_task = token.clone();
-  let status_for_task = Arc::clone(&status);
-  let handle = tokio::spawn(async move {
-    serve(state, bind_addr, token_for_task, status_for_task)
-      .await
-      .expect("proxy serve returns Ok");
-  });
-  let bound = wait_for_listening(&status, Duration::from_secs(2))
-    .await
-    .expect("listener reaches Listening");
-  (bound, token, handle)
-}
-
-/// Trigger shutdown and join the serve task; catches a hung serve loop.
-async fn shutdown_listener(shutdown: ShutdownToken, handle: tokio::task::JoinHandle<()>) {
-  shutdown.trigger();
-  tokio::time::timeout(Duration::from_secs(5), handle)
-    .await
-    .expect("proxy serve loop must exit after shutdown.trigger()")
-    .expect("proxy serve task must not panic");
-}
-
-async fn wait_for_listening(status: &StatusCell, budget: Duration) -> Option<SocketAddr> {
-  let deadline = std::time::Instant::now() + budget;
-  while std::time::Instant::now() < deadline {
-    if let ProxyStatus::Listening { addr, .. } = status.read().unwrap().clone() {
-      return Some(addr);
-    }
-    sleep(Duration::from_millis(10)).await;
-  }
-  None
-}
-
+/// A JSON `POST` against the test proxy, `(status, headers, body)`.
 async fn http_post(
   addr: SocketAddr,
   path: &str,
   body: &str,
 ) -> (u16, Vec<(String, String)>, Vec<u8>) {
-  let mut sock = TcpStream::connect(addr).await.expect("connect");
-  let req = format!(
-    "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
-    body.len()
-  );
-  sock.write_all(req.as_bytes()).await.expect("write");
-  let mut buf = Vec::new();
-  sock.read_to_end(&mut buf).await.expect("read");
-  parse_response(&buf)
+  llamastash::test_support::http_post(addr, path, body, &[]).await
 }
 
-async fn http_get(addr: SocketAddr, path: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
-  let mut sock = TcpStream::connect(addr).await.expect("connect");
-  let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-  sock.write_all(req.as_bytes()).await.expect("write");
-  let mut buf = Vec::new();
-  sock.read_to_end(&mut buf).await.expect("read");
-  parse_response(&buf)
-}
-
-fn parse_response(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
-  let needle = b"\r\n\r\n";
-  let split = buf
-    .windows(needle.len())
-    .position(|w| w == needle)
-    .expect("CRLFCRLF");
-  let head = std::str::from_utf8(&buf[..split]).expect("utf8");
-  let mut lines = head.split("\r\n");
-  let status_line = lines.next().expect("status");
-  let status: u16 = status_line
-    .split_whitespace()
-    .nth(1)
-    .expect("code")
-    .parse()
-    .expect("u16");
-  let mut headers = Vec::new();
-  for l in lines {
-    if let Some((k, v)) = l.split_once(':') {
-      headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
-    }
-  }
-  let body = buf[split + needle.len()..].to_vec();
-  (status, headers, body)
-}
-
-fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-  headers
-    .iter()
-    .find(|(k, _)| k.eq_ignore_ascii_case(name))
-    .map(|(_, v)| v.as_str())
-}
-
+/// A bare `GET` against the test proxy, `(status, headers, body)`.
 async fn stop_all(ctx: &MethodContext, extras: &[ManagedModel]) {
   let snap = ctx.supervisors.snapshot().await;
   let mut stopped_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
@@ -1032,7 +920,7 @@ async fn v1_models_lists_named_row_while_live_and_drops_after_stop() {
   assert_eq!(status, 200, "named auto-start must succeed");
 
   // /v1/models must list the named row `qwen3@coder`.
-  let (status, _, resp) = http_get(addr, "/v1/models").await;
+  let (status, _, resp) = llamastash::test_support::http_get(addr, "/v1/models", &[]).await;
   assert_eq!(status, 200);
   let v: serde_json::Value = serde_json::from_slice(&resp).expect("json");
   let ids: Vec<&str> = v["data"]
@@ -1051,7 +939,7 @@ async fn v1_models_lists_named_row_while_live_and_drops_after_stop() {
   tokio::time::sleep(Duration::from_millis(1000)).await;
 
   // /v1/models must no longer list the named row.
-  let (status, _, resp) = http_get(addr, "/v1/models").await;
+  let (status, _, resp) = llamastash::test_support::http_get(addr, "/v1/models", &[]).await;
   assert_eq!(status, 200);
   let v: serde_json::Value = serde_json::from_slice(&resp).expect("json");
   let ids: Vec<&str> = v["data"]

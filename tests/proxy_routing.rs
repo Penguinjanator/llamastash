@@ -32,17 +32,17 @@ use llamastash::daemon::shutdown::ShutdownToken;
 use llamastash::daemon::supervisor::{spawn as supervisor_spawn, ManagedSpawn, ManagedState};
 use llamastash::discovery::{DiscoveredModel, ModelCatalog, ModelSource};
 use llamastash::gguf::identity::ModelId;
-use llamastash::gguf::metadata::{ModeHint, ModelMetadata, Quant};
 use llamastash::ipc::{dispatch_request, Request};
 use llamastash::launch::mode::LaunchMode;
 use llamastash::launch::params::LaunchParams;
 use llamastash::proxy::request_log::RequestState;
-use llamastash::proxy::server::{
-  loopback_addr, new_status_cell, serve_with_options, ProxyStatus, ServeOptions, StatusCell,
-};
+use llamastash::proxy::server::ServeOptions;
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
-use llamastash::test_support::{finished_request, newest_request_when};
+use llamastash::test_support::{
+  fake_metadata, finished_request, http_post, newest_request_when, shutdown_listener,
+  spawn_listener, spawn_listener_with_options,
+};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -55,8 +55,7 @@ fn unique_temp(label: &str) -> PathBuf {
 }
 
 fn allocate_port() -> u16 {
-  let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-  l.local_addr().unwrap().port()
+  llamastash::test_support::allocate_port_range(1).start
 }
 
 fn fake_binary() -> PathBuf {
@@ -67,24 +66,6 @@ fn fast_probe() -> ProbeOptions {
   ProbeOptions {
     interval: Duration::from_millis(30),
     timeout: Duration::from_secs(5),
-  }
-}
-
-fn fake_metadata(arch: &str) -> ModelMetadata {
-  ModelMetadata {
-    arch: Some(arch.to_string()),
-    total_parameters: Some(7_000_000_000),
-    parameter_label: Some("7B".to_string()),
-    quant: Quant::Q4_K,
-    quant_label: None,
-    native_ctx: Some(8192),
-    chat_template: None,
-    tokenizer_kind: Some("llama".to_string()),
-    reasoning_hint: false,
-    mode_hint: ModeHint::Chat,
-    weights_bytes: Some(4_000_000_000),
-    lazy_tensor_bytes: Vec::new(),
-    mtp: None,
   }
 }
 
@@ -162,52 +143,6 @@ async fn spawn_fake_supervisor(
   (model, port, id)
 }
 
-async fn spawn_listener_with_state(
-  state: Arc<ProxyState>,
-) -> (SocketAddr, ShutdownToken, tokio::task::JoinHandle<()>) {
-  spawn_listener_with_options(state, ServeOptions::default()).await
-}
-
-async fn spawn_listener_with_options(
-  state: Arc<ProxyState>,
-  options: ServeOptions,
-) -> (SocketAddr, ShutdownToken, tokio::task::JoinHandle<()>) {
-  let token = ShutdownToken::new();
-  let status: StatusCell = new_status_cell();
-  let bind_addr = loopback_addr(0);
-  let token_for_task = token.clone();
-  let status_for_task = Arc::clone(&status);
-  let handle = tokio::spawn(async move {
-    serve_with_options(state, bind_addr, token_for_task, status_for_task, options)
-      .await
-      .expect("proxy serve returns Ok");
-  });
-  let bound = wait_for_listening(&status, Duration::from_secs(2))
-    .await
-    .expect("listener reaches Listening");
-  (bound, token, handle)
-}
-
-/// Trigger shutdown and join the serve task; catches a hung serve loop.
-async fn shutdown_listener(shutdown: ShutdownToken, handle: tokio::task::JoinHandle<()>) {
-  shutdown.trigger();
-  tokio::time::timeout(Duration::from_secs(5), handle)
-    .await
-    .expect("proxy serve loop must exit after shutdown.trigger()")
-    .expect("proxy serve task must not panic");
-}
-
-async fn wait_for_listening(status: &StatusCell, budget: Duration) -> Option<SocketAddr> {
-  let deadline = std::time::Instant::now() + budget;
-  while std::time::Instant::now() < deadline {
-    if let ProxyStatus::Listening { addr, .. } = status.read().unwrap().clone() {
-      return Some(addr);
-    }
-    sleep(Duration::from_millis(10)).await;
-  }
-  None
-}
-
 /// Build a ProxyState whose catalog has the supplied discovered
 /// models and whose supervisor registry is the provided one (default
 /// body cap).
@@ -268,72 +203,9 @@ async fn proxy_state_with_aliases(
     .0
 }
 
-/// Send an HTTP GET and read the response head + body. Returns
-/// `(status, headers, body_bytes)`. Closes the connection after.
-async fn http_get(addr: SocketAddr, path: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
-  let mut sock = TcpStream::connect(addr).await.expect("connect");
-  sock
-    .write_all(
-      format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
-    )
-    .await
-    .expect("write");
-  let mut buf = Vec::new();
-  sock.read_to_end(&mut buf).await.expect("read");
-  parse_response(&buf)
-}
-
-/// Send an HTTP POST and read the response head + body. Returns
-/// `(status, headers, body_bytes)`. Closes the connection after.
-async fn http_post(
-  addr: SocketAddr,
-  path: &str,
-  body: &str,
-  extra_headers: &[(&str, &str)],
-) -> (u16, Vec<(String, String)>, Vec<u8>) {
-  let mut sock = TcpStream::connect(addr).await.expect("connect");
-  let mut req = format!(
-    "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n",
-    body.len()
-  );
-  for (k, v) in extra_headers {
-    req.push_str(&format!("{k}: {v}\r\n"));
-  }
-  req.push_str("\r\n");
-  req.push_str(body);
-  sock.write_all(req.as_bytes()).await.expect("write");
-  let mut buf = Vec::new();
-  sock.read_to_end(&mut buf).await.expect("read");
-  parse_response(&buf)
-}
-
-fn parse_response(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
-  let needle = b"\r\n\r\n";
-  let split = buf
-    .windows(needle.len())
-    .position(|w| w == needle)
-    .expect("CRLFCRLF terminator");
-  let head = std::str::from_utf8(&buf[..split]).expect("utf8 headers");
-  let mut lines = head.split("\r\n");
-  let status_line = lines.next().expect("status line");
-  let status: u16 = status_line
-    .split_whitespace()
-    .nth(1)
-    .expect("status code")
-    .parse()
-    .expect("parse status");
-  let mut headers = Vec::new();
-  for l in lines {
-    if let Some((k, v)) = l.split_once(':') {
-      headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
-    }
-  }
-  let body = buf[split + needle.len()..].to_vec();
-  (status, headers, body)
-}
-
 // --- happy paths --------------------------------------------------------
 
+/// A bare `GET` against the test proxy, `(status, headers, body)`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chat_completion_streams_back_byte_identical() {
   let dir = unique_temp("chat");
@@ -351,7 +223,7 @@ async fn chat_completion_streams_back_byte_identical() {
     registry,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let body = serde_json::json!({
     "model": "qwen3",
@@ -418,7 +290,7 @@ async fn embeddings_endpoint_round_trips_json() {
     registry,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let body = serde_json::json!({
     "model": "nomic-embed",
@@ -453,7 +325,7 @@ async fn rerank_endpoint_forwards() {
     registry,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let body = serde_json::json!({
     "model": "bge-rerank",
@@ -489,7 +361,7 @@ async fn anthropic_messages_endpoint_forwards() {
     registry,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let body = serde_json::json!({
     "model": "qwen-chat",
@@ -534,7 +406,7 @@ async fn anthropic_messages_endpoint_resolves_an_alias() {
     &[("claude-haiku", "qwen-chat")],
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let body = serde_json::json!({
     "model": "claude-haiku",
@@ -577,7 +449,7 @@ async fn anthropic_messages_effort_reaches_the_upstream_body() {
     registry,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   // Nothing to map, so the upstream sees the client's exact bytes.
   let plain =
@@ -617,7 +489,7 @@ async fn unknown_model_name_returns_404_model_not_found() {
     registry,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let body = r#"{"model":"definitely-absent","messages":[]}"#;
   let (status, _headers, response) = http_post(addr, "/v1/chat/completions", body, &[]).await;
@@ -653,7 +525,7 @@ async fn model_file_with_at_in_name_resolves_as_plain_reference() {
   // A local GGUF carries no display label, so its reference *is* the filename
   // — the case D2's fail-safe exists for.
   let state = proxy_state_with(vec![discovered(catalog_path, None, "qwen3")], registry).await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   // Request the full filename (with `@` in it). The D2 fail-safe must treat
   // the whole string as a model reference, not split it on `@`.
@@ -685,7 +557,7 @@ async fn proxy_alias_reaches_the_model_it_names() {
     &[("gpt-4o-mini", "qwen3")],
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let body = r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}"#;
   let (status, _headers, response) = http_post(addr, "/v1/chat/completions", body, &[]).await;
@@ -695,7 +567,7 @@ async fn proxy_alias_reaches_the_model_it_names() {
   );
 
   // And it stays off the listings: `/v1/models` is one row per model.
-  let (status, _h, listing) = http_get(addr, "/v1/models").await;
+  let (status, _h, listing) = llamastash::test_support::http_get(addr, "/v1/models", &[]).await;
   assert_eq!(status, 200);
   let text = String::from_utf8(listing).expect("utf8 listing");
   assert!(
@@ -728,7 +600,7 @@ async fn an_alias_settles_a_name_two_models_both_contain() {
     &[("gpt-oss", "gpt-oss-20b")],
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let body = r#"{"model":"gpt-oss","messages":[]}"#;
   let (status, _headers, response) = http_post(addr, "/v1/chat/completions", body, &[]).await;
@@ -747,7 +619,7 @@ async fn an_alias_settles_a_name_two_models_both_contain() {
     SupervisorRegistry::new(),
   )
   .await;
-  let (plain_addr, plain_shutdown, plain_handle) = spawn_listener_with_state(plain).await;
+  let (plain_addr, plain_shutdown, plain_handle) = spawn_listener(plain).await;
   let (status, _headers, response) = http_post(plain_addr, "/v1/chat/completions", body, &[]).await;
   assert_eq!(
     status, 400,
@@ -781,7 +653,7 @@ async fn a_real_model_id_beats_an_alias_of_the_same_name() {
     &[("gpt-4o-mini", "other-model")],
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let body = r#"{"model":"gpt-4o-mini","messages":[]}"#;
   let (status, _headers, response) = http_post(addr, "/v1/chat/completions", body, &[]).await;
@@ -812,7 +684,7 @@ async fn an_alias_names_a_model_not_a_launch_or_preset() {
     &[("helper", "qwen3@coder")],
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let body = r#"{"model":"helper","messages":[]}"#;
   let (status, _headers, response) = http_post(addr, "/v1/chat/completions", body, &[]).await;
@@ -837,7 +709,7 @@ async fn ambiguous_substring_returns_400_with_candidates() {
     registry,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let body = r#"{"model":"qwen-coder","messages":[]}"#;
   let (status, _headers, response) = http_post(addr, "/v1/chat/completions", body, &[]).await;
@@ -871,7 +743,7 @@ async fn ambiguous_matches_name_each_candidate_distinctly() {
     registry,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let body = r#"{"model":"gemma-4-E2B-it-Q4_K_M","messages":[]}"#;
   let (status, _headers, response) = http_post(addr, "/v1/chat/completions", body, &[]).await;
@@ -910,7 +782,7 @@ async fn a_published_plain_id_is_not_ambiguous_against_a_longer_name() {
     registry,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let body = r#"{"model":"demo-model","messages":[]}"#;
   let (status, _headers, response) = http_post(addr, "/v1/chat/completions", body, &[]).await;
@@ -946,7 +818,7 @@ async fn a_published_plain_id_is_not_ambiguous_against_a_longer_name() {
 async fn missing_model_field_returns_400_model_required() {
   let registry = SupervisorRegistry::new();
   let state = proxy_state_with(Vec::new(), registry).await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let (status, _headers, response) = http_post(addr, "/v1/chat/completions", "{}", &[]).await;
   assert_eq!(status, 400);
@@ -961,7 +833,7 @@ async fn missing_model_field_returns_400_model_required() {
 async fn empty_model_string_returns_400_model_required() {
   let registry = SupervisorRegistry::new();
   let state = proxy_state_with(Vec::new(), registry).await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let (status, _headers, response) =
     http_post(addr, "/v1/chat/completions", r#"{"model":""}"#, &[]).await;
@@ -983,7 +855,7 @@ async fn catalog_match_without_running_supervisor_returns_launch_failed() {
     registry,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let body = r#"{"model":"qwen3","messages":[]}"#;
   let (status, _headers, response) = http_post(addr, "/v1/chat/completions", body, &[]).await;
@@ -1004,7 +876,7 @@ async fn body_exceeding_cap_returns_413() {
   // so the refusal proves the configured cap — not the default —
   // is in force.
   let state = proxy_state_with_cap(Vec::new(), registry, 1024).await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   // A body just over the cap: the `Limited` adapter trips before
   // serde even runs.
@@ -1046,7 +918,7 @@ async fn zero_cap_disables_the_body_check() {
     0,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let pad = "A".repeat(17 * 1024 * 1024 + 64);
   let body = format!(r#"{{"model":"qwen3","pad":"{pad}"}}"#);
@@ -1072,7 +944,7 @@ async fn body_between_old_and_new_default_passes_cap() {
     registry,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let pad = "A".repeat(3 * 1024 * 1024);
   let body = format!(r#"{{"model":"qwen3","pad":"{pad}"}}"#);
@@ -1088,7 +960,7 @@ async fn body_between_old_and_new_default_passes_cap() {
 async fn malformed_json_body_returns_400() {
   let registry = SupervisorRegistry::new();
   let state = proxy_state_with(Vec::new(), registry).await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let (status, _h, response) = http_post(addr, "/v1/chat/completions", "{not json", &[]).await;
   assert_eq!(status, 400);
@@ -1116,7 +988,7 @@ async fn hop_by_hop_headers_dont_break_forwarding() {
     registry,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let body = r#"{"model":"hop","messages":[],"stream":true}"#;
   // The inbound request already carries `Connection: close` (added
@@ -1177,7 +1049,7 @@ async fn upstream_400_passes_through_as_400() {
     registry,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let body = r#"{"model":"fail","messages":[],"__TEST_INJECT_FAIL_400__":true}"#;
   let (status, _headers, response) = http_post(addr, "/v1/chat/completions", body, &[]).await;
@@ -1211,7 +1083,7 @@ async fn upstream_unreachable_after_stop_returns_structured_error() {
     registry,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   // Stop the supervisor, wait for the state machine to settle.
   let _ = model.stop(Duration::from_secs(3)).await;
@@ -1320,7 +1192,7 @@ async fn a_served_request_is_logged_and_reaches_requests_tail_and_status() {
     DEFAULT_BODY_LIMIT_BYTES,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let body = r#"{"model":"qwen3","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
   let (status, _, _) = http_post(addr, "/v1/chat/completions", body, &[]).await;
@@ -1404,7 +1276,7 @@ async fn tokens_and_speed_come_from_the_end_of_the_response() {
     DEFAULT_BODY_LIMIT_BYTES,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   // A stream whose last chunk carries `timings` and no `usage`.
   let streamed = r#"{"model":"qwen3","stream":true,"messages":[{"role":"user","content":"__TEST_EMIT_TIMINGS__"}]}"#;
@@ -1462,7 +1334,7 @@ async fn requests_the_proxy_answers_itself_are_logged_with_the_error_type() {
     64,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
   let post =
     |body: &'static str| async move { http_post(addr, "/v1/chat/completions", body, &[]).await.0 };
 
@@ -1534,7 +1406,7 @@ async fn a_client_that_hangs_up_mid_stream_is_logged_as_client_closed() {
     DEFAULT_BODY_LIMIT_BYTES,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let body = r#"{"model":"qwen3","stream":true,"messages":[{"role":"user","content":"__TEST_SLOW_STREAM__"}]}"#;
   let mut sock = TcpStream::connect(addr).await.expect("connect");
@@ -1592,7 +1464,7 @@ async fn an_upstream_that_dies_mid_body_is_logged_as_upstream_error() {
     DEFAULT_BODY_LIMIT_BYTES,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let body = r#"{"model":"qwen3","stream":true,"messages":[{"role":"user","content":"__TEST_TRUNCATE_STREAM__"}]}"#;
   let mut sock = TcpStream::connect(addr).await.expect("connect");
@@ -1635,7 +1507,7 @@ async fn a_503_for_a_model_whose_umbrella_is_down_is_filed_under_the_model() {
     DEFAULT_BODY_LIMIT_BYTES,
   )
   .await;
-  let (addr, shutdown, listener_handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
 
   let body = r#"{"model":"qwen-npu","messages":[]}"#;
   let (status, _, response) = http_post(addr, "/v1/chat/completions", body, &[]).await;

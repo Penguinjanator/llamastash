@@ -256,6 +256,18 @@ ascii_glyphs: false
 #           Env: (none).
 mouse_focus: false
 
+# ─── Terminal bell ──────────────────────────────────────────────
+#
+# Ring the terminal bell (a bare `\a`) when something you are waiting
+# for ends: `llamastash pull` finishes or fails, a TUI download finishes
+# or fails, and a launch the TUI started turns ready or failed. The
+# bell goes to stderr only, so it never lands in piped or `--json`
+# output. Preloaded and CLI-started launches do not ring in the TUI.
+# Set false for silence.
+#
+# Sources — CLI: (none) · Env: (none).
+bell: true
+
 # ─── Left/right pane split cycle (Alt+L) ──────────────────────────
 #
 # Left (Models list) pane width percentages that Alt+L cycles through

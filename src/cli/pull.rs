@@ -15,7 +15,11 @@ use crate::init::download::{DownloadProgress, PullProgress, PullTotals, RateMete
 use crate::tui::fmt::{format_bytes, format_rate, percent_of, take_head_by_width, truncate_middle};
 
 pub async fn handle(args: PullArgs, cli: &Cli, config: &Config) -> CliResult {
-  crate::init::download::run(args, cli, config).await
+  let result = crate::init::download::run(args, cli, config).await;
+  // A pull is long enough to walk away from, on both outcomes. The sink is
+  // stderr, and only a live terminal gets through it.
+  crate::util::bell::ring_after_wait(config.bell, cli.json, &mut crate::util::bell::tty_sink());
+  result
 }
 
 /// Longest filename kept on the line before the middle is elided.

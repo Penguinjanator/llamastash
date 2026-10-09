@@ -6,6 +6,8 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ### Added
 
+- The terminal bell rings when a pull, a `start --wait`, or a TUI-started launch ends, ready or failed. One bell per launch, never in piped or `--json` output; `bell: false` in `config.yaml` turns it off. ([#104](https://github.com/llamastash/llamastash/pull/104))
+- A `docs/usage.md` section for running the daemon as a login service: a systemd user unit (run live: preload comes up, `systemctl --user stop` unloads the models and takes its `llama-server` with it) and a launchd agent, both around `daemon start --foreground` with `daemon.preload`. ([#104](https://github.com/llamastash/llamastash/pull/104))
 - **Shell completions.** `llamastash completions <bash|zsh|fish|powershell|elvish>` prints a completion script built from the command spec: subcommands, flags and fixed value lists complete, model names do not. It needs no daemon and writes nothing.
 - **`doctor --fix`.** Two findings now repair themselves: `chmod 0600` on a config whose mode drifted, and removing a `runtime.json` / `daemon.pid` pair no daemon holds. `--dry-run` prints the same list and changes nothing, and `doctor` still always exits `0`.
 - **Proxy request log.** `llamastash requests [model]` and a per-model Requests tab in the TUI (`Shift+Q`) show the last 1000 proxy requests: status, total time, time to first byte, token counts, tok/s, and the auto-start, unload or error behind each one. `status --json` gains per-launch `request_stats`, and `proxy.request_log_file: true` also writes the requests to a JSON Lines file. ([#97](https://github.com/llamastash/llamastash/pull/97))

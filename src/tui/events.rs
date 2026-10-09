@@ -1872,9 +1872,20 @@ fn dispatch_launch(
   cmd: WriterCmd,
   name: String,
 ) {
+  let mut pending_bell: Option<std::path::PathBuf> = None;
+  if let (true, WriterCmd::StartModel(args)) = (app.options.bell, &cmd) {
+    // One watch per launch, keyed by path: the daemon assigns the launch id, and
+    // the TUI learns it only from the next `status` tick. `ingest_status` rings
+    // and drops it. Only a command the writer actually took earns a watch, so a
+    // refused send cannot leave a path waiting for a launch that never started.
+    pending_bell = Some(args.model_path.clone());
+  }
   match writer {
     Some(tx) => match tx.try_send(cmd) {
       Ok(()) => {
+        if let Some(path) = pending_bell {
+          app.queue_bell_watch(path);
+        }
         app.show_toast(format!("launching {name}…"));
         app.close_launch_picker();
       }
@@ -1985,6 +1996,12 @@ pub enum RefreshTick {
   WriterInfo {
     message: String,
   },
+  /// The daemon accepted a `start_model` and named the launch. Binds the bell
+  /// watch that dispatch queued, so it rings for that row and not for another
+  /// launch of the same model.
+  StartAccepted {
+    launch_id: String,
+  },
 }
 
 pub fn spawn_refresher(socket: PathBuf, tx: mpsc::Sender<Event>) {
@@ -2027,6 +2044,12 @@ pub fn spawn_refresher(socket: PathBuf, tx: mpsc::Sender<Event>) {
       }
     }
   });
+}
+
+/// The launch id a successful `start_model` names, if it names one. This is the
+/// only thing that ties a bell watch to the row it is waiting for.
+fn start_accepted_launch_id(resp: &serde_json::Value) -> Option<String> {
+  Some(resp.get("launch_id").and_then(|v| v.as_str())?.to_string())
 }
 
 /// Bound on outstanding writer commands. The TUI dispatches at human
@@ -2096,6 +2119,15 @@ pub fn spawn_writer(
         // of R6 / D-admission. Other methods carry no warnings.
         Ok(resp) => {
           if method == "start_model" {
+            if let Some(id) = start_accepted_launch_id(&resp) {
+              if let Some(fb) = &feedback {
+                let _ = fb
+                  .send(Event::Refresh(RefreshTick::StartAccepted {
+                    launch_id: id.to_string(),
+                  }))
+                  .await;
+              }
+            }
             if let Some(ws) = resp.get("warnings").and_then(|v| v.as_array()) {
               let joined = ws
                 .iter()
@@ -2606,7 +2638,14 @@ fn apply_refresh(app: &mut App, tick: RefreshTick) {
     RefreshTick::Disconnected => {
       app.daemon_connected = false;
     }
+    RefreshTick::StartAccepted { launch_id } => {
+      app.bind_bell_watch(launch_id.as_str());
+    }
     RefreshTick::WriterError { method, message } => {
+      // A refused start produces no row to watch, so its bell watch would hang
+      // around. The error carries no path, so nothing is dropped here: that watch
+      // never binds and ages out in `App::bell_tick`, while launches from the same
+      // batch that did start keep theirs.
       app.show_error_toast(writer_error_toast(method, &message));
     }
     RefreshTick::WriterInfo { message } => {
@@ -2774,6 +2813,7 @@ pub async fn launch(
   keymap: crate::tui::keybindings::KeyMap,
   offline: bool,
   mouse_focus: bool,
+  bell: bool,
   left_pane_ratios: Vec<u16>,
   socket: &Path,
   daemon_opts: Option<crate::daemon::DaemonOptions>,
@@ -2785,6 +2825,7 @@ pub async fn launch(
     keymap,
     offline,
     mouse_focus,
+    bell,
     left_pane_ratios,
   });
   // Startup auto-spawn refused (backend fail-fast precheck) — the TUI
@@ -3526,6 +3567,149 @@ mod tests {
     assert!(
       app.confirm_dialog.is_some(),
       "click must not dismiss the dialog"
+    );
+  }
+
+  #[test]
+  fn a_launch_that_never_reaches_the_writer_leaves_no_bell_watch() {
+    // A launch that never leaves the TUI has no launch to announce, so the
+    // bell watch must stay empty: a stale path would ring on some later,
+    // unrelated launch of the same model.
+    use crate::tui::app::{AppOptions, StartModelArgs};
+    let args = Box::new(StartModelArgs {
+      model_path: "/m/qwen.gguf".into(),
+      ctx: None,
+      reasoning: None,
+      knobs: Default::default(),
+      extras: Vec::new(),
+      mode: None,
+      prefer_port: None,
+      backend: Default::default(),
+      selection: "explicit",
+      server: None,
+      name: None,
+      preset: None,
+    });
+    let mut app = App::new(AppOptions::default());
+    dispatch_launch(
+      &mut app,
+      None,
+      WriterCmd::StartModel(args.clone()),
+      "qwen".into(),
+    );
+    assert!(
+      app.bell_watch.is_empty(),
+      "no writer means nothing was launched: {:?}",
+      app.bell_watch
+    );
+
+    // With a writer that takes the command, the path is watched.
+    let (tx, mut rx) = mpsc::channel(4);
+    dispatch_launch(
+      &mut app,
+      Some(&tx),
+      WriterCmd::StartModel(args),
+      "qwen".into(),
+    );
+    assert_eq!(
+      app.bell_watch,
+      vec![crate::tui::app::BellWatch::waiting("/m/qwen.gguf")]
+    );
+    assert!(
+      matches!(rx.try_recv(), Ok(WriterCmd::StartModel(_))),
+      "the command still goes out"
+    );
+  }
+
+  #[test]
+  fn a_launch_queued_with_the_bell_off_is_never_watched() {
+    use crate::tui::app::{AppOptions, BellWatch, StartModelArgs};
+    let args = Box::new(StartModelArgs {
+      model_path: "/m/qwen.gguf".into(),
+      ctx: None,
+      reasoning: None,
+      knobs: Default::default(),
+      extras: Vec::new(),
+      mode: None,
+      prefer_port: None,
+      backend: Default::default(),
+      selection: "explicit",
+      server: None,
+      name: None,
+      preset: None,
+    });
+    let mut app = App::new(AppOptions {
+      bell: false,
+      ..AppOptions::default()
+    });
+    let (tx, _rx) = mpsc::channel(4);
+    dispatch_launch(
+      &mut app,
+      Some(&tx),
+      WriterCmd::StartModel(args),
+      "qwen".into(),
+    );
+    assert_eq!(app.bell_watch, Vec::<BellWatch>::new(), "bell: false");
+  }
+
+  #[test]
+  fn a_start_reply_without_a_launch_id_binds_nothing() {
+    assert_eq!(
+      start_accepted_launch_id(&serde_json::json!({ "launch_id": "L-7" })).as_deref(),
+      Some("L-7")
+    );
+    assert_eq!(
+      start_accepted_launch_id(&serde_json::json!({ "warnings": [] })),
+      None,
+      "a reply with no id leaves the watch on its dispatch snapshot"
+    );
+  }
+
+  #[test]
+  fn the_daemon_reply_binds_the_queued_bell_watch() {
+    // The reply names the launch, which is what stops the watch from being
+    // satisfied by a row that was already there or by a later launch.
+    let mut app = App::new(crate::tui::app::AppOptions::default());
+    app.queue_bell_watch("/m/qwen.gguf");
+    apply_refresh(
+      &mut app,
+      RefreshTick::StartAccepted {
+        launch_id: "L-7".into(),
+      },
+    );
+    assert_eq!(app.bell_watch[0].launch_id.as_deref(), Some("L-7"));
+    apply_refresh(
+      &mut app,
+      RefreshTick::StartAccepted {
+        launch_id: "L-8".into(),
+      },
+    );
+    assert_eq!(
+      app.bell_watch[0].launch_id.as_deref(),
+      Some("L-7"),
+      "a watch that is already named keeps its id"
+    );
+  }
+
+  #[test]
+  fn a_refused_start_leaves_the_other_launches_bells_alone() {
+    // The error names no path, so clearing everything would silence the bells
+    // of launches from the same batch that did start. The watch that has no row
+    // ages out in `App::bell_tick` instead.
+    use crate::tui::app::BellWatch;
+    let mut app = App::new(crate::tui::app::AppOptions::default());
+    app.bell_watch = vec![BellWatch::waiting("/m/qwen.gguf")];
+    apply_refresh(
+      &mut app,
+      RefreshTick::WriterError {
+        method: "start_model",
+        message: "no ports left".into(),
+      },
+    );
+    assert_eq!(
+      app.bell_watch,
+      vec![BellWatch::waiting("/m/qwen.gguf")],
+      "the toast is the report; the watch ages out on its own"
     );
   }
 

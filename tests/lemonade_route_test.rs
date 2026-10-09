@@ -32,11 +32,9 @@ use llamastash::discovery::{DiscoveredModel, ModelCatalog, ModelSource};
 use llamastash::launch::mode::LaunchMode;
 use llamastash::launch::params::LaunchParams;
 use llamastash::proxy::eviction;
-use llamastash::proxy::server::{loopback_addr, new_status_cell, serve, ProxyStatus, StatusCell};
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use llamastash::test_support::{shutdown_listener, spawn_listener};
 use tokio::time::sleep;
 
 fn fake_lemond_binary() -> PathBuf {
@@ -48,8 +46,7 @@ fn unique_temp(label: &str) -> PathBuf {
 }
 
 fn allocate_port() -> u16 {
-  let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-  l.local_addr().unwrap().port()
+  llamastash::test_support::allocate_port_range(1).start
 }
 
 fn fast_probe() -> ProbeOptions {
@@ -112,55 +109,10 @@ async fn proxy_state_with(
   ProxyState::from_context(&ctx, false, true, DEFAULT_BODY_LIMIT_BYTES)
 }
 
-async fn spawn_listener(
-  state: Arc<ProxyState>,
-) -> (SocketAddr, ShutdownToken, tokio::task::JoinHandle<()>) {
-  let token = ShutdownToken::new();
-  let status: StatusCell = new_status_cell();
-  let token_for_task = token.clone();
-  let status_for_task = Arc::clone(&status);
-  let handle = tokio::spawn(async move {
-    serve(state, loopback_addr(0), token_for_task, status_for_task)
-      .await
-      .expect("proxy serve returns Ok");
-  });
-  let deadline = Instant::now() + Duration::from_secs(2);
-  loop {
-    if let ProxyStatus::Listening { addr, .. } = status.read().unwrap().clone() {
-      return (addr, token, handle);
-    }
-    assert!(Instant::now() < deadline, "listener never bound");
-    sleep(Duration::from_millis(10)).await;
-  }
-}
-
+/// A JSON `POST` to the test proxy, `(status, body)`.
 async fn http_post(addr: SocketAddr, path: &str, body: &str) -> (u16, Vec<u8>) {
-  let mut sock = TcpStream::connect(addr).await.expect("connect");
-  let req = format!(
-    "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
-    body.len()
-  );
-  sock.write_all(req.as_bytes()).await.expect("write");
-  let mut buf = Vec::new();
-  sock.read_to_end(&mut buf).await.expect("read");
-  let needle = b"\r\n\r\n";
-  let split = buf
-    .windows(needle.len())
-    .position(|w| w == needle)
-    .expect("CRLFCRLF");
-  let head = std::str::from_utf8(&buf[..split]).expect("utf8 head");
-  let status: u16 = head
-    .split_whitespace()
-    .nth(1)
-    .expect("status code")
-    .parse()
-    .expect("parse status");
-  (status, buf[split + needle.len()..].to_vec())
-}
-
-async fn shutdown(token: ShutdownToken, handle: tokio::task::JoinHandle<()>) {
-  token.trigger();
-  let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+  let (status, _, body) = llamastash::test_support::http_post(addr, path, body, &[]).await;
+  (status, body)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -200,7 +152,7 @@ async fn lemonade_model_routes_through_proxy_to_umbrella() {
   );
 
   umbrella.stop(Duration::from_secs(3)).await;
-  shutdown(token, handle).await;
+  shutdown_listener(token, handle).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -245,7 +197,7 @@ async fn second_lemonade_model_reuses_the_one_umbrella() {
   }
 
   umbrella.stop(Duration::from_secs(3)).await;
-  shutdown(token, handle).await;
+  shutdown_listener(token, handle).await;
 }
 
 /// Sweep a resident fake-lemond model and assert the model alone is freed.
@@ -423,7 +375,7 @@ async fn lemonade_request_without_umbrella_fails_cleanly() {
     "error should name the unavailable backend, got: {body}"
   );
 
-  shutdown(token, handle).await;
+  shutdown_listener(token, handle).await;
 }
 
 /// Lifecycle-aware eviction on the global TTL: an idle Lemonade model is freed

@@ -112,6 +112,8 @@ daemon: # Launch ports, health probing, lifecycle. Config-only.
 
 mouse_focus: false # Opt into mouse capture for click-to-focus / click-to-tab. Default off keeps native terminal text selection.
 
+bell: true # Ring the terminal bell (`\a` on stderr) when a pull or a TUI-started launch ends. false for silence.
+
 ascii_glyphs: false # Render the TUI with the 7-bit ASCII glyph fallback (status dots, severity markers, box borders) for fonts that show the Unicode set as tofu. `LLAMASTASH_ASCII=1` wins over this.
 
 left_pane_ratios: [65, 100, 50, 35, 0] # Left (Models list) width % that `Alt+L` cycles through in wide mode; the right pane takes the remainder. 100 hides the right pane, 0 hides the list. Slot 0 is the startup default; the pick is session-only. At most 5 slots (extras ignored), each clamped 0..=100.
@@ -654,6 +656,92 @@ Without `llama-server`, `daemon start` refuses unless another backend is enabled
 `daemon stop` calls the IPC `shutdown` RPC, then waits for the daemon process to actually exit before printing `daemon: stopped` — up to 10 s, or the longest managed-launch stop grace plus 5 s when that is longer — so `daemon stop && daemon start` never races the dying daemon's lockfile or its managed `lemond` umbrella. If teardown outlives the wait it falls back to `daemon: shutdown requested (still exiting, pid N)`. When `runtime.json` is missing (the IPC channel can't be opened because a stale daemon from an older version is holding the lockfile) pass `--force` (or `-f`) to fall back to a `SIGTERM` on the PID recorded in `daemon.pid`. The CLI auto-detects this state on every command and prints the exact `kill` / `--force` invocation needed. A `runtime.json` left behind by a crash — a handshake with no process holding the lock — is cleared by `stop` and `restart`, which then report `daemon: not running`.
 
 `daemon status --json` emits the raw `version` IPC response (the same `{name, version, protocol_version, pid, uptime_seconds, connections}` object an agent would get by hitting the UDS directly). The plain form is a human key/value block and is not a stable machine contract — agents should always use `--json`.
+
+### Run the daemon as a login service
+
+`daemon start --foreground` keeps the daemon under a supervisor instead of detaching, so a service manager can own its lifecycle and read its stdout. Combine it with `daemon.preload` in `config.yaml` and the daemon — plus the models you want waiting — comes up when you log in.
+
+**Linux: a systemd user unit.** Write `~/.config/systemd/user/llamastash.service`:
+
+```ini
+[Unit]
+Description=LlamaStash daemon
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/llamastash daemon start --foreground
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HF_HOME=%h/.cache/huggingface
+TimeoutStopSec=90
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+llamastash daemon stop                            # any daemon you started by hand first
+systemctl --user daemon-reload
+systemctl --user start llamastash.service
+systemctl --user status llamastash.service      # Main PID + the daemon's own log lines
+systemctl --user enable llamastash.service      # start at login
+loginctl enable-linger $USER                    # start at boot with no login session
+```
+
+Check linger took with `loginctl show-user $USER -p Linger` (`Linger=yes`). Without it the user manager only exists while you are logged in.
+
+- **Stop the daemon you started by hand before starting the unit.** Any client command (`status`, `list`, the TUI) auto-spawns a daemon, so one normally runs in the default state dir already. `daemon start --foreground` there prints `daemon: already running (pid N)` and exits 0. That is not a failure, so `Restart=on-failure` does not fire: the unit goes `active` then `inactive (dead)` at once, `preload` never runs, and `status` shows no Main PID. Stop the running daemon and start the unit again.
+
+- **A unit gets no shell profile.** No `.zshrc`, no `.profile`, so anything your login shell sets has to be an `Environment=` line: `PATH` (wherever `llamastash` and `llama-server` live), `HF_HOME` if your weights cache is not the default, and `LLAMASTASH_CONFIG_DIR` / `LLAMASTASH_STATE_DIR` / `LLAMASTASH_CACHE_DIR` if you keep them somewhere non-default. `%h` expands to your home directory.
+- **A client has to be pointed at the same state dir.** `llamastash status` reads `runtime.json` from the default state dir. If the unit sets `LLAMASTASH_STATE_DIR`, export the same value in your shell, otherwise the CLI talks to a different daemon and reports it as not running.
+- **Second daemon on the same machine?** A running daemon already holds proxy port `11435`, so give the service its own with `--proxy-port` next to `--foreground`, and its own state dir.
+- **Keep the default `KillMode` (`control-group`).** On `systemctl --user stop` the daemon's SIGTERM handler stops every launch — each gets a 5 s grace, raised to whatever floor that backend declares (a `backend.generic` entry can ask for more) — and anything still in the unit's cgroup goes with the unit, so no `llama-server` is orphaned. `TimeoutStopSec=90` is systemd's own default and leaves room for the slowest child; raise it only if a generic entry declares a longer stop grace.
+- **`Restart=on-failure`** brings a crashed daemon back (and a `kill -9`'d one). A clean `systemctl --user stop` is not a failure, so it stays down.
+
+Checked on systemd 262 with an isolated `LLAMASTASH_STATE_DIR` and `--proxy-port 11599`: the unit came up with its preloaded model `ready` and the model's server as a child inside the unit's cgroup; `systemctl --user stop` returned in well under a second with that child gone and `runtime.json` / `daemon.pid` removed; `kill -9` on the main PID was restarted (`NRestarts=1`).
+
+**macOS: a launchd agent.** Untested — it has not been run on a Mac, so treat it as a starting point, not a verified recipe. Write `~/Library/LaunchAgents/com.llamastash.daemon.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.llamastash.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/llamastash</string>
+    <string>daemon</string>
+    <string>start</string>
+    <string>--foreground</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HF_HOME</key>
+    <string>/Users/you/.cache/huggingface</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/you/Library/Logs/llamastash-daemon.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/you/Library/Logs/llamastash-daemon.log</string>
+</dict>
+</plist>
+```
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.llamastash.daemon.plist
+launchctl print gui/$(id -u)/com.llamastash.daemon      # state, last exit, stdout path
+launchctl bootout gui/$(id -u)/com.llamastash.daemon    # stop and unload
+```
+
+Like a systemd user unit, launchd does not read your shell profile, so `EnvironmentVariables` carries `PATH` and `HF_HOME`. `KeepAlive` is what restarts a crashed daemon, which also means `bootout` is the way to stop it — a bare `kill` would just be re-launched.
 
 ## MTP speculative decoding
 
@@ -1719,6 +1807,17 @@ These are the defaults. Override any binding via the `keybindings:` block in `co
 An HF-shaped tree that is *not* under the configured cache root (an rsynced backup, a restored archive) never gets the recursive removal — it falls back to per-file unlinking.
 
 Refusals: a running, loading or errored launch (stop it first), and Lemonade registry models (delete those through Lemonade — there is no local GGUF).
+
+### Terminal bell (on by default)
+
+One terminal bell — a bare `\a` on stderr — when something you are waiting on ends:
+
+- `llamastash pull` finishes or fails.
+- `llamastash start --wait` ends: ready, failed, the wait budget ran out, or the daemon went away.
+- A TUI download finishes or fails.
+- A launch you started in the TUI turns ready or fails. One bell per launch: the watch is bound to the id the daemon named, so a duplicate launch of a model that is already running rings when *its* instance comes up, not off the one already on screen.
+
+Nothing else rings: `preload` models, launches started from the CLI without `--wait` or from the proxy, and a TUI pull that finds every shard already cached, where there was nothing to wait for. A `llamastash pull` of a repo you already downloaded does ring, because the command you ran has to end either way. The bell never reaches a non-terminal stream, so piped and `--json` output stays clean. Set `bell: false` in `config.yaml` for silence.
 
 ### Mouse focus (opt-in)
 

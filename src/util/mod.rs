@@ -1,4 +1,5 @@
 pub mod atomic_write;
+pub mod bell;
 pub mod clipboard;
 pub mod config_patch;
 pub mod datetime;

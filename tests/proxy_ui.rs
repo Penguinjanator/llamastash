@@ -11,7 +11,6 @@
 #![cfg(feature = "test-fixtures")]
 
 use std::{
-  net::SocketAddr,
   path::{Path, PathBuf},
   sync::Arc,
   time::Duration,
@@ -25,15 +24,14 @@ use llamastash::daemon::shutdown::ShutdownToken;
 use llamastash::daemon::supervisor::{spawn as supervisor_spawn, ManagedSpawn, ManagedState};
 use llamastash::discovery::{DiscoveredModel, ModelCatalog, ModelSource};
 use llamastash::gguf::identity::ModelId;
-use llamastash::gguf::metadata::{ModeHint, ModelMetadata, Quant};
 use llamastash::launch::mode::LaunchMode;
 use llamastash::launch::params::LaunchParams;
-use llamastash::proxy::server::{loopback_addr, new_status_cell, serve, ProxyStatus, StatusCell};
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
+use llamastash::test_support::{
+  fake_metadata, header_value, http_get, http_post, shutdown_listener, spawn_listener,
+};
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::sleep;
 
 // --- helpers -------------------------------------------------------------
@@ -60,24 +58,6 @@ fn fast_probe() -> ProbeOptions {
   }
 }
 
-fn fake_metadata() -> ModelMetadata {
-  ModelMetadata {
-    arch: Some("llama".to_string()),
-    total_parameters: Some(7_000_000_000),
-    parameter_label: Some("7B".to_string()),
-    quant: Quant::Q4_K,
-    quant_label: None,
-    native_ctx: Some(8192),
-    chat_template: None,
-    tokenizer_kind: Some("llama".to_string()),
-    reasoning_hint: false,
-    mode_hint: ModeHint::Chat,
-    weights_bytes: Some(4_000_000_000),
-    lazy_tensor_bytes: Vec::new(),
-    mtp: None,
-  }
-}
-
 fn discovered(path: &str, display_label: Option<&str>) -> DiscoveredModel {
   let p = PathBuf::from(path);
   let parent = p.parent().unwrap().to_path_buf();
@@ -85,7 +65,7 @@ fn discovered(path: &str, display_label: Option<&str>) -> DiscoveredModel {
     path: p,
     parent,
     source: ModelSource::UserPath,
-    metadata: Some(fake_metadata()),
+    metadata: Some(fake_metadata("llama")),
     parse_error: None,
     split_siblings: Vec::new(),
     display_label: display_label.map(str::to_string),
@@ -149,44 +129,6 @@ async fn spawn_fake(
   model
 }
 
-async fn spawn_listener_with_state(
-  state: Arc<ProxyState>,
-) -> (SocketAddr, ShutdownToken, tokio::task::JoinHandle<()>) {
-  let token = ShutdownToken::new();
-  let status: StatusCell = new_status_cell();
-  let bind_addr = loopback_addr(0);
-  let token_for_task = token.clone();
-  let status_for_task = Arc::clone(&status);
-  let handle = tokio::spawn(async move {
-    serve(state, bind_addr, token_for_task, status_for_task)
-      .await
-      .expect("proxy serve returns Ok");
-  });
-  let bound = wait_for_listening(&status, Duration::from_secs(2))
-    .await
-    .expect("listener reaches Listening");
-  (bound, token, handle)
-}
-
-async fn shutdown_listener(shutdown: ShutdownToken, handle: tokio::task::JoinHandle<()>) {
-  shutdown.trigger();
-  tokio::time::timeout(Duration::from_secs(5), handle)
-    .await
-    .expect("proxy serve loop must exit after shutdown.trigger()")
-    .expect("proxy serve task must not panic");
-}
-
-async fn wait_for_listening(status: &StatusCell, budget: Duration) -> Option<SocketAddr> {
-  let deadline = std::time::Instant::now() + budget;
-  while std::time::Instant::now() < deadline {
-    if let ProxyStatus::Listening { addr, .. } = status.read().unwrap().clone() {
-      return Some(addr);
-    }
-    sleep(Duration::from_millis(10)).await;
-  }
-  None
-}
-
 async fn build_state(
   models: Vec<DiscoveredModel>,
   supervisors: SupervisorRegistry,
@@ -218,81 +160,6 @@ async fn build_state_with_cap(
     max_body_size,
     &Default::default(),
   )
-}
-
-/// Send a raw HTTP/1.1 GET and return `(status, headers, body)`. Does
-/// not follow redirects, so 3xx + `Location` are observable.
-async fn http_get(
-  addr: SocketAddr,
-  path: &str,
-  extra_headers: &[(&str, &str)],
-) -> (u16, Vec<(String, String)>, Vec<u8>) {
-  let mut sock = TcpStream::connect(addr).await.expect("connect");
-  let mut req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
-  for (k, v) in extra_headers {
-    req.push_str(&format!("{k}: {v}\r\n"));
-  }
-  req.push_str("\r\n");
-  sock.write_all(req.as_bytes()).await.expect("write");
-  let mut buf = Vec::new();
-  sock.read_to_end(&mut buf).await.expect("read");
-  parse_response(&buf)
-}
-
-/// Send a raw HTTP/1.1 POST and return `(status, headers, body)`. Closes
-/// the connection after.
-async fn http_post(
-  addr: SocketAddr,
-  path: &str,
-  body: &str,
-  extra_headers: &[(&str, &str)],
-) -> (u16, Vec<(String, String)>, Vec<u8>) {
-  let mut sock = TcpStream::connect(addr).await.expect("connect");
-  let mut req = format!(
-    "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n",
-    body.len()
-  );
-  for (k, v) in extra_headers {
-    req.push_str(&format!("{k}: {v}\r\n"));
-  }
-  req.push_str("\r\n");
-  req.push_str(body);
-  sock.write_all(req.as_bytes()).await.expect("write");
-  let mut buf = Vec::new();
-  sock.read_to_end(&mut buf).await.expect("read");
-  parse_response(&buf)
-}
-
-fn parse_response(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
-  let needle = b"\r\n\r\n";
-  let split = buf
-    .windows(needle.len())
-    .position(|w| w == needle)
-    .expect("CRLFCRLF terminator");
-  let head = std::str::from_utf8(&buf[..split]).expect("utf8 headers");
-  let mut lines = head.split("\r\n");
-  let status_line = lines.next().expect("status line");
-  let status: u16 = status_line
-    .split_whitespace()
-    .nth(1)
-    .expect("status code")
-    .parse()
-    .expect("parse status");
-  let mut headers = Vec::new();
-  for l in lines {
-    if let Some((k, v)) = l.split_once(':') {
-      headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
-    }
-  }
-  let body = buf[split + needle.len()..].to_vec();
-  (status, headers, body)
-}
-
-fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-  headers
-    .iter()
-    .find(|(k, _)| k == name)
-    .map(|(_, v)| v.as_str())
 }
 
 /// Standard base64 (padded) — the test crate doesn't pull the `base64`
@@ -335,11 +202,11 @@ async fn get_ui_redirects_to_slash() {
     None,
   )
   .await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, headers, _body) = http_get(addr, "/ui", &[]).await;
   assert_eq!(status, 302, "GET /ui must 302 to the trailing-slash form");
-  assert_eq!(header(&headers, "location"), Some("/ui/"));
+  assert_eq!(header_value(&headers, "location"), Some("/ui/"));
 
   let _ = model.stop(Duration::from_secs(3)).await;
   shutdown_listener(shutdown, handle).await;
@@ -358,7 +225,7 @@ async fn single_running_serves_ui_and_forwards_paths() {
     None,
   )
   .await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   // `/ui/` strips to `/` → the backend's web-UI index.
   let (status, _h, body) = http_get(addr, "/ui/", &[]).await;
@@ -401,7 +268,7 @@ async fn ui_post_body_over_cap_returns_413() {
     1024,
   )
   .await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   // A body just over the cap: `forward_ui` buffers it under the cap
   // before forwarding, so the 413 fires here, not upstream.
@@ -442,7 +309,7 @@ async fn two_running_shows_chooser_then_cookie_pins() {
     None,
   )
   .await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   // Two running, no cookie → the chooser, linking each backend.
   let (status, _h, body) = http_get(addr, "/ui/", &[]).await;
@@ -455,8 +322,8 @@ async fn two_running_shows_chooser_then_cookie_pins() {
   // Clicking a chooser link sets the pin cookie and 302s back to `/ui/`.
   let (status, headers, _b) = http_get(addr, "/ui/?target=L2", &[]).await;
   assert_eq!(status, 302);
-  assert_eq!(header(&headers, "location"), Some("/ui/"));
-  let set_cookie = header(&headers, "set-cookie").expect("set-cookie present");
+  assert_eq!(header_value(&headers, "location"), Some("/ui/"));
+  let set_cookie = header_value(&headers, "set-cookie").expect("set-cookie present");
   assert!(
     set_cookie.contains("ls_ui_target=L2") && set_cookie.contains("Path=/ui"),
     "unexpected Set-Cookie: {set_cookie}"
@@ -500,11 +367,11 @@ async fn zero_running_serves_no_model_page() {
   let dir = unique_temp("empty");
   let registry = SupervisorRegistry::new();
   let state = build_state(Vec::new(), registry, None).await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   let (status, headers, body) = http_get(addr, "/ui/", &[]).await;
   assert_eq!(status, 200, "zero running must be a page, not a 500");
-  assert!(header(&headers, "content-type")
+  assert!(header_value(&headers, "content-type")
     .unwrap_or("")
     .contains("text/html"));
   let text = String::from_utf8(body).expect("utf8 body");
@@ -527,12 +394,12 @@ async fn auth_enforced_ui_challenges_basic_and_accepts_credentials() {
     Some(key),
   )
   .await;
-  let (addr, shutdown, handle) = spawn_listener_with_state(state).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
 
   // No credential → 401 carrying a *Basic* challenge so a browser prompts.
   let (status, headers, _b) = http_get(addr, "/ui/", &[]).await;
   assert_eq!(status, 401);
-  let challenge = header(&headers, "www-authenticate").unwrap_or("");
+  let challenge = header_value(&headers, "www-authenticate").unwrap_or("");
   assert!(
     challenge.starts_with("Basic"),
     "expected a Basic challenge, got: {challenge:?}"

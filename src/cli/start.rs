@@ -210,6 +210,7 @@ pub async fn handle(args: StartArgs, cli: &Cli, config: &Config) -> CliResult {
       &resp,
       args.json,
       cli.quiet,
+      config.bell,
     )
     .await;
   }
@@ -229,6 +230,7 @@ async fn wait_and_emit(
   resp: &Value,
   json: bool,
   quiet: bool,
+  bell: bool,
 ) -> CliResult {
   use crate::cli::resolve::{fetch_status, running_index};
 
@@ -245,8 +247,17 @@ async fn wait_and_emit(
   // actuals before settling — otherwise `--wait` prints `ctx=—`.
   let mut ready_since: Option<std::time::Instant> = None;
   let actuals_grace = std::time::Duration::from_secs(5);
+  // A daemon that dies mid-wait still ends the wait, so the bell still rings
+  // before the error surfaces.
+  let mut poll_error: Option<CliExit> = None;
   while std::time::Instant::now() < deadline {
-    let snap = fetch_status(client).await?;
+    let snap = match fetch_status(client).await {
+      Ok(snap) => snap,
+      Err(e) => {
+        poll_error = Some(e);
+        break;
+      }
+    };
     let index = running_index(&snap.models);
     // Prefer the launch_id match; fall back to the model path (a daemon
     // build without launch_id on the row still resolves by path).
@@ -277,6 +288,17 @@ async fn wait_and_emit(
       }
     }
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+  }
+
+  // The wait is what the user walked away from, so it ends with the bell like a
+  // pull does, whatever it ended on.
+  crate::util::bell::ring_after_wait(bell, json, &mut crate::util::bell::tty_sink());
+  if let Some(e) = poll_error {
+    // The daemon went away: report that and stop. The follow-up below would read
+    // as a timeout that never happened, pointing at `llamastash status` for a
+    // daemon that is gone, and `--json` would carry `"state": null` exactly as
+    // the 900 s budget does.
+    return Err(e);
   }
 
   let failed = matches!(settled.as_ref().map(|r| r.state.as_str()), Some("error"));

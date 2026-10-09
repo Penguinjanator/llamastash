@@ -513,6 +513,26 @@ fn build_tui_fetch_client(offline: bool) -> crate::init::fetch::FetchClient {
 /// queued pull when the active one finishes / errors / hits the
 /// cache; surfaces a toast when a cache-hit short-circuit lands.
 pub fn apply_download_event(app: &mut App, evt: crate::tui::download_strip::DownloadEvent) {
+  // Only the two ending arms ring, so only they pay for a sink. `Progress`
+  // arrives once per HTTP chunk and would otherwise take a `is_terminal` ioctl
+  // and a boxed writer on every frame.
+  match evt {
+    crate::tui::download_strip::DownloadEvent::Finished { .. }
+    | crate::tui::download_strip::DownloadEvent::Error { .. } => {
+      let mut sink = crate::util::bell::tty_sink();
+      apply_download_event_to(app, evt, &mut sink)
+    }
+    _ => apply_download_event_to(app, evt, &mut std::io::sink()),
+  }
+}
+
+/// [`apply_download_event`] with the bell writer handed in, so the rings that
+/// end a download are testable (a run is never a terminal under a test runner).
+pub fn apply_download_event_to(
+  app: &mut App,
+  evt: crate::tui::download_strip::DownloadEvent,
+  bell_sink: &mut dyn std::io::Write,
+) {
   use crate::tui::download_strip::DownloadEvent;
   let next_pull = match evt {
     DownloadEvent::Started {
@@ -543,9 +563,13 @@ pub fn apply_download_event(app: &mut App, evt: crate::tui::download_strip::Down
       if let Some(name) = label {
         app.show_toast(format!("downloaded {name}"));
       }
+      let _ = crate::util::bell::ring_into(app.options.bell, bell_sink);
       next
     }
-    DownloadEvent::Error { repo_id, message } => app.download_strip.apply_error(&repo_id, message),
+    DownloadEvent::Error { repo_id, message } => {
+      let _ = crate::util::bell::ring_into(app.options.bell, bell_sink);
+      app.download_strip.apply_error(&repo_id, message)
+    }
     DownloadEvent::AlreadyCached {
       repo_id,
       cached_path,
@@ -635,6 +659,69 @@ mod tests {
 
   fn key(code: KeyCode, mods: KeyModifiers) -> TermEvent {
     TermEvent::Key(KeyEvent::new(code, mods))
+  }
+
+  #[test]
+  fn the_download_strip_rings_only_on_the_ends_that_end_a_wait() {
+    use crate::tui::app::AppOptions;
+    use crate::tui::download_strip::DownloadEvent;
+    let finished = || DownloadEvent::Finished {
+      repo_id: "repo/x".into(),
+    };
+
+    let mut rang: Vec<u8> = Vec::new();
+    apply_download_event_to(&mut App::new(AppOptions::default()), finished(), &mut rang);
+    assert_eq!(
+      rang, b"\x07",
+      "a finished download is what the user waited for"
+    );
+
+    let mut failed_ring: Vec<u8> = Vec::new();
+    apply_download_event_to(
+      &mut App::new(AppOptions::default()),
+      DownloadEvent::Error {
+        repo_id: "repo/x".into(),
+        message: "403 gated repo".into(),
+      },
+      &mut failed_ring,
+    );
+    assert_eq!(
+      failed_ring, b"\x07",
+      "a failed one ends the wait just as hard"
+    );
+
+    let mut quiet: Vec<u8> = Vec::new();
+    let mut running = App::new(AppOptions::default());
+    apply_download_event_to(
+      &mut running,
+      DownloadEvent::Progress {
+        repo_id: "repo/x".into(),
+        bytes_done: 10,
+        bytes_total: 100,
+        transferred: 10,
+      },
+      &mut quiet,
+    );
+    apply_download_event_to(
+      &mut running,
+      DownloadEvent::AlreadyCached {
+        repo_id: "repo/x".into(),
+        cached_path: std::path::PathBuf::from("/cache/x.gguf"),
+      },
+      &mut quiet,
+    );
+    assert!(quiet.is_empty(), "mid-flight and a cache hit were no wait");
+
+    let mut off: Vec<u8> = Vec::new();
+    apply_download_event_to(
+      &mut App::new(AppOptions {
+        bell: false,
+        ..AppOptions::default()
+      }),
+      finished(),
+      &mut off,
+    );
+    assert!(off.is_empty(), "bell: false is silence");
   }
 
   #[test]
