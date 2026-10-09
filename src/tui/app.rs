@@ -78,13 +78,22 @@ const RECENT_LIST_CAP: usize = 5;
 /// which never happened stops waiting before the next launch of that model.
 const BELL_WATCH_MAX_MISSES: u32 = 8;
 
-/// One launch this TUI started, waiting for its bell. `misses` counts ticks
-/// seen with no row for `path`; such a watch expires after
-/// `BELL_WATCH_MAX_MISSES` of them.
+/// One launch this TUI started, waiting for its bell.
+///
+/// Rows are matched by path, and the same model can hold several rows, so a
+/// watch also carries what it knows about the launch:
+/// * `known`: the launch ids on screen when the launch was queued. Those rows
+///   predate it, so they can never be its end.
+/// * `launch_id`: the id the daemon named in its `start_model` reply, once that
+///   arrives. Until then any row for the path that is not `known` is a
+///   candidate, which is why `misses` (ticks with no candidate) still expires a
+///   watch whose launch never appeared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BellWatch {
   pub path: PathBuf,
   pub misses: u32,
+  pub known: Vec<String>,
+  pub launch_id: Option<String>,
 }
 
 impl BellWatch {
@@ -93,7 +102,18 @@ impl BellWatch {
     Self {
       path: path.into(),
       misses: 0,
+      known: Vec::new(),
+      launch_id: None,
     }
+  }
+
+  /// The rows this watch may still consider its own launch.
+  fn candidate(&self, row: &ManagedRow) -> bool {
+    row.path == self.path
+      && match &self.launch_id {
+        Some(id) => row.launch_id == *id,
+        None => !self.known.contains(&row.launch_id),
+      }
   }
 }
 
@@ -929,12 +949,39 @@ impl App {
       .any(|b| b != crate::backend::DEFAULT_BACKEND_ID)
   }
 
+  /// Queue the bell for a launch this TUI is about to send, remembering the
+  /// rows already on screen for that path. Those belong to earlier launches:
+  /// without this a duplicate launch of a running model would ring a second
+  /// after the keystroke off the old Ready row and stay quiet at its own end.
+  pub fn queue_bell_watch(&mut self, path: impl Into<PathBuf>) {
+    let path = path.into();
+    self.bell_watch.push(BellWatch {
+      known: self
+        .managed
+        .iter()
+        .filter(|row| row.path == path)
+        .map(|row| row.launch_id.clone())
+        .collect(),
+      ..BellWatch::waiting(path)
+    });
+  }
+
+  /// Name the launch a queued bell belongs to, from the daemon's `start_model`
+  /// reply. Oldest unbound watch first: the writer answers in dispatch order.
+  pub fn bind_bell_watch(&mut self, launch_id: &str) {
+    if let Some(watch) = self.bell_watch.iter_mut().find(|w| w.launch_id.is_none()) {
+      watch.launch_id = Some(launch_id.to_string());
+      watch.misses = 0;
+    }
+  }
+
   /// Bell bookkeeping for one status tick. Rings once per watched launch whose
-  /// row reached a terminal load state, and keeps the rest. A watch with no row
-  /// at all ages: a start the daemon refused or never received, or a launch
-  /// stopped mid-load, has no row to turn terminal, so it expires instead of
-  /// ringing for some later launch of the same model. Pure, because `ring`
-  /// writes to the process's own stderr and is a no-op in a test run.
+  /// own row reached a terminal load state, and keeps the rest. A watch with no
+  /// candidate row ages: a start the daemon refused, one that never reached the
+  /// daemon, or one whose reply never came back has no row of its own to turn
+  /// terminal, so it expires instead of ringing for some later launch of the
+  /// same model. Pure, because `ring` writes to the process's own stderr and is
+  /// a no-op in a test run.
   fn bell_tick(watch: &[BellWatch], rows: &[ManagedRow]) -> (Vec<BellWatch>, usize) {
     let mut keep: Vec<BellWatch> = Vec::with_capacity(watch.len());
     let mut claimed: Vec<usize> = Vec::with_capacity(watch.len());
@@ -942,7 +989,7 @@ impl App {
     for entry in watch {
       let hit = rows.iter().enumerate().find(|(i, row)| {
         !claimed.contains(i)
-          && row.path == entry.path
+          && entry.candidate(row)
           && matches!(row.state, SurfaceState::Ready | SurfaceState::Error)
       });
       if let Some((i, _)) = hit {
@@ -950,18 +997,18 @@ impl App {
         fired += 1;
         continue;
       }
-      if rows.iter().any(|row| row.path == entry.path) {
+      if rows.iter().any(|row| entry.candidate(row)) {
         // Still loading: keep waiting. A row on screen is proof the launch is
         // real, so the clock restarts and a later disappearance gets its own
         // full grace.
         keep.push(BellWatch {
-          path: entry.path.clone(),
           misses: 0,
+          ..entry.clone()
         });
       } else if entry.misses + 1 < BELL_WATCH_MAX_MISSES {
         keep.push(BellWatch {
-          path: entry.path.clone(),
           misses: entry.misses + 1,
+          ..entry.clone()
         });
       }
     }
@@ -3604,38 +3651,126 @@ mod tests {
   }
 
   #[test]
-  fn a_watch_with_no_row_expires_instead_of_ringing_for_someone_else() {
-    // A start the daemon refused, or a launch stopped before it turned Ready,
-    // has no row to go terminal on. Without an expiry that path keeps its watch
-    // and rings when a later CLI or `preload` launch of the same model appears.
-    let watch = vec![crate::tui::app::BellWatch::waiting("/m/qwen.gguf")];
+  fn a_watch_never_claims_a_row_that_predates_its_launch() {
+    // The duplicate-launch case: the model is already Ready from an earlier
+    // launch, and the user launches it again. A watch matched on path alone
+    // would ring a second after the keystroke off the old Ready row and then
+    // stay quiet when the launch it belongs to finally comes up.
+    let mut app = App::new(AppOptions::default());
+    let old_ready = serde_json::json!({
+      "models": [{
+        "launch_id": "L-old",
+        "id": { "path": "/m/a.gguf", "header_hash": "h" },
+        "port": 41100,
+        "state": { "state": "ready" },
+      }]
+    });
+    app.ingest_status(&old_ready);
+    app.queue_bell_watch("/m/a.gguf");
+    assert_eq!(
+      app.bell_watch[0].known,
+      vec!["L-old".to_string()],
+      "the rows on screen at dispatch are excluded from the start"
+    );
+    app.ingest_status(&old_ready);
+    assert_eq!(
+      app.bell_watch.len(),
+      1,
+      "a Ready row that predates the launch is not its end"
+    );
+
+    // The daemon names the launch in its reply; only that row can satisfy the
+    // watch now, even though it is for the same path.
+    app.bind_bell_watch("L-new");
+    let both_ready = serde_json::json!({
+      "models": [
+        {
+          "launch_id": "L-old",
+          "id": { "path": "/m/a.gguf", "header_hash": "h" },
+          "port": 41100,
+          "state": { "state": "ready" },
+        },
+        {
+          "launch_id": "L-new",
+          "id": { "path": "/m/a.gguf", "header_hash": "h" },
+          "port": 41101,
+          "state": { "state": "ready" },
+        }
+      ]
+    });
+    app.ingest_status(&both_ready);
+    assert!(
+      app.bell_watch.is_empty(),
+      "its own Ready row rings, and the old row did not consume the watch"
+    );
+  }
+
+  #[test]
+  fn a_bound_watch_ignores_another_launch_of_the_same_model() {
+    // The stuck-launch case: this watch's row is still loading, so the watch
+    // stays, but a different launch turning Ready must not spend it.
+    use crate::tui::app::BellWatch;
+    // `ready_managed` names a row after its port, so this watch is bound to the
+    // 41100 launch and the 41101 one belongs to someone else.
+    let watch = vec![BellWatch {
+      launch_id: Some("L-41100".into()),
+      ..BellWatch::waiting("/m/a.gguf")
+    }];
+    let rows = vec![
+      ready_managed("/m/a.gguf", 41100, SurfaceState::Loading),
+      ready_managed("/m/a.gguf", 41101, SurfaceState::Ready),
+    ];
+    let (still, fired) = App::bell_tick(&watch, &rows);
+    assert_eq!(fired, 0, "that Ready row belongs to another launch");
+    assert_eq!(still, watch, "its own loading row holds the watch open");
+
+    let mine_now_ready = vec![
+      ready_managed("/m/a.gguf", 41100, SurfaceState::Ready),
+      ready_managed("/m/a.gguf", 41101, SurfaceState::Ready),
+    ];
+    let (still_after, rings) = App::bell_tick(&watch, &mine_now_ready);
+    assert_eq!(rings, 1);
+    assert!(still_after.is_empty());
+  }
+
+  #[test]
+  fn a_watch_with_no_candidate_dies_on_the_eighth_miss() {
+    // Pinned to BELL_WATCH_MAX_MISSES so the boundary is a fact in the suite and
+    // not an off-by-one nobody checked.
     let unrelated = [ready_managed("/m/other.gguf", 41101, SurfaceState::Ready)];
-    let mut pending = watch;
-    for _ in 0..16 {
+    let mut pending = vec![BellWatch::waiting("/m/qwen.gguf")];
+    for tick in 1..8 {
       let (aging, fired) = App::bell_tick(&pending, &unrelated);
       assert_eq!(fired, 0, "an unwatched model's Ready row never rings");
+      assert_eq!(
+        aging,
+        vec![BellWatch {
+          misses: tick,
+          ..BellWatch::waiting("/m/qwen.gguf")
+        }],
+        "tick {tick}: one more miss"
+      );
       pending = aging;
-      if pending.is_empty() {
-        break;
-      }
     }
-    assert!(
-      pending.is_empty(),
-      "a watch with no row must expire, not outlive its launch"
-    );
-    // A row appearing at all resets the clock, so a slow start is not cut off.
-    let (keep, _) = App::bell_tick(
-      &[crate::tui::app::BellWatch {
-        path: PathBuf::from("/m/qwen.gguf"),
-        misses: 1,
-      }],
-      &[ready_managed("/m/qwen.gguf", 41100, SurfaceState::Loading)],
-    );
-    assert_eq!(
-      keep,
-      vec![crate::tui::app::BellWatch::waiting("/m/qwen.gguf")],
-      "a watch with a row does not age"
-    );
+    let (aging, fired) = App::bell_tick(&pending, &unrelated);
+    assert_eq!(fired, 0);
+    assert!(aging.is_empty(), "the eighth miss with no row is the last");
+  }
+
+  #[test]
+  fn a_bell_off_tui_leaves_its_watches_alone() {
+    // The gate covers the whole bookkeeping, expiry included: nothing rings, so
+    // nothing ages either.
+    let mut app = App::new(AppOptions {
+      bell: false,
+      ..AppOptions::default()
+    });
+    app.bell_watch = vec![crate::tui::app::BellWatch::waiting("/m/qwen.gguf")];
+    let before = app.bell_watch.clone();
+    for _ in 0..20 {
+      app.ingest_status(&serde_json::json!({ "models": [] }));
+    }
+    assert_eq!(app.bell_watch, before);
   }
 
   #[test]
@@ -3689,8 +3824,8 @@ mod tests {
     assert_eq!(
       keep,
       vec![crate::tui::app::BellWatch {
-        path: PathBuf::from("/m/gone.gguf"),
         misses: 1,
+        ..BellWatch::waiting("/m/gone.gguf")
       }],
       "only the missing row ages"
     );

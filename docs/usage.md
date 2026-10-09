@@ -1774,7 +1774,7 @@ One terminal bell — a bare `\a` on stderr — when something you are waiting o
 
 - `llamastash pull` finishes or fails.
 - A TUI download finishes or fails.
-- A launch you started in the TUI turns ready or fails. One bell per launch, on the first status tick that reports the end.
+- A launch you started in the TUI turns ready or fails. One bell per launch: the watch is bound to the id the daemon named, so a duplicate launch of a model that is already running rings when *its* instance comes up, not off the one already on screen.
 
 Nothing else rings: `preload` models, launches started from the CLI or the proxy, and a TUI pull that finds every shard already cached, where there was nothing to wait for. A `llamastash pull` of a repo you already downloaded does ring, because the command you ran has to end either way. The bell never reaches a non-terminal stream, so piped and `--json` output stays clean. Set `bell: false` in `config.yaml` for silence.
 

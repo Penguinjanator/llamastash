@@ -1884,9 +1884,7 @@ fn dispatch_launch(
     Some(tx) => match tx.try_send(cmd) {
       Ok(()) => {
         if let Some(path) = pending_bell {
-          app
-            .bell_watch
-            .push(crate::tui::app::BellWatch::waiting(path));
+          app.queue_bell_watch(path);
         }
         app.show_toast(format!("launching {name}…"));
         app.close_launch_picker();
@@ -1998,6 +1996,12 @@ pub enum RefreshTick {
   WriterInfo {
     message: String,
   },
+  /// The daemon accepted a `start_model` and named the launch. Binds the bell
+  /// watch that dispatch queued, so it rings for that row and not for another
+  /// launch of the same model.
+  StartAccepted {
+    launch_id: String,
+  },
 }
 
 pub fn spawn_refresher(socket: PathBuf, tx: mpsc::Sender<Event>) {
@@ -2040,6 +2044,12 @@ pub fn spawn_refresher(socket: PathBuf, tx: mpsc::Sender<Event>) {
       }
     }
   });
+}
+
+/// The launch id a successful `start_model` names, if it names one. This is the
+/// only thing that ties a bell watch to the row it is waiting for.
+fn start_accepted_launch_id(resp: &serde_json::Value) -> Option<String> {
+  Some(resp.get("launch_id").and_then(|v| v.as_str())?.to_string())
 }
 
 /// Bound on outstanding writer commands. The TUI dispatches at human
@@ -2109,6 +2119,15 @@ pub fn spawn_writer(
         // of R6 / D-admission. Other methods carry no warnings.
         Ok(resp) => {
           if method == "start_model" {
+            if let Some(id) = start_accepted_launch_id(&resp) {
+              if let Some(fb) = &feedback {
+                let _ = fb
+                  .send(Event::Refresh(RefreshTick::StartAccepted {
+                    launch_id: id.to_string(),
+                  }))
+                  .await;
+              }
+            }
             if let Some(ws) = resp.get("warnings").and_then(|v| v.as_array()) {
               let joined = ws
                 .iter()
@@ -2619,11 +2638,14 @@ fn apply_refresh(app: &mut App, tick: RefreshTick) {
     RefreshTick::Disconnected => {
       app.daemon_connected = false;
     }
+    RefreshTick::StartAccepted { launch_id } => {
+      app.bind_bell_watch(launch_id.as_str());
+    }
     RefreshTick::WriterError { method, message } => {
       // A refused start produces no row to watch, so its bell watch would hang
-      // around. The error carries no path, so nothing is dropped here: the watch
-      // ages out in `App::bell_tick` while launches from the same batch that did
-      // start keep theirs.
+      // around. The error carries no path, so nothing is dropped here: that watch
+      // never binds and ages out in `App::bell_tick`, while launches from the same
+      // batch that did start keep theirs.
       app.show_error_toast(writer_error_toast(method, &message));
     }
     RefreshTick::WriterInfo { message } => {
@@ -3628,6 +3650,45 @@ mod tests {
       "qwen".into(),
     );
     assert_eq!(app.bell_watch, Vec::<BellWatch>::new(), "bell: false");
+  }
+
+  #[test]
+  fn a_start_reply_without_a_launch_id_binds_nothing() {
+    assert_eq!(
+      start_accepted_launch_id(&serde_json::json!({ "launch_id": "L-7" })).as_deref(),
+      Some("L-7")
+    );
+    assert_eq!(
+      start_accepted_launch_id(&serde_json::json!({ "warnings": [] })),
+      None,
+      "a reply with no id leaves the watch on its dispatch snapshot"
+    );
+  }
+
+  #[test]
+  fn the_daemon_reply_binds_the_queued_bell_watch() {
+    // The reply names the launch, which is what stops the watch from being
+    // satisfied by a row that was already there or by a later launch.
+    let mut app = App::new(crate::tui::app::AppOptions::default());
+    app.queue_bell_watch("/m/qwen.gguf");
+    apply_refresh(
+      &mut app,
+      RefreshTick::StartAccepted {
+        launch_id: "L-7".into(),
+      },
+    );
+    assert_eq!(app.bell_watch[0].launch_id.as_deref(), Some("L-7"));
+    apply_refresh(
+      &mut app,
+      RefreshTick::StartAccepted {
+        launch_id: "L-8".into(),
+      },
+    );
+    assert_eq!(
+      app.bell_watch[0].launch_id.as_deref(),
+      Some("L-7"),
+      "a watch that is already named keeps its id"
+    );
   }
 
   #[test]
