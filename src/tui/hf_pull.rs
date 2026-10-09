@@ -513,7 +513,17 @@ fn build_tui_fetch_client(offline: bool) -> crate::init::fetch::FetchClient {
 /// queued pull when the active one finishes / errors / hits the
 /// cache; surfaces a toast when a cache-hit short-circuit lands.
 pub fn apply_download_event(app: &mut App, evt: crate::tui::download_strip::DownloadEvent) {
-  apply_download_event_to(app, evt, &mut crate::util::bell::tty_sink())
+  // Only the two ending arms ring, so only they pay for a sink. `Progress`
+  // arrives once per HTTP chunk and would otherwise take a `is_terminal` ioctl
+  // and a boxed writer on every frame.
+  match evt {
+    crate::tui::download_strip::DownloadEvent::Finished { .. }
+    | crate::tui::download_strip::DownloadEvent::Error { .. } => {
+      let mut sink = crate::util::bell::tty_sink();
+      apply_download_event_to(app, evt, &mut sink)
+    }
+    _ => apply_download_event_to(app, evt, &mut std::io::sink()),
+  }
 }
 
 /// [`apply_download_event`] with the bell writer handed in, so the rings that
