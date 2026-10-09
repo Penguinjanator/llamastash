@@ -1815,9 +1815,13 @@ mod tests {
     let link = config_dir.join("config.yaml");
     symlink(&real, &link).unwrap();
 
+    // The plan reports the canonical chain it walked, and a temp root reached
+    // through a symlink is not that string. macOS is always like this: its
+    // `temp_dir()` is `/tmp`, which resolves to `/private/tmp`.
+    let open_canonical = std::fs::canonicalize(&open).unwrap();
     assert_eq!(
       chmod_plan(&link).expect("plan").blocked.map(|(d, _)| d),
-      Some(open.clone()),
+      Some(open_canonical),
       "the blocking dir is the one the link lands in"
     );
     let fix = fix_config_mode(&link, false);
