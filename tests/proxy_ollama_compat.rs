@@ -18,7 +18,7 @@
 #![cfg(feature = "test-fixtures")]
 
 use std::{
-  net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener},
+  net::SocketAddr,
   path::{Path, PathBuf},
   sync::Arc,
   time::Duration,
@@ -57,8 +57,7 @@ fn unique_temp_dir(label: &str) -> PathBuf {
 
 #[allow(dead_code)]
 fn pick_free_port() -> u16 {
-  let l = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral");
-  l.local_addr().expect("local_addr").port()
+  llamastash::test_support::allocate_port_range(1).start
 }
 
 async fn http_get(addr: SocketAddr, path: &str) -> (u16, Vec<u8>) {

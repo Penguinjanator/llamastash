@@ -55,8 +55,7 @@ fn unique_temp(label: &str) -> PathBuf {
 }
 
 fn allocate_port() -> u16 {
-  let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-  l.local_addr().unwrap().port()
+  llamastash::test_support::allocate_port_range(1).start
 }
 
 fn fake_binary() -> PathBuf {
@@ -207,10 +206,6 @@ async fn proxy_state_with_aliases(
 // --- happy paths --------------------------------------------------------
 
 /// A bare `GET` against the test proxy, `(status, headers, body)`.
-async fn http_get(addr: SocketAddr, path: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
-  llamastash::test_support::http_get(addr, path, &[]).await
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chat_completion_streams_back_byte_identical() {
   let dir = unique_temp("chat");
@@ -572,7 +567,7 @@ async fn proxy_alias_reaches_the_model_it_names() {
   );
 
   // And it stays off the listings: `/v1/models` is one row per model.
-  let (status, _h, listing) = http_get(addr, "/v1/models").await;
+  let (status, _h, listing) = llamastash::test_support::http_get(addr, "/v1/models", &[]).await;
   assert_eq!(status, 200);
   let text = String::from_utf8(listing).expect("utf8 listing");
   assert!(

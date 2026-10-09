@@ -176,10 +176,6 @@ async fn http_post(
 }
 
 /// A bare `GET` against the test proxy, `(status, headers, body)`.
-async fn http_get(addr: SocketAddr, path: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
-  llamastash::test_support::http_get(addr, path, &[]).await
-}
-
 async fn stop_all(ctx: &MethodContext, extras: &[ManagedModel]) {
   let snap = ctx.supervisors.snapshot().await;
   let mut stopped_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
@@ -924,7 +920,7 @@ async fn v1_models_lists_named_row_while_live_and_drops_after_stop() {
   assert_eq!(status, 200, "named auto-start must succeed");
 
   // /v1/models must list the named row `qwen3@coder`.
-  let (status, _, resp) = http_get(addr, "/v1/models").await;
+  let (status, _, resp) = llamastash::test_support::http_get(addr, "/v1/models", &[]).await;
   assert_eq!(status, 200);
   let v: serde_json::Value = serde_json::from_slice(&resp).expect("json");
   let ids: Vec<&str> = v["data"]
@@ -943,7 +939,7 @@ async fn v1_models_lists_named_row_while_live_and_drops_after_stop() {
   tokio::time::sleep(Duration::from_millis(1000)).await;
 
   // /v1/models must no longer list the named row.
-  let (status, _, resp) = http_get(addr, "/v1/models").await;
+  let (status, _, resp) = llamastash::test_support::http_get(addr, "/v1/models", &[]).await;
   assert_eq!(status, 200);
   let v: serde_json::Value = serde_json::from_slice(&resp).expect("json");
   let ids: Vec<&str> = v["data"]

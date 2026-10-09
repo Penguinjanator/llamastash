@@ -46,8 +46,7 @@ fn unique_temp(label: &str) -> PathBuf {
 }
 
 fn allocate_port() -> u16 {
-  let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-  l.local_addr().unwrap().port()
+  llamastash::test_support::allocate_port_range(1).start
 }
 
 fn fast_probe() -> ProbeOptions {
