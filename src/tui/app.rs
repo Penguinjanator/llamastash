@@ -1099,8 +1099,12 @@ impl App {
       if self.options.bell {
         let (keep, fired) = Self::bell_tick(&self.bell_watch, &self.managed);
         self.bell_watch = keep;
-        for _ in 0..fired {
-          crate::util::bell::ring();
+        if fired > 0 {
+          // One sink for the tick, not one per ring.
+          let mut sink = crate::util::bell::tty_sink();
+          for _ in 0..fired {
+            let _ = crate::util::bell::ring_into(true, &mut sink);
+          }
         }
       }
     } else {
