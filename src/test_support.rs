@@ -304,14 +304,27 @@ pub async fn spawn_listener(
   crate::daemon::shutdown::ShutdownToken,
   tokio::task::JoinHandle<()>,
 ) {
-  use crate::proxy::server::{loopback_addr, new_status_cell, serve};
+  spawn_listener_with_options(state, crate::proxy::server::ServeOptions::default()).await
+}
+
+/// The same listener with explicit `ServeOptions`, for the suites that
+/// exercise a non-default serve knob (a short header-read timeout).
+pub async fn spawn_listener_with_options(
+  state: std::sync::Arc<crate::proxy::state::ProxyState>,
+  options: crate::proxy::server::ServeOptions,
+) -> (
+  std::net::SocketAddr,
+  crate::daemon::shutdown::ShutdownToken,
+  tokio::task::JoinHandle<()>,
+) {
+  use crate::proxy::server::{loopback_addr, new_status_cell, serve_with_options};
   let token = crate::daemon::shutdown::ShutdownToken::new();
   let status = new_status_cell();
   let bind_addr = loopback_addr(0);
   let token_for_task = token.clone();
   let status_for_task = std::sync::Arc::clone(&status);
   let handle = tokio::spawn(async move {
-    serve(state, bind_addr, token_for_task, status_for_task)
+    serve_with_options(state, bind_addr, token_for_task, status_for_task, options)
       .await
       .expect("proxy serve returns Ok");
   });
