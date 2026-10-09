@@ -290,6 +290,17 @@ async fn wait_and_emit(
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
   }
 
+  // The wait is what the user walked away from, so it ends with the bell like a
+  // pull does, whatever it ended on.
+  crate::util::bell::ring_after_wait(bell, json, &mut crate::util::bell::tty_sink());
+  if let Some(e) = poll_error {
+    // The daemon went away: report that and stop. The follow-up below would read
+    // as a timeout that never happened, pointing at `llamastash status` for a
+    // daemon that is gone, and `--json` would carry `"state": null` exactly as
+    // the 900 s budget does.
+    return Err(e);
+  }
+
   let failed = matches!(settled.as_ref().map(|r| r.state.as_str()), Some("error"));
   if json {
     let mut body = json!({
@@ -319,12 +330,6 @@ async fn wait_and_emit(
     // readiness follow-up.
     emit_response(preset, row, resp, false, false);
     print_wait_followup(settled.as_ref());
-  }
-  // The wait is what the user walked away from, so it ends with the bell like
-  // a pull does, whether the model came up or not.
-  crate::util::bell::ring_after_wait(bell, json, &mut crate::util::bell::tty_sink());
-  if let Some(e) = poll_error {
-    return Err(e);
   }
   if failed {
     // The launch was accepted but the model never came up; reflect that
