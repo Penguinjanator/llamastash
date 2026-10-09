@@ -63,6 +63,9 @@ pub enum AcquireOutcome {
 #[derive(Debug)]
 pub struct Lockfile {
   path: PathBuf,
+  /// Set by [`Lockfile::disarm`] when the caller has already dealt with the
+  /// path itself and `Drop` must not touch whatever lives there now.
+  disarmed: bool,
   /// Held open for the daemon lifetime. Closing the fd releases the
   /// `flock` automatically (the kernel does this on process exit too,
   /// which is what gives us recycled-PID safety).
@@ -73,10 +76,21 @@ impl Lockfile {
   pub fn path(&self) -> &Path {
     &self.path
   }
+
+  /// Keep the lock, leave the file: `Drop` closes the fd (releasing the
+  /// `flock`) but does not unlink. For a caller that removed the path while
+  /// the lock was held, where a new owner may already have created its own
+  /// file under the same name.
+  pub fn disarm(&mut self) {
+    self.disarmed = true;
+  }
 }
 
 impl Drop for Lockfile {
   fn drop(&mut self) {
+    if self.disarmed {
+      return;
+    }
     if let Err(e) = std::fs::remove_file(&self.path) {
       if e.kind() != io::ErrorKind::NotFound {
         log::warn!("failed to remove lockfile {}: {e}", self.path.display());
@@ -154,7 +168,11 @@ pub fn acquire(state_dir: &Path) -> Result<AcquireOutcome, LockfileError> {
       file.set_len(0)?;
       writeln!(file, "{}", std::process::id())?;
       file.sync_all()?;
-      Ok(AcquireOutcome::Acquired(Lockfile { path, _file: file }))
+      Ok(AcquireOutcome::Acquired(Lockfile {
+        path,
+        disarmed: false,
+        _file: file,
+      }))
     }
     FlockOutcome::Contended => {
       // Another process holds the lock — read its PID for a friendly
@@ -289,6 +307,32 @@ mod tests {
         assert_eq!(raw.trim(), std::process::id().to_string());
       }
       AcquireOutcome::AlreadyRunning { pid, .. } => panic!("unexpected AlreadyRunning(pid={pid})"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn disarm_leaves_the_path_alone_and_releases_the_lock() {
+    let dir = temp_state_dir("disarm");
+    let path = {
+      let mut lock = match acquire(&dir).expect("acquire") {
+        AcquireOutcome::Acquired(l) => l,
+        AcquireOutcome::AlreadyRunning { .. } => panic!("unexpected AlreadyRunning"),
+      };
+      let p = lock.path().to_path_buf();
+      std::fs::remove_file(&p).expect("unlink while held");
+      // Somebody recreated the name after we unlinked ours; disarming means
+      // `Drop` must not treat that file as ours.
+      std::fs::write(&p, b"9999\n").unwrap();
+      lock.disarm();
+      drop(lock);
+      p
+    };
+    assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "9999");
+    // And the lock really went with the drop, not with the process.
+    match acquire(&dir).expect("re-acquire after disarm") {
+      AcquireOutcome::Acquired(_) => {}
+      AcquireOutcome::AlreadyRunning { pid, .. } => panic!("still held by {pid}"),
     }
     std::fs::remove_dir_all(&dir).ok();
   }

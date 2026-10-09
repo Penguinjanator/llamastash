@@ -433,8 +433,9 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 
 ### Batch 5: CLI setup commands ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-5-cli-setup-commands))
 
-- [ ] Shell completions
-- [ ] `doctor --fix` for findings with a safe mechanical repair
+- [x] ~~Shell completions~~
+- [x] ~~`doctor --fix` for findings with a safe mechanical repair~~
+- [ ] A `doctor --fix` repair for a tool config whose proxy URL names a port the proxy no longer listens on — needs that check first
 
 ### Batch 6: small standalone items ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-6-small-standalone-items))
 
@@ -507,6 +508,7 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 - [ ] **Per-model make-room inside a multiplexer.** Idle is per umbrella: a request to any model inside it takes the umbrella's in-flight guard and MRU stamp, so one busy model keeps every idle neighbour loaded, for the sweep and for make-room. Per-model idle needs the proxy to take the guard and stamp on the delegated row as well. See [`src/proxy/eviction.rs`](src/proxy/eviction.rs) `umbrella_idle_rows`.
 - [ ] **TUI has no residency editor.** `Ctrl+P` captures a running launch's params, and residency is not part of a launch's params, so `idle_ttl_secs` / `preload` stay CLI/config-authored (`presets save --idle-ttl` / `--preload`, hand-edited like `default:`). Surfacing them in the preset cycle or the save dialog needs a decision on whether a captured preset should carry a running launch's residency over. See [`src/tui/save_preset_dialog.rs`](src/tui/save_preset_dialog.rs).
 - [ ] **Confirm the user-private-group swap-surface rule on macOS.** [`is_user_private_group`](src/util/file_security.rs) is tested on Linux only (uid 1000 / gid 1000, a private group). On macOS every local user's primary group is `staff`, so a self-owned `0775` dir should still refuse, as it did before the user-private-group rule. Walk [`docs/testing/hardware-uat.md`](docs/testing/hardware-uat.md) § Apple Silicon Metal with a `chmod g+w` config dir and confirm the refusal names the shared group.
+- [ ] **`doctor --fix` still promises the chmod for a non-regular config.** `ChmodPlan` works out `regular` but only `blocked` decides the finding's `fix` ([`src/init/doctor.rs`](src/init/doctor.rs)), so a `config.yaml` symlinked to a device node or a FIFO advertises `config_chmod_0600` and the repair then answers `skipped: not a regular file`. Fold `!regular` into `blocked` so that finding carries its hand hint instead of pointing at `--fix`. Origin: `doctor --fix` review, 2026-10-09.
 - [ ] **Anthropic effort mapping: retire it, and file the gufo gap** (origin: PR #95, plan [`2026-09-30-002`](docs/plans/2026-09-30-002-feat-anthropic-effort-mapping-plan.md)).
   - [ ] **Delete `src/backend/llama_cpp/effort.rs`** once llama.cpp maps the Anthropic effort fields itself — [ggml-org/llama.cpp#20479](https://github.com/ggml-org/llama.cpp/pull/20479), open since 2026-03-13 and quiet since 2026-06-26 as of 2026-10-01. Run `scripts/effort-live-check.sh <proxy> <model> <upstream>` to confirm: the `proxy-effort-*` rows move on their own once upstream handles it.
   - [x] **Filed at gufo**: its `/v1/messages` answers `400 request field '<x>' is not supported on this endpoint` for `thinking`, `output_config`, `reasoning_effort` and `chat_template_kwargs`, so Claude Code cannot reach that engine at all. Filed as [gufo-org/gufo#370](https://github.com/gufo-org/gufo/issues/370) (2026-10-01); text in the plan's appendix.

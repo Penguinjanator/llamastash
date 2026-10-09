@@ -1528,7 +1528,7 @@ Port collision (Ollama-compat mode against a running Ollama on `11434`, another 
 
 ## Setup subcommands
 
-These three are first-run and admin surfaces. They're separated from the runtime CLI above because they touch durable state on disk (the `llama-server` binary, the snapshot file, the user's config) and have their own exit-code contract.
+These are the first-run and admin surfaces. They're separated from the runtime CLI above because they touch durable state on disk (the `llama-server` binary, the snapshot file, the user's config) and have their own exit-code contract. [`llamastash completions`](#llamastash-completions-shell) is the one exception: it reads nothing and writes nothing.
 
 ### `llamastash init`
 
@@ -1591,15 +1591,26 @@ Non-interactive contract: when stdout isn't a terminal and `--recommended` is no
 
 ### `llamastash doctor`
 
-Read-only diagnostic (its one write is the memory-drift baseline refresh). Re-runs hardware detection, diffs against `_init_snapshot.json`, and emits findings with stable ids agents can branch on: `binary_missing`, `binary_digest_drift` (skipped on brew installs — routine `brew upgrade` legitimately rotates the digest), `hardware_drift`, `memory_drift`, `gtt_hint`, `snapshot_stale`, `config_mode_drift`, `remote_snapshot_unreachable`, plus two configured-server advisories — `server_binary_missing` (Warning: a `backend.<id>.servers[].binary` path no longer resolves) and `servers_configured` (Info: a summary of the resolvable servers and their device counts; silent when no `servers:` are configured). All of these ids are additive, so `schema_version` stays `2`; readers refuse only versions above their max. When the local benchmark snapshot looks stale, `doctor` probes the latest remote (the same one the recommender prefers) before judging `snapshot_stale`, so it only fires when no fresher snapshot is actually reachable; `LLAMASTASH_OFFLINE` skips that probe.
+Diagnoses the setup; read-only unless you ask for `--fix` (its one always-on write is the memory-drift baseline refresh). Re-runs hardware detection, diffs against `_init_snapshot.json`, and emits findings with stable ids agents can branch on: `binary_missing`, `binary_digest_drift` (skipped on brew installs — routine `brew upgrade` legitimately rotates the digest), `hardware_drift`, `memory_drift`, `gtt_hint`, `snapshot_stale`, `config_mode_drift`, `stale_daemon_files` (a `runtime.json` / `daemon.pid` pair with no process holding the lock), `remote_snapshot_unreachable`, plus two configured-server advisories — `server_binary_missing` (Warning: a `backend.<id>.servers[].binary` path no longer resolves) and `servers_configured` (Info: a summary of the resolvable servers and their device counts; silent when no `servers:` are configured). All of these ids are additive, so `schema_version` stays `2`; readers refuse only versions above their max. When the local benchmark snapshot looks stale, `doctor` probes the latest remote (the same one the recommender prefers) before judging `snapshot_stale`, so it only fires when no fresher snapshot is actually reachable; `LLAMASTASH_OFFLINE` skips that probe.
+
+`binary_missing`, `binary_digest_drift`, `hardware_drift`, `memory_drift`, `snapshot_stale`, `config_mode_drift` and `remote_snapshot_unreachable` are diffs against the baseline, so they only appear once `init` has written `_init_snapshot.json`. The rest read the machine as it is now and fire before `init` too: `gtt_hint`, `stale_daemon_files`, and the `server_binary_missing` / `servers_configured` advisories.
 
 ```
-llamastash doctor [--json]
+llamastash doctor [--json] [--fix] [--dry-run]
 ```
 
 `doctor` **always exits 0** — findings are informative, not a failure signal. Branch on a non-empty `findings` array (or filter for `severity == "error"`) to escalate, not on the exit code. This makes `doctor` safe to run unconditionally from health-check loops without `set -e` blowing up.
 
-Each `--json` finding carries `{id, severity, message, fix_hint, safe_to_log}`. `safe_to_log: true` on every finding means the output is safe to paste into a public issue.
+Each `--json` finding carries `{id, severity, message, fix_hint, safe_to_log}`, plus `fix` when `--fix` can repair it, and an id can repeat when one check has more than one cause (`config_mode_drift` reports the config dir and the config file separately). `fix_hint` names `doctor --fix` only for a finding it will actually act on; anything else carries the manual step. `safe_to_log: true` on every finding means the output is safe to paste into a public issue.
+
+**`--fix` applies the repairs that are safe to automate**; `--dry-run` prints the same list and changes nothing.
+
+| Repair id | Fixes | What it does |
+| --- | --- | --- |
+| `config_chmod_0600` | `config_mode_drift` | `chmod 0600` on the config file, following a symlink so a dotfiles-managed config has its real file fixed (the ledger names that file). Withheld when the config dir **or the directory a symlink resolves into** is world-writable, group-writable with a group that is not your user-private group, or owned by an account that is neither you nor root; also when the link resolves to something that is not a regular file. There, whoever writes that directory would be picking what the automated chmod hits, so `--fix` prints the hand step instead. |
+| `remove_stale_daemon_files` | `stale_daemon_files` | Removes `runtime.json` and `daemon.pid`, but only after taking the lock — which succeeds only when no daemon holds it. A running daemon's files are never touched. |
+
+Nothing else gets repaired: no daemon is stopped, no model is deleted, no live state rewritten. Taking the lock for the stale-file repair does write `daemon.pid` for the moment of the repair and removes it again. A repair that fails is reported and `doctor` still exits `0`. `--json` carries a top-level `fixes` array of `{fix, action, target, outcome, detail}`, where `outcome` is `applied`, `would_apply`, `skipped` or `failed`; a read-only run carries `"fixes": []`, and a repair withheld for safety shows up once as `skipped` naming the hand step to take instead, so `--fix` is never silent about what it left alone.
 
 `--json` (schema `2`) also carries a `hardware` section — the same live snapshot the init banner and `status` render: `cpu_brand`, `cpu_cores`, `mem_total_bytes`, `disk_free_bytes`, `gpu_backend`, `unified`, `uma_class_source` (how the unified-vs-discrete verdict was reached), `gpu_pool_total_bytes` (raw GPU memory ceiling — carve-out + GTT on a UMA APU), and the `uma_carve_bytes` / `uma_shared_bytes` composition. Two of the findings read this section: `memory_drift` fires when the GPU pool grows (info) or shrinks (warning) past `max(5%, 512 MiB)` versus the recorded baseline (doctor re-stamps the baseline after it fires); `gtt_hint` fires on Linux unified hosts whose GTT is still at the amdgpu default (~half of RAM), pointing at the `amdgpu.gttsize` ceiling.
 
@@ -1702,6 +1713,35 @@ llamastash pull <repo> [--json] [--offline]
 `pull` performs a disk-space precheck by HEADing each file before download, so an out-of-space failure surfaces before any bytes hit disk. It refuses to write the HF token to disk in cache-file modes that would persist it insecurely.
 
 On a terminal, `pull` paints one progress line on **stderr**, in the shape `⬇ <file> (2/4)  42%  1.2G / 4.1G · 85M/s`. The percent, bytes and rate cover the whole pull, not just the current file. The rate counts bytes off the wire, so files served from the HF cache advance the percent without inflating it. The line is trimmed to the terminal width — a long filename loses its middle, keeping the directory and the shard suffix — and it repaints in place and clears itself before the summary. Redirect stderr, or pipe it, and nothing is written: stdout (including `--json`) is identical either way.
+
+### `llamastash completions <shell>`
+
+```
+llamastash completions <bash|elvish|fish|powershell|zsh>
+```
+
+Print a completion script for `llamastash` on stdout. It is built from the command spec, so it needs no daemon, does not read `config.yaml` (a broken one will not stop it), and writes nothing itself — `--json` is refused because the script is the whole stdout contract. Subcommands, flags and fixed value lists complete; a model reference does not, because those come off the daemon. The `powershell` and `elvish` scripts are generated too; put them wherever your own PowerShell `$PROFILE` or Elvish module path points.
+
+Install once per machine:
+
+```bash
+# bash — needs bash-completion, which reads $XDG_DATA_HOME/bash-completion
+# when that is set, and ~/.local/share/bash-completion otherwise.
+mkdir -p ~/.local/share/bash-completion/completions
+llamastash completions bash > ~/.local/share/bash-completion/completions/llamastash
+
+# zsh — the directory must be on $fpath *before* `compinit` runs, so add
+# `fpath+=(~/.zsh/completions)` above the `autoload -U compinit; compinit`
+# pair in ~/.zshrc (or into ~/.zshenv). Appending it at the end of the file
+# lands after compinit and does nothing.
+mkdir -p ~/.zsh/completions
+llamastash completions zsh > ~/.zsh/completions/_llamastash
+
+# fish — autoloaded by file name, no config edit.
+llamastash completions fish > ~/.config/fish/completions/llamastash.fish
+```
+
+For the current shell only: `source <(llamastash completions bash)` in bash or zsh, `llamastash completions fish | source` in fish. The script is written in one piece, so a closed or failing stdout (`llamastash completions bash | head -1`, a full disk) exits `71` with an error on stderr instead of ending in a panic.
 
 ## Exit codes
 
