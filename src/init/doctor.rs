@@ -174,12 +174,12 @@ pub struct Finding {
   /// when it does not, so the pre-`--fix` shape of a finding is unchanged.
   #[serde(skip_serializing_if = "Option::is_none")]
   pub fix: Option<FixId>,
-  /// The repair this finding wanted but `--fix` withheld, with the hand step
-  /// to take instead. Internal: it drives the ledger line for the blocked
-  /// repair, while `fix` stays absent so a pre-`--fix` consumer sees the
-  /// shape it already knows.
+  /// The repair this finding wanted but `--fix` withheld, with the path it
+  /// would have acted on and why. Internal: it drives the ledger line for
+  /// the blocked repair, while `fix` stays absent so a pre-`--fix` consumer
+  /// sees the shape it already knows.
   #[serde(skip)]
-  withheld: Option<(FixId, &'static str)>,
+  withheld: Option<(FixId, String, String)>,
 }
 
 impl Finding {
@@ -198,21 +198,35 @@ impl Finding {
     }
   }
 
-  /// A finding whose id carries a repair that cannot run here: `fix` stays
-  /// absent, and `hint` (the id's own hand step unless overridden) is what
-  /// the reader must do instead. `--fix` still reports the repair as
-  /// withheld, once per repair rather than once per finding.
+  /// A finding about something `--fix` cannot fix at all, whose hint is the
+  /// hand step the reader takes instead. Promises no repair and withholds
+  /// none.
   #[cfg(unix)]
   fn manual(
     id: FindingId,
     severity: Severity,
     message: impl Into<String>,
-    hint: Option<&'static str>,
+    hint: &'static str,
   ) -> Self {
-    let fix_hint = hint.unwrap_or_else(|| id.fix_hint());
+    Self::from_parts(id.as_str(), severity, message, hint)
+  }
+
+  /// The id's repair exists but could not run on `target` for `why`: nothing
+  /// is advertised on the finding, and `--fix` ledges it as skipped instead
+  /// of staying quiet.
+  #[cfg(unix)]
+  fn blocked(
+    id: FindingId,
+    severity: Severity,
+    message: impl Into<String>,
+    target: &Path,
+    why: String,
+  ) -> Self {
     Self {
-      withheld: id.fix_action().map(|fix| (fix, fix_hint)),
-      ..Self::from_parts(id.as_str(), severity, message, fix_hint)
+      withheld: id
+        .fix_action()
+        .map(|fix| (fix, target.display().to_string(), why)),
+      ..Self::from_parts(id.as_str(), severity, message, id.fix_hint())
     }
   }
 
@@ -341,7 +355,6 @@ pub struct DoctorReport {
   /// Repairs applied (or, under `--dry-run`, proposed) for the findings
   /// that carry a `fix`. Empty — and therefore an empty JSON array —
   /// whenever `doctor` ran read-only.
-  #[serde(default)]
   pub fixes: Vec<FixReport>,
 }
 
@@ -700,11 +713,9 @@ fn check_snapshot_stale(snapshot: &InitSnapshot) -> Option<Finding> {
   ))
 }
 
-/// Config hardening: the file's own mode, and whether its parent dir is
-/// somewhere another user could swap files into. Both are reported; the
-/// mode drift only carries a repair when the parent is safe, because
-/// `chmod` follows a symlink and a swappable dir lets its writer pick what
-/// the automated repair touches.
+/// Config hardening: the file's own mode, and whether a `chmod` can be run
+/// on it safely at all. Both are reported; the mode drift only advertises a
+/// repair when [`chmod_plan`] says the repair would act.
 fn check_config_mode_drift() -> Vec<Finding> {
   let Some(path) = crate::util::paths::user_config_file() else {
     return Vec::new();
@@ -714,39 +725,37 @@ fn check_config_mode_drift() -> Vec<Finding> {
   }
   #[cfg(unix)]
   {
-    use std::os::unix::fs::PermissionsExt;
-    let our_uid = unsafe { libc::geteuid() };
-    let parent = path.parent().unwrap_or(path.as_ref());
-    let parent_surface = crate::util::file_security::dir_swap_surface(parent, our_uid);
+    let Some(plan) = chmod_plan(&path) else {
+      return Vec::new();
+    };
     let mut findings = Vec::new();
-    if let Some(surface) = &parent_surface {
+    if let Some((dir, why)) = &plan.blocked {
       // No repair here: replacing or re-owning a directory another user
       // could swap into is not a mechanical repair.
       findings.push(Finding::manual(
         FindingId::ConfigModeDrift,
         Severity::Warning,
-        format!(
-          "parent dir `{}` {}",
-          parent.display(),
-          surface.describe(our_uid)
-        ),
-        Some("run `chmod go-w` on the parent dir"),
+        format!("parent dir `{}` {why}", dir.display()),
+        "run `chmod go-w` on that dir, or move the config out of it",
       ));
     }
-    if let Ok(file_meta) = std::fs::metadata(&path) {
-      let file_mode = file_meta.permissions().mode() & 0o777;
-      if file_mode != 0o600 {
-        let message = format!(
-          "`{}` is mode {file_mode:#o} (expected 0600) — \
-           re-run init or `chmod 600` to restore the hardening",
-          path.display()
-        );
-        findings.push(if parent_surface.is_some() {
-          Finding::manual(FindingId::ConfigModeDrift, Severity::Warning, message, None)
-        } else {
-          Finding::new(FindingId::ConfigModeDrift, Severity::Warning, message)
-        });
-      }
+    if plan.mode != 0o600 {
+      let message = format!(
+        "`{}` is mode {:#o} (expected 0600) — \
+         re-run init or `chmod 600` to restore the hardening",
+        path.display(),
+        plan.mode
+      );
+      findings.push(match &plan.blocked {
+        None => Finding::new(FindingId::ConfigModeDrift, Severity::Warning, message),
+        Some((_, why)) => Finding::blocked(
+          FindingId::ConfigModeDrift,
+          Severity::Warning,
+          message,
+          &plan.real,
+          why.clone(),
+        ),
+      });
     }
     findings
   }
@@ -755,6 +764,45 @@ fn check_config_mode_drift() -> Vec<Finding> {
     let _ = path;
     Vec::new()
   }
+}
+
+/// What an automated `chmod` on the config file would touch, and whether it
+/// may run. `set_permissions` follows a symlink, so a writable directory at
+/// either end — the config dir, or the dir the link resolves into — lets that
+/// directory's writer choose what the repair hits. The report and the repair
+/// both ask this, so a finding cannot advertise a repair the repair would
+/// then refuse.
+#[cfg(unix)]
+struct ChmodPlan {
+  /// The resolved file the `chmod` would write.
+  real: PathBuf,
+  mode: u32,
+  regular: bool,
+  /// The directory that blocks the repair, with the reason.
+  blocked: Option<(PathBuf, String)>,
+}
+
+#[cfg(unix)]
+fn chmod_plan(path: &Path) -> Option<ChmodPlan> {
+  use std::os::unix::fs::PermissionsExt;
+  let our_uid = unsafe { libc::geteuid() };
+  let real = crate::util::paths::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+  let meta = std::fs::metadata(&real).ok()?;
+  let blocked = [
+    path.parent().unwrap_or(path.as_ref()),
+    real.parent().unwrap_or(real.as_ref()),
+  ]
+  .into_iter()
+  .find_map(|dir| {
+    crate::util::file_security::dir_swap_surface(dir, our_uid)
+      .map(|surface| (dir.to_path_buf(), surface.describe(our_uid)))
+  });
+  Some(ChmodPlan {
+    mode: meta.permissions().mode() & 0o777,
+    regular: meta.is_file(),
+    real,
+    blocked,
+  })
 }
 
 /// `daemon.pid` with no flock holder is left over from a dead daemon by
@@ -797,45 +845,23 @@ fn stale_daemon_files(state_dir: &Path) -> Vec<PathBuf> {
   .collect()
 }
 
-/// The file a repair works on, for the ledger line of a repair that was
-/// withheld before it could run.
-fn fix_target(fix: FixId) -> Option<String> {
-  match fix {
-    FixId::ConfigMode => crate::util::paths::user_config_file().map(|p| p.display().to_string()),
-    FixId::StaleDaemonFiles => crate::util::paths::state_dir().map(|d| d.display().to_string()),
-  }
-}
-
 /// Apply every repair the report marks fixable, in finding order. Under
 /// `dry_run` nothing is touched and every entry comes back `would_apply`.
 /// The set is bounded on purpose: no daemon is signalled, no model is
 /// deleted, and daemon state is only removed once nothing holds the lock.
-/// A repair a finding wanted but could not get is ledged once, with the hand
-/// steps in finding order, so `--fix` is never silent about what it left
-/// alone.
+/// A repair a finding wanted but could not get is ledged against the path it
+/// wanted, so `--fix` is never silent about what it left alone.
 fn apply_fixes(findings: &[Finding], dry_run: bool) -> Vec<FixReport> {
   let mut fixes: Vec<FixReport> = Vec::new();
   for f in findings {
-    if let Some((fix, step)) = f.withheld {
-      let Some(target) = fix_target(fix) else {
-        continue;
-      };
-      // Several findings can block one repair (the config dir and the mode
-      // behind it), so they share a line instead of repeating it.
-      match fixes
-        .iter_mut()
-        .find(|r| r.fix == fix && r.target == target && r.outcome == FixOutcome::Skipped)
-      {
-        Some(row) if !row.detail.contains(step) => {
-          row.detail = format!("{}, then {step}", row.detail)
-        }
-        Some(_) => {}
-        None => fixes.push(FixReport::skipped(
-          fix,
-          target,
-          format!("withheld; manual step: {step}"),
-        )),
-      }
+    if let Some((fix, target, why)) = &f.withheld {
+      // The finding already names the path the repair wanted, so the ledger
+      // points there rather than at whatever the repair id implies.
+      fixes.push(FixReport::skipped(
+        *fix,
+        target.clone(),
+        format!("withheld: {why}; manual step: {}", f.fix_hint),
+      ));
       continue;
     }
     let Some(fix) = f.fix else { continue };
@@ -859,33 +885,27 @@ fn apply_fixes(findings: &[Finding], dry_run: bool) -> Vec<FixReport> {
 
 /// Put the config file back to the `0600` it ships with.
 ///
-/// The target is the canonical path: `set_permissions` follows a symlink,
-/// so a dotfiles-managed config has its real file chmodded, and the ledger
-/// names the file that was actually written rather than the link. A
-/// swappable parent or a non-regular target stops the repair — in a
-/// directory someone else can write into, they would be choosing what an
-/// automated `chmod` hits, which is why `lockfile::acquire` refuses the same
-/// shape with `O_NOFOLLOW`.
+/// [`chmod_plan`] decides whether that is allowed and which file it means, so
+/// the repair cannot act on something the report did not already refuse.
 #[cfg(unix)]
 fn fix_config_mode(path: &Path, dry_run: bool) -> FixReport {
   use std::os::unix::fs::PermissionsExt;
-  let real = crate::util::paths::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-  let target = real.display().to_string();
-  if let Some(dir) = path.parent() {
-    let our_uid = unsafe { libc::geteuid() };
-    if let Some(surface) = crate::util::file_security::dir_swap_surface(dir, our_uid) {
-      return FixReport::skipped(FixId::ConfigMode, target, surface.describe(our_uid));
-    }
-  }
-  let mode = match std::fs::metadata(&real) {
-    Ok(meta) if meta.is_file() => meta.permissions().mode() & 0o777,
-    Ok(_) => {
-      return FixReport::skipped(FixId::ConfigMode, target, "not a regular file");
-    }
-    Err(e) => {
-      return FixReport::new(FixId::ConfigMode, target, FixOutcome::Failed, e.to_string());
-    }
+  let Some(plan) = chmod_plan(path) else {
+    return FixReport::new(
+      FixId::ConfigMode,
+      path.display().to_string(),
+      FixOutcome::Failed,
+      "could not read the config file",
+    );
   };
+  let target = plan.real.display().to_string();
+  if let Some((_, why)) = &plan.blocked {
+    return FixReport::skipped(FixId::ConfigMode, target, why.clone());
+  }
+  if !plan.regular {
+    return FixReport::skipped(FixId::ConfigMode, target, "not a regular file");
+  }
+  let mode = plan.mode;
   if mode == 0o600 {
     return FixReport::skipped(FixId::ConfigMode, target, "already 0600");
   }
@@ -893,7 +913,7 @@ fn fix_config_mode(path: &Path, dry_run: bool) -> FixReport {
   if dry_run {
     return FixReport::new(FixId::ConfigMode, target, FixOutcome::WouldApply, detail);
   }
-  match std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)) {
+  match std::fs::set_permissions(&plan.real, std::fs::Permissions::from_mode(0o600)) {
     Ok(()) => FixReport::new(FixId::ConfigMode, target, FixOutcome::Applied, detail),
     Err(e) => FixReport::new(FixId::ConfigMode, target, FixOutcome::Failed, e.to_string()),
   }
@@ -1777,6 +1797,39 @@ mod tests {
 
   #[cfg(unix)]
   #[test]
+  fn fix_config_mode_refuses_a_link_that_lands_in_a_swap_surface() {
+    // The config dir is ours and tight; the link points into a directory
+    // anyone can write. That other directory's writer would be choosing what
+    // the automated chmod hits, so the repair stays home.
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let dir = crate::test_support::unique_temp_dir("doctor-fix", "link-out");
+    let open = dir.join("open");
+    let config_dir = dir.join("config");
+    std::fs::create_dir_all(&open).unwrap();
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+    std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let real = open.join("real.yaml");
+    std::fs::write(&real, b"proxy:\n  port: 11435\n").unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let link = config_dir.join("config.yaml");
+    symlink(&real, &link).unwrap();
+
+    assert_eq!(
+      chmod_plan(&link).expect("plan").blocked.map(|(d, _)| d),
+      Some(open.clone()),
+      "the blocking dir is the one the link lands in"
+    );
+    let fix = fix_config_mode(&link, false);
+    assert_eq!(fix.outcome, FixOutcome::Skipped, "{fix:?}");
+    assert!(fix.detail.contains("world-writable"), "{fix:?}");
+    assert_eq!(mode_of(&real), 0o644, "nothing may be chmodded");
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[cfg(unix)]
+  #[test]
   fn fix_config_mode_refuses_a_non_regular_target() {
     use std::os::unix::fs::{symlink, PermissionsExt};
     let dir = crate::test_support::unique_temp_dir("doctor-fix", "device");
@@ -1896,7 +1949,7 @@ mod tests {
       FindingId::ConfigModeDrift,
       Severity::Warning,
       "parent dir is world-writable",
-      Some("run `chmod go-w` on the parent dir"),
+      "run `chmod go-w` on the parent dir",
     );
     assert_eq!(parent_drift.fix, None);
     assert!(
@@ -1914,35 +1967,41 @@ mod tests {
 
   #[cfg(unix)]
   #[test]
-  fn a_withheld_repair_is_ledged_rather_than_dropped() {
-    // `--fix` with nothing applicable still says so, instead of answering
-    // with an empty ledger that looks like a broken `--fix`.
-    let parent = Finding::manual(
+  fn a_withheld_repair_is_ledged_against_its_own_path() {
+    // The dir finding has no repair to withhold; the mode finding's chmod
+    // was blocked, and the ledger line names the file it wanted.
+    let dir_finding = Finding::manual(
       FindingId::ConfigModeDrift,
       Severity::Warning,
       "parent dir `/x` is world-writable",
-      Some("run `chmod go-w` on the parent dir"),
+      "run `chmod go-w` on that dir, or move the config out of it",
     );
-    let mode = Finding::manual(
+    let mode_finding = Finding::blocked(
       FindingId::ConfigModeDrift,
       Severity::Warning,
       "`/x/config.yaml` is mode 0o666",
-      None,
+      Path::new("/x/config.yaml"),
+      "is world-writable (mode 0o777)".to_string(),
     );
-    assert_eq!(mode.fix_hint, FindingId::ConfigModeDrift.fix_hint());
-    let fixes = apply_fixes(&[parent, mode], false);
-    // Two findings, one blocked chmod: one line, both hand steps.
+    let fixes = apply_fixes(&[dir_finding, mode_finding], false);
     assert_eq!(fixes.len(), 1, "{fixes:?}");
     assert_eq!(fixes[0].fix, FixId::ConfigMode);
     assert_eq!(fixes[0].outcome, FixOutcome::Skipped);
+    assert_eq!(fixes[0].target, "/x/config.yaml", "{fixes:?}");
     assert!(
       fixes[0]
         .detail
-        .starts_with("withheld; manual step: run `chmod go-w`"),
+        .starts_with("withheld: is world-writable (mode 0o777); manual step:"),
       "{fixes:?}"
     );
-    assert!(fixes[0].detail.contains("then"), "{fixes:?}");
-    assert!(apply_fixes(&[], false).is_empty());
+    // A dir finding on its own withholds nothing, so `--fix` stays empty.
+    let only_dir = Finding::manual(
+      FindingId::ConfigModeDrift,
+      Severity::Warning,
+      "parent dir `/x` is world-writable",
+      "run `chmod go-w` on that dir, or move the config out of it",
+    );
+    assert!(apply_fixes(&[only_dir], false).is_empty());
   }
 
   #[test]
@@ -1969,11 +2028,22 @@ mod tests {
         FixOutcome::WouldApply,
         "mode 0o644 → 0600",
       ),
+      FixReport::skipped(
+        FixId::ConfigMode,
+        "/other/config.yaml",
+        "is world-writable (mode 0o777)",
+      ),
+      FixReport::new(
+        FixId::ConfigMode,
+        "/ro/config.yaml",
+        FixOutcome::Failed,
+        "Read-only file system (os error 30)",
+      ),
     ];
     let out = format_human(&report);
     console::set_colors_enabled(prior_colors);
     assert!(
-      out.contains("fixes (2 actions)\n"),
+      out.contains("fixes (4 actions)\n"),
       "fixes section header drift: {out:?}"
     );
     assert!(
@@ -1982,6 +2052,14 @@ mod tests {
     );
     assert!(
       out.contains("would chmod 0600 /state/config.yaml (mode 0o644 → 0600)"),
+      "{out:?}"
+    );
+    assert!(
+      out.contains("chmod 0600 /other/config.yaml — skipped: is world-writable (mode 0o777)"),
+      "{out:?}"
+    );
+    assert!(
+      out.contains("chmod 0600 /ro/config.yaml failed: Read-only file system (os error 30)"),
       "{out:?}"
     );
   }

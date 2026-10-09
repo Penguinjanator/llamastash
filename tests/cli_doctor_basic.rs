@@ -177,10 +177,39 @@ fn a_config_no_repair_can_touch_is_reported_and_ledged() {
   assert_eq!(fixes[0]["outcome"], "skipped", "{fixes:#?}");
   assert_eq!(fixes[0]["fix"], "config_chmod_0600", "{fixes:#?}");
   assert!(
+    fixes[0]["target"]
+      .as_str()
+      .unwrap()
+      .ends_with("config.yaml"),
+    "the ledger names the file the chmod wanted: {fixes:#?}"
+  );
+  assert!(
     fixes[0]["detail"].as_str().unwrap().contains("chmod go-w"),
     "{fixes:#?}"
   );
   assert_eq!(mode_of(&config), 0o666, "nothing may be chmodded");
+
+  // A dir that blocks a repair nobody wanted leaves the ledger empty: the
+  // parent finding on its own is not a withheld chmod.
+  std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+  let clean = isolated(&dir)
+    .args(["doctor", "--fix", "--json"])
+    .output()
+    .unwrap();
+  let clean: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
+  assert!(
+    clean["findings"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .any(|f| f["id"] == "config_mode_drift"),
+    "the dir is still worth reporting: {clean:#?}"
+  );
+  assert_eq!(
+    clean["fixes"].as_array().unwrap().len(),
+    0,
+    "nothing was withheld, so nothing is ledged: {clean:#?}"
+  );
   std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700)).ok();
   std::fs::remove_dir_all(&dir).ok();
 }
