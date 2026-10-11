@@ -30,6 +30,11 @@ pub const DEFAULT_TAIL: usize = 100;
 /// Name of the request log file inside the daemon's log directory.
 pub const FILE_NAME: &str = "requests.jsonl";
 
+/// How many stopped launches keep their totals. A launch id is never reused,
+/// so totals deleted the moment a launch stops read as a counter reset to
+/// anything that keeps reading them.
+pub const RETIRED_LAUNCH_HISTORY: usize = 16;
+
 /// Finished rows that may wait for the file writer. Past this the line is
 /// dropped from the file (the in-memory log still has the row) rather
 /// than holding up the request that produced it.
@@ -329,10 +334,16 @@ struct Totals {
   completion_tokens: u64,
   auto_starts: u64,
   evictions: u64,
+  /// Display name of the model these rows belong to, taken from them, so a
+  /// launch's figures and the model's print the same name.
+  label: Option<String>,
 }
 
 impl Totals {
   fn add(&mut self, row: &RequestRow) {
+    if row.model.is_some() {
+      self.label = row.model.clone();
+    }
     self.requests += 1;
     if row.is_error() {
       self.errors += 1;
@@ -382,12 +393,24 @@ struct Inner {
   // catalog paths, so the map is as large as the catalog at most.
   by_model: HashMap<String, Totals>,
   // One entry per launch a request was handed to. A launch id is never
-  // reused, so [`RequestLog::forget_launch`] drops the entry when the
+  // reused, so [`RequestLog::forget_launch`] moves the entry out when the
   // launch stops, or every auto-start would leave one behind.
   by_launch: HashMap<String, Totals>,
+  // The entries `forget_launch` moved out, oldest first, capped at
+  // [`RETIRED_LAUNCH_HISTORY`].
+  retired: VecDeque<(String, Totals)>,
 }
 
 impl Inner {
+  /// Totals for `scope`, or `None` for a scope nothing has contributed to.
+  fn totals(&self, scope: &LogScope) -> Option<&Totals> {
+    match scope {
+      LogScope::All => Some(&self.all),
+      LogScope::Model { path } => self.by_model.get(path),
+      LogScope::Launch { id } => RequestLog::launch_totals(self, id),
+    }
+  }
+
   /// Overwrite the ring's copy of `row`, if the ring still holds it.
   fn store(&mut self, row: &RequestRow) {
     let Some(front) = self.rows.front().map(|r| r.seq) else {
@@ -516,41 +539,81 @@ impl RequestLog {
     }
   }
 
-  /// The newest `limit` rows, newest first, and the summary for the same
-  /// scope: one model when `model_path` is given, every request otherwise.
-  pub fn tail(&self, model_path: Option<&str>, limit: usize) -> Tail {
+  /// The newest `limit` rows of `scope`, newest first, and the summary for
+  /// that same scope.
+  pub fn tail(&self, scope: LogScope, limit: usize) -> Tail {
     let inner = self.lock();
-    let totals = match model_path {
-      Some(path) => inner.by_model.get(path),
-      None => Some(&inner.all),
-    };
+    let totals = inner.totals(&scope);
     Tail {
       summary: totals.map(Totals::summary).unwrap_or_default(),
       rows: inner
         .rows
         .iter()
         .rev()
-        .filter(|r| model_path.is_none_or(|p| r.model_path.as_deref() == Some(p)))
+        .filter(|r| scope.matches(r))
         .take(limit)
         .cloned()
         .collect(),
     }
   }
 
-  /// Drop a stopped launch's totals. `status` only reads the totals of
-  /// launches that are still registered.
+  /// Retire a stopped launch's totals. `status` only reads the totals of
+  /// launches that are still registered; [`Self::launch_summary`] still
+  /// answers for the last [`RETIRED_LAUNCH_HISTORY`] stopped launches.
   pub fn forget_launch(&self, launch_id: &str) {
-    self.lock().by_launch.remove(launch_id);
+    let mut inner = self.lock();
+    let Some(totals) = inner.by_launch.remove(launch_id) else {
+      return;
+    };
+    inner.retired.push_back((launch_id.to_string(), totals));
+    while inner.retired.len() > RETIRED_LAUNCH_HISTORY {
+      inner.retired.pop_front();
+    }
   }
 
-  /// Summary of the requests one launch served.
+  /// Summary of the requests one launch served, live first then retired.
   pub fn launch_summary(&self, launch_id: &str) -> RequestSummary {
-    self
-      .lock()
-      .by_launch
-      .get(launch_id)
+    Self::launch_totals(&self.lock(), launch_id)
       .map(Totals::summary)
       .unwrap_or_default()
+  }
+
+  /// Display name of the model `launch_id` served, or `None` when no finished
+  /// row of it carries one.
+  pub fn launch_label(&self, launch_id: &str) -> Option<String> {
+    Self::launch_totals(&self.lock(), launch_id).and_then(|totals| totals.label.clone())
+  }
+
+  fn launch_totals<'a>(inner: &'a Inner, launch_id: &str) -> Option<&'a Totals> {
+    inner.by_launch.get(launch_id).or_else(|| {
+      inner
+        .retired
+        .iter()
+        .rev()
+        .find(|(retired, _)| retired == launch_id)
+        .map(|(_, totals)| totals)
+    })
+  }
+}
+
+/// Which requests a read covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogScope {
+  /// Every request the log holds.
+  All,
+  /// One model's, across every launch that served it.
+  Model { path: String },
+  /// One launch's, live or retired.
+  Launch { id: String },
+}
+
+impl LogScope {
+  fn matches(&self, row: &RequestRow) -> bool {
+    match self {
+      LogScope::All => true,
+      LogScope::Model { path } => row.model_path.as_deref() == Some(path.as_str()),
+      LogScope::Launch { id } => row.launch_id.as_deref() == Some(id.as_str()),
+    }
   }
 }
 
@@ -716,7 +779,7 @@ mod tests {
   fn begin_shows_an_in_flight_row_and_finish_completes_it() {
     let log = RequestLog::new();
     let mut rec = log.begin(ROUTE, Some("127.0.0.1:5000".parse().unwrap()));
-    let tail = log.tail(None, 10);
+    let tail = log.tail(LogScope::All, 10);
     assert_eq!(tail.rows.len(), 1);
     assert_eq!(tail.rows[0].state, RequestState::InFlight);
     assert_eq!(tail.rows[0].client.as_deref(), Some("127.0.0.1:5000"));
@@ -724,7 +787,7 @@ mod tests {
 
     rec.set_status(200);
     rec.finish(RequestState::Done, Usage::default());
-    let done = log.tail(None, 10);
+    let done = log.tail(LogScope::All, 10);
     assert_eq!(done.rows[0].state, RequestState::Done);
     assert_eq!(done.rows[0].status, Some(200));
     assert!(done.rows[0].duration_ms.is_some());
@@ -736,10 +799,10 @@ mod tests {
     let log = RequestLog::new();
     let mut rec = log.begin(ROUTE, None);
     rec.set_model("m", "/m/a.gguf");
-    assert_eq!(log.tail(None, 10).rows[0].model_path, None);
+    assert_eq!(log.tail(LogScope::All, 10).rows[0].model_path, None);
     rec.publish();
     assert_eq!(
-      log.tail(None, 10).rows[0].model_path.as_deref(),
+      log.tail(LogScope::All, 10).rows[0].model_path.as_deref(),
       Some("/m/a.gguf")
     );
   }
@@ -748,7 +811,7 @@ mod tests {
   fn a_dropped_record_is_logged_as_client_closed() {
     let log = RequestLog::new();
     drop(log.begin(ROUTE, None));
-    let tail = log.tail(None, 10);
+    let tail = log.tail(LogScope::All, 10);
     assert_eq!(tail.rows[0].state, RequestState::ClientClosed);
     assert_eq!(tail.rows[0].status, None);
     assert_eq!(tail.summary.errors, 0);
@@ -759,7 +822,7 @@ mod tests {
     let log = RequestLog::new();
     let rec = log.begin(ROUTE, None);
     rec.respond(503, Some("launch_failed"), Some("out of memory"));
-    let tail = log.tail(None, 10);
+    let tail = log.tail(LogScope::All, 10);
     assert_eq!(tail.rows[0].status, Some(503));
     assert_eq!(tail.rows[0].error.as_deref(), Some("launch_failed"));
     assert_eq!(tail.rows[0].cause.as_deref(), Some("out of memory"));
@@ -773,15 +836,39 @@ mod tests {
     served(&log, "/m/b.gguf", "L2", Usage::default());
     let a2 = served(&log, "/m/a.gguf", "L1", Usage::default());
 
-    let tail = log.tail(Some("/m/a.gguf"), 10);
+    let tail = log.tail(
+      LogScope::Model {
+        path: "/m/a.gguf".to_string(),
+      },
+      10,
+    );
     assert_eq!(
       tail.rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
       vec![a2, a1]
     );
     assert_eq!(tail.summary.requests, 2);
-    assert_eq!(log.tail(None, 10).summary.requests, 3);
-    assert_eq!(log.tail(Some("/m/a.gguf"), 1).rows.len(), 1);
-    assert_eq!(log.tail(Some("/m/none.gguf"), 10), Tail::default());
+    assert_eq!(log.tail(LogScope::All, 10).summary.requests, 3);
+    assert_eq!(
+      log
+        .tail(
+          LogScope::Model {
+            path: "/m/a.gguf".to_string()
+          },
+          1
+        )
+        .rows
+        .len(),
+      1
+    );
+    assert_eq!(
+      log.tail(
+        LogScope::Model {
+          path: "/m/none.gguf".to_string()
+        },
+        10
+      ),
+      Tail::default()
+    );
   }
 
   #[test]
@@ -799,7 +886,14 @@ mod tests {
     failed.set_model("m", "/m/a.gguf");
     failed.respond(503, Some("launch_failed"), None);
 
-    let s = log.tail(Some("/m/a.gguf"), 0).summary;
+    let s = log
+      .tail(
+        LogScope::Model {
+          path: "/m/a.gguf".to_string(),
+        },
+        0,
+      )
+      .summary;
     assert_eq!(s.requests, 3);
     assert_eq!(s.errors, 1);
     assert_eq!(s.prompt_tokens, 20);
@@ -824,7 +918,14 @@ mod tests {
     rec.set_evicted(vec!["L3".to_string(), "L4".to_string()]);
     rec.set_status(200);
     rec.finish(RequestState::Done, Usage::default());
-    let s = log.tail(Some("/m/a.gguf"), 0).summary;
+    let s = log
+      .tail(
+        LogScope::Model {
+          path: "/m/a.gguf".to_string(),
+        },
+        0,
+      )
+      .summary;
     assert_eq!((s.auto_starts, s.evictions), (1, 2));
   }
 
@@ -834,7 +935,7 @@ mod tests {
     for _ in 0..CAPACITY + 5 {
       served(&log, "/m/a.gguf", "L1", Usage::default());
     }
-    let tail = log.tail(None, usize::MAX);
+    let tail = log.tail(LogScope::All, usize::MAX);
     assert_eq!(tail.rows.len(), CAPACITY);
     assert_eq!(tail.rows[0].seq, (CAPACITY + 5) as u64);
     assert_eq!(tail.summary.requests, (CAPACITY + 5) as u64);
@@ -852,10 +953,21 @@ mod tests {
     slow.finish(RequestState::Done, Usage::default());
     // The newest row is untouched by the late finish.
     assert_eq!(
-      log.tail(None, 1).rows[0].model_path.as_deref(),
+      log.tail(LogScope::All, 1).rows[0].model_path.as_deref(),
       Some("/m/a.gguf")
     );
-    assert_eq!(log.tail(Some("/m/slow.gguf"), 0).summary.requests, 1);
+    assert_eq!(
+      log
+        .tail(
+          LogScope::Model {
+            path: "/m/slow.gguf".to_string()
+          },
+          0
+        )
+        .summary
+        .requests,
+      1
+    );
   }
 
   #[test]
@@ -865,7 +977,7 @@ mod tests {
     rec.set_requested_model(Some(&"é".repeat(MAX_MODEL_CHARS + 50)));
     let long_cause = "x".repeat(MAX_CAUSE_CHARS + 50);
     rec.respond(503, Some("launch_failed"), Some(&long_cause));
-    let row = log.tail(None, 1).rows.remove(0);
+    let row = log.tail(LogScope::All, 1).rows.remove(0);
     assert_eq!(
       row.requested_model.unwrap().chars().count(),
       MAX_MODEL_CHARS
@@ -875,7 +987,7 @@ mod tests {
     let mut hostile = log.begin(ROUTE, None);
     hostile.set_requested_model(Some("evil\x1b[2Jmodel\nname\ttab"));
     hostile.respond(503, Some("launch_failed"), Some("line one\nline two"));
-    let cleaned = log.tail(None, 1).rows.remove(0);
+    let cleaned = log.tail(LogScope::All, 1).rows.remove(0);
     assert_eq!(
       cleaned.requested_model.as_deref(),
       Some("evil [2Jmodel name tab")
@@ -1102,7 +1214,7 @@ mod tests {
     assert_eq!(rows[0].model_path.as_deref(), Some("/m/a.gguf"));
     assert_eq!(rows[1].error.as_deref(), Some("model_not_found"));
     // The in-memory log is unchanged by the file.
-    assert_eq!(log.tail(None, 10).rows.len(), 3);
+    assert_eq!(log.tail(LogScope::All, 10).rows.len(), 3);
     assert_eq!(log.file_status(), Some(FileStatus { path, dropped: 0 }));
     assert_eq!(RequestLog::new().file_status(), None, "no file asked for");
   }
@@ -1134,7 +1246,7 @@ mod tests {
     served(&log, "/m/a.gguf", "L1", Usage::default());
     assert_eq!(log.file_status().expect("file status").dropped, 4);
     // The in-memory log has all four.
-    assert_eq!(log.tail(None, 10).summary.requests, 4);
+    assert_eq!(log.tail(LogScope::All, 10).summary.requests, 4);
   }
 
   /// `/dev/full` opens and then fails every write with `ENOSPC`.
@@ -1188,7 +1300,7 @@ mod tests {
   }
 
   #[test]
-  fn a_stopped_launch_is_forgotten_and_a_late_finish_does_not_bring_it_back() {
+  fn a_stopped_launch_keeps_its_totals_and_a_late_finish_does_not_bring_it_back() {
     let log = RequestLog::new();
     served(&log, "/m/a.gguf", "L1", Usage::default());
     // Still streaming when the launch is stopped.
@@ -1199,11 +1311,112 @@ mod tests {
     assert_eq!(log.launch_summary("L1").requests, 1);
 
     log.forget_launch("L1");
-    assert_eq!(log.launch_summary("L1"), RequestSummary::default());
+    assert_eq!(log.launch_summary("L1").requests, 1);
+    assert_eq!(
+      log.lock().by_launch.len(),
+      0,
+      "the live entry is retired, not left behind"
+    );
     late.finish(RequestState::UpstreamError, Usage::default());
     assert_eq!(log.lock().by_launch.len(), 0);
     // The model's own totals keep both requests.
-    assert_eq!(log.tail(Some("/m/a.gguf"), 0).summary.requests, 2);
+    assert_eq!(
+      log
+        .tail(
+          LogScope::Model {
+            path: "/m/a.gguf".to_string()
+          },
+          0
+        )
+        .summary
+        .requests,
+      2
+    );
+  }
+
+  #[test]
+  fn retirement_keeps_the_last_sixteen_stopped_launches_oldest_first() {
+    let log = RequestLog::new();
+    let ids: Vec<String> = (1..=17).map(|n| format!("L{n}")).collect();
+    for id in &ids {
+      served(&log, "/m/a.gguf", id, Usage::default());
+    }
+    for id in &ids {
+      log.forget_launch(id);
+    }
+    assert_eq!(
+      log.launch_summary("L1"),
+      RequestSummary::default(),
+      "the oldest of seventeen is pushed out"
+    );
+    for id in &ids[1..] {
+      assert_eq!(log.launch_summary(id).requests, 1, "{id} is retired");
+    }
+  }
+
+  #[test]
+  fn a_launch_scope_sees_one_launch_of_a_model() {
+    let log = RequestLog::new();
+    let a1 = served(&log, "/m/a.gguf", "L1", Usage::default());
+    served(&log, "/m/a.gguf", "L2", Usage::default());
+    let a3 = served(&log, "/m/a.gguf", "L1", Usage::default());
+
+    let scoped = log.tail(
+      LogScope::Launch {
+        id: "L1".to_string(),
+      },
+      10,
+    );
+    assert_eq!(
+      scoped.rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+      vec![a3, a1]
+    );
+    assert_eq!(scoped.summary.requests, 2);
+    // The same model under another launch is the wider scope.
+    assert_eq!(
+      log
+        .tail(
+          LogScope::Model {
+            path: "/m/a.gguf".to_string()
+          },
+          0
+        )
+        .summary
+        .requests,
+      3
+    );
+    // A launch's series carries the model's own name, not the launch id.
+    assert_eq!(log.launch_label("L1").as_deref(), Some("m"));
+    assert_eq!(
+      log.tail(
+        LogScope::Launch {
+          id: "L9".to_string()
+        },
+        10
+      ),
+      Tail::default(),
+      "a launch that served nothing is an empty scope"
+    );
+  }
+
+  #[test]
+  fn a_retired_launch_still_scopes_rows_and_totals() {
+    let log = RequestLog::new();
+    let seq = served(&log, "/m/a.gguf", "L1", Usage::default());
+    log.forget_launch("L1");
+
+    let scoped = log.tail(
+      LogScope::Launch {
+        id: "L1".to_string(),
+      },
+      10,
+    );
+    assert_eq!(
+      scoped.rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+      vec![seq]
+    );
+    assert_eq!(scoped.summary.requests, 1);
+    assert_eq!(log.launch_label("L1").as_deref(), Some("m"));
   }
 
   #[test]
@@ -1220,7 +1433,7 @@ mod tests {
   fn row_wire_shape_keeps_every_key() {
     let log = RequestLog::new();
     drop(log.begin(ROUTE, None));
-    let v = serde_json::to_value(&log.tail(None, 1).rows[0]).unwrap();
+    let v = serde_json::to_value(&log.tail(LogScope::All, 1).rows[0]).unwrap();
     for key in [
       "seq",
       "started_at_ms",

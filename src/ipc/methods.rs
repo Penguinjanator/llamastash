@@ -493,6 +493,10 @@ struct RequestsTailParams {
   /// Catalog path of one model. Absent: every request.
   #[serde(default)]
   model_path: Option<String>,
+  /// Launch id (`L3`): one launch's rows and totals, live or recently stopped.
+  /// It wins over `model_path`, since a launch serves one model.
+  #[serde(default)]
+  launch_id: Option<String>,
   #[serde(default)]
   limit: Option<usize>,
 }
@@ -500,15 +504,18 @@ struct RequestsTailParams {
 /// The proxy's request log: the newest rows, newest first, and the summary
 /// for the same scope.
 fn requests_tail_handler(ctx: &MethodContext, params: Option<Value>) -> Result<Value, ErrorObject> {
-  use crate::proxy::request_log::{CAPACITY, DEFAULT_TAIL};
+  use crate::proxy::request_log::{LogScope, CAPACITY, DEFAULT_TAIL};
   let parsed: RequestsTailParams = match params {
     None | Some(Value::Null) => RequestsTailParams::default(),
     some => parse_params(some)?,
   };
   let limit = parsed.limit.unwrap_or(DEFAULT_TAIL).min(CAPACITY);
-  Ok(json!(ctx
-    .requests
-    .tail(parsed.model_path.as_deref(), limit)))
+  let scope = match (parsed.launch_id, parsed.model_path) {
+    (Some(id), _) => LogScope::Launch { id },
+    (None, Some(path)) => LogScope::Model { path },
+    (None, None) => LogScope::All,
+  };
+  Ok(json!(ctx.requests.tail(scope, limit)))
 }
 
 /// Sorted list of every method `dispatch_request` knows. Used by
@@ -1182,6 +1189,29 @@ mod tests {
 
     let bad = call(Some(json!({"limit": "ten"}))).await;
     assert_eq!(bad.error.unwrap().code, ErrorCode::InvalidParams.as_i32());
+
+    // `launch_id` scopes to one launch: its rows and its own totals.
+    for launch in ["L1", "L2"] {
+      let mut rec = ctx.requests.begin("/v1/chat/completions", None);
+      rec.set_model("m", "/m/a.gguf");
+      rec.set_launch(launch);
+      rec.respond(200, None, None);
+    }
+    let one_launch = call(Some(json!({"launch_id": "L1"}))).await.result.unwrap();
+    assert_eq!(one_launch["summary"]["requests"], 1);
+    let launch_rows = one_launch["requests"].as_array().unwrap();
+    assert_eq!(launch_rows.len(), 1);
+    assert_eq!(launch_rows[0]["launch_id"], "L1");
+    // It outranks `model_path`, the wider scope, and a launch that served
+    // nothing is an empty scope rather than an error.
+    let both = call(Some(json!({"launch_id": "L2", "model_path": "/m/a.gguf"})))
+      .await
+      .result
+      .unwrap();
+    assert_eq!(both["summary"]["requests"], 1);
+    let nothing = call(Some(json!({"launch_id": "L9"}))).await.result.unwrap();
+    assert_eq!(nothing["summary"]["requests"], 0);
+    assert!(nothing["requests"].as_array().unwrap().is_empty());
   }
 
   #[tokio::test]

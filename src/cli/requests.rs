@@ -11,7 +11,10 @@ use crate::cli::cli_args::{Cli, RequestsArgs};
 use crate::cli::client::connect_or_spawn;
 use crate::cli::exit_codes::{CliExit, CliResult};
 use crate::cli::output::pretty_json;
-use crate::cli::resolve::{fetch_catalog, fetch_status, resolve_model_or_launch};
+use crate::cli::resolve::{
+  fetch_catalog, fetch_status, resolve_model, resolve_model_or_launch, resolve_running, CatalogRow,
+  RunningRow,
+};
 use crate::cli::{colors, format};
 use crate::config::Config;
 use crate::proxy::request_log::{RequestRow, Tail};
@@ -25,8 +28,7 @@ pub async fn handle(args: RequestsArgs, cli: &Cli, config: &Config) -> CliResult
   if let Some(reference) = &args.model {
     let catalog = fetch_catalog(&mut client).await?;
     let running = fetch_status(&mut client).await?.models;
-    let (model, _) = resolve_model_or_launch(&catalog, &running, reference)?;
-    params["model_path"] = json!(model.path);
+    params = tail_scope(&catalog, &running, reference)?;
   }
   if let Some(n) = args.lines {
     params["limit"] = json!(n);
@@ -41,6 +43,26 @@ pub async fn handle(args: RequestsArgs, cli: &Cli, config: &Config) -> CliResult
     print!("{}", requests_human(&body, args.model.is_some()));
   }
   Ok(())
+}
+
+/// The `requests_tail` params a reference asks for: a launch reference scopes
+/// to that one launch, a model reference to the model and every launch of it.
+/// The catalog answers first, so a model whose own name looks like a launch
+/// still reads as a model, and `model@name` with no such launch live keeps the
+/// model scope rather than failing.
+fn tail_scope(
+  catalog: &[CatalogRow],
+  running: &[RunningRow],
+  reference: &str,
+) -> Result<Value, CliExit> {
+  if let Ok(model) = resolve_model(catalog, reference) {
+    return Ok(json!({ "model_path": model.path }));
+  }
+  if let Ok(launch) = resolve_running(running, reference) {
+    return Ok(json!({ "launch_id": launch.launch_id }));
+  }
+  let (model, _) = resolve_model_or_launch(catalog, running, reference)?;
+  Ok(json!({ "model_path": model.path }))
 }
 
 /// The summary and the table. The summary is terminal-only so piped output
@@ -109,7 +131,32 @@ fn cells_for(row: &RequestRow, one_model: bool) -> Vec<String> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::cli::resolve::running_rows_in;
   use crate::proxy::request_log::RequestState;
+
+  #[test]
+  fn a_reference_that_names_a_launch_scopes_to_that_launch() {
+    let running = running_rows_in(&json!({
+      "models": [{
+        "launch_id": "L3",
+        "id": {"path": "/m/qwen.gguf", "header_blake3": "deadbeef"},
+        "port": 41100,
+        "mode": "chat",
+        "state": "ready",
+        "name": "coder",
+      }],
+    }));
+    // An empty catalog leaves only the launch half to resolve against.
+    for reference in ["L3", "41100", "coder"] {
+      assert_eq!(
+        tail_scope(&[], &running, reference).unwrap(),
+        json!({ "launch_id": "L3" }),
+        "`{reference}` names a launch"
+      );
+    }
+    let miss = tail_scope(&[], &running, "nope").unwrap_err();
+    assert!(miss.message.unwrap_or_default().contains("nope"));
+  }
 
   fn row() -> RequestRow {
     RequestRow {

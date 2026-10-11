@@ -793,7 +793,12 @@ mod tests {
     logged.observe(&Some(Ok(Frame::data(body))));
     logged.observe(&None);
     drop(logged);
-    let row = log.tail(None, 1).rows.into_iter().next().expect("a row");
+    let row = log
+      .tail(crate::proxy::request_log::LogScope::All, 1)
+      .rows
+      .into_iter()
+      .next()
+      .expect("a row");
     assert!(row.tokens_per_second_estimated);
     row.tokens_per_second.expect("an estimate")
   }

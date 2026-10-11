@@ -279,7 +279,7 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
         // so its totals are the ones filed under the model itself.
         "request_stats": ctx
           .requests
-          .tail(Some(&running_snap.params.model_path.to_string_lossy()), 0)
+          .tail(crate::proxy::request_log::LogScope::Model { path: running_snap.params.model_path.to_string_lossy().to_string() }, 0)
           .summary,
       });
       // Same only-when-set `preset` the managed branch stamps, so a

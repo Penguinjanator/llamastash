@@ -28,7 +28,7 @@ const GIB: u64 = 1024 * 1024 * 1024;
 use llamastash::daemon::shutdown::ShutdownToken;
 use llamastash::discovery::{DiscoveredModel, ModelCatalog, ModelSource};
 use llamastash::gguf::metadata::{ModeHint, ModelMetadata};
-use llamastash::proxy::request_log::RequestState;
+use llamastash::proxy::request_log::{LogScope, RequestState};
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
 use llamastash::test_support::{
@@ -833,7 +833,12 @@ async fn auto_start_refusal_unloads_the_idle_model_and_retries_once() {
   assert_eq!(row.evicted, vec![first_launch]);
   let summary = ctx
     .requests
-    .tail(Some(&second.to_string_lossy()), 0)
+    .tail(
+      LogScope::Model {
+        path: second.to_string_lossy().to_string(),
+      },
+      0,
+    )
     .summary;
   assert_eq!((summary.auto_starts, summary.evictions), (1, 1));
 
@@ -893,7 +898,12 @@ async fn a_client_that_hangs_up_during_make_room_still_logs_the_unload() {
   assert_eq!(row.evicted, vec![first_launch]);
   let summary = ctx
     .requests
-    .tail(Some(&second.to_string_lossy()), 0)
+    .tail(
+      LogScope::Model {
+        path: second.to_string_lossy().to_string(),
+      },
+      0,
+    )
     .summary;
   assert_eq!((summary.evictions, summary.errors), (1, 0));
 
