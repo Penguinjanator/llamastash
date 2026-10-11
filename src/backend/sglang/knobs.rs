@@ -137,6 +137,23 @@ pub const KNOBS: &[KnobDef] = &[
     ring: Ring::None,
     volatile: false,
   },
+  // Unset by default, so a launch's argv and the engine's port posture stay
+  // exactly as they were until someone asks for the engine's own counters.
+  KnobDef {
+    id: "enable-metrics",
+    flag: None,
+    concept: None,
+    kind: KnobKind::Bool,
+    auto: None,
+    group: Group::Advanced,
+    label: "Engine metrics",
+    help: "serve SGLang's Prometheus counters on its /metrics path",
+    aliases: &[],
+    fallback: crate::launch::params::LayerLabel::ServerDefault,
+    emit: Emit::BareFlagWhenTrue,
+    ring: Ring::None,
+    volatile: false,
+  },
   KnobDef {
     // Closed sets: both parsers are argparse `choices` (`["auto"]` plus the
     // detector map's keys), so a value outside the list fails at spawn anyway.

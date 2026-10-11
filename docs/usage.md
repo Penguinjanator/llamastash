@@ -849,7 +849,7 @@ llamastash start owner/repo --backend sglang --ctx 4096
 
 With vLLM installed too, a repo lists both engines in `supported_backends` and an `auto` launch picks vLLM; `--backend sglang` selects SGLang. Detection, the directory-shaped row and the slow readiness window are as for vLLM.
 
-`--ctx` maps to `--context-length`. Eight further tunables are declared (`mem-fraction-static`, `max-total-tokens`, `enable-unified-memory`, `max-running-requests`, `quantization`, `trust-remote-code`, `tool-call-parser`, `reasoning-parser`); the rest ride the `-- <extras>` tail minus a denylist that keeps the launch loopback-only, single-host and on the HTTP server the proxy forwards to.
+`--ctx` maps to `--context-length`. Nine further tunables are declared (`mem-fraction-static`, `max-total-tokens`, `enable-unified-memory`, `max-running-requests`, `quantization`, `trust-remote-code`, `tool-call-parser`, `reasoning-parser`, `enable-metrics`); the rest ride the `-- <extras>` tail minus a denylist that keeps the launch loopback-only, single-host and on the HTTP server the proxy forwards to.
 
 **On unified-memory hosts the KV pool is capped in tokens.** SGLang has no byte-level cap — `--mem-fraction-static` is a fraction of the whole pool — so when neither `max_total_tokens` nor `mem_fraction_static` is set, the launcher divides the shared byte budget by the model's KV bytes per token, read from the repo's `config.json`, and passes `--max-total-tokens`. A repo whose attention geometry cannot be read is refused, naming the override. See [SGLang setup](sglang-setup.md#notes-and-limitations).
 
@@ -1886,7 +1886,7 @@ Knob set, grouped into labelled clusters in display order:
 | Attention & KV cache                         | `flash_attn`, `cache_type_k`, `cache_type_v`       |
 | Throughput                                   | `threads`, `parallel`, `batch_size`, `ubatch_size` |
 | Memory loading                               | `load_mode`                                        |
-| Advanced                                     | `rope_freq_scale`, `keep`, `extras`                |
+| Advanced                                     | `rope_freq_scale`, `keep`, `metrics`, `extras`                |
 
 Groups are ordered by how often a knob is typically changed; related
 knobs sit together. (This display order is independent of the order

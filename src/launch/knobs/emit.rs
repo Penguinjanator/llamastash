@@ -136,10 +136,9 @@ mod tests {
 
   #[test]
   fn bare_bool_emits_only_when_true() {
-    // The default backend declares no `BareFlagWhenTrue` bool any more —
-    // `mlock` / `no-mmap` folded into the `load-mode` enum when llama.cpp
-    // replaced their flags — so this exercises the emission rule on a backend
-    // that still has one.
+    // The default backend has one bare-flag bool, `metrics`, and it is
+    // covered by its own test below; this one exercises the rule on a backend
+    // whose tuning knobs use the bare form throughout.
     let backend = crate::test_support::backend_declaring("enforce-eager");
     let mut on = KnobSet::new();
     on.set_scalar(id("enforce-eager"), Scalar::Bool(true));
@@ -151,6 +150,34 @@ mod tests {
       emit_argv(backend, &off, &[]).is_empty(),
       "false emits no --no-flag form"
     );
+  }
+
+  /// The opt-in engine counters change nothing until someone asks for them.
+  #[test]
+  fn an_unset_engine_metrics_knob_emits_no_argv() {
+    for (backend, knob) in [
+      (crate::backend::DEFAULT_BACKEND_ID, "metrics"),
+      (crate::backend::sglang::SGLANG_BACKEND_ID, "enable-metrics"),
+    ] {
+      let id = registry::resolve_id_for(backend, knob).expect("the knob is declared");
+      assert!(
+        emit_argv(backend, &KnobSet::new(), &[]).is_empty(),
+        "{backend} launches unchanged while the knob is unset"
+      );
+      let mut on = KnobSet::new();
+      on.set_scalar(id, Scalar::Bool(true));
+      assert_eq!(
+        strs(emit_argv(backend, &on, &[])),
+        vec![format!("--{knob}")],
+        "{backend} passes the bare flag through"
+      );
+      let mut off = KnobSet::new();
+      off.set_scalar(id, Scalar::Bool(false));
+      assert!(
+        emit_argv(backend, &off, &[]).is_empty(),
+        "false emits no --no-flag form for {knob}"
+      );
+    }
   }
 
   fn strs(args: Vec<OsString>) -> Vec<String> {

@@ -14,6 +14,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 - `proxy.aliases` maps a model name a tool is hard-wired to onto a local model (`gpt-4o-mini: qwen3.8-27b-q8`, or a `name:`/`target:` list when you want a comment per entry), so that tool needs no config edit. A value has to name exactly one model by itself, so it never routes to a guess. A name that names a model outright wins over an alias of the same name, an alias settles a name two models share, an alias names a model rather than a preset, and aliases are not listed by `/v1/models` or `/api/tags`. ([#99](https://github.com/llamastash/llamastash/pull/99))
 - The `/ui` model chooser colours each row: green for a model whose backend has a web UI you can open, red for one that is running but serves none. ([#99](https://github.com/llamastash/llamastash/pull/99))
 - **`llamastash requests` can scope to one launch.** A reference naming a running launch — its id (`L3`), its port or its name — lists that launch's requests and its own totals; a model reference still covers every launch of it.
+- **Engine counter knobs.** `metrics` (llama.cpp) and `enable-metrics` (SGLang) pass the engine's own metrics flag, so a launch can serve its Prometheus counters on its own port. Both are unset by default and change nothing until you set one.
 
 ### Changed
 
