@@ -137,13 +137,17 @@ fn seeded_dashboard_app() -> App {
 }
 
 fn render_to_lines(app: &mut App) -> Vec<String> {
-  let backend = TestBackend::new(WIDTH, HEIGHT);
+  render_to_lines_at(app, WIDTH, HEIGHT)
+}
+
+fn render_to_lines_at(app: &mut App, width: u16, height: u16) -> Vec<String> {
+  let backend = TestBackend::new(width, height);
   let mut terminal = Terminal::new(backend).expect("test terminal");
   terminal.draw(|f| render(f, app)).expect("render");
   let buf = terminal.backend().buffer();
-  let mut rows: Vec<String> = Vec::with_capacity(HEIGHT as usize);
+  let mut rows: Vec<String> = Vec::with_capacity(height as usize);
   for y in 0..buf.area.height {
-    let mut row = String::with_capacity(WIDTH as usize);
+    let mut row = String::with_capacity(width as usize);
     for x in 0..buf.area.width {
       row.push_str(buf[(x, y)].symbol());
     }
@@ -266,6 +270,17 @@ fn requests_view_golden_render_matches_fixture() {
   // machine's zone, so the fixture holds `HH:MM:SS` in its place.
   let rendered = mask_clock_times(&render_to_lines(&mut seeded_requests_view_app()).join("\n"));
   assert_golden_text(rendered + "\n", "tests/golden/requests-view.txt");
+}
+
+#[cfg_attr(target_os = "macos", ignore = "fixture uses Linux key glyphs")]
+#[test]
+fn requests_view_wide_golden_render_matches_fixture() {
+  // The wide frame is the only golden that shows `Launch`, `Client`,
+  // `Note` and `Route`, and the only one where a long note wraps onto a
+  // continuation line instead of being dropped with the column.
+  let mut app = seeded_requests_view_app();
+  let rendered = mask_clock_times(&render_to_lines_at(&mut app, 280, 30).join("\n"));
+  assert_golden_text(rendered + "\n", "tests/golden/requests-view-wide.txt");
 }
 
 /// `text` with every `dd:dd:dd` clock time replaced by `HH:MM:SS`.
@@ -475,7 +490,11 @@ fn seeded_requests_view_app() -> App {
       launch_id: None,
       auto_start: true,
       error: Some("launch_failed".into()),
-      cause: Some("compose_and_spawn: not enough memory".into()),
+      cause: Some(
+        "compose_and_spawn: not enough memory to map the KV cache at this \
+         context; unload a model or lower --ctx-size"
+          .into(),
+      ),
       ttfb_ms: None,
       duration_ms: Some(96),
       prompt_tokens: None,
