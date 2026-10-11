@@ -18,6 +18,7 @@ use crate::cli::resolve::{
 use crate::cli::{colors, format};
 use crate::config::Config;
 use crate::proxy::request_log::{RequestRow, Tail};
+use crate::util::wrap::wrap_cells;
 
 /// Cell text for a value the log does not have.
 const NONE: &str = "-";
@@ -83,15 +84,50 @@ fn requests_human(body: &Value, one_model: bool) -> String {
     out.push('\n');
     return out;
   }
-  let mut header = vec![
-    "TIME", "STATUS", "TOTAL", "TTFB", "TOK/S", "IN", "OUT", "ROUTE",
-  ];
+  let mut header = vec!["TIME", "CODE", "TOK/S", "TOTAL", "TTFB", "IN", "OUT"];
   if !one_model {
     header.push("MODEL");
   }
-  header.extend(["LAUNCH", "CLIENT", "NOTE"]);
+  header.extend(["LAUNCH", "CLIENT", "NOTE", "ROUTE"]);
   let table: Vec<Vec<String>> = rows.iter().map(|r| cells_for(r, one_model)).collect();
+  let table = wrap_notes(&header, table);
   out.push_str(&format::table(&header, &table));
+  out
+}
+
+/// The widest the NOTE column gets on a terminal. One refused auto-start
+/// carries the engine's whole cause, and a note wider than the screen
+/// buries the figures of every row under it.
+const NOTE_MAX_W: usize = 60;
+
+/// Split long notes over continuation lines under the NOTE column, on a
+/// terminal only. Piped output keeps one line per request with the whole
+/// note in its field, so `awk -F\t` pipelines are untouched.
+fn wrap_notes(header: &[&str], rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
+  if !console::colors_enabled() {
+    return rows;
+  }
+  let Some(note) = header.iter().position(|h| *h == "NOTE") else {
+    return rows;
+  };
+  let mut out = Vec::with_capacity(rows.len());
+  for row in rows {
+    let note_text = row.get(note).cloned().unwrap_or_default();
+    for (i, chunk) in wrap_cells(&note_text, NOTE_MAX_W).into_iter().enumerate() {
+      let mut line = row.clone();
+      line[note] = chunk;
+      if i > 0 {
+        // A continuation line carries only the note: the row's own
+        // figures already appeared above it.
+        for (j, cell) in line.iter_mut().enumerate() {
+          if j != note {
+            *cell = String::new();
+          }
+        }
+      }
+      out.push(line);
+    }
+  }
   out
 }
 
@@ -106,12 +142,11 @@ fn cells_for(row: &RequestRow, one_model: bool) -> Vec<String> {
   let mut cells = vec![
     c.time,
     status,
+    c.speed,
     c.total,
     c.ttfb,
-    c.speed,
     c.tokens_in,
     c.tokens_out,
-    c.route,
   ];
   if !one_model {
     cells.push(c.model);
@@ -124,6 +159,7 @@ fn cells_for(row: &RequestRow, one_model: bool) -> Vec<String> {
     } else {
       c.note
     },
+    c.route,
   ]);
   cells
 }
@@ -201,7 +237,7 @@ mod tests {
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(
       lines[0],
-      "TIME\tSTATUS\tTOTAL\tTTFB\tTOK/S\tIN\tOUT\tROUTE\tMODEL\tLAUNCH\tCLIENT\tNOTE"
+      "TIME\tCODE\tTOK/S\tTOTAL\tTTFB\tIN\tOUT\tMODEL\tLAUNCH\tCLIENT\tNOTE\tROUTE"
     );
     assert_eq!(lines.len(), 2);
     let cells: Vec<&str> = lines[1].split('\t').collect();
@@ -209,16 +245,16 @@ mod tests {
       &cells[1..],
       [
         "200",
+        "39.6",
         "1.2s",
         "180ms",
-        "39.6",
         "41",
         "12.3k",
-        "chat/completions",
         "Qwen3.8-27B",
         "L1",
         "127.0.0.1:5000",
-        "-"
+        "-",
+        "chat/completions",
       ]
     );
   }
@@ -247,10 +283,73 @@ mod tests {
     let out = piped(&[failed], false);
     let cells: Vec<&str> = out.lines().nth(1).unwrap().split('\t').collect();
     assert_eq!(cells[1], "404");
-    assert_eq!(cells[3], "-");
-    assert_eq!(cells[8], "qwen");
-    assert_eq!(cells[9], "-");
-    assert_eq!(cells[11], "model_not_found");
+    assert_eq!(cells[2], "-");
+    assert_eq!(cells[4], "-");
+    assert_eq!(cells[7], "qwen");
+    assert_eq!(cells[8], "-");
+    assert_eq!(cells[10], "model_not_found");
+    assert_eq!(cells[11], "chat/completions");
+  }
+
+  /// Terminal rendering, with the process-wide color flag restored. It
+  /// gates the padded layout and the note wrap, so the same rows print
+  /// differently here than under [`piped`].
+  fn on_terminal(rows: &[RequestRow], one_model: bool) -> String {
+    let body = json!(Tail {
+      rows: rows.to_vec(),
+      ..Tail::default()
+    });
+    let _lock = crate::cli::test_lock::serialize();
+    let prior = console::colors_enabled();
+    console::set_colors_enabled(true);
+    let out = requests_human(&body, one_model);
+    console::set_colors_enabled(prior);
+    out
+  }
+
+  /// A row whose note runs past the NOTE column's cap.
+  fn long_note_row() -> RequestRow {
+    RequestRow {
+      status: Some(503),
+      error: Some("launch_failed".to_string()),
+      cause: Some(
+        "auto-start of the model failed because the KV cache did not fit; \
+         unload another model or lower --ctx-size"
+          .to_string(),
+      ),
+      ..row()
+    }
+  }
+
+  #[test]
+  fn a_long_note_wraps_onto_a_continuation_line_on_a_terminal() {
+    let lines: Vec<String> = on_terminal(&[long_note_row()], false)
+      .lines()
+      .map(|l| console::strip_ansi_codes(l).to_string())
+      // Drop the summary block: it is terminal-only and has its own wrap.
+      .skip_while(|l| !l.starts_with("TIME"))
+      .collect();
+    assert_eq!(lines.len(), 4, "header, rule, row, continuation: {lines:?}");
+    let (row_line, cont) = (&lines[2], &lines[3]);
+    assert!(row_line.contains("launch_failed:"), "{row_line}");
+    assert!(
+      !row_line.contains("--ctx-size"),
+      "the note must wrap: {row_line}"
+    );
+    assert!(cont.contains("--ctx-size"), "{cont}");
+    // The continuation line carries the note and nothing else.
+    assert!(!cont.contains("chat/completions"), "{cont}");
+    assert!(!cont.contains("1.2s"), "{cont}");
+  }
+
+  #[test]
+  fn a_piped_long_note_stays_one_field_on_one_line() {
+    let out = piped(&[long_note_row()], false);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    let cells: Vec<&str> = lines[1].split('\t').collect();
+    assert_eq!(cells.len(), 12);
+    assert!(cells[10].ends_with("lower --ctx-size"), "{}", cells[10]);
   }
 
   #[test]

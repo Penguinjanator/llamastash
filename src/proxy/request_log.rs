@@ -285,6 +285,11 @@ pub struct RequestSummary {
   pub avg_ttfb_ms: Option<u64>,
   /// Mean of the per-request speeds, estimated ones included.
   pub tokens_per_second_avg: Option<f64>,
+  /// Mean speed of the newest launch of the scoped model only: what this
+  /// session is running at, with a reloaded model no older launch pulling
+  /// the average. Set for a model scope only; `None` for the whole log and
+  /// for a scope no request has reported a speed for yet.
+  pub tokens_per_second_session: Option<f64>,
   /// The most recent speed a request reported.
   pub tokens_per_second_last: Option<f64>,
   pub prompt_tokens: u64,
@@ -310,12 +315,21 @@ impl RequestSummary {
       ("Avg total", ms(self.avg_duration_ms)),
       ("Avg TTFB", ms(self.avg_ttfb_ms)),
       ("Tok/s avg", tps(self.tokens_per_second_avg)),
+    ]
+    .into_iter()
+    .chain(
+      self
+        .tokens_per_second_session
+        .map(|t| ("Tok/s session", format!("{t:.1}"))),
+    )
+    .chain([
       ("Tok/s last", tps(self.tokens_per_second_last)),
       ("Tokens in", fmt_count(self.prompt_tokens)),
       ("Tokens out", fmt_count(self.completion_tokens)),
       ("Auto-starts", self.auto_starts.to_string()),
       ("Unloaded", self.evictions.to_string()),
-    ]
+    ])
+    .collect()
   }
 }
 
@@ -375,6 +389,9 @@ impl Totals {
       avg_duration_ms: self.duration_ms_sum.checked_div(self.timed),
       avg_ttfb_ms: self.ttfb_ms_sum.checked_div(self.timed),
       tokens_per_second_avg: (self.tps_n > 0).then(|| self.tps_sum / self.tps_n as f64),
+      // `RequestLog::tail` fills this for a model scope; a single set of
+      // totals has no notion of "the newest launch".
+      tokens_per_second_session: None,
       tokens_per_second_last: self.tps_last,
       prompt_tokens: self.prompt_tokens,
       completion_tokens: self.completion_tokens,
@@ -544,8 +561,21 @@ impl RequestLog {
   pub fn tail(&self, scope: LogScope, limit: usize) -> Tail {
     let inner = self.lock();
     let totals = inner.totals(&scope);
+    let mut summary = totals.map(Totals::summary).unwrap_or_default();
+    // The speed of the newest launch that served this model, so a model
+    // reloaded at a different speed shows both numbers.
+    if let LogScope::Model { .. } = scope {
+      summary.tokens_per_second_session = inner
+        .rows
+        .iter()
+        .rev()
+        .find(|r| scope.matches(r))
+        .and_then(|r| r.launch_id.as_deref())
+        .and_then(|id| RequestLog::launch_totals(&inner, id))
+        .and_then(|t| Totals::summary(t).tokens_per_second_avg);
+    }
     Tail {
-      summary: totals.map(Totals::summary).unwrap_or_default(),
+      summary,
       rows: inner
         .rows
         .iter()
@@ -1352,6 +1382,71 @@ mod tests {
     for id in &ids[1..] {
       assert_eq!(log.launch_summary(id).requests, 1, "{id} is retired");
     }
+  }
+
+  #[test]
+  fn a_model_scope_reports_the_newest_launch_speed_as_the_session() {
+    let speed = |t: f64| Usage {
+      completion_tokens: Some(10),
+      tokens_per_second: Some(t),
+      ..Usage::default()
+    };
+    let log = RequestLog::new();
+    served(&log, "/m/a.gguf", "L1", speed(80.0));
+    served(&log, "/m/a.gguf", "L1", speed(60.0));
+    served(&log, "/m/a.gguf", "L2", speed(20.0));
+
+    let model = log
+      .tail(
+        LogScope::Model {
+          path: "/m/a.gguf".to_string(),
+        },
+        10,
+      )
+      .summary;
+    assert_eq!(
+      model.tokens_per_second_avg,
+      Some((80.0 + 60.0 + 20.0) / 3.0)
+    );
+    // The newest launch of the model runs at 20, and that is the session.
+    assert_eq!(model.tokens_per_second_session, Some(20.0));
+    // The whole log has no single session to name, and a launch scope is
+    // already one launch, so neither gets the extra figure.
+    assert_eq!(
+      log
+        .tail(LogScope::All, 10)
+        .summary
+        .tokens_per_second_session,
+      None
+    );
+    assert_eq!(
+      log
+        .tail(
+          LogScope::Launch {
+            id: "L1".to_string()
+          },
+          10,
+        )
+        .summary
+        .tokens_per_second_session,
+      None
+    );
+    // The strip shows the figure only when there is one, so an old daemon
+    // (no key in the JSON) renders exactly as before.
+    let with = model.cells("-");
+    assert!(with.iter().any(|(k, _)| *k == "Tok/s session"));
+    assert_eq!(
+      with[with
+        .iter()
+        .position(|(k, _)| *k == "Tok/s session")
+        .unwrap()]
+      .1,
+      "20.0"
+    );
+    assert!(!RequestSummary::default()
+      .cells("-")
+      .iter()
+      .any(|(k, _)| *k == "Tok/s session"));
   }
 
   #[test]

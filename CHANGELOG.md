@@ -15,9 +15,11 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 - The `/ui` model chooser colours each row: green for a model whose backend has a web UI you can open, red for one that is running but serves none. ([#99](https://github.com/llamastash/llamastash/pull/99))
 - **`llamastash requests` can scope to one launch.** A reference naming a running launch — its id (`L3`), its port or its name — lists that launch's requests and its own totals; a model reference still covers every launch of it.
 - **Engine counter knobs.** `metrics` (llama.cpp) and `enable-metrics` (SGLang) pass the engine's own metrics flag, so a launch can serve its Prometheus counters on its own port. Both are unset by default and change nothing until you set one.
+- **`Tok/s session`.** The request summary carries the mean speed of the model's newest launch on its own, so a reloaded model shows what it is running at now rather than a mean over every launch since the daemon started. It shows in the Requests tab and the `requests` summary, and as `tokens_per_second_session` in `requests --json`.
 
 ### Changed
 
+- **The request tables reordered.** `llamastash requests` and the Requests tab now read Time, Code, Tok/s, Total, TTFB, In, Out, Model, Launch, Client, Note, Route, and the tab gained the `Launch` column the CLI already had. A note longer than its column wraps onto continuation lines instead of pushing the figures out of view; piped output still keeps one line per request with the whole note in its field.
 - A preset lookup no longer reads a model header on the daemon's async worker thread, so a slow disk cannot stall the control-plane calls queued behind it. ([#99](https://github.com/llamastash/llamastash/pull/99))
 - `/api/show` reads `<model>@<launch>` the way the chat surfaces do: the launch name is a pointer to a running launch, and a name that does not exist falls back to that model's unnamed launch. It used to answer `404` for anything containing an `@`. ([#99](https://github.com/llamastash/llamastash/pull/99))
 - The proxy reads the model catalog through one shared snapshot instead of copying every row for every request, so routing a request no longer allocates in proportion to how many models are on disk. ([#99](https://github.com/llamastash/llamastash/pull/99))

@@ -527,17 +527,17 @@ llamastash requests [model-ref] [-n N] [--json]
 Without `model-ref` it lists every request. A `model-ref` that names a running launch — its id (`L3`), its port or its name — scopes to that launch: its own rows, and totals for what that launch served, so an earlier launch of the same model is not counted in. Any other `model-ref` names a model and keeps the wider scope, covering every launch of it. `-n` sets how many rows to print (default 100, at least 1).
 
 ```
-TIME      STATUS  TOTAL  TTFB   TOK/S  IN  OUT  ROUTE             MODEL                         LAUNCH  CLIENT           NOTE
-16:05:11  200     1.0s   22ms   -      -   -    chat/completions  Llama-3.2-1B-Instruct-Q4_K_M  L1      127.0.0.1:49178  client closed
-16:05:11  200     29ms   12ms   122.6  41  3    chat/completions  Llama-3.2-1B-Instruct-Q4_K_M  L1      127.0.0.1:49120  -
-16:05:07  200     3.4s   3.4s   110.4  41  7    chat/completions  Llama-3.2-1B-Instruct-Q4_K_M  L1      127.0.0.1:49106  auto-start
-16:05:07  404     0ms    -      -      -   -    chat/completions  nope                          -       127.0.0.1:49062  model_not_found: nope not found
+TIME      CODE  TOK/S  TOTAL  TTFB   IN  OUT  MODEL                         LAUNCH  CLIENT           NOTE                             ROUTE
+16:05:11  200   -      1.0s   22ms   -   -    Llama-3.2-1B-Instruct-Q4_K_M  L1      127.0.0.1:49178  client closed                    chat/completions
+16:05:11  200   122.6  29ms   12ms   41  3    Llama-3.2-1B-Instruct-Q4_K_M  L1      127.0.0.1:49120  -                                chat/completions
+16:05:07  200   110.4  3.4s   3.4s   41  7    Llama-3.2-1B-Instruct-Q4_K_M  L1      127.0.0.1:49106  auto-start                       chat/completions
+16:05:07  404   -      0ms    -      -   -    nope                          -       127.0.0.1:49062  model_not_found: nope not found  chat/completions
 ```
 
 - `TOTAL` is the time from the proxy receiving the request to the end of the response. `TTFB` is the time to the first response body byte, which includes any model load.
 - `IN` / `OUT` are prompt and generated tokens. `TOK/S` is the generation speed. A leading `~` marks a speed the proxy estimated because the model's server reported none.
 - `NOTE` says what happened beyond the status code: `auto-start` (this request started the model), `unloaded L3` (launches unloaded to make room), `fallback (<reason>) for <model>`, `client closed`, `upstream error`, `loading model`, `in flight`, or the proxy's own error and its message (`launch_failed: auto-start of ...`).
-- On a terminal a summary block is printed above the table. Piped output is the header plus one tab-separated line per request. The `MODEL` column is dropped when `model-ref` is given.
+- On a terminal a summary block is printed above the table, and a `NOTE` longer than 60 cells wraps onto continuation lines under its column rather than running off the screen. Piped output is the header plus one tab-separated line per request with the whole note in its field, and the `MODEL` column is dropped when `model-ref` names one model or one launch.
 
 `--json` emits `{ "summary": {...}, "requests": [...] }`. Every key of a request is always present; a value the proxy does not have is `null`:
 
@@ -569,7 +569,7 @@ TIME      STATUS  TOTAL  TTFB   TOK/S  IN  OUT  ROUTE             MODEL         
 
 `state` is `in_flight`, `done`, `client_closed` (the client went away before the response was complete) or `upstream_error` (the model's server dropped the connection mid-response). When the proxy answered the request itself, `error` is its error `code`, or its `type` when the error has no code (`model_not_found`, `model_required`, `launch_failed`, ...), and `cause` is the error message. When another model answered because the launch failed, the row is filed under the model that answered and `fallback` holds the reason.
 
-`summary` covers the same scope as the rows (one launch, one model, or everything) and counts finished requests since the daemon started, so it keeps counting requests whose rows have left the log. `errors` counts 4xx / 5xx answers and `upstream_error` rows; a client that hung up is not an error. The two averages cover completed 2xx / 3xx requests only. `tokens_per_second_avg` is the mean of the per-request speeds, estimated ones included. `tokens_per_second_last` is the most recent speed a request reported. `auto_starts` counts the requests that started the model; a request that waited on a load someone else started is not one, and neither is one whose launch was refused before it spawned. `evictions` counts the launches unloaded to make room.
+`summary` covers the same scope as the rows (one launch, one model, or everything) and counts finished requests since the daemon started, so it keeps counting requests whose rows have left the log. `errors` counts 4xx / 5xx answers and `upstream_error` rows; a client that hung up is not an error. The two averages cover completed 2xx / 3xx requests only. `tokens_per_second_avg` is the mean of the per-request speeds, estimated ones included. `tokens_per_second_session` is that mean for the model's newest launch alone, so a model you reloaded shows what it runs at now instead of a mean over every launch since the daemon started; it is present for a model scope only, and absent when no request has reported a speed. `tokens_per_second_last` is the most recent speed a request reported. `auto_starts` counts the requests that started the model; a request that waited on a load someone else started is not one, and neither is one whose launch was refused before it spawned. `evictions` counts the launches unloaded to make room.
 
 What is and is not recorded:
 
@@ -1994,7 +1994,7 @@ The last tab of every model that has a launch. It shows that model's proxy reque
 
 - The top lines are the model's summary: requests, errors, average total time and time to first byte, tok/s (average and last), tokens in and out, auto-starts, and launches unloaded to make room.
 - Below is the table, newest request first. `↑` / `↓` scroll it.
-- The columns are `Time`, `Code`, `Tok/s`, `Total`, `In`, `Out`, `TTFB`, `Route`, `Client` and `Note`. As the pane narrows they drop out in this order: `Client`, `Note`, `Route`, `TTFB`, `Out`, `In`, `Total`, `Tok/s`, `Code`, `Time`. When `Note` shows it takes whatever width is left.
+- The columns are `Time`, `Code`, `Tok/s`, `Total`, `TTFB`, `In`, `Out`, `Launch`, `Client`, `Note` and `Route`. As the pane narrows they drop out in this order: `Client`, `Route`, `Note`, `Launch`, `Out`, `In`, `TTFB`, `Total`, `Tok/s`, `Code`, `Time`. `Note` takes the spare width up to 48 cells and wraps onto continuation lines beyond that; `Route`, which is last, takes what `Note` leaves.
 
 ### Chat tab (`Focus::ChatInput`)
 

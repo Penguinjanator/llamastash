@@ -519,6 +519,7 @@ fn seeded_requests_view_app() -> App {
       avg_duration_ms: Some(20_165),
       avg_ttfb_ms: Some(16_026),
       tokens_per_second_avg: Some(41.27),
+      tokens_per_second_session: Some(48.9),
       tokens_per_second_last: Some(41.27),
       prompt_tokens: 36_864,
       completion_tokens: 328,

@@ -15,9 +15,10 @@
 │────────────────────────────────────────────────────────────────────────────││ ────────────────────────────────────── │
 │m/x                                                                         ││ Requests 4   Errors 1                  │
 │ ★ mistral-7b                             llama       Q4_K    8.0k    4.0G  ││ Avg total 20.2s   Avg TTFB 16.0s       │
-│m/y                                                                         ││ Tok/s avg 41.3   Tok/s last 41.3       │
-│   phi-3                                  phi         Q4_K    8.0k    3.9G  ││ Tokens in 36.9k   Tokens out 328       │
-│                                                                            ││ Auto-starts 2   Unloaded 1             │
+│m/y                                                                         ││ Tok/s avg 41.3   Tok/s session 48.9    │
+│   phi-3                                  phi         Q4_K    8.0k    3.9G  ││ Tok/s last 41.3   Tokens in 36.9k      │
+│                                                                            ││ Tokens out 328   Auto-starts 2         │
+│                                                                            ││ Unloaded 1                             │
 │                                                                            ││                                        │
 │                                                                            ││ Time     Code Tok/s  Total   TTFB      │
 │                                                                            ││ HH:MM:SS 200  —      —       182ms     │
@@ -25,6 +26,5 @@
 │                                                                            ││ HH:MM:SS 503  —      96ms    —         │
 │                                                                            ││ HH:MM:SS 200  41.3   36.0s   31.9s     │
 │                                                                            ││ HH:MM:SS 200  41.3   4.3s    182ms     │
-│                                                                            ││                                        │
 │                                                                            ││                                        │
 └ ◌ launching · ◐ loading · ● ready · ▲ error · ○ stopped · ⇪ external ──────┘└────────────────────────────────────────┘
