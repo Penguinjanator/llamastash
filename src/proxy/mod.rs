@@ -17,6 +17,8 @@ pub mod eviction;
 pub(crate) mod failure_tracker;
 pub(crate) mod forward;
 pub(crate) mod launch;
+pub(crate) mod metrics;
+pub(crate) mod metrics_backend;
 pub(crate) mod mru;
 pub(crate) mod ollama_compat;
 pub(crate) mod openai;

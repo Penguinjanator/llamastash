@@ -15,6 +15,11 @@
 //!   `/v1/models` so tests can assert the right model is being run)
 //! - `-c <N>` (recorded; no behaviour change)
 //! - `--embeddings`, `--reranking` (records the mode)
+//! - `--metrics` (mirrors real `llama-server`: with it, `GET /metrics` serves a
+//!   small Prometheus document; without it the endpoint answers `501` with a
+//!   `not_supported_error` body, which is how a server started without the flag
+//!   behaves. Two servers, one with the flag and one without, give a fan-out test
+//!   a working target and a refusing one.)
 //! - `--health-delay-ms <N>` (test-only — returns 503 until N ms
 //!   after process start, then 200; lets tests exercise the
 //!   Loading → Ready transition deterministically)
@@ -60,6 +65,8 @@ struct Args {
   /// to read.
   fit_ctx: Option<u32>,
   mode: Mode,
+  /// Set with `--metrics`; decides whether `GET /metrics` serves text or 501.
+  metrics: bool,
   health_delay_ms: u64,
   trap_sigterm: bool,
   // Only read under cfg(unix): Windows has no SIGTERM to delay.
@@ -125,6 +132,7 @@ fn parse_args() -> Args {
   let mut ctx: Option<u32> = None;
   let mut fit_ctx: Option<u32> = None;
   let mut mode = Mode::Chat;
+  let mut metrics = false;
   let mut health_delay_ms: u64 = 0;
   let mut trap_sigterm = false;
   let mut sigterm_exit_delay_ms = None;
@@ -141,6 +149,7 @@ fn parse_args() -> Args {
       "--fit-ctx" => fit_ctx = args.next().and_then(|v| v.parse().ok()),
       "--embeddings" => mode = Mode::Embedding,
       "--reranking" => mode = Mode::Rerank,
+      "--metrics" => metrics = true,
       "--spec-type" => spec_mtp = args.next().as_deref() == Some("draft-mtp"),
       "--health-delay-ms" => {
         health_delay_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -163,6 +172,7 @@ fn parse_args() -> Args {
     ctx,
     fit_ctx,
     mode,
+    metrics,
     health_delay_ms,
     trap_sigterm,
     sigterm_exit_delay_ms,
@@ -356,6 +366,32 @@ async fn handle(
         .await?;
       } else {
         write_response(&mut wr, 200, "application/json", b"{\"status\":\"ok\"}").await?;
+      }
+    }
+    ("GET", "/metrics") => {
+      // Real `llama-server` only serves `/metrics` when started with `--metrics`;
+      // without the flag the endpoint answers 501 and points at the flag.
+      if args.metrics {
+        // The names and shapes are llama.cpp's: `<unit>_total` counters plus
+        // gauges, one label-free sample each, `# HELP` then `# TYPE`.
+        let body = "# HELP llamacpp:prompt_tokens_total Number of prompt tokens processed.\n\
+# TYPE llamacpp:prompt_tokens_total counter\n\
+llamacpp:prompt_tokens_total 21\n\
+# HELP llamacpp:predicted_tokens_total Number of predicted tokens.\n\
+# TYPE llamacpp:predicted_tokens_total counter\n\
+llamacpp:predicted_tokens_total{model_name=\"fake\"} 7\n\
+# HELP llamacpp:requests_processing Number of requests currently being processed.\n\
+# TYPE llamacpp:requests_processing gauge\n\
+llamacpp:requests_processing 0\n";
+        write_response(&mut wr, 200, "text/plain; version=0.0.4", body.as_bytes()).await?;
+      } else {
+        write_response(
+          &mut wr,
+          501,
+          "application/json",
+          b"{\"error\":{\"code\":\"not_supported_error\",\"message\":\"the metrics endpoint is disabled; start the server with --metrics\",\"type\":\"not_supported_error\"}}",
+        )
+        .await?;
       }
     }
     ("GET", "/props") => {

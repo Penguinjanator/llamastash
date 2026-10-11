@@ -1426,12 +1426,127 @@ The proxy speaks HTTP/1.1 only on `127.0.0.1:<port>` (no h2c upgrade, no ALPN-ne
 | `POST` | `/v1/completions`      | OpenAI text completions. Same forwarding semantics.                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `POST` | `/v1/embeddings`       | OpenAI embeddings. JSON pass-through.                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `POST` | `/v1/rerank`           | llama.cpp's rerank endpoint (also exposed under the `/v1/` prefix for client uniformity). JSON pass-through.                                                                                                                                                                                                                                                                                                                                         |
+| `GET`  | `/metrics`             | Prometheus text scrape of the proxy's own counters and gauges, or JSON on request. See [Metrics](#metrics-metrics).                                                                                                                                                                                                                     |
+| `GET`  | `/metrics/backend`     | The same text format with every Ready launch's own `/metrics` merged in, each sample labelled with its `launch`. See [Metrics](#metrics-metrics).                                                                                                                     |
 | `GET`  | `/api/tags`            | **Ollama compat — discovery.** Ollama-shape `{"models":[{name, model, modified_at, size, digest, details:{format,family,parameter_size,quantization_level,…}}]}` projection of the discovered catalog. Sorted alphabetically by `name`. Empty catalog → `{"models":[]}`. See [Ollama-compat surface](#ollama-compat-surface).                                                                                                                        |
 | `GET`  | `/api/version`         | **Ollama compat.** `{"version":"<crate-version>"}` — same value `status.daemon.build` surfaces.                                                                                                                                                                                                                                                                                                                                                      |
 | `GET`  | `/api/ps`              | **Ollama compat.** Currently-Ready supervisors in Ollama's running-list shape (`{models:[…{expires_at, size_vram, …}]}`). `expires_at` is a far-future placeholder until idle-TTL eviction lands (R34 deferred); `size_vram` is `0` until per-PID VRAM attribution lands.                                                                                                                                                                            |
 | `POST` | `/api/show`            | **Ollama compat.** `{"model":"<name>"}` or `{"name":"<name>"}` body → per-model metadata in Ollama shape (`{modelfile, parameters, template, details, model_info, capabilities}`). Same fuzzy resolver as `/v1/chat/completions`.                                                                                                                                                                                                                    |
 
 Request body cap: **`proxy.max_body_size` bytes, default 16 MiB**, enforced via `http-body-util::Limited` before forwarding. Anything larger returns HTTP 413 naming the configured limit. Text-only chat completions are typically well under 1 MiB even with long histories; 16 MiB covers vision payloads (a base64 image is ~33% larger than the source file — one phone photo fits with room to spare) while still bounding worst-case per-request memory. The cap is **per request body, not a global pool** — N concurrent max-size requests buffer up to N × the cap, so a LAN-exposed proxy (`proxy.host`) with many large in-flight bodies can use more RAM than the cap alone suggests. `0` disables the check: one request can buffer arbitrary RAM (we buffer in memory — unlike nginx's `client_max_body_size 0`, which spools to disk, so its `0` carries a safety property ours does not). To stop serving bodies altogether, `proxy.enabled: false` is the honest switch.
+
+### Metrics (`/metrics`)
+
+The proxy publishes its own counters at `GET /metrics` in the Prometheus text
+format, and the same numbers as JSON for scripts. It is the HTTP equivalent of the
+`--json` agent contract: one surface, stable names, and a client that parses the JSON
+form already parses `llamastash requests --json`. Every value is counted **since the
+daemon started** and nothing is persisted; a daemon restart resets every counter to
+zero, which is a restart, not data loss. The durable record stays
+`<log dir>/requests.jsonl`. Scraping costs the proxy nothing it would not otherwise
+pay: `/metrics` reads the in-memory request log and never contacts a backend, and a
+scrape is not itself logged as a request.
+
+Both routes answer the proxy API key the same way the `/v1/*` routes do when one is
+configured (`Bearer` challenge). `HEAD /metrics` is not routed (404), same as
+`/health`.
+
+`GET /metrics` answers in one of two formats. The rule is deterministic and has to
+survive a naive `curl` and a real Prometheus scraper alike.
+
+| Request | Response |
+| --- | --- |
+| no `Accept` header | Prometheus text |
+| `Accept: */*` (what plain `curl` sends) | **Prometheus text** — a wildcard must never select JSON |
+| `Accept: text/plain` or `text/plain; version=0.0.4; charset=utf-8` | Prometheus text |
+| `Accept: application/openmetrics-text; version=1.0.0,text/plain` | Prometheus text (OpenMetrics is served as text format 0.0.4) |
+| `Accept: application/json` | JSON |
+| `Accept: application/json;q=0.9, text/plain;q=0.5` | JSON (higher q wins) |
+| `Accept: application/json;q=0.9, text/plain;q=0.9` | Prometheus text (tie goes to text) |
+| `Accept: application/xml` | `406` with the OpenAI-shaped error envelope |
+| `?format=json` | JSON, regardless of `Accept` |
+| `?format=prometheus` | Prometheus text, regardless of `Accept` |
+| `?format=<anything else>` | `400` naming the two accepted values |
+
+Only `application/json` and `text/plain` are matched, so a `;` parameter that is not
+`q` (a `version=0.0.4`, say) does not affect the match. A missing `q` is 1.0. `?format=`
+beats `Accept`, and `Accept` beats the default, which is text. Responses carry
+`text/plain; version=0.0.4; charset=utf-8` or `application/json`.
+
+Names follow the engines behind us (`llamacpp:`, `vllm:`, `sglang:`), so a dashboard
+that scrapes both layers reads the same shape. There are no `gen_ai.*` aliases and no
+histograms: counters and average gauges only.
+
+Counters, monotonic since daemon start:
+
+| Name | Labels | Meaning |
+| --- | --- | --- |
+| `llamastash:requests_total` | `model` | finished requests (a row counts when it finishes, not when it starts) |
+| `llamastash:route_requests_total` | `route` | same, keyed by request path instead of model |
+| `llamastash:request_errors_total` | `model` | rows `RequestRow::is_error()` |
+| `llamastash:prompt_tokens_total` | `model` | |
+| `llamastash:completion_tokens_total` | `model` | |
+| `llamastash:request_duration_seconds_total` | `model` | sum of finished durations; mean = `rate(…_total) / rate(llamastash:requests_total)` |
+| `llamastash:request_ttft_seconds_total` | `model` | sum of time-to-first-byte |
+| `llamastash:auto_starts_total` | `model` | requests that spawned the launch |
+| `llamastash:evictions_total` | `model` | launches unloaded to make room |
+
+Gauges: `llamastash:requests_in_flight{model}`, `llamastash:request_duration_seconds_avg{model}`,
+`llamastash:request_ttft_seconds_avg{model}`, `llamastash:request_tokens_per_second{model}`
+(last reported), `llamastash:request_tokens_per_second_avg{model}`, `llamastash:models_loaded`,
+`llamastash:models_discovered`, `llamastash:request_log_rows`, `llamastash:request_log_capacity`,
+`llamastash:request_log_file_dropped_total`.
+
+The per-launch series are opt-in because they multiply every series above by the
+number of launches a model has had. Ask for them with `?launch=1`:
+`llamastash:launch_info{launch,model,port}` (gauge 1, live launches only),
+`llamastash:launch_requests_total{launch,model}`,
+`llamastash:launch_request_errors_total{launch,model}`,
+`llamastash:launch_prompt_tokens_total{launch,model}`,
+`llamastash:launch_completion_tokens_total{launch,model}`,
+`llamastash:launch_requests_in_flight{launch,model}`. A launch that has stopped keeps
+its series until 16 newer retirements push it out.
+
+`?model=<ref>` and `?launch=<ref>` narrow the response to one model or one launch. A
+reference is matched as a launch id (`L3`), then a port, then an exact catalog path,
+then a case-insensitive display-name substring, which is the same order
+`llamastash requests <ref>` uses. Nothing matches: `404` naming the value; a substring
+that matches several models is a `400` saying so.
+
+The JSON form is the `requests --json` body with a couple of blocks added: `scope`,
+`summary`, `models`, `launches`, and `requests` (the same array
+`llamastash requests --json` returns, `?limit=` capped).
+
+```bash
+curl -s                              localhost:11435/metrics | head -20
+curl -s -H 'Accept: application/json' localhost:11435/metrics | jq '{summary, n: (.requests|length)}'
+curl -s 'localhost:11435/metrics?format=json&limit=5' | jq '.requests|length'
+curl -s 'localhost:11435/metrics?launch=1' | grep launch_info
+curl -s 'localhost:11435/metrics?model=gemma-4b' | grep requests_total
+curl -s                              localhost:11435/metrics/backend | head -20
+```
+
+### `GET /metrics/backend`
+
+`/metrics/backend` is the engines' own numbers in one scrape. For every Ready launch
+it fetches `http://127.0.0.1:<port>/metrics` in parallel, with a 2 s timeout and a
+4 MiB body cap per target, and merges the text into one document: `# HELP` and `# TYPE`
+kept once per metric name (first wins), and every engine sample line gains
+`launch="L3"` and `model="<name>"` labels. The engine's own labels (vLLM's
+`model_name`, say) are left alone. One target that refuses, times out or answers
+nothing parseable never fails the response; unparsable lines are skipped and counted.
+Beside the engine's samples sit four proxy-owned gauges, labelled `model,launch`:
+`llamastash:backend_metrics_available` (1/0 — a `501` from llama.cpp started without
+`--metrics` lands here), `llamastash:backend_metrics_series`,
+`llamastash:backend_metrics_scrape_duration_seconds`,
+`llamastash:backend_metrics_skipped_total`.
+
+llama.cpp and SGLang need their flag before they serve anything: start with `--metrics`
+(llama.cpp) or `--enable-metrics` (SGLang), in a preset or on the command line. vLLM
+serves `/metrics` on its own. Same `Accept` and `?format=` rules as `/metrics`, and
+`?model=` / `?launch=` restrict the fan-out to one target. The JSON form answers
+`{"generated_at_ms", "scope", "backends": [{launch, model, url, status, ok, series,
+skipped, duration_ms, truncated, error}]}` with no metric text in it.
 
 ### Ollama-compat surface
 

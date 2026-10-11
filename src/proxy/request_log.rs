@@ -406,6 +406,9 @@ struct Inner {
   rows: VecDeque<RequestRow>,
   next_seq: u64,
   all: Totals,
+  // Finished requests per request path. The router logs only the fixed paths
+  // it matches exactly, so this cannot grow past the route table.
+  by_route: HashMap<String, u64>,
   // One entry per model that got a request. Never removed: the keys are
   // catalog paths, so the map is as large as the catalog at most.
   by_model: HashMap<String, Totals>,
@@ -624,6 +627,106 @@ impl RequestLog {
         .map(|(_, totals)| totals)
     })
   }
+
+  /// The whole log in owned data, taken under one lock. A `/metrics` scrape
+  /// renders from this instead of holding the lock while it builds a body.
+  pub fn snapshot(&self) -> LogSnapshot {
+    let inner = self.lock();
+    let view = |key: String, totals: &Totals| ScopeTotals {
+      key,
+      label: totals.label.clone(),
+      summary: totals.summary(),
+      duration_ms_sum: totals.duration_ms_sum,
+      ttfb_ms_sum: totals.ttfb_ms_sum,
+    };
+    let mut models: Vec<ScopeTotals> = inner
+      .by_model
+      .iter()
+      .map(|(path, totals)| view(path.clone(), totals))
+      .collect();
+    models.sort_by(|a, b| a.key.cmp(&b.key));
+    let mut launches: Vec<LaunchTotals> = inner
+      .by_launch
+      .iter()
+      .map(|(id, totals)| LaunchTotals {
+        totals: view(id.clone(), totals),
+        live: true,
+      })
+      .collect();
+    launches.sort_by(|a, b| a.totals.key.cmp(&b.totals.key));
+    launches.extend(inner.retired.iter().map(|(id, totals)| LaunchTotals {
+      totals: view(id.clone(), totals),
+      live: false,
+    }));
+    let mut routes: Vec<(String, u64)> = inner
+      .by_route
+      .iter()
+      .map(|(route, n)| (route.clone(), *n))
+      .collect();
+    routes.sort();
+    LogSnapshot {
+      rows: inner.rows.iter().cloned().collect(),
+      all: view(String::new(), &inner.all),
+      models,
+      launches,
+      routes,
+    }
+  }
+}
+
+/// One scope's totals as a `/metrics` scrape reads them: the summary
+/// `requests --json` returns, plus the sums behind its averages. A counter
+/// needs the total; a mean cannot be re-expanded into one.
+pub struct ScopeTotals {
+  /// Catalog path for a model, launch id for a launch, empty for the whole log.
+  pub key: String,
+  /// Display name of the model these totals belong to.
+  pub label: Option<String>,
+  pub summary: RequestSummary,
+  pub duration_ms_sum: u64,
+  pub ttfb_ms_sum: u64,
+}
+
+/// A launch's totals, and whether the launch is still running.
+pub struct LaunchTotals {
+  pub totals: ScopeTotals,
+  pub live: bool,
+}
+
+/// Owned view of the log for one scrape.
+pub struct LogSnapshot {
+  /// The ring's rows, oldest first.
+  pub rows: Vec<RequestRow>,
+  /// Totals of every finished request.
+  pub all: ScopeTotals,
+  /// One entry per model a request reached, sorted by catalog path.
+  pub models: Vec<ScopeTotals>,
+  /// Live launches sorted by id, then the retired ones, oldest first.
+  pub launches: Vec<LaunchTotals>,
+  /// Finished requests per request path, sorted by path.
+  pub routes: Vec<(String, u64)>,
+}
+
+impl LogSnapshot {
+  /// Requests still waiting on a load or still streaming, for one scope.
+  pub fn in_flight(&self, mut pred: impl FnMut(&RequestRow) -> bool) -> u64 {
+    self
+      .rows
+      .iter()
+      .filter(|row| row.state == RequestState::InFlight && pred(row))
+      .count() as u64
+  }
+
+  /// Catalog path a launch served, from the rows that carry both. A retired
+  /// launch whose rows left the ring has no entry.
+  pub fn launch_path(&self, launch_id: &str) -> Option<&str> {
+    self
+      .rows
+      .iter()
+      .rev()
+      .find(|row| row.launch_id.as_deref() == Some(launch_id))
+      .and_then(|row| row.model_path.as_deref())
+  }
 }
 
 /// Which requests a read covers.
@@ -736,6 +839,7 @@ impl RequestRecord {
       let inner = &mut *inner;
       inner.store(&self.row);
       inner.all.add(&self.row);
+      *inner.by_route.entry(self.row.route.clone()).or_default() += 1;
       if let Some(path) = &self.row.model_path {
         inner
           .by_model
