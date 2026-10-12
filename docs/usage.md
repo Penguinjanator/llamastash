@@ -1521,7 +1521,8 @@ totals until 16 newer retirements push it out, but prints no
 `launch_requests_in_flight`: in-flight is a live quantity and a stopped launch has
 nothing still running. There is no per-launch host series: one metric name carries one
 label set, and `hosts_in_flight` already carries `model`, so a launch's live hosts live on
-the JSON surfaces instead (`status`'s `models[].request_stats`, and `requests L3 --json`).
+the JSON surfaces instead (`status`'s `models[].request_stats`, and `requests L3 --json`
+for a live launch).
 `?launch=1` grows with the number of launches a daemon has served, so a long-lived daemon
 means many series; every counter restarts from zero when the daemon does.
 
