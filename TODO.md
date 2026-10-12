@@ -459,10 +459,10 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 - [ ] Duplication
   - [ ] next copy: `fast_probe` exists in 8 test files with two different timeouts (5 s and 15 s). Move it to `test_support` beside the listener helpers.
   - [ ] next copy: the temp-dir helper is in twice (`test_support::unique_temp_dir(prefix, label)` for the integration tests, `util::test_temp::unique_temp_dir(label)` for `src/` unit tests), and 24 `tests/*.rs` binaries wrap the first in the same one-line `fn unique_temp`. One helper with the prefix folded into the label retires all 24.
-- CI cleanup
   - [ ] next copy: `metrics::live_launches` walks supervisors and the catalog the way `proxy/ui.rs::collect_running` does, and the plan asked for one enumeration. Have `collect_running` consume `live_launches` (filtering on `ready`) instead of its own copy.
-- [ ] `/metrics?format=json` with a launch scope reads the request log twice: once for the snapshot in `serve`, once inside `resolve_launch`, and `json_body` then calls `tail` again. Thread one `LogSnapshot` through the way the live-launch list is threaded. Bounded by the 1000-row ring, so it is tidiness and consistency rather than a hot path.
+- CI cleanup
   - [ ] Bell: no test can see the byte at the two CLI call sites. `pull` and `start --wait` ring only when stderr is a TTY and a test runner's stderr never is, so deleting the `ring_after_wait` call keeps CI green; `start_wait_settles_and_ends_the_command` pins the wait loop and the exit code only. Needs a pty harness (see the contract in `scripts/tui/`) driving `llamastash pull`; the `&mut dyn Write` seam is already there.
+- [ ] `/metrics?format=json` with a launch scope reads the request log twice: once for the snapshot in `serve`, once inside `resolve_launch`, and `json_body` then calls `tail` again. Thread one `LogSnapshot` through the way the live-launch list is threaded. Bounded by the 1000-row ring, so it is tidiness and consistency rather than a hot path.
 - [ ] Login-service docs: run the launchd agent on a Mac. The section shipped in `docs/usage.md` § Run the daemon as a login service (#104) and the systemd unit was run live on systemd 262, but the plist is transcribed from `launchd.plist(5)`: load it, confirm preload comes up `ready` and a clean unload on `launchctl bootout`, then tick the plan item.
 - [ ] A `doctor --fix` repair for a tool config whose proxy URL names a port the proxy no longer listens on — needs that check first
 
