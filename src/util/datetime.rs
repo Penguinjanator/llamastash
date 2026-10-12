@@ -26,6 +26,16 @@ pub fn iso8601_now() -> String {
   iso8601(SystemTime::now())
 }
 
+/// Whole milliseconds since the Unix epoch, `0` on a clock set before it. A
+/// wall clock, so a backward step can shorten a duration: a caller that times
+/// elapsed work uses a monotonic clock instead.
+pub fn now_ms() -> u64 {
+  SystemTime::now()
+    .duration_since(SystemTime::UNIX_EPOCH)
+    .map(|d| d.as_millis() as u64)
+    .unwrap_or(0)
+}
+
 /// Compact `YYYY-MM-DD` — used by doctor's snapshot-staleness check.
 pub fn yyyymmdd_from_secs(total_secs: u64) -> String {
   let days = (total_secs / 86_400) as i64;

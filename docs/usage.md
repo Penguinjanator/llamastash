@@ -494,7 +494,7 @@ Snapshot of daemon health, managed launches, external (unmanaged) `llama-server`
 
 Each row in `models` carries `name` when the launch was started with `--name`, and `preset` when the launch resolved one — an explicit `--preset` / launch file / TUI preset stop, a `<model>@<preset>` auto-start address, or the model's config `default:`. Both keys are omitted, not nulled, when they don't apply; `preset` is the preset that actually launched this copy, unlike the sibling `default` field, which is the model's configured default either way. The human table has no MODEL column, so its NAME cell renders `<model>@<name>` for a named launch and the model alone otherwise: two different models both named `coder` stay tellable apart in the command you reach for to work out what to stop.
 
-Each row also carries `request_stats`: totals of the proxy requests that launch has served, dropped when the launch stops (for a model inside a managed multiplexer, the requests filed under the model since the daemon started) (`requests`, `errors`, `avg_duration_ms`, `avg_ttfb_ms`, `tokens_per_second_avg`, `tokens_per_second_last`, `prompt_tokens`, `completion_tokens`, `auto_starts`, `evictions`). Counts are `0` and averages `null` until the first request. Field meanings are under [`llamastash requests`](#llamastash-requests-model-ref).
+Each row also carries `request_stats`: totals of the proxy requests that launch has served, dropped when the launch stops (for a model inside a managed multiplexer, the requests filed under the model since the daemon started) (`requests`, `errors`, `avg_duration_ms`, `avg_ttfb_ms`, `tokens_per_second_avg`, `tokens_per_second_last`, `hosts`, `connections`, `live_hosts`, `live_connections`, `prompt_tokens`, `completion_tokens`, `auto_starts`, `evictions`). Counts are `0` and averages `null` until the first request. Field meanings are under [`llamastash requests`](#llamastash-requests-model-ref).
 
 The `proxy` block is documented in detail under [Proxy → Is the proxy up?](#is-the-proxy-up).
 
@@ -535,20 +535,20 @@ The requests the proxy handled, newest first. It answers "why did my agent get a
 llamastash requests [model-ref] [-n N] [--json]
 ```
 
-Without `model-ref` it lists every request; with one, only that model's. `model-ref` also takes what `stop` and `logs` take for a running launch: its id (`L3`), its port or its name. That selects the model the launch runs, so requests an earlier launch of the same model served are listed too. `-n` sets how many rows to print (default 100, at least 1).
+Without `model-ref` it lists every request. A `model-ref` that names a running launch — its id (`L3`), its port or its name — scopes to that launch: its own rows, and totals for what that launch served, so an earlier launch of the same model is not counted in. Any other `model-ref` names a model and keeps the wider scope, covering every launch of it. `-n` sets how many rows to print (default 100, at least 1).
 
 ```
-TIME      STATUS  TOTAL  TTFB   TOK/S  IN  OUT  ROUTE             MODEL                         LAUNCH  CLIENT           NOTE
-16:05:11  200     1.0s   22ms   -      -   -    chat/completions  Llama-3.2-1B-Instruct-Q4_K_M  L1      127.0.0.1:49178  client closed
-16:05:11  200     29ms   12ms   122.6  41  3    chat/completions  Llama-3.2-1B-Instruct-Q4_K_M  L1      127.0.0.1:49120  -
-16:05:07  200     3.4s   3.4s   110.4  41  7    chat/completions  Llama-3.2-1B-Instruct-Q4_K_M  L1      127.0.0.1:49106  auto-start
-16:05:07  404     0ms    -      -      -   -    chat/completions  nope                          -       127.0.0.1:49062  model_not_found: nope not found
+TIME      CODE  TOK/S  TOTAL  TTFB   IN  OUT  MODEL                         LAUNCH  CLIENT           NOTE                             ROUTE
+16:05:11  200   -      1.0s   22ms   -   -    Llama-3.2-1B-Instruct-Q4_K_M  L1      127.0.0.1:49178  client closed                    chat/completions
+16:05:11  200   122.6  29ms   12ms   41  3    Llama-3.2-1B-Instruct-Q4_K_M  L1      127.0.0.1:49120  -                                chat/completions
+16:05:07  200   110.4  3.4s   3.4s   41  7    Llama-3.2-1B-Instruct-Q4_K_M  L1      127.0.0.1:49106  auto-start                       chat/completions
+16:05:07  404   -      0ms    -      -   -    nope                          -       127.0.0.1:49062  model_not_found: nope not found  chat/completions
 ```
 
 - `TOTAL` is the time from the proxy receiving the request to the end of the response. `TTFB` is the time to the first response body byte, which includes any model load.
 - `IN` / `OUT` are prompt and generated tokens. `TOK/S` is the generation speed. A leading `~` marks a speed the proxy estimated because the model's server reported none.
 - `NOTE` says what happened beyond the status code: `auto-start` (this request started the model), `unloaded L3` (launches unloaded to make room), `fallback (<reason>) for <model>`, `client closed`, `upstream error`, `loading model`, `in flight`, or the proxy's own error and its message (`launch_failed: auto-start of ...`).
-- On a terminal a summary block is printed above the table. Piped output is the header plus one tab-separated line per request. The `MODEL` column is dropped when `model-ref` is given.
+- On a terminal the table is padded: a summary block prints above it, and a `NOTE` longer than 60 cells wraps onto continuation lines under its column rather than running off the screen. The block leads with `Requests`, `Errors`, `Hosts` and `Connections`, and puts a single `Live` line between the errors and the hosts only while something is in flight — one number when every host in flight is on one connection, `hosts/connections` when they differ (one agent runner with two tools open reads `1/2`). The rest is the averages, the token counts, auto-starts and unloads. The wrap belongs to that padded layout, so `--no-colors`, `NO_COLOR`, or piped stdout prints the header plus one tab-separated line per request with the whole note in its field. The `MODEL` column is dropped when `model-ref` names one model or one launch.
 
 `--json` emits `{ "summary": {...}, "requests": [...] }`. Every key of a request is always present; a value the proxy does not have is `null`:
 
@@ -580,7 +580,9 @@ TIME      STATUS  TOTAL  TTFB   TOK/S  IN  OUT  ROUTE             MODEL         
 
 `state` is `in_flight`, `done`, `client_closed` (the client went away before the response was complete) or `upstream_error` (the model's server dropped the connection mid-response). When the proxy answered the request itself, `error` is its error `code`, or its `type` when the error has no code (`model_not_found`, `model_required`, `launch_failed`, ...), and `cause` is the error message. When another model answered because the launch failed, the row is filed under the model that answered and `fallback` holds the reason.
 
-`summary` covers the same scope as the rows (one model, or everything) and counts finished requests since the daemon started, so it keeps counting requests whose rows have left the log. `errors` counts 4xx / 5xx answers and `upstream_error` rows; a client that hung up is not an error. The two averages cover completed 2xx / 3xx requests only. `tokens_per_second_avg` is the mean of the per-request speeds, estimated ones included. `tokens_per_second_last` is the most recent speed a request reported. `auto_starts` counts the requests that started the model; a request that waited on a load someone else started is not one, and neither is one whose launch was refused before it spawned. `evictions` counts the launches unloaded to make room.
+`summary` covers the same scope as the rows (one launch, one model, or everything) and counts finished requests since the daemon started, so it keeps counting requests whose rows have left the log. `errors` counts 4xx / 5xx answers and `upstream_error` rows; a client that hung up is not an error. The two averages cover completed 2xx / 3xx requests only. `tokens_per_second_avg` is the mean of the per-request speeds, estimated ones included. `tokens_per_second_session` is that mean for the model's newest launch alone, so a model you reloaded shows what it runs at now instead of a mean over every launch since the daemon started; it is present for a model scope only, and absent when no request has reported a speed. `tokens_per_second_last` is the most recent speed a request reported; it is in the JSON and the row table, not in the summary block a terminal prints, where the session figure says what is running now. `auto_starts` counts the requests that started the model; a request that waited on a load someone else started is not one, and neither is one whose launch was refused before it spawned. `evictions` counts the launches unloaded to make room.
+
+`hosts` and `connections` count who sent the requests: distinct client IPs, and distinct clients on `ip:port`. Connections is the figure that counts tools — three editors open on one machine is one host and three connections — while `hosts` counts machines, which on a loopback-only daemon is always 1 until you bind the proxy to the LAN. `live_hosts` and `live_connections` are the same two counts over the requests in flight right now. All four count the rows the log still keeps, so they describe the table on screen instead of growing since daemon start, and a launch's figures count only the requests that launch served. A summary from a daemon older than these fields leaves them out (JSON `null`), which is not the same answer as `0`.
 
 What is and is not recorded:
 
@@ -860,7 +862,7 @@ llamastash start owner/repo --backend sglang --ctx 4096
 
 With vLLM installed too, a repo lists both engines in `supported_backends` and an `auto` launch picks vLLM; `--backend sglang` selects SGLang. Detection, the directory-shaped row and the slow readiness window are as for vLLM.
 
-`--ctx` maps to `--context-length`. Eight further tunables are declared (`mem-fraction-static`, `max-total-tokens`, `enable-unified-memory`, `max-running-requests`, `quantization`, `trust-remote-code`, `tool-call-parser`, `reasoning-parser`); the rest ride the `-- <extras>` tail minus a denylist that keeps the launch loopback-only, single-host and on the HTTP server the proxy forwards to.
+`--ctx` maps to `--context-length`. Nine further tunables are declared (`mem-fraction-static`, `max-total-tokens`, `enable-unified-memory`, `max-running-requests`, `quantization`, `trust-remote-code`, `tool-call-parser`, `reasoning-parser`, `enable-metrics`); the rest ride the `-- <extras>` tail minus a denylist that keeps the launch loopback-only, single-host and on the HTTP server the proxy forwards to.
 
 **On unified-memory hosts the KV pool is capped in tokens.** SGLang has no byte-level cap — `--mem-fraction-static` is a fraction of the whole pool — so when neither `max_total_tokens` nor `mem_fraction_static` is set, the launcher divides the shared byte budget by the model's KV bytes per token, read from the repo's `config.json`, and passes `--max-total-tokens`. A repo whose attention geometry cannot be read is refused, naming the override. See [SGLang setup](sglang-setup.md#notes-and-limitations).
 
@@ -1437,12 +1439,178 @@ The proxy speaks HTTP/1.1 only on `127.0.0.1:<port>` (no h2c upgrade, no ALPN-ne
 | `POST` | `/v1/completions`      | OpenAI text completions. Same forwarding semantics.                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `POST` | `/v1/embeddings`       | OpenAI embeddings. JSON pass-through.                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `POST` | `/v1/rerank`           | llama.cpp's rerank endpoint (also exposed under the `/v1/` prefix for client uniformity). JSON pass-through.                                                                                                                                                                                                                                                                                                                                         |
+| `GET`  | `/metrics`             | Prometheus text scrape of the proxy's own counters and gauges, or JSON on request. See [Metrics](#metrics-metrics).                                                                                                                                                                                                                     |
+| `GET`  | `/metrics/backend`     | The same text format with every Ready launch's own `/metrics` merged in, each sample labelled with its `launch`. See [Metrics](#metrics-metrics).                                                                                                                     |
 | `GET`  | `/api/tags`            | **Ollama compat — discovery.** Ollama-shape `{"models":[{name, model, modified_at, size, digest, details:{format,family,parameter_size,quantization_level,…}}]}` projection of the discovered catalog. Sorted alphabetically by `name`. Empty catalog → `{"models":[]}`. See [Ollama-compat surface](#ollama-compat-surface).                                                                                                                        |
 | `GET`  | `/api/version`         | **Ollama compat.** `{"version":"<crate-version>"}` — same value `status.daemon.build` surfaces.                                                                                                                                                                                                                                                                                                                                                      |
 | `GET`  | `/api/ps`              | **Ollama compat.** Currently-Ready supervisors in Ollama's running-list shape (`{models:[…{expires_at, size_vram, …}]}`). `expires_at` is a far-future placeholder until idle-TTL eviction lands (R34 deferred); `size_vram` is `0` until per-PID VRAM attribution lands.                                                                                                                                                                            |
 | `POST` | `/api/show`            | **Ollama compat.** `{"model":"<name>"}` or `{"name":"<name>"}` body → per-model metadata in Ollama shape (`{modelfile, parameters, template, details, model_info, capabilities}`). Same fuzzy resolver as `/v1/chat/completions`.                                                                                                                                                                                                                    |
 
 Request body cap: **`proxy.max_body_size` bytes, default 16 MiB**, enforced via `http-body-util::Limited` before forwarding. Anything larger returns HTTP 413 naming the configured limit. Text-only chat completions are typically well under 1 MiB even with long histories; 16 MiB covers vision payloads (a base64 image is ~33% larger than the source file — one phone photo fits with room to spare) while still bounding worst-case per-request memory. The cap is **per request body, not a global pool** — N concurrent max-size requests buffer up to N × the cap, so a LAN-exposed proxy (`proxy.host`) with many large in-flight bodies can use more RAM than the cap alone suggests. `0` disables the check: one request can buffer arbitrary RAM (we buffer in memory — unlike nginx's `client_max_body_size 0`, which spools to disk, so its `0` carries a safety property ours does not). To stop serving bodies altogether, `proxy.enabled: false` is the honest switch.
+
+### Metrics (`/metrics`)
+
+The proxy publishes its own counters at `GET /metrics` in the Prometheus text
+format, and the same numbers as JSON for scripts. It is the HTTP equivalent of the
+`--json` agent contract: one surface, stable names, and a client that parses the JSON
+form already parses `llamastash requests --json`. Every value is counted **since the
+daemon started** and nothing is persisted; a daemon restart resets every counter to
+zero, which is a restart, not data loss. The durable record stays
+`<log dir>/requests.jsonl`. Scraping costs the proxy nothing it would not otherwise
+pay: `/metrics` reads the in-memory request log and never contacts a backend, and a
+scrape is not itself logged as a request.
+
+Both routes answer the proxy API key the same way the `/v1/*` routes do when one is
+configured (`Bearer` challenge). `HEAD /metrics` is not routed (404), same as
+`/health`.
+
+`GET /metrics` answers in one of two formats. The rule is deterministic and has to
+survive a naive `curl` and a real Prometheus scraper alike.
+
+| Request | Response |
+| --- | --- |
+| no `Accept` header, or an empty one | Prometheus text |
+| `Accept: */*` (what plain `curl` sends) | **Prometheus text** — a wildcard on its own never selects JSON |
+| `Accept: text/plain` or `text/plain; version=0.0.4; charset=utf-8` | Prometheus text |
+| `Accept: application/openmetrics-text; version=1.0.0,text/plain` | Prometheus text (OpenMetrics is served as text format 0.0.4) |
+| `Accept: application/json` | JSON |
+| `Accept: application/json, */*` | JSON (a wildcard loses the tie to the type that was named) |
+| `Accept: application/json;q=0.9, text/plain;q=0.5` | JSON (higher q wins) |
+| `Accept: application/json;q=0.9, text/plain;q=0.9` | Prometheus text (tie goes to text) |
+| `Accept: text/plain;q=0, */*` | JSON (a `q=0` refuses that type outright, so the wildcard is left speaking only for the other) |
+| `Accept: application/xml`, `image/*`, anything else | `406` with the OpenAI-shaped error envelope |
+| `?format=json` | JSON, regardless of `Accept` |
+| `?format=prometheus` | Prometheus text, regardless of `Accept` |
+| `?format=<anything else>` | `400` naming the two accepted values |
+
+Only `application/json` and `text/plain` are matched, so a `;` parameter that is not
+`q` (a `version=0.0.4`, say) does not affect the match. A missing `q` is 1.0. Only an
+exact type selects its format, and `*/*` accepts both a step under the q it carries, so
+a wildcard never wins over a named type and a scrape that does not name `application/json`
+can never receive JSON by accident. A type that is neither of the two — `image/*`,
+`application/xml` — asks for something the route is not, and is refused rather than
+answered in text. `?format=`
+beats `Accept`, and `Accept` beats the default, which is text. Responses carry
+`text/plain; version=0.0.4; charset=utf-8` or `application/json`.
+
+Names follow the engines behind us (`llamacpp:`, `vllm:`, `sglang:`), so a dashboard
+that scrapes both layers reads the same shape. There are no `gen_ai.*` aliases and no
+histograms: counters and average gauges only.
+
+Counters, monotonic since daemon start:
+
+| Name | Labels | Meaning |
+| --- | --- | --- |
+| `llamastash:requests_total` | `model` | finished requests (a row counts when it finishes, not when it starts) |
+| `llamastash:route_requests_total` | `route` | same, keyed by request path instead of model |
+| `llamastash:request_errors_total` | `model` | rows `RequestRow::is_error()` |
+| `llamastash:prompt_tokens_total` | `model` | |
+| `llamastash:completion_tokens_total` | `model` | |
+| `llamastash:request_duration_seconds_total` | `model` | sum of finished durations |
+| `llamastash:request_timed_total` | `model` | how many requests that sum and the one below cover; mean = `rate(request_duration_seconds_total) / rate(request_timed_total)` |
+| `llamastash:request_ttft_seconds_total` | `model` | sum of time-to-first-byte |
+| `llamastash:auto_starts_total` | `model` | requests that spawned the launch |
+| `llamastash:evictions_total` | `model` | launches unloaded to make room |
+
+The two latency sums cover only requests the proxy could time — a completed
+successful response with both a total duration and a first byte — so the count
+they divide by is `llamastash:request_timed_total`, not
+`llamastash:requests_total`. A failed or cancelled request moves the request count
+and neither sum, and dividing by the request count reads the mean low by exactly
+that traffic.
+
+Gauges: `llamastash:requests_in_flight{model}`, `llamastash:hosts_in_flight{model}`
+(distinct client hosts with a request in flight right now), `llamastash:request_duration_seconds_avg{model}`,
+`llamastash:request_ttft_seconds_avg{model}`, `llamastash:request_tokens_per_second{model}`
+(last reported), `llamastash:request_tokens_per_second_avg{model}`, `llamastash:models_loaded`,
+`llamastash:models_discovered`, `llamastash:request_log_rows`, `llamastash:request_log_capacity`,
+`llamastash:request_log_file_dropped_total`.
+`llamastash:route_requests_total` and the daemon gauges above that carry no `model` label
+describe the process rather than a scope, so a `?model=` / `?launch=` scrape prints them
+whole and their sum does not add up to the scoped `requests_total`.
+A request the proxy answered without reaching a model — an unknown model name, a body it
+could not read — belongs to no model, so `requests`, `errors` and `requests_in_flight`
+carry those under `model="none"` and `rate(llamastash:requests_total)` adds up to what
+`summary.requests` says. `hosts_in_flight` follows the same rule. Token and latency series
+need a model to be counted, so they never carry `none`. That label is text-format only; the
+JSON shape is unchanged, because `summary` already counted those requests.
+
+A `model` label is a display name while that name is unique and a catalog path once two
+models share it, so the second of two same-named models takes its first request, the
+first one's label switches to its path and its series splits in two — that is the
+collision rule working, not a restarted counter. The JSON form does not apply the rule:
+every `model` field there is the display name, and `path` tells two same-named models apart.
+
+The per-launch series are opt-in because they multiply every series above by the
+number of launches a model has had. Ask for them with `?launch=1`:
+`llamastash:launch_info{launch,model,port}` (gauge 1, one per live launch the scope
+keeps),
+`llamastash:launch_requests_total{launch,model}`,
+`llamastash:launch_request_errors_total{launch,model}`,
+`llamastash:launch_prompt_tokens_total{launch,model}`,
+`llamastash:launch_completion_tokens_total{launch,model}`,
+`llamastash:launch_requests_in_flight{launch,model}`. A concrete `?launch=<ref>` scopes
+to that launch and turns the same series on for it — and the `model`-labelled series carry
+that launch's own figures then, the same ones `summary` reports, not everything every launch
+of the model has served since daemon start. A launch that has stopped keeps its
+totals until 16 newer retirements push it out, but prints no
+`launch_requests_in_flight`: in-flight is a live quantity and a stopped launch has
+nothing still running. There is no per-launch host series: one metric name carries one
+label set, and `hosts_in_flight` already carries `model`, so a launch's live hosts live on
+the JSON surfaces instead (`status`'s `models[].request_stats`, and `requests L3 --json`
+for a live launch).
+`?launch=1` grows with the number of launches a daemon has served, so a long-lived daemon
+means many series; every counter restarts from zero when the daemon does.
+
+`?model=<ref>` and `?launch=<ref>` narrow the response to one model or one launch.
+`?model=` matches an exact catalog path first, then the reference rules
+`/v1/chat/completions` uses: a name that owns one model outright, a `proxy.aliases`
+entry, then a case-insensitive substring. `?launch=` matches a launch id (`L3`), live or
+retired, first, then a live launch's port, then the catalog path of a live launch.
+Nothing matches: `404` naming the value; a `?model=` substring that matches several
+models is a `400` saying so. So is a `?launch=` model reference that more than one live
+launch answers for — a model launched twice has two sets of figures and guessing which you
+meant would print one launch's numbers under a reference that meant both — and the answer
+names the launch ids to choose between. Both together have to agree: a
+`?launch=` that is not a launch of the `?model=` you named is a `400` naming both.
+
+The JSON form is the `requests --json` body with a couple of blocks added: `scope`,
+`summary`, `models`, `launches`, and `requests` (the same array
+`llamastash requests --json` returns, `?limit=` capped).
+
+```bash
+curl -s                              localhost:11435/metrics | head -20
+curl -s -H 'Accept: application/json' localhost:11435/metrics | jq '{summary, n: (.requests|length)}'
+curl -s 'localhost:11435/metrics?format=json&limit=5' | jq '.requests|length'
+curl -s 'localhost:11435/metrics?launch=1' | grep launch_info
+curl -s 'localhost:11435/metrics?model=gemma-4b' | grep requests_total
+curl -s                              localhost:11435/metrics/backend | head -20
+```
+
+### `GET /metrics/backend`
+
+`/metrics/backend` is the engines' own numbers in one scrape. For every Ready launch
+it fetches `http://127.0.0.1:<port>/metrics` in parallel, with a 2 s timeout and a
+4 MiB body cap per target, and merges the text into one document: `# HELP` and `# TYPE`
+kept once per metric name (first wins), and every engine sample line gains
+`launch="L3"` and `model="<name>"` labels. The engine's own labels (vLLM's
+`model_name`, say) are left alone, except an engine label already called `launch` or
+`model`: the proxy's own value replaces it, because a sample cannot carry the same
+label twice and still be scraped. One target that refuses, times out or answers
+nothing parseable never fails the response; unparsable lines are skipped and counted.
+Beside the engine's samples sit four proxy-owned gauges, labelled `launch,model`:
+`llamastash:backend_metrics_available` (1/0 — only a plain `200` is a 1, so a `501` from
+llama.cpp started without `--metrics` and a `404` both land here), `llamastash:backend_metrics_series`,
+`llamastash:backend_metrics_scrape_duration_seconds`,
+`llamastash:backend_metrics_skipped` (how many of this scrape's lines did not parse, for
+this scrape — not a running total, which is why it carries no `_total`).
+
+llama.cpp and SGLang need their flag before they serve anything: start with `--metrics`
+(llama.cpp) or `--enable-metrics` (SGLang), in a preset or on the command line. vLLM
+serves `/metrics` on its own. Same `Accept` and `?format=` rules as `/metrics`, and
+`?model=` / `?launch=` restrict the fan-out to one target. The JSON form answers
+`{"generated_at_ms", "scope", "backends": [{launch, model, url, status, ok, series,
+skipped, duration_ms, truncated, error}]}` with no metric text in it.
 
 ### Ollama-compat surface
 
@@ -1897,7 +2065,7 @@ Knob set, grouped into labelled clusters in display order:
 | Attention & KV cache                         | `flash_attn`, `cache_type_k`, `cache_type_v`       |
 | Throughput                                   | `threads`, `parallel`, `batch_size`, `ubatch_size` |
 | Memory loading                               | `load_mode`                                        |
-| Advanced                                     | `rope_freq_scale`, `keep`, `extras`                |
+| Advanced                                     | `rope_freq_scale`, `keep`, `metrics`, `extras`     |
 
 Groups are ordered by how often a knob is typically changed; related
 knobs sit together. (This display order is independent of the order
@@ -2001,11 +2169,11 @@ inheritance is visible at the row level.
 
 ### Requests tab
 
-The last tab of every model that has a launch. It shows that model's proxy requests only: the same data as [`llamastash requests <model-ref>`](#llamastash-requests-model-ref), refreshed twice a second while the tab is open. The Chat, Embed and Rerank tabs talk to the launch's own port, so what they send does not appear here.
+The last tab of every model that has a launch. It shows that launch's proxy requests only — the same data as [`llamastash requests <launch-ref>`](#llamastash-requests-model-ref), refreshed twice a second while the tab is open, so an earlier launch of the same model is not counted in. A model resident in a managed multiplexer is the exception: its requests are filed under the model, not under a launch of their own, so that row shows the whole-model aggregate. The Chat, Embed and Rerank tabs talk to the launch's own port, so what they send does not appear here.
 
-- The top lines are the model's summary: requests, errors, average total time and time to first byte, tok/s (average and last), tokens in and out, auto-starts, and launches unloaded to make room.
+- The top lines are the launch's summary: requests, errors, live hosts and connections while anything is in flight, hosts and connections over the rows the log keeps, average total time and time to first byte, tok/s (average and session), tokens in and out, auto-starts, and launches unloaded to make room.
 - Below is the table, newest request first. `↑` / `↓` scroll it.
-- The columns are `Time`, `Code`, `Tok/s`, `Total`, `In`, `Out`, `TTFB`, `Route`, `Client` and `Note`. As the pane narrows they drop out in this order: `Client`, `Note`, `Route`, `TTFB`, `Out`, `In`, `Total`, `Tok/s`, `Code`, `Time`. When `Note` shows it takes whatever width is left.
+- The columns are `Time`, `Code`, `Tok/s`, `Total`, `TTFB`, `In`, `Out`, `Launch`, `Client`, `Note` and `Route`. As the pane narrows they drop out in this order: `Client`, `Route`, `Note`, `Launch`, `Out`, `In`, `TTFB`, `Total`, `Tok/s`, `Code`, `Time`. `Note` takes the spare width up to 48 cells and wraps onto continuation lines beyond that; `Route`, which is last, takes what `Note` leaves.
 
 ### Chat tab (`Focus::ChatInput`)
 

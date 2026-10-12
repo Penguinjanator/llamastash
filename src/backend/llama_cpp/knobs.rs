@@ -323,6 +323,23 @@ pub const KNOBS: &[KnobDef] = &[
     ring: Ring::Fixed(&["0", "64", "128", "256", "512", "1024"]),
     volatile: false,
   },
+  // Unset by default, so a launch's argv and the engine's port posture stay
+  // exactly as they were until someone asks for the engine's own counters.
+  KnobDef {
+    id: "metrics",
+    flag: None,
+    concept: None,
+    kind: KnobKind::Bool,
+    auto: None,
+    group: Group::Advanced,
+    label: "Engine metrics",
+    help: "serve llama.cpp's Prometheus counters on its /metrics path",
+    aliases: &[],
+    fallback: LayerLabel::ServerDefault,
+    emit: Emit::BareFlagWhenTrue,
+    ring: Ring::None,
+    volatile: false,
+  },
   KnobDef {
     id: "mode",
     flag: None,

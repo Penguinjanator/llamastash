@@ -15,6 +15,18 @@
 //!   `/v1/models` so tests can assert the right model is being run)
 //! - `-c <N>` (recorded; no behaviour change)
 //! - `--embeddings`, `--reranking` (records the mode)
+//! - `--metrics` (mirrors real `llama-server`: with it, `GET /metrics` serves a
+//!   small Prometheus document; without it the endpoint answers `501` with a
+//!   `not_supported_error` body, which is how a server started without the flag
+//!   behaves. Two servers, one with the flag and one without, give a fan-out test
+//!   a working target and a refusing one.)
+//! - `--metrics-status <N>` (test-only — the status `GET /metrics` answers with,
+//!   standing in for an engine that answers success-but-not-`200`.)
+//! - `--metrics-vllm` (test-only — append a vLLM-shaped section to that body: a
+//!   counter declared under one name and sampled under `<name>_total`, and a
+//!   histogram sampled as `_bucket`/`_sum`/`_count`. llama.cpp prints sample
+//!   names that match its own `# TYPE` lines, so only a second shape catches a
+//!   merge that keys a metric on the sample line instead of the declared family.)
 //! - `--health-delay-ms <N>` (test-only — returns 503 until N ms
 //!   after process start, then 200; lets tests exercise the
 //!   Loading → Ready transition deterministically)
@@ -60,6 +72,22 @@ struct Args {
   /// to read.
   fit_ctx: Option<u32>,
   mode: Mode,
+  /// Set with `--metrics`; decides whether `GET /metrics` serves text or 501.
+  metrics: bool,
+  /// `--metrics-delay-ms`: milliseconds to stall before answering `GET /metrics`,
+  /// standing in for an engine that is wedged or still loading.
+  metrics_delay_ms: u64,
+  /// `--metrics-pad`: bytes of comment filler to append to the `/metrics` body.
+  metrics_pad: usize,
+  /// `--metrics-cut`: make the `/metrics` body exactly this many bytes, ending
+  /// it with a sample line, so a reader with a smaller cap stops mid-sample.
+  metrics_cut: Option<usize>,
+  /// `--metrics-status`: the status `GET /metrics` answers with, for an engine
+  /// whose scrape succeeds with something other than `200`.
+  metrics_status: Option<u16>,
+  /// `--metrics-vllm`: also answer `GET /metrics` with a vLLM-shaped section,
+  /// where the sample names are the declared family name plus a suffix.
+  metrics_vllm: bool,
   health_delay_ms: u64,
   trap_sigterm: bool,
   // Only read under cfg(unix): Windows has no SIGTERM to delay.
@@ -117,6 +145,19 @@ fn print_fake_devices() {
   let _ = std::io::stdout().flush();
 }
 
+/// Pad `body` to exactly `len` bytes with one comment line of the width that
+/// fits, so the caller controls where the body ends without adding anything a
+/// parser would read.
+fn pad_to(body: &mut String, len: usize) {
+  let fill = len.saturating_sub(body.len());
+  if fill < 3 {
+    return;
+  }
+  body.push('#');
+  body.push_str(&".".repeat(fill - 2));
+  body.push('\n');
+}
+
 fn parse_args() -> Args {
   let mut args = std::env::args().skip(1);
   let mut host = String::from("127.0.0.1");
@@ -125,6 +166,12 @@ fn parse_args() -> Args {
   let mut ctx: Option<u32> = None;
   let mut fit_ctx: Option<u32> = None;
   let mut mode = Mode::Chat;
+  let mut metrics = false;
+  let mut metrics_delay_ms: u64 = 0;
+  let mut metrics_pad: usize = 0;
+  let mut metrics_cut: Option<usize> = None;
+  let mut metrics_status: Option<u16> = None;
+  let mut metrics_vllm = false;
   let mut health_delay_ms: u64 = 0;
   let mut trap_sigterm = false;
   let mut sigterm_exit_delay_ms = None;
@@ -141,6 +188,16 @@ fn parse_args() -> Args {
       "--fit-ctx" => fit_ctx = args.next().and_then(|v| v.parse().ok()),
       "--embeddings" => mode = Mode::Embedding,
       "--reranking" => mode = Mode::Rerank,
+      "--metrics" => metrics = true,
+      "--metrics-delay-ms" => {
+        metrics_delay_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0)
+      }
+      "--metrics-pad" => metrics_pad = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+      "--metrics-cut" => metrics_cut = args.next().and_then(|v| v.parse().ok()),
+      "--metrics-status" => {
+        metrics_status = args.next().and_then(|v| v.parse().ok());
+      }
+      "--metrics-vllm" => metrics_vllm = true,
       "--spec-type" => spec_mtp = args.next().as_deref() == Some("draft-mtp"),
       "--health-delay-ms" => {
         health_delay_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -163,6 +220,12 @@ fn parse_args() -> Args {
     ctx,
     fit_ctx,
     mode,
+    metrics,
+    metrics_delay_ms,
+    metrics_pad,
+    metrics_cut,
+    metrics_status,
+    metrics_vllm,
     health_delay_ms,
     trap_sigterm,
     sigterm_exit_delay_ms,
@@ -356,6 +419,74 @@ async fn handle(
         .await?;
       } else {
         write_response(&mut wr, 200, "application/json", b"{\"status\":\"ok\"}").await?;
+      }
+    }
+    ("GET", "/metrics") => {
+      // Real `llama-server` only serves `/metrics` when started with `--metrics`;
+      // without the flag the endpoint answers 501 and points at the flag.
+      if args.metrics {
+        if args.metrics_delay_ms > 0 {
+          std::thread::sleep(std::time::Duration::from_millis(args.metrics_delay_ms));
+        }
+        // The names and shapes are llama.cpp's: `<unit>_total` counters plus
+        // gauges, one label-free sample each, `# HELP` then `# TYPE`.
+        let mut body = String::from(
+          "# HELP llamacpp:prompt_tokens_total Number of prompt tokens processed.\n\
+# TYPE llamacpp:prompt_tokens_total counter\n\
+llamacpp:prompt_tokens_total 21\n\
+# HELP llamacpp:predicted_tokens_total Number of predicted tokens.\n\
+# TYPE llamacpp:predicted_tokens_total counter\n\
+llamacpp:predicted_tokens_total{model_name=\"fake\"} 7\n\
+# HELP llamacpp:requests_processing Number of requests currently being processed.\n\
+# TYPE llamacpp:requests_processing gauge\n\
+llamacpp:requests_processing 0\n",
+        );
+        if args.metrics_vllm {
+          // vLLM declares a family and prints its samples under derived names —
+          // the one shape llama.cpp does not, and the one a merge that keys on
+          // the sample line's name gets wrong.
+          body.push_str(
+            "# HELP vllm:prompt_tokens Number of prompt tokens processed.\n\
+# TYPE vllm:prompt_tokens counter\n\
+vllm:prompt_tokens_total{model_name=\"fake\"} 21\n\
+# HELP vllm:time_to_first_token_seconds Histogram of time to first token.\n\
+# TYPE vllm:time_to_first_token_seconds histogram\n\
+vllm:time_to_first_token_seconds_bucket{model_name=\"fake\",le=\"0.1\"} 1\n\
+vllm:time_to_first_token_seconds_sum{model_name=\"fake\"} 0.05\n\
+vllm:time_to_first_token_seconds_count{model_name=\"fake\"} 1\n",
+          );
+        }
+        if args.metrics_pad > 0 {
+          // Filler is a comment line: it parses as nothing and only shows up in
+          // the size, which is what a scraper's cap is about.
+          while body.len() < args.metrics_pad {
+            body.push_str("# pad\n");
+          }
+        }
+        if let Some(cut) = args.metrics_cut {
+          // The body ends mid-sample exactly at `cut`, so a reader capped below
+          // it is left holding half a sample: padding to just before the cut,
+          // then a sample line that runs past it.
+          let tail = "llamacpp:tail_series_total 987654\n";
+          pad_to(&mut body, cut.saturating_sub(tail.len() - 3));
+          body.push_str(tail);
+          body.truncate(cut);
+        }
+        write_response(
+          &mut wr,
+          args.metrics_status.unwrap_or(200),
+          "text/plain; version=0.0.4",
+          body.as_bytes(),
+        )
+        .await?;
+      } else {
+        write_response(
+          &mut wr,
+          501,
+          "application/json",
+          b"{\"error\":{\"code\":\"not_supported_error\",\"message\":\"the metrics endpoint is disabled; start the server with --metrics\",\"type\":\"not_supported_error\"}}",
+        )
+        .await?;
       }
     }
     ("GET", "/props") => {

@@ -843,6 +843,19 @@ pub(crate) fn served_name_for_row(row: &CatalogRow) -> String {
   crate::util::paths::model_display_name(std::path::Path::new(&row.path))
 }
 
+/// The same rule for a catalog row looked up by path, for callers that hold a
+/// supervisor's path rather than a catalog row: the row's `display_label` when
+/// the catalog has one, else the file stem of `fallback` (the launched path,
+/// which is what `/v1/models` would print for that model).
+pub(crate) fn served_name_for_model(
+  row: Option<&DiscoveredModel>,
+  fallback: &std::path::Path,
+) -> String {
+  row
+    .and_then(|m| m.display_label.clone())
+    .unwrap_or_else(|| crate::util::paths::model_display_name(fallback))
+}
+
 /// Index a catalog snapshot by canonical path string for O(1) metadata
 /// lookup keyed off a supervisor's `ModelId::path`. The catalog is small
 /// (tens to hundreds of rows), so the build is cheap.
@@ -884,9 +897,7 @@ async fn collect_fallback_candidates(state: &Arc<ProxyState>) -> Vec<FallbackCan
     let arch = catalog_entry
       .and_then(|m| m.metadata.as_ref())
       .and_then(|md| md.arch.clone());
-    let served_model_id = catalog_entry
-      .and_then(|m| m.display_label.clone())
-      .unwrap_or_else(|| crate::util::paths::model_display_name(&id.path));
+    let served_model_id = served_name_for_model(catalog_entry.copied(), &id.path);
     let last_request_at = state.mru.last_request_at(&id).await;
     out.push(FallbackCandidate {
       model_id: id,

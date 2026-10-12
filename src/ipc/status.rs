@@ -256,6 +256,18 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
         &preset_rows,
         &preset_store,
       );
+      // A delegated model's requests are served by the umbrella launch, so its
+      // totals are the ones filed under the model itself. Hoisted out of the
+      // `json!` because rustfmt does not format inside its macro syntax.
+      let umbrella_stats = ctx
+        .requests
+        .tail(
+          crate::proxy::request_log::LogScope::Model {
+            path: running_snap.params.model_path.to_string_lossy().to_string(),
+          },
+          0,
+        )
+        .summary;
       let mut delegated_row = json!({
         "launch_id": launch_id,
         "id": synthetic_id,
@@ -275,12 +287,7 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
         "latest_cpu_pct": u_cpu,
         "preset_count": preset_count,
         "default": preset_default,
-        // A delegated model's requests are served by the umbrella launch,
-        // so its totals are the ones filed under the model itself.
-        "request_stats": ctx
-          .requests
-          .tail(Some(&running_snap.params.model_path.to_string_lossy()), 0)
-          .summary,
+        "request_stats": umbrella_stats,
       });
       // Same only-when-set `preset` the managed branch stamps, so a
       // delegated row is shape-identical to a process row.

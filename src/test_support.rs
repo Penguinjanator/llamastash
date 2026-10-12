@@ -242,7 +242,12 @@ pub async fn newest_request_when(
 ) -> crate::proxy::request_log::RequestRow {
   let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
   loop {
-    match log.tail(None, 1).rows.into_iter().next() {
+    match log
+      .tail(crate::proxy::request_log::LogScope::All, 1)
+      .rows
+      .into_iter()
+      .next()
+    {
       Some(row) if done(&row) => return row,
       other => {
         assert!(

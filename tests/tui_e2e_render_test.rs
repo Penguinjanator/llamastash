@@ -140,13 +140,17 @@ fn seeded_dashboard_app() -> App {
 }
 
 fn render_to_lines(app: &mut App) -> Vec<String> {
-  let backend = TestBackend::new(WIDTH, HEIGHT);
+  render_to_lines_at(app, WIDTH, HEIGHT)
+}
+
+fn render_to_lines_at(app: &mut App, width: u16, height: u16) -> Vec<String> {
+  let backend = TestBackend::new(width, height);
   let mut terminal = Terminal::new(backend).expect("test terminal");
   terminal.draw(|f| render(f, app)).expect("render");
   let buf = terminal.backend().buffer();
-  let mut rows: Vec<String> = Vec::with_capacity(HEIGHT as usize);
+  let mut rows: Vec<String> = Vec::with_capacity(height as usize);
   for y in 0..buf.area.height {
-    let mut row = String::with_capacity(WIDTH as usize);
+    let mut row = String::with_capacity(width as usize);
     for x in 0..buf.area.width {
       row.push_str(buf[(x, y)].symbol());
     }
@@ -269,6 +273,17 @@ fn requests_view_golden_render_matches_fixture() {
   // machine's zone, so the fixture holds `HH:MM:SS` in its place.
   let rendered = mask_clock_times(&render_to_lines(&mut seeded_requests_view_app()).join("\n"));
   assert_golden_text(rendered + "\n", "tests/golden/requests-view.txt");
+}
+
+#[cfg_attr(target_os = "macos", ignore = "fixture uses Linux key glyphs")]
+#[test]
+fn requests_view_wide_golden_render_matches_fixture() {
+  // The wide frame is the only golden that shows `Launch`, `Client`,
+  // `Note` and `Route`, and the only one where a long note wraps onto a
+  // continuation line instead of being dropped with the column.
+  let mut app = seeded_requests_view_app();
+  let rendered = mask_clock_times(&render_to_lines_at(&mut app, 280, 30).join("\n"));
+  assert_golden_text(rendered + "\n", "tests/golden/requests-view-wide.txt");
 }
 
 /// `text` with every `dd:dd:dd` clock time replaced by `HH:MM:SS`.
@@ -431,9 +446,10 @@ fn seeded_logs_view_app() -> App {
 /// Dashboard with the right pane focused on the Requests tab of the
 /// running launch: a served request, one that auto-started the model and
 /// unloaded another for it, a failed auto-start, a client that hung up,
-/// and one still streaming.
+/// and two still streaming from two peers of one host.
 fn seeded_requests_view_app() -> App {
   use llamastash::proxy::request_log::{RequestRow, RequestState, RequestSummary};
+  use llamastash::tui::tabs::requests::RequestsScope;
   let mut app = seeded_dashboard_app();
   app.focus = Focus::RightPane;
   app.right_tab = RightTab::Requests;
@@ -466,6 +482,15 @@ fn seeded_requests_view_app() -> App {
       ..row(5)
     },
     RequestRow {
+      state: RequestState::InFlight,
+      client: Some("127.0.0.1:53498".into()),
+      duration_ms: None,
+      prompt_tokens: None,
+      completion_tokens: None,
+      tokens_per_second: None,
+      ..row(6)
+    },
+    RequestRow {
       state: RequestState::ClientClosed,
       prompt_tokens: None,
       completion_tokens: None,
@@ -474,11 +499,16 @@ fn seeded_requests_view_app() -> App {
       ..row(4)
     },
     RequestRow {
+      client: Some("192.168.1.42:51820".into()),
       status: Some(503),
       launch_id: None,
       auto_start: true,
       error: Some("launch_failed".into()),
-      cause: Some("compose_and_spawn: not enough memory".into()),
+      cause: Some(
+        "compose_and_spawn: not enough memory to map the KV cache at this \
+         context; unload a model or lower --ctx-size"
+          .into(),
+      ),
       ttfb_ms: None,
       duration_ms: Some(96),
       prompt_tokens: None,
@@ -496,13 +526,20 @@ fn seeded_requests_view_app() -> App {
     row(1),
   ];
   app.requests.set(
-    "/m/x/qwen-7b.gguf".into(),
+    RequestsScope::Launch("L1".into()),
     RequestSummary {
-      requests: 4,
+      requests: 6,
       errors: 1,
+      // Two hosts, four peers; both live requests share one host but not
+      // one peer, so the live pair prints as `1/2`.
+      hosts: Some(2),
+      connections: Some(4),
+      live_hosts: Some(1),
+      live_connections: Some(2),
       avg_duration_ms: Some(20_165),
       avg_ttfb_ms: Some(16_026),
       tokens_per_second_avg: Some(41.27),
+      tokens_per_second_session: Some(48.9),
       tokens_per_second_last: Some(41.27),
       prompt_tokens: 36_864,
       completion_tokens: 328,

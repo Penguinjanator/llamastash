@@ -11,10 +11,14 @@ use crate::cli::cli_args::{Cli, RequestsArgs};
 use crate::cli::client::connect_or_spawn;
 use crate::cli::exit_codes::{CliExit, CliResult};
 use crate::cli::output::pretty_json;
-use crate::cli::resolve::{fetch_catalog, fetch_status, resolve_model_or_launch};
+use crate::cli::resolve::{
+  fetch_catalog, fetch_status, resolve_model, resolve_model_or_launch, resolve_running, CatalogRow,
+  RunningRow,
+};
 use crate::cli::{colors, format};
 use crate::config::Config;
 use crate::proxy::request_log::{RequestRow, Tail};
+use crate::util::wrap::wrap_cells;
 
 /// Cell text for a value the log does not have.
 const NONE: &str = "-";
@@ -25,8 +29,7 @@ pub async fn handle(args: RequestsArgs, cli: &Cli, config: &Config) -> CliResult
   if let Some(reference) = &args.model {
     let catalog = fetch_catalog(&mut client).await?;
     let running = fetch_status(&mut client).await?.models;
-    let (model, _) = resolve_model_or_launch(&catalog, &running, reference)?;
-    params["model_path"] = json!(model.path);
+    params = tail_scope(&catalog, &running, reference)?;
   }
   if let Some(n) = args.lines {
     params["limit"] = json!(n);
@@ -41,6 +44,26 @@ pub async fn handle(args: RequestsArgs, cli: &Cli, config: &Config) -> CliResult
     print!("{}", requests_human(&body, args.model.is_some()));
   }
   Ok(())
+}
+
+/// The `requests_tail` params a reference asks for: a launch reference scopes
+/// to that one launch, a model reference to the model and every launch of it.
+/// The catalog answers first, so a model whose own name looks like a launch
+/// still reads as a model, and `model@name` with no such launch live keeps the
+/// model scope rather than failing.
+fn tail_scope(
+  catalog: &[CatalogRow],
+  running: &[RunningRow],
+  reference: &str,
+) -> Result<Value, CliExit> {
+  if let Ok(model) = resolve_model(catalog, reference) {
+    return Ok(json!({ "model_path": model.path }));
+  }
+  if let Ok(launch) = resolve_running(running, reference) {
+    return Ok(json!({ "launch_id": launch.launch_id }));
+  }
+  let (model, _) = resolve_model_or_launch(catalog, running, reference)?;
+  Ok(json!({ "model_path": model.path }))
 }
 
 /// The summary and the table. The summary is terminal-only so piped output
@@ -61,15 +84,50 @@ fn requests_human(body: &Value, one_model: bool) -> String {
     out.push('\n');
     return out;
   }
-  let mut header = vec![
-    "TIME", "STATUS", "TOTAL", "TTFB", "TOK/S", "IN", "OUT", "ROUTE",
-  ];
+  let mut header = vec!["TIME", "CODE", "TOK/S", "TOTAL", "TTFB", "IN", "OUT"];
   if !one_model {
     header.push("MODEL");
   }
-  header.extend(["LAUNCH", "CLIENT", "NOTE"]);
+  header.extend(["LAUNCH", "CLIENT", "NOTE", "ROUTE"]);
   let table: Vec<Vec<String>> = rows.iter().map(|r| cells_for(r, one_model)).collect();
+  let table = wrap_notes(&header, table);
   out.push_str(&format::table(&header, &table));
+  out
+}
+
+/// The widest the NOTE column gets on a terminal. One refused auto-start
+/// carries the engine's whole cause, and a note wider than the screen
+/// buries the figures of every row under it.
+const NOTE_MAX_W: usize = 60;
+
+/// Split long notes over continuation lines under the NOTE column, on a
+/// terminal only. Piped output keeps one line per request with the whole
+/// note in its field, so `awk -F\t` pipelines are untouched.
+fn wrap_notes(header: &[&str], rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
+  if !console::colors_enabled() {
+    return rows;
+  }
+  let Some(note) = header.iter().position(|h| *h == "NOTE") else {
+    return rows;
+  };
+  let mut out = Vec::with_capacity(rows.len());
+  for row in rows {
+    let note_text = row.get(note).cloned().unwrap_or_default();
+    for (i, chunk) in wrap_cells(&note_text, NOTE_MAX_W).into_iter().enumerate() {
+      let mut line = row.clone();
+      line[note] = chunk;
+      if i > 0 {
+        // A continuation line carries only the note: the row's own
+        // figures already appeared above it.
+        for (j, cell) in line.iter_mut().enumerate() {
+          if j != note {
+            *cell = String::new();
+          }
+        }
+      }
+      out.push(line);
+    }
+  }
   out
 }
 
@@ -84,12 +142,11 @@ fn cells_for(row: &RequestRow, one_model: bool) -> Vec<String> {
   let mut cells = vec![
     c.time,
     status,
+    c.speed,
     c.total,
     c.ttfb,
-    c.speed,
     c.tokens_in,
     c.tokens_out,
-    c.route,
   ];
   if !one_model {
     cells.push(c.model);
@@ -102,6 +159,7 @@ fn cells_for(row: &RequestRow, one_model: bool) -> Vec<String> {
     } else {
       c.note
     },
+    c.route,
   ]);
   cells
 }
@@ -109,7 +167,32 @@ fn cells_for(row: &RequestRow, one_model: bool) -> Vec<String> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::proxy::request_log::RequestState;
+  use crate::cli::resolve::running_rows_in;
+  use crate::proxy::request_log::{RequestState, RequestSummary};
+
+  #[test]
+  fn a_reference_that_names_a_launch_scopes_to_that_launch() {
+    let running = running_rows_in(&json!({
+      "models": [{
+        "launch_id": "L3",
+        "id": {"path": "/m/qwen.gguf", "header_blake3": "deadbeef"},
+        "port": 41100,
+        "mode": "chat",
+        "state": "ready",
+        "name": "coder",
+      }],
+    }));
+    // An empty catalog leaves only the launch half to resolve against.
+    for reference in ["L3", "41100", "coder"] {
+      assert_eq!(
+        tail_scope(&[], &running, reference).unwrap(),
+        json!({ "launch_id": "L3" }),
+        "`{reference}` names a launch"
+      );
+    }
+    let miss = tail_scope(&[], &running, "nope").unwrap_err();
+    assert!(miss.message.unwrap_or_default().contains("nope"));
+  }
 
   fn row() -> RequestRow {
     RequestRow {
@@ -154,7 +237,7 @@ mod tests {
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(
       lines[0],
-      "TIME\tSTATUS\tTOTAL\tTTFB\tTOK/S\tIN\tOUT\tROUTE\tMODEL\tLAUNCH\tCLIENT\tNOTE"
+      "TIME\tCODE\tTOK/S\tTOTAL\tTTFB\tIN\tOUT\tMODEL\tLAUNCH\tCLIENT\tNOTE\tROUTE"
     );
     assert_eq!(lines.len(), 2);
     let cells: Vec<&str> = lines[1].split('\t').collect();
@@ -162,16 +245,16 @@ mod tests {
       &cells[1..],
       [
         "200",
+        "39.6",
         "1.2s",
         "180ms",
-        "39.6",
         "41",
         "12.3k",
-        "chat/completions",
         "Qwen3.8-27B",
         "L1",
         "127.0.0.1:5000",
-        "-"
+        "-",
+        "chat/completions",
       ]
     );
   }
@@ -200,14 +283,137 @@ mod tests {
     let out = piped(&[failed], false);
     let cells: Vec<&str> = out.lines().nth(1).unwrap().split('\t').collect();
     assert_eq!(cells[1], "404");
-    assert_eq!(cells[3], "-");
-    assert_eq!(cells[8], "qwen");
-    assert_eq!(cells[9], "-");
-    assert_eq!(cells[11], "model_not_found");
+    assert_eq!(cells[2], "-");
+    assert_eq!(cells[4], "-");
+    assert_eq!(cells[7], "qwen");
+    assert_eq!(cells[8], "-");
+    assert_eq!(cells[10], "model_not_found");
+    assert_eq!(cells[11], "chat/completions");
+  }
+
+  /// Terminal rendering, with the process-wide color flag restored. It
+  /// gates the padded layout and the note wrap, so the same rows print
+  /// differently here than under [`piped`].
+  fn on_terminal(rows: &[RequestRow], one_model: bool) -> String {
+    let body = json!(Tail {
+      rows: rows.to_vec(),
+      ..Tail::default()
+    });
+    let _lock = crate::cli::test_lock::serialize();
+    let prior = console::colors_enabled();
+    console::set_colors_enabled(true);
+    let out = requests_human(&body, one_model);
+    console::set_colors_enabled(prior);
+    out
+  }
+
+  /// A row whose note runs past the NOTE column's cap.
+  fn long_note_row() -> RequestRow {
+    RequestRow {
+      status: Some(503),
+      error: Some("launch_failed".to_string()),
+      cause: Some(
+        "auto-start of the model failed because the KV cache did not fit; \
+         unload another model or lower --ctx-size"
+          .to_string(),
+      ),
+      ..row()
+    }
+  }
+
+  #[test]
+  fn a_long_note_wraps_onto_a_continuation_line_on_a_terminal() {
+    let lines: Vec<String> = on_terminal(&[long_note_row()], false)
+      .lines()
+      .map(|l| console::strip_ansi_codes(l).to_string())
+      // Drop the summary block: it is terminal-only and has its own wrap.
+      .skip_while(|l| !l.starts_with("TIME"))
+      .collect();
+    assert_eq!(lines.len(), 4, "header, rule, row, continuation: {lines:?}");
+    let (row_line, cont) = (&lines[2], &lines[3]);
+    assert!(row_line.contains("launch_failed:"), "{row_line}");
+    assert!(
+      !row_line.contains("--ctx-size"),
+      "the note must wrap: {row_line}"
+    );
+    assert!(cont.contains("--ctx-size"), "{cont}");
+    // The continuation line carries the note and nothing else.
+    assert!(!cont.contains("chat/completions"), "{cont}");
+    assert!(!cont.contains("1.2s"), "{cont}");
+  }
+
+  #[test]
+  fn a_piped_long_note_stays_one_field_on_one_line() {
+    let out = piped(&[long_note_row()], false);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    let cells: Vec<&str> = lines[1].split('\t').collect();
+    assert_eq!(cells.len(), 12);
+    assert!(cells[10].ends_with("lower --ctx-size"), "{}", cells[10]);
   }
 
   #[test]
   fn an_empty_log_says_so() {
     assert_eq!(piped(&[], false), "(no requests logged)\n");
+  }
+
+  /// Terminal rendering of a whole tail, summary block included.
+  fn summary_on_terminal(summary: RequestSummary) -> String {
+    let body = json!(Tail {
+      summary,
+      rows: vec![row()],
+    });
+    let _lock = crate::cli::test_lock::serialize();
+    let prior = console::colors_enabled();
+    console::set_colors_enabled(true);
+    let out = requests_human(&body, false);
+    console::set_colors_enabled(prior);
+    console::strip_ansi_codes(&out).to_string()
+  }
+
+  #[test]
+  fn the_summary_block_prints_the_clients_of_the_scope_and_a_live_pair() {
+    let live = RequestSummary {
+      requests: 3,
+      hosts: Some(2),
+      connections: Some(3),
+      live_hosts: Some(1),
+      live_connections: Some(2),
+      tokens_per_second_last: Some(41.3),
+      ..RequestSummary::default()
+    };
+    let strip = summary_on_terminal(live.clone());
+    assert!(strip.contains("Live  1/2"), "{strip}");
+    assert!(strip.contains("Hosts  2"), "{strip}");
+    assert!(strip.contains("Connections  3"), "{strip}");
+    // The newest speed is the row table's business, not the summary's.
+    assert!(!strip.contains("Tok/s last"), "{strip}");
+
+    // One host, one peer: one number, not a pair.
+    let one_number = summary_on_terminal(RequestSummary {
+      live_hosts: Some(2),
+      live_connections: Some(2),
+      ..live.clone()
+    });
+    assert!(one_number.contains("Live  2"), "{one_number}");
+
+    // Nothing in flight: no Live line at all.
+    let idle = summary_on_terminal(RequestSummary {
+      live_hosts: Some(0),
+      live_connections: Some(0),
+      ..live
+    });
+    assert!(!idle.contains("Live"), "{idle}");
+
+    // An older daemon that never computed them: placeholders, not zeros.
+    let predates = summary_on_terminal(RequestSummary {
+      hosts: None,
+      connections: None,
+      live_hosts: None,
+      live_connections: None,
+      ..RequestSummary::default()
+    });
+    assert!(predates.contains("Hosts  -"), "{predates}");
+    assert!(predates.contains("Connections  -"), "{predates}");
   }
 }

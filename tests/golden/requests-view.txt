@@ -13,18 +13,18 @@
 │★ Favorites                                                                 ││                                        │
 │ ★ mistral-7b                             llama       Q4_K    8.0k    4.0G  ││ ID:L1  :41100  ● ready · 4.2G RAM · 31 │
 │────────────────────────────────────────────────────────────────────────────││ ────────────────────────────────────── │
-│m/x                                                                         ││ Requests 4   Errors 1                  │
-│ ★ mistral-7b                             llama       Q4_K    8.0k    4.0G  ││ Avg total 20.2s   Avg TTFB 16.0s       │
-│m/y                                                                         ││ Tok/s avg 41.3   Tok/s last 41.3       │
-│   phi-3                                  phi         Q4_K    8.0k    3.9G  ││ Tokens in 36.9k   Tokens out 328       │
+│m/x                                                                         ││ Requests 6   Errors 1   Live 1/2       │
+│ ★ mistral-7b                             llama       Q4_K    8.0k    4.0G  ││ Hosts 2   Connections 4                │
+│m/y                                                                         ││ Avg total 20.2s   Avg TTFB 16.0s       │
+│   phi-3                                  phi         Q4_K    8.0k    3.9G  ││ Tok/s avg 41.3   Tok/s session 48.9    │
+│                                                                            ││ Tokens in 36.9k   Tokens out 328       │
 │                                                                            ││ Auto-starts 2   Unloaded 1             │
 │                                                                            ││                                        │
-│                                                                            ││ Time     Code Tok/s  Total   In        │
-│                                                                            ││ HH:MM:SS 200  —      —       —         │
-│                                                                            ││ HH:MM:SS 200  —      4.3s    —         │
+│                                                                            ││ Time     Code Tok/s  Total   TTFB      │
+│                                                                            ││ HH:MM:SS 200  —      —       182ms     │
+│                                                                            ││ HH:MM:SS 200  —      —       182ms     │
+│                                                                            ││ HH:MM:SS 200  —      4.3s    182ms     │
 │                                                                            ││ HH:MM:SS 503  —      96ms    —         │
-│                                                                            ││ HH:MM:SS 200  41.3   36.0s   18.4k     │
-│                                                                            ││ HH:MM:SS 200  41.3   4.3s    18.4k     │
-│                                                                            ││                                        │
-│                                                                            ││                                        │
+│                                                                            ││ HH:MM:SS 200  41.3   36.0s   31.9s     │
+│                                                                            ││ HH:MM:SS 200  41.3   4.3s    182ms     │
 └ ◌ launching · ◐ loading · ● ready · ▲ error · ○ stopped · ⇪ external ──────┘└────────────────────────────────────────┘

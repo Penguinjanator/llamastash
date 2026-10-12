@@ -35,7 +35,7 @@ use llamastash::gguf::identity::ModelId;
 use llamastash::ipc::{dispatch_request, Request};
 use llamastash::launch::mode::LaunchMode;
 use llamastash::launch::params::LaunchParams;
-use llamastash::proxy::request_log::RequestState;
+use llamastash::proxy::request_log::{LogScope, RequestState};
 use llamastash::proxy::server::ServeOptions;
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
@@ -1310,7 +1310,15 @@ async fn tokens_and_speed_come_from_the_end_of_the_response() {
   let estimate = row.tokens_per_second.expect("estimated speed");
   assert!(estimate > 0.0 && estimate.is_finite(), "{estimate}");
 
-  let summary = ctx.requests.tail(Some(catalog_path), 0).summary;
+  let summary = ctx
+    .requests
+    .tail(
+      LogScope::Model {
+        path: catalog_path.to_string(),
+      },
+      0,
+    )
+    .summary;
   assert_eq!(summary.requests, 2);
   assert_eq!(summary.prompt_tokens, 42);
   assert_eq!(summary.completion_tokens, 4);
@@ -1347,7 +1355,7 @@ async fn requests_the_proxy_answers_itself_are_logged_with_the_error_type() {
   // In the catalog, but the file does not exist: the auto-start fails.
   assert_eq!(post(r#"{"model":"qwen3","messages":[]}"#).await, 503);
 
-  let rows = ctx.requests.tail(None, 10).rows;
+  let rows = ctx.requests.tail(LogScope::All, 10).rows;
   let seen: Vec<(Option<u16>, Option<&str>)> = rows
     .iter()
     .map(|r| (r.status, r.error.as_deref()))
@@ -1384,10 +1392,19 @@ async fn requests_the_proxy_answers_itself_are_logged_with_the_error_type() {
 
   // The model's summary counts its one failure; the unfiltered one all five.
   assert_eq!(
-    ctx.requests.tail(Some("/m/qwen3.gguf"), 0).summary.errors,
+    ctx
+      .requests
+      .tail(
+        LogScope::Model {
+          path: "/m/qwen3.gguf".to_string()
+        },
+        0
+      )
+      .summary
+      .errors,
     1
   );
-  let all = ctx.requests.tail(None, 0).summary;
+  let all = ctx.requests.tail(LogScope::All, 0).summary;
   assert_eq!((all.requests, all.errors, all.auto_starts), (5, 5, 0));
 
   shutdown_listener(shutdown, listener_handle).await;
@@ -1437,7 +1454,15 @@ async fn a_client_that_hangs_up_mid_stream_is_logged_as_client_closed() {
   let row = finished_request(&ctx.requests).await;
   assert_eq!(row.state, RequestState::ClientClosed);
   assert_eq!(row.status, Some(200));
-  let summary = ctx.requests.tail(Some(catalog_path), 0).summary;
+  let summary = ctx
+    .requests
+    .tail(
+      LogScope::Model {
+        path: catalog_path.to_string(),
+      },
+      0,
+    )
+    .summary;
   assert_eq!(
     (summary.requests, summary.errors),
     (1, 0),
@@ -1486,7 +1511,19 @@ async fn an_upstream_that_dies_mid_body_is_logged_as_upstream_error() {
     (None, None),
     "the body ended before any usage arrived"
   );
-  assert_eq!(ctx.requests.tail(Some(catalog_path), 0).summary.errors, 1);
+  assert_eq!(
+    ctx
+      .requests
+      .tail(
+        LogScope::Model {
+          path: catalog_path.to_string()
+        },
+        0
+      )
+      .summary
+      .errors,
+    1
+  );
 
   let _ = model.stop(Duration::from_secs(3)).await;
   shutdown_listener(shutdown, listener_handle).await;
@@ -1515,7 +1552,12 @@ async fn a_503_for_a_model_whose_umbrella_is_down_is_filed_under_the_model() {
   let v: Value = serde_json::from_slice(&response).expect("json");
   assert_eq!(v["error"]["type"], "backend_unavailable");
 
-  let tail = ctx.requests.tail(Some(path), 10);
+  let tail = ctx.requests.tail(
+    LogScope::Model {
+      path: path.to_string(),
+    },
+    10,
+  );
   assert_eq!(tail.rows.len(), 1, "the 503 shows under the model");
   assert_eq!(tail.rows[0].error.as_deref(), Some("backend_unavailable"));
   assert_eq!(tail.rows[0].model.as_deref(), Some("qwen-npu"));

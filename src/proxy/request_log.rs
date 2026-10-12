@@ -9,12 +9,12 @@
 //! have been pushed out. The ring and the totals are lost when the daemon
 //! stops. [`RequestLog::write_to`] also appends each finished row to a file.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -27,8 +27,19 @@ pub const CAPACITY: usize = 1000;
 /// Rows one `requests_tail` call returns when it names no `limit`.
 pub const DEFAULT_TAIL: usize = 100;
 
+/// A caller's row limit: the default when it named none, never more than the
+/// ring holds, so one query cannot ask for more rows than exist.
+pub(crate) fn clamp_limit(raw: Option<usize>) -> usize {
+  raw.unwrap_or(DEFAULT_TAIL).min(CAPACITY)
+}
+
 /// Name of the request log file inside the daemon's log directory.
 pub const FILE_NAME: &str = "requests.jsonl";
+
+/// How many stopped launches keep their totals. A launch id is never reused,
+/// so totals deleted the moment a launch stops read as a counter reset to
+/// anything that keeps reading them.
+pub const RETIRED_LAUNCH_HISTORY: usize = 16;
 
 /// Finished rows that may wait for the file writer. Past this the line is
 /// dropped from the file (the in-memory log still has the row) rather
@@ -280,8 +291,26 @@ pub struct RequestSummary {
   pub avg_ttfb_ms: Option<u64>,
   /// Mean of the per-request speeds, estimated ones included.
   pub tokens_per_second_avg: Option<f64>,
-  /// The most recent speed a request reported.
+  /// Mean speed of the newest launch of the scoped model only: what this
+  /// session is running at, with a reloaded model no older launch pulling
+  /// the average. Set for a model scope only; `None` for the whole log and
+  /// for a scope no request has reported a speed for yet.
+  pub tokens_per_second_session: Option<f64>,
+  /// The most recent speed a request reported. Kept in the JSON and in the
+  /// row table, but no longer on the summary strips: the session figure says
+  /// the same thing about what is running now.
   pub tokens_per_second_last: Option<f64>,
+  /// Distinct client IPs among the rows the scope retains. Loopback tools
+  /// all share `127.0.0.1`, so this counts machines and reads 1 until a LAN
+  /// bind; [`Self::connections`] is the figure that counts tools.
+  pub hosts: Option<u64>,
+  /// Distinct client peers on `ip:port` among the retained rows — what one
+  /// tool's live connection looks like to the proxy.
+  pub connections: Option<u64>,
+  /// [`Self::hosts`] over the requests in flight right now.
+  pub live_hosts: Option<u64>,
+  /// [`Self::connections`] over the requests in flight right now.
+  pub live_connections: Option<u64>,
   pub prompt_tokens: u64,
   pub completion_tokens: u64,
   /// Requests that started the model.
@@ -299,19 +328,124 @@ impl RequestSummary {
       v.map(|t| format!("{t:.1}"))
         .unwrap_or_else(|| none.to_string())
     };
+    let num = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_else(|| none.to_string());
     vec![
       ("Requests", self.requests.to_string()),
       ("Errors", self.errors.to_string()),
+    ]
+    .into_iter()
+    .chain(self.live_cell())
+    .chain([
+      ("Hosts", num(self.hosts)),
+      ("Connections", num(self.connections)),
       ("Avg total", ms(self.avg_duration_ms)),
       ("Avg TTFB", ms(self.avg_ttfb_ms)),
       ("Tok/s avg", tps(self.tokens_per_second_avg)),
-      ("Tok/s last", tps(self.tokens_per_second_last)),
+    ])
+    .chain(
+      self
+        .tokens_per_second_session
+        .map(|t| ("Tok/s session", format!("{t:.1}"))),
+    )
+    .chain([
       ("Tokens in", fmt_count(self.prompt_tokens)),
       ("Tokens out", fmt_count(self.completion_tokens)),
       ("Auto-starts", self.auto_starts.to_string()),
       ("Unloaded", self.evictions.to_string()),
-    ]
+    ])
+    .collect()
   }
+
+  /// The in-flight pair as one cell: `Live N` when every host in flight is on
+  /// one connection and `Live N/M` when they differ (an agent runner with two
+  /// tools open reads `1/2`). Absent when nothing is in flight, so an idle
+  /// launch's strip looks the way it did before the figure existed, and
+  /// absent from a daemon that never computed it.
+  fn live_cell(&self) -> Option<(&'static str, String)> {
+    let (hosts, connections) = (self.live_hosts?, self.live_connections?);
+    (hosts > 0 || connections > 0).then(|| {
+      let text = if hosts == connections {
+        hosts.to_string()
+      } else {
+        format!("{hosts}/{connections}")
+      };
+      ("Live", text)
+    })
+  }
+}
+
+/// How many hosts and `ip:port` peers a set of rows came from. Both figures
+/// count rows a scope still retains rather than the since-daemon-start
+/// totals, so they describe the table on screen and do not grow as the daemon
+/// ages.
+#[derive(Debug, Clone, Default)]
+pub struct Clients {
+  requests: u64,
+  hosts: HashSet<String>,
+  connections: HashSet<String>,
+}
+
+impl Clients {
+  fn add(&mut self, row: &RequestRow) {
+    self.requests += 1;
+    let Some(client) = &row.client else {
+      return;
+    };
+    self.connections.insert(client.clone());
+    self.hosts.insert(client_host(client).to_string());
+  }
+
+  /// Rows counted, in flight ones included.
+  pub fn requests(&self) -> u64 {
+    self.requests
+  }
+
+  /// Distinct client IPs.
+  pub fn hosts(&self) -> u64 {
+    self.hosts.len() as u64
+  }
+
+  /// Distinct `ip:port` peers.
+  pub fn connections(&self) -> u64 {
+    self.connections.len() as u64
+  }
+}
+
+/// [`Clients`] of a scope and the same over its in-flight rows.
+#[derive(Default)]
+struct ClientPair {
+  all: Clients,
+  live: Clients,
+}
+
+impl ClientPair {
+  fn add(&mut self, row: &RequestRow) {
+    self.all.add(row);
+    if row.state == RequestState::InFlight {
+      self.live.add(row);
+    }
+  }
+
+  /// Stamp the four client figures onto `summary`. A daemon that computes
+  /// them always answers, so an empty scope reads `Some(0)`; only an older
+  /// daemon leaves them `None`.
+  fn stamp(&self, summary: &mut RequestSummary) {
+    summary.hosts = Some(self.all.hosts());
+    summary.connections = Some(self.all.connections());
+    summary.live_hosts = Some(self.live.hosts());
+    summary.live_connections = Some(self.live.connections());
+  }
+}
+
+/// The address part of a client string, which is always a `SocketAddr`'s text
+/// (`127.0.0.1:5000`, `[::1]:5000`). Anything that does not carry a port is
+/// its own host.
+fn client_host(client: &str) -> &str {
+  let host = match client.rsplit_once(':') {
+    Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty() => host,
+    _ => client,
+  };
+  host.trim_matches(&['[', ']'][..])
 }
 
 #[derive(Debug, Clone, Default)]
@@ -329,10 +463,16 @@ struct Totals {
   completion_tokens: u64,
   auto_starts: u64,
   evictions: u64,
+  /// Display name of the model these rows belong to, taken from them, so a
+  /// launch's figures and the model's print the same name.
+  label: Option<String>,
 }
 
 impl Totals {
   fn add(&mut self, row: &RequestRow) {
+    if row.model.is_some() {
+      self.label = row.model.clone();
+    }
     self.requests += 1;
     if row.is_error() {
       self.errors += 1;
@@ -364,7 +504,16 @@ impl Totals {
       avg_duration_ms: self.duration_ms_sum.checked_div(self.timed),
       avg_ttfb_ms: self.ttfb_ms_sum.checked_div(self.timed),
       tokens_per_second_avg: (self.tps_n > 0).then(|| self.tps_sum / self.tps_n as f64),
+      // `RequestLog::tail` fills this for a model scope; a single set of
+      // totals has no notion of "the newest launch".
+      tokens_per_second_session: None,
       tokens_per_second_last: self.tps_last,
+      // The client figures count rows, which a set of totals no longer holds.
+      // `RequestLog::tail` and `snapshot` fill them in.
+      hosts: None,
+      connections: None,
+      live_hosts: None,
+      live_connections: None,
       prompt_tokens: self.prompt_tokens,
       completion_tokens: self.completion_tokens,
       auto_starts: self.auto_starts,
@@ -378,16 +527,31 @@ struct Inner {
   rows: VecDeque<RequestRow>,
   next_seq: u64,
   all: Totals,
+  // Finished requests per request path. The router logs only the fixed paths
+  // it matches exactly, so this cannot grow past the route table.
+  by_route: HashMap<String, u64>,
   // One entry per model that got a request. Never removed: the keys are
   // catalog paths, so the map is as large as the catalog at most.
   by_model: HashMap<String, Totals>,
   // One entry per launch a request was handed to. A launch id is never
-  // reused, so [`RequestLog::forget_launch`] drops the entry when the
+  // reused, so [`RequestLog::forget_launch`] moves the entry out when the
   // launch stops, or every auto-start would leave one behind.
   by_launch: HashMap<String, Totals>,
+  // The entries `forget_launch` moved out, oldest first, capped at
+  // [`RETIRED_LAUNCH_HISTORY`].
+  retired: VecDeque<(String, Totals)>,
 }
 
 impl Inner {
+  /// Totals for `scope`, or `None` for a scope nothing has contributed to.
+  fn totals(&self, scope: &LogScope) -> Option<&Totals> {
+    match scope {
+      LogScope::All => Some(&self.all),
+      LogScope::Model { path } => self.by_model.get(path),
+      LogScope::Launch { id } => RequestLog::launch_totals(self, id),
+    }
+  }
+
   /// Overwrite the ring's copy of `row`, if the ring still holds it.
   fn store(&mut self, row: &RequestRow) {
     let Some(front) = self.rows.front().map(|r| r.seq) else {
@@ -491,10 +655,7 @@ impl RequestLog {
   /// `route` is stored uncut: the router logs only the fixed paths it
   /// matches exactly, so a client cannot make it long.
   pub fn begin(&self, route: &str, client: Option<SocketAddr>) -> RequestRecord {
-    let started_at_ms = SystemTime::now()
-      .duration_since(UNIX_EPOCH)
-      .map(|d| d.as_millis() as u64)
-      .unwrap_or(0);
+    let started_at_ms = crate::util::datetime::now_ms();
     let mut inner = self.lock();
     inner.next_seq += 1;
     let row = RequestRow {
@@ -516,41 +677,253 @@ impl RequestLog {
     }
   }
 
-  /// The newest `limit` rows, newest first, and the summary for the same
-  /// scope: one model when `model_path` is given, every request otherwise.
-  pub fn tail(&self, model_path: Option<&str>, limit: usize) -> Tail {
+  /// The newest `limit` rows of `scope`, newest first, and the summary for
+  /// that same scope.
+  pub fn tail(&self, scope: LogScope, limit: usize) -> Tail {
     let inner = self.lock();
-    let totals = match model_path {
-      Some(path) => inner.by_model.get(path),
-      None => Some(&inner.all),
-    };
+    let totals = inner.totals(&scope);
+    let mut summary = totals.map(Totals::summary).unwrap_or_default();
+    let mut counts = ClientPair::default();
+    for row in inner.rows.iter().filter(|row| scope.matches(row)) {
+      counts.add(row);
+    }
+    counts.stamp(&mut summary);
+    // The speed of the newest launch that served this model, so a model
+    // reloaded at a different speed shows both numbers.
+    if let LogScope::Model { .. } = scope {
+      summary.tokens_per_second_session = inner
+        .rows
+        .iter()
+        .rev()
+        .find(|r| scope.matches(r))
+        .and_then(|r| r.launch_id.as_deref())
+        .and_then(|id| RequestLog::launch_totals(&inner, id))
+        .and_then(|t| Totals::summary(t).tokens_per_second_avg);
+    }
     Tail {
-      summary: totals.map(Totals::summary).unwrap_or_default(),
+      summary,
       rows: inner
         .rows
         .iter()
         .rev()
-        .filter(|r| model_path.is_none_or(|p| r.model_path.as_deref() == Some(p)))
+        .filter(|r| scope.matches(r))
         .take(limit)
         .cloned()
         .collect(),
     }
   }
 
-  /// Drop a stopped launch's totals. `status` only reads the totals of
-  /// launches that are still registered.
+  /// Retire a stopped launch's totals. `status` only reads the totals of
+  /// launches that are still registered; [`Self::launch_summary`] still
+  /// answers for the last [`RETIRED_LAUNCH_HISTORY`] stopped launches.
   pub fn forget_launch(&self, launch_id: &str) {
-    self.lock().by_launch.remove(launch_id);
+    let mut inner = self.lock();
+    let Some(totals) = inner.by_launch.remove(launch_id) else {
+      return;
+    };
+    inner.retired.push_back((launch_id.to_string(), totals));
+    while inner.retired.len() > RETIRED_LAUNCH_HISTORY {
+      inner.retired.pop_front();
+    }
   }
 
-  /// Summary of the requests one launch served.
+  /// Summary of the requests one launch served, live first then retired.
+  ///
+  /// This is [`Self::tail`] on a launch scope with no rows asked for, so the
+  /// stamping `tail` does reaches the per-launch surfaces too.
   pub fn launch_summary(&self, launch_id: &str) -> RequestSummary {
     self
-      .lock()
+      .tail(
+        LogScope::Launch {
+          id: launch_id.to_string(),
+        },
+        0,
+      )
+      .summary
+  }
+
+  /// Display name of the model `launch_id` served, or `None` when no finished
+  /// row of it carries one.
+  pub fn launch_label(&self, launch_id: &str) -> Option<String> {
+    Self::launch_totals(&self.lock(), launch_id).and_then(|totals| totals.label.clone())
+  }
+
+  fn launch_totals<'a>(inner: &'a Inner, launch_id: &str) -> Option<&'a Totals> {
+    inner.by_launch.get(launch_id).or_else(|| {
+      inner
+        .retired
+        .iter()
+        .rev()
+        .find(|(retired, _)| retired == launch_id)
+        .map(|(_, totals)| totals)
+    })
+  }
+
+  /// The whole log in owned data, taken under one lock. A `/metrics` scrape
+  /// renders from this instead of holding the lock while it builds a body.
+  pub fn snapshot(&self) -> LogSnapshot {
+    let inner = self.lock();
+    // The client figures of every scope, in one pass over the ring, so a
+    // `/metrics` summary prints the same four numbers as `requests --json`
+    // of the same scope: both count these rows and nothing else.
+    let mut counts = ClientPair::default();
+    let mut model_counts: HashMap<&str, ClientPair> = HashMap::new();
+    let mut launch_counts: HashMap<&str, ClientPair> = HashMap::new();
+    for row in inner.rows.iter() {
+      counts.add(row);
+      if let Some(path) = row.model_path.as_deref() {
+        model_counts.entry(path).or_default().add(row);
+      }
+      if let Some(launch) = row.launch_id.as_deref() {
+        launch_counts.entry(launch).or_default().add(row);
+      }
+    }
+    let view = |key: String, totals: &Totals| ScopeTotals {
+      key,
+      label: totals.label.clone(),
+      summary: totals.summary(),
+      duration_ms_sum: totals.duration_ms_sum,
+      ttfb_ms_sum: totals.ttfb_ms_sum,
+      timed: totals.timed,
+    };
+    let mut models: Vec<ScopeTotals> = inner
+      .by_model
+      .iter()
+      .map(|(path, totals)| view(path.clone(), totals))
+      .collect();
+    models.sort_by(|a, b| a.key.cmp(&b.key));
+    // A scope whose rows all left the ring has no counts of its own; zero is
+    // the answer, not "not computed".
+    let empty = ClientPair::default();
+    for model in &mut models {
+      model_counts
+        .get(model.key.as_str())
+        .unwrap_or(&empty)
+        .stamp(&mut model.summary);
+    }
+    let mut launches: Vec<LaunchTotals> = inner
       .by_launch
-      .get(launch_id)
-      .map(Totals::summary)
-      .unwrap_or_default()
+      .iter()
+      .map(|(id, totals)| LaunchTotals {
+        totals: view(id.clone(), totals),
+        live: true,
+      })
+      .collect();
+    launches.sort_by(|a, b| a.totals.key.cmp(&b.totals.key));
+    launches.extend(inner.retired.iter().map(|(id, totals)| LaunchTotals {
+      totals: view(id.clone(), totals),
+      live: false,
+    }));
+    for launch in &mut launches {
+      launch_counts
+        .get(launch.totals.key.as_str())
+        .unwrap_or(&empty)
+        .stamp(&mut launch.totals.summary);
+    }
+    let mut all = view(String::new(), &inner.all);
+    counts.stamp(&mut all.summary);
+    let mut routes: Vec<(String, u64)> = inner
+      .by_route
+      .iter()
+      .map(|(route, n)| (route.clone(), *n))
+      .collect();
+    routes.sort();
+    LogSnapshot {
+      rows: inner.rows.iter().cloned().collect(),
+      all,
+      models,
+      launches,
+      routes,
+    }
+  }
+}
+
+/// One scope's totals as a `/metrics` scrape reads them: the summary
+/// `requests --json` returns, plus the sums behind its averages. A counter
+/// needs the total; a mean cannot be re-expanded into one.
+#[derive(Debug, Clone)]
+pub struct ScopeTotals {
+  /// Catalog path for a model, launch id for a launch, empty for the whole log.
+  pub key: String,
+  /// Display name of the model these totals belong to.
+  pub label: Option<String>,
+  pub summary: RequestSummary,
+  pub duration_ms_sum: u64,
+  pub ttfb_ms_sum: u64,
+  /// How many requests the two sums above cover. Not `summary.requests`: a sum
+  /// only holds a request the proxy could time, so a mean has to divide by this,
+  /// and an error or a cancellation moves the request count but neither sum.
+  pub timed: u64,
+}
+
+/// A launch's totals, and whether the launch is still running.
+pub struct LaunchTotals {
+  pub totals: ScopeTotals,
+  pub live: bool,
+}
+
+/// Owned view of the log for one scrape.
+pub struct LogSnapshot {
+  /// The ring's rows, oldest first.
+  pub rows: Vec<RequestRow>,
+  /// Totals of every finished request.
+  pub all: ScopeTotals,
+  /// One entry per model a request reached, sorted by catalog path.
+  pub models: Vec<ScopeTotals>,
+  /// Live launches sorted by id, then the retired ones, oldest first.
+  pub launches: Vec<LaunchTotals>,
+  /// Finished requests per request path, sorted by path.
+  pub routes: Vec<(String, u64)>,
+}
+
+impl LogSnapshot {
+  /// The in-flight rows one scope holds: how many there are, and how many
+  /// distinct hosts and peers they came from.
+  pub fn in_flight(&self, mut pred: impl FnMut(&RequestRow) -> bool) -> Clients {
+    let mut clients = Clients::default();
+    for row in self
+      .rows
+      .iter()
+      .filter(|row| row.state == RequestState::InFlight)
+      .filter(|row| pred(row))
+    {
+      clients.add(row);
+    }
+    clients
+  }
+
+  /// Catalog path a launch served, from the rows that carry both. A retired
+  /// launch whose rows left the ring has no entry.
+  pub fn launch_path(&self, launch_id: &str) -> Option<&str> {
+    self
+      .rows
+      .iter()
+      .rev()
+      .find(|row| row.launch_id.as_deref() == Some(launch_id))
+      .and_then(|row| row.model_path.as_deref())
+  }
+}
+
+/// Which requests a read covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogScope {
+  /// Every request the log holds.
+  All,
+  /// One model's, across every launch that served it.
+  Model { path: String },
+  /// One launch's, live or retired. Strictly the launch's own rows: a request
+  /// filed under the model that never reached this launch belongs to the
+  /// model's figures, not here.
+  Launch { id: String },
+}
+
+impl LogScope {
+  fn matches(&self, row: &RequestRow) -> bool {
+    match self {
+      LogScope::All => true,
+      LogScope::Model { path } => row.model_path.as_deref() == Some(path.as_str()),
+      LogScope::Launch { id } => row.launch_id.as_deref() == Some(id.as_str()),
+    }
   }
 }
 
@@ -613,8 +986,23 @@ impl RequestRecord {
 
   /// Copy the row as it stands into the log, so a reader sees a request
   /// that is still waiting on a load or still streaming.
+  ///
+  /// A row that already names its model opens that model's totals entry here
+  /// rather than leaving it to [`Self::finish`]: the first request to a model is
+  /// the one that carries the whole load, and the per-model in-flight gauge
+  /// needs an entry to sit on while that request is still running.
   pub fn publish(&self) {
-    self.log.lock().store(&self.row);
+    let mut inner = self.log.lock();
+    inner.store(&self.row);
+    if let Some(path) = &self.row.model_path {
+      let totals = inner.by_model.entry(path.clone()).or_default();
+      // Only the label, not `Totals::add`: the request has not finished. The
+      // label has to be the display name now, or the first scrape of a model
+      // prints a different `model` value than every scrape after it.
+      if totals.label.is_none() {
+        totals.label = self.row.model.clone();
+      }
+    }
   }
 
   /// The proxy answered the request itself, with `error` (its error code
@@ -643,6 +1031,7 @@ impl RequestRecord {
       let inner = &mut *inner;
       inner.store(&self.row);
       inner.all.add(&self.row);
+      *inner.by_route.entry(self.row.route.clone()).or_default() += 1;
       if let Some(path) = &self.row.model_path {
         inner
           .by_model
@@ -712,11 +1101,33 @@ mod tests {
     seq
   }
 
+  /// One served request from one client peer.
+  fn served_from(log: &RequestLog, path: &str, launch: &str, client: &str) {
+    let mut rec = log.begin(ROUTE, Some(client.parse().unwrap()));
+    rec.set_model("m", path);
+    rec.set_launch(launch);
+    rec.set_status(200);
+    rec.mark_first_byte();
+    rec.finish(RequestState::Done, Usage::default());
+  }
+
+  /// A current daemon always answers the client questions, so an empty scope
+  /// reads computed zeros. `None` belongs to a daemon that never had them.
+  fn zeros() -> RequestSummary {
+    RequestSummary {
+      hosts: Some(0),
+      connections: Some(0),
+      live_hosts: Some(0),
+      live_connections: Some(0),
+      ..RequestSummary::default()
+    }
+  }
+
   #[test]
   fn begin_shows_an_in_flight_row_and_finish_completes_it() {
     let log = RequestLog::new();
     let mut rec = log.begin(ROUTE, Some("127.0.0.1:5000".parse().unwrap()));
-    let tail = log.tail(None, 10);
+    let tail = log.tail(LogScope::All, 10);
     assert_eq!(tail.rows.len(), 1);
     assert_eq!(tail.rows[0].state, RequestState::InFlight);
     assert_eq!(tail.rows[0].client.as_deref(), Some("127.0.0.1:5000"));
@@ -724,7 +1135,7 @@ mod tests {
 
     rec.set_status(200);
     rec.finish(RequestState::Done, Usage::default());
-    let done = log.tail(None, 10);
+    let done = log.tail(LogScope::All, 10);
     assert_eq!(done.rows[0].state, RequestState::Done);
     assert_eq!(done.rows[0].status, Some(200));
     assert!(done.rows[0].duration_ms.is_some());
@@ -736,19 +1147,136 @@ mod tests {
     let log = RequestLog::new();
     let mut rec = log.begin(ROUTE, None);
     rec.set_model("m", "/m/a.gguf");
-    assert_eq!(log.tail(None, 10).rows[0].model_path, None);
+    assert_eq!(log.tail(LogScope::All, 10).rows[0].model_path, None);
     rec.publish();
     assert_eq!(
-      log.tail(None, 10).rows[0].model_path.as_deref(),
+      log.tail(LogScope::All, 10).rows[0].model_path.as_deref(),
       Some("/m/a.gguf")
     );
+  }
+
+  #[test]
+  fn publishing_a_model_row_opens_its_totals_entry() {
+    let log = RequestLog::new();
+    let mut rec = log.begin(ROUTE, None);
+    rec.set_model("m", "/m/a.gguf");
+    rec.publish();
+    let snap = log.snapshot();
+    // The in-flight gauge only has a series to sit on once the model has an
+    // entry, and the entry has to carry the display name from the start or the
+    // first scrape of a model prints a different `model` than later ones.
+    assert_eq!(snap.models.len(), 1);
+    assert_eq!(snap.models[0].key, "/m/a.gguf");
+    assert_eq!(snap.models[0].label.as_deref(), Some("m"));
+    assert_eq!(snap.models[0].summary.requests, 0);
+    assert_eq!(snap.in_flight(|row| row.model_path.is_some()).requests(), 1);
+  }
+
+  #[test]
+  fn hosts_and_connections_count_the_clients_of_the_rows_a_scope_keeps() {
+    let log = RequestLog::new();
+    // Three finished requests over three peers from two hosts, then two
+    // requests still streaming from one host over two peers.
+    served_from(&log, "/m/a.gguf", "L1", "127.0.0.1:5001");
+    served_from(&log, "/m/a.gguf", "L1", "127.0.0.1:5002");
+    served_from(&log, "/m/a.gguf", "L2", "192.168.1.7:6001");
+    // The two live requests share a host but not a peer, which is the case
+    // the pair exists for: one machine, two tools talking. The records have
+    // to stay alive — dropping one finishes the row.
+    let streaming: Vec<RequestRecord> = [6002u16, 6003]
+      .into_iter()
+      .map(|port| {
+        let mut rec = log.begin(ROUTE, Some(format!("192.168.1.7:{port}").parse().unwrap()));
+        rec.set_model("m", "/m/a.gguf");
+        rec.set_launch("L2");
+        // Setters stay private to the record until the row is published.
+        rec.publish();
+        rec
+      })
+      .collect();
+
+    let s = log
+      .tail(
+        LogScope::Model {
+          path: "/m/a.gguf".to_string(),
+        },
+        0,
+      )
+      .summary;
+    assert_eq!((s.requests, s.hosts, s.connections), (3, Some(2), Some(5)));
+    assert_eq!((s.live_hosts, s.live_connections), (Some(1), Some(2)));
+
+    // A launch scope sees its own clients only: L1 never met the LAN host.
+    let l1 = log.launch_summary("L1");
+    assert_eq!(
+      (l1.hosts, l1.connections, l1.live_hosts, l1.live_connections),
+      (Some(1), Some(2), Some(0), Some(0))
+    );
+
+    // An IPv6 loopback is its own host, brackets and all.
+    served_from(&log, "/m/b.gguf", "L3", "[::1]:5001");
+    let all = log.tail(LogScope::All, 0).summary;
+    assert_eq!((all.hosts, all.connections), (Some(3), Some(6)));
+    drop(streaming);
+  }
+
+  #[test]
+  fn an_empty_scope_answers_zero_where_an_old_daemon_answers_nothing() {
+    let log = RequestLog::new();
+    let idle = log.tail(
+      LogScope::Model {
+        path: "/m/none.gguf".to_string(),
+      },
+      10,
+    );
+    assert_eq!(idle.summary, zeros());
+    assert_eq!(log.launch_summary("L9"), zeros());
+    // With nothing in flight the live pair is not displayed at all.
+    assert!(!idle
+      .summary
+      .cells("—")
+      .iter()
+      .any(|(label, _)| *label == "Live"));
+  }
+
+  #[test]
+  fn a_summary_from_an_older_daemon_leaves_the_client_figures_out() {
+    // The wire shape grew; a summary written before it grew must not read as
+    // "zero hosts", and must not gain a Live cell.
+    let old: RequestSummary = serde_json::from_str(r#"{"requests": 2}"#).unwrap();
+    assert_eq!((old.hosts, old.connections), (None, None));
+    assert_eq!((old.live_hosts, old.live_connections), (None, None));
+    let cells = old.cells("—");
+    assert_eq!(cells[2], ("Hosts", "—".to_string()));
+    assert!(!cells.iter().any(|(label, _)| *label == "Live"));
+  }
+
+  #[test]
+  fn the_live_pair_reads_as_one_number_when_hosts_and_peers_agree() {
+    let cells = |hosts, connections| {
+      RequestSummary {
+        live_hosts: Some(hosts),
+        live_connections: Some(connections),
+        ..RequestSummary::default()
+      }
+      .cells("—")
+    };
+    assert_eq!(
+      cells(2, 2).iter().find(|c| c.0 == "Live").unwrap().1,
+      "2".to_string()
+    );
+    assert_eq!(
+      cells(1, 2).iter().find(|c| c.0 == "Live").unwrap().1,
+      "1/2".to_string()
+    );
+    assert!(!cells(0, 0).iter().any(|c| c.0 == "Live"));
   }
 
   #[test]
   fn a_dropped_record_is_logged_as_client_closed() {
     let log = RequestLog::new();
     drop(log.begin(ROUTE, None));
-    let tail = log.tail(None, 10);
+    let tail = log.tail(LogScope::All, 10);
     assert_eq!(tail.rows[0].state, RequestState::ClientClosed);
     assert_eq!(tail.rows[0].status, None);
     assert_eq!(tail.summary.errors, 0);
@@ -759,7 +1287,7 @@ mod tests {
     let log = RequestLog::new();
     let rec = log.begin(ROUTE, None);
     rec.respond(503, Some("launch_failed"), Some("out of memory"));
-    let tail = log.tail(None, 10);
+    let tail = log.tail(LogScope::All, 10);
     assert_eq!(tail.rows[0].status, Some(503));
     assert_eq!(tail.rows[0].error.as_deref(), Some("launch_failed"));
     assert_eq!(tail.rows[0].cause.as_deref(), Some("out of memory"));
@@ -773,15 +1301,42 @@ mod tests {
     served(&log, "/m/b.gguf", "L2", Usage::default());
     let a2 = served(&log, "/m/a.gguf", "L1", Usage::default());
 
-    let tail = log.tail(Some("/m/a.gguf"), 10);
+    let tail = log.tail(
+      LogScope::Model {
+        path: "/m/a.gguf".to_string(),
+      },
+      10,
+    );
     assert_eq!(
       tail.rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
       vec![a2, a1]
     );
     assert_eq!(tail.summary.requests, 2);
-    assert_eq!(log.tail(None, 10).summary.requests, 3);
-    assert_eq!(log.tail(Some("/m/a.gguf"), 1).rows.len(), 1);
-    assert_eq!(log.tail(Some("/m/none.gguf"), 10), Tail::default());
+    assert_eq!(log.tail(LogScope::All, 10).summary.requests, 3);
+    assert_eq!(
+      log
+        .tail(
+          LogScope::Model {
+            path: "/m/a.gguf".to_string()
+          },
+          1
+        )
+        .rows
+        .len(),
+      1
+    );
+    assert_eq!(
+      log
+        .tail(
+          LogScope::Model {
+            path: "/m/none.gguf".to_string()
+          },
+          10
+        )
+        .summary,
+      zeros(),
+      "a scope with no rows has no clients, not unknown ones"
+    );
   }
 
   #[test]
@@ -799,7 +1354,14 @@ mod tests {
     failed.set_model("m", "/m/a.gguf");
     failed.respond(503, Some("launch_failed"), None);
 
-    let s = log.tail(Some("/m/a.gguf"), 0).summary;
+    let s = log
+      .tail(
+        LogScope::Model {
+          path: "/m/a.gguf".to_string(),
+        },
+        0,
+      )
+      .summary;
     assert_eq!(s.requests, 3);
     assert_eq!(s.errors, 1);
     assert_eq!(s.prompt_tokens, 20);
@@ -812,7 +1374,7 @@ mod tests {
     // The 503 never reached a launch, so the launch's totals leave it out.
     let l = log.launch_summary("L1");
     assert_eq!((l.requests, l.errors), (2, 0));
-    assert_eq!(log.launch_summary("L9"), RequestSummary::default());
+    assert_eq!(log.launch_summary("L9"), zeros());
   }
 
   #[test]
@@ -824,7 +1386,14 @@ mod tests {
     rec.set_evicted(vec!["L3".to_string(), "L4".to_string()]);
     rec.set_status(200);
     rec.finish(RequestState::Done, Usage::default());
-    let s = log.tail(Some("/m/a.gguf"), 0).summary;
+    let s = log
+      .tail(
+        LogScope::Model {
+          path: "/m/a.gguf".to_string(),
+        },
+        0,
+      )
+      .summary;
     assert_eq!((s.auto_starts, s.evictions), (1, 2));
   }
 
@@ -834,7 +1403,7 @@ mod tests {
     for _ in 0..CAPACITY + 5 {
       served(&log, "/m/a.gguf", "L1", Usage::default());
     }
-    let tail = log.tail(None, usize::MAX);
+    let tail = log.tail(LogScope::All, usize::MAX);
     assert_eq!(tail.rows.len(), CAPACITY);
     assert_eq!(tail.rows[0].seq, (CAPACITY + 5) as u64);
     assert_eq!(tail.summary.requests, (CAPACITY + 5) as u64);
@@ -852,10 +1421,21 @@ mod tests {
     slow.finish(RequestState::Done, Usage::default());
     // The newest row is untouched by the late finish.
     assert_eq!(
-      log.tail(None, 1).rows[0].model_path.as_deref(),
+      log.tail(LogScope::All, 1).rows[0].model_path.as_deref(),
       Some("/m/a.gguf")
     );
-    assert_eq!(log.tail(Some("/m/slow.gguf"), 0).summary.requests, 1);
+    assert_eq!(
+      log
+        .tail(
+          LogScope::Model {
+            path: "/m/slow.gguf".to_string()
+          },
+          0
+        )
+        .summary
+        .requests,
+      1
+    );
   }
 
   #[test]
@@ -865,7 +1445,7 @@ mod tests {
     rec.set_requested_model(Some(&"é".repeat(MAX_MODEL_CHARS + 50)));
     let long_cause = "x".repeat(MAX_CAUSE_CHARS + 50);
     rec.respond(503, Some("launch_failed"), Some(&long_cause));
-    let row = log.tail(None, 1).rows.remove(0);
+    let row = log.tail(LogScope::All, 1).rows.remove(0);
     assert_eq!(
       row.requested_model.unwrap().chars().count(),
       MAX_MODEL_CHARS
@@ -875,7 +1455,7 @@ mod tests {
     let mut hostile = log.begin(ROUTE, None);
     hostile.set_requested_model(Some("evil\x1b[2Jmodel\nname\ttab"));
     hostile.respond(503, Some("launch_failed"), Some("line one\nline two"));
-    let cleaned = log.tail(None, 1).rows.remove(0);
+    let cleaned = log.tail(LogScope::All, 1).rows.remove(0);
     assert_eq!(
       cleaned.requested_model.as_deref(),
       Some("evil [2Jmodel name tab")
@@ -1054,8 +1634,9 @@ mod tests {
   fn summary_cells_use_the_placeholder_for_missing_figures() {
     let cells = RequestSummary::default().cells("—");
     assert_eq!(cells[0], ("Requests", "0".to_string()));
-    assert_eq!(cells[2], ("Avg total", "—".to_string()));
-    assert_eq!(cells[4], ("Tok/s avg", "—".to_string()));
+    assert_eq!(cells[2], ("Hosts", "—".to_string()));
+    assert_eq!(cells[4], ("Avg total", "—".to_string()));
+    assert_eq!(cells[6], ("Tok/s avg", "—".to_string()));
     let filled = RequestSummary {
       avg_duration_ms: Some(1_240),
       tokens_per_second_avg: Some(39.64),
@@ -1063,9 +1644,12 @@ mod tests {
       ..RequestSummary::default()
     };
     let filled_cells = filled.cells("—");
-    assert_eq!(filled_cells[2].1, "1.2s");
-    assert_eq!(filled_cells[4].1, "39.6");
-    assert_eq!(filled_cells[6].1, "12.3k");
+    assert_eq!(filled_cells[4].1, "1.2s");
+    assert_eq!(filled_cells[6].1, "39.6");
+    assert_eq!(filled_cells[7].1, "12.3k");
+    // The session speed is the newest one a stream reported, and the only
+    // speed on the strip besides the average.
+    assert!(!filled_cells.iter().any(|c| c.0 == "Tok/s last"));
   }
 
   #[tokio::test]
@@ -1102,7 +1686,7 @@ mod tests {
     assert_eq!(rows[0].model_path.as_deref(), Some("/m/a.gguf"));
     assert_eq!(rows[1].error.as_deref(), Some("model_not_found"));
     // The in-memory log is unchanged by the file.
-    assert_eq!(log.tail(None, 10).rows.len(), 3);
+    assert_eq!(log.tail(LogScope::All, 10).rows.len(), 3);
     assert_eq!(log.file_status(), Some(FileStatus { path, dropped: 0 }));
     assert_eq!(RequestLog::new().file_status(), None, "no file asked for");
   }
@@ -1134,7 +1718,7 @@ mod tests {
     served(&log, "/m/a.gguf", "L1", Usage::default());
     assert_eq!(log.file_status().expect("file status").dropped, 4);
     // The in-memory log has all four.
-    assert_eq!(log.tail(None, 10).summary.requests, 4);
+    assert_eq!(log.tail(LogScope::All, 10).summary.requests, 4);
   }
 
   /// `/dev/full` opens and then fails every write with `ENOSPC`.
@@ -1188,7 +1772,7 @@ mod tests {
   }
 
   #[test]
-  fn a_stopped_launch_is_forgotten_and_a_late_finish_does_not_bring_it_back() {
+  fn a_stopped_launch_keeps_its_totals_and_a_late_finish_does_not_bring_it_back() {
     let log = RequestLog::new();
     served(&log, "/m/a.gguf", "L1", Usage::default());
     // Still streaming when the launch is stopped.
@@ -1199,11 +1783,195 @@ mod tests {
     assert_eq!(log.launch_summary("L1").requests, 1);
 
     log.forget_launch("L1");
-    assert_eq!(log.launch_summary("L1"), RequestSummary::default());
+    assert_eq!(log.launch_summary("L1").requests, 1);
+    assert_eq!(
+      log.lock().by_launch.len(),
+      0,
+      "the live entry is retired, not left behind"
+    );
     late.finish(RequestState::UpstreamError, Usage::default());
     assert_eq!(log.lock().by_launch.len(), 0);
     // The model's own totals keep both requests.
-    assert_eq!(log.tail(Some("/m/a.gguf"), 0).summary.requests, 2);
+    assert_eq!(
+      log
+        .tail(
+          LogScope::Model {
+            path: "/m/a.gguf".to_string()
+          },
+          0
+        )
+        .summary
+        .requests,
+      2
+    );
+  }
+
+  /// `launch_summary` answers with `tail`'s summary for the same launch scope,
+  /// so a figure `tail` stamps cannot skip the per-launch surfaces.
+  #[test]
+  fn a_launch_summary_equals_the_launch_scope_tail_summary() {
+    let log = RequestLog::new();
+    let scope = |id: &str| LogScope::Launch { id: id.to_string() };
+    served_from(&log, "/m/a.gguf", "L1", "192.168.1.7:5001");
+    served(&log, "/m/b.gguf", "L1", Usage::default());
+    assert_eq!(log.launch_summary("L1"), log.tail(scope("L1"), 0).summary);
+
+    log.forget_launch("L1");
+    assert_eq!(log.launch_summary("L1"), log.tail(scope("L1"), 0).summary);
+    // A launch the log never heard of answers the same way on both paths.
+    assert_eq!(log.launch_summary("L9"), log.tail(scope("L9"), 0).summary);
+  }
+
+  #[test]
+  fn retirement_keeps_the_last_sixteen_stopped_launches_oldest_first() {
+    let log = RequestLog::new();
+    let ids: Vec<String> = (1..=17).map(|n| format!("L{n}")).collect();
+    for id in &ids {
+      served(&log, "/m/a.gguf", id, Usage::default());
+    }
+    for id in &ids {
+      log.forget_launch(id);
+    }
+    assert_eq!(
+      log.launch_summary("L1"),
+      zeros(),
+      "the oldest of seventeen is pushed out"
+    );
+    for id in &ids[1..] {
+      assert_eq!(log.launch_summary(id).requests, 1, "{id} is retired");
+    }
+  }
+
+  #[test]
+  fn a_model_scope_reports_the_newest_launch_speed_as_the_session() {
+    let speed = |t: f64| Usage {
+      completion_tokens: Some(10),
+      tokens_per_second: Some(t),
+      ..Usage::default()
+    };
+    let log = RequestLog::new();
+    served(&log, "/m/a.gguf", "L1", speed(80.0));
+    served(&log, "/m/a.gguf", "L1", speed(60.0));
+    served(&log, "/m/a.gguf", "L2", speed(20.0));
+
+    let model = log
+      .tail(
+        LogScope::Model {
+          path: "/m/a.gguf".to_string(),
+        },
+        10,
+      )
+      .summary;
+    assert_eq!(
+      model.tokens_per_second_avg,
+      Some((80.0 + 60.0 + 20.0) / 3.0)
+    );
+    // The newest launch of the model runs at 20, and that is the session.
+    assert_eq!(model.tokens_per_second_session, Some(20.0));
+    // The whole log has no single session to name, and a launch scope is
+    // already one launch, so neither gets the extra figure.
+    assert_eq!(
+      log
+        .tail(LogScope::All, 10)
+        .summary
+        .tokens_per_second_session,
+      None
+    );
+    assert_eq!(
+      log
+        .tail(
+          LogScope::Launch {
+            id: "L1".to_string()
+          },
+          10,
+        )
+        .summary
+        .tokens_per_second_session,
+      None
+    );
+    // The strip shows the figure only when there is one, so an old daemon
+    // (no key in the JSON) renders exactly as before.
+    let with = model.cells("-");
+    assert!(with.iter().any(|(k, _)| *k == "Tok/s session"));
+    assert_eq!(
+      with[with
+        .iter()
+        .position(|(k, _)| *k == "Tok/s session")
+        .unwrap()]
+      .1,
+      "20.0"
+    );
+    assert!(!RequestSummary::default()
+      .cells("-")
+      .iter()
+      .any(|(k, _)| *k == "Tok/s session"));
+  }
+
+  #[test]
+  fn a_launch_scope_sees_one_launch_of_a_model() {
+    let log = RequestLog::new();
+    let a1 = served(&log, "/m/a.gguf", "L1", Usage::default());
+    served(&log, "/m/a.gguf", "L2", Usage::default());
+    let a3 = served(&log, "/m/a.gguf", "L1", Usage::default());
+
+    let scoped = log.tail(
+      LogScope::Launch {
+        id: "L1".to_string(),
+      },
+      10,
+    );
+    assert_eq!(
+      scoped.rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+      vec![a3, a1]
+    );
+    assert_eq!(scoped.summary.requests, 2);
+    // The same model under another launch is the wider scope.
+    assert_eq!(
+      log
+        .tail(
+          LogScope::Model {
+            path: "/m/a.gguf".to_string()
+          },
+          0
+        )
+        .summary
+        .requests,
+      3
+    );
+    // A launch's series carries the model's own name, not the launch id.
+    assert_eq!(log.launch_label("L1").as_deref(), Some("m"));
+    assert_eq!(
+      log
+        .tail(
+          LogScope::Launch {
+            id: "L9".to_string()
+          },
+          10
+        )
+        .summary,
+      zeros(),
+      "a launch that served nothing is an empty scope"
+    );
+  }
+
+  #[test]
+  fn a_retired_launch_still_scopes_rows_and_totals() {
+    let log = RequestLog::new();
+    let seq = served(&log, "/m/a.gguf", "L1", Usage::default());
+    log.forget_launch("L1");
+
+    let scoped = log.tail(
+      LogScope::Launch {
+        id: "L1".to_string(),
+      },
+      10,
+    );
+    assert_eq!(
+      scoped.rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+      vec![seq]
+    );
+    assert_eq!(scoped.summary.requests, 1);
+    assert_eq!(log.launch_label("L1").as_deref(), Some("m"));
   }
 
   #[test]
@@ -1220,7 +1988,7 @@ mod tests {
   fn row_wire_shape_keeps_every_key() {
     let log = RequestLog::new();
     drop(log.begin(ROUTE, None));
-    let v = serde_json::to_value(&log.tail(None, 1).rows[0]).unwrap();
+    let v = serde_json::to_value(&log.tail(LogScope::All, 1).rows[0]).unwrap();
     for key in [
       "seq",
       "started_at_ms",

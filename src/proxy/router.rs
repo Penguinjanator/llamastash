@@ -132,6 +132,13 @@ pub async fn route(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyRespo
     (&Method::GET, "/api/version") => ollama_version(),
     (&Method::GET, "/api/ps") => ollama_ps(state).await,
     (&Method::POST, "/api/show") => ollama_show(state, req).await,
+    // Prometheus surface. `/metrics` is the proxy's own numbers, answered from
+    // the request log without touching a backend; `/metrics/backend` fans out to
+    // the engines' own `/metrics` and merges them. Neither is logged in the
+    // request log, so a scraper polling every few seconds cannot push real
+    // traffic out of the ring.
+    (&Method::GET, "/metrics") => super::metrics::serve(state, req).await,
+    (&Method::GET, "/metrics/backend") => super::metrics_backend::serve(state, req).await,
     // Web-UI surface. `GET /ui` 302s to `/ui/` (trailing slash so the
     // stock UI's relative base resolves); every `/ui/...` request —
     // any method, for assets + base-relative API calls — delegates to
@@ -977,7 +984,7 @@ pub(crate) fn json_response(
 /// `Infallible`; `map_err` widens it (via the `From<Infallible>`
 /// blanket impl) so non-streaming arms share the streaming arm's
 /// body alias.
-fn full_body(bytes: Bytes) -> BoxBody<Bytes, BodyError> {
+pub(crate) fn full_body(bytes: Bytes) -> BoxBody<Bytes, BodyError> {
   Full::new(bytes).map_err(|never| match never {}).boxed()
 }
 
