@@ -1,7 +1,7 @@
 ---
 title: "feat: proxy metrics surface (/metrics, /metrics/backend, launch-scoped request stats)"
 type: feat
-status: planned
+status: completed
 date: 2026-10-11
 origin: TODO.md batch 3 item "Standard metrics endpoint on the proxy" (three sub-items reconciled)
 ---
