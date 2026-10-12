@@ -27,6 +27,12 @@ pub const CAPACITY: usize = 1000;
 /// Rows one `requests_tail` call returns when it names no `limit`.
 pub const DEFAULT_TAIL: usize = 100;
 
+/// A caller's row limit: the default when it named none, never more than the
+/// ring holds, so one query cannot ask for more rows than exist.
+pub(crate) fn clamp_limit(raw: Option<usize>) -> usize {
+  raw.unwrap_or(DEFAULT_TAIL).min(CAPACITY)
+}
+
 /// Name of the request log file inside the daemon's log directory.
 pub const FILE_NAME: &str = "requests.jsonl";
 

@@ -26,7 +26,7 @@ use hyper::{Request, Response, StatusCode};
 use serde_json::{Map, Value};
 
 use super::request_log::{
-  Clients, LogScope, LogSnapshot, RequestLog, RequestSummary, ScopeTotals, CAPACITY, DEFAULT_TAIL,
+  clamp_limit, Clients, LogScope, LogSnapshot, RequestLog, RequestSummary, ScopeTotals, CAPACITY,
 };
 use super::route;
 use super::router::{self, ProxyResponse};
@@ -142,7 +142,7 @@ impl Query {
 
   /// Row limit for the JSON shape, clamped to what the log can hold.
   pub(crate) fn limit(&self) -> usize {
-    self.limit.unwrap_or(DEFAULT_TAIL).min(CAPACITY)
+    clamp_limit(self.limit)
   }
 }
 
@@ -1211,7 +1211,7 @@ pub(crate) fn json_response(body: Value) -> ProxyResponse {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::proxy::request_log::RequestState;
+  use crate::proxy::request_log::{RequestState, DEFAULT_TAIL};
   use crate::proxy::usage_tap::Usage;
   use std::collections::BTreeSet;
 

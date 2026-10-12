@@ -504,12 +504,12 @@ struct RequestsTailParams {
 /// The proxy's request log: the newest rows, newest first, and the summary
 /// for the same scope.
 fn requests_tail_handler(ctx: &MethodContext, params: Option<Value>) -> Result<Value, ErrorObject> {
-  use crate::proxy::request_log::{LogScope, CAPACITY, DEFAULT_TAIL};
+  use crate::proxy::request_log::{clamp_limit, LogScope};
   let parsed: RequestsTailParams = match params {
     None | Some(Value::Null) => RequestsTailParams::default(),
     some => parse_params(some)?,
   };
-  let limit = parsed.limit.unwrap_or(DEFAULT_TAIL).min(CAPACITY);
+  let limit = clamp_limit(parsed.limit);
   let scope = match (parsed.launch_id, parsed.model_path) {
     (Some(id), _) => LogScope::Launch { id },
     (None, Some(path)) => LogScope::Model { path },
