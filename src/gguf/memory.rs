@@ -90,7 +90,28 @@ pub struct EstimateOptions {
   /// Number of transformer blocks offloaded to GPU (`-ngl`). `None` means
   /// CPU only; `Some(usize::MAX)` means "all on GPU".
   pub n_gpu_layers: Option<u32>,
+  /// MTP speculative decoding is on. A hybrid's MTP layers hold KV only in
+  /// the draft context, which llama.cpp creates only then. Only hybrids get
+  /// this split: a dense MTP header keeps its MTP layers priced either way,
+  /// since llama.cpp does not filter them out for every arch (`granite-switch`
+  /// repurposes the count for a router layer the trunk attends).
+  pub mtp_active: bool,
+  /// Parallel sequences (`--parallel`). Each one gets its own recurrent
+  /// state; the attention KV is shared across them.
+  pub n_seq: u32,
+  /// Tokens drafted per MTP step (`--spec-draft-n-max`). With MTP on,
+  /// llama.cpp keeps this many extra recurrent-state snapshots per sequence
+  /// so it can roll back rejected drafts.
+  pub mtp_draft_n: u32,
 }
+
+/// llama-server's `--parallel` when left on auto.
+pub const DEFAULT_N_SEQ: u32 = 4;
+
+/// llama.cpp's draft count when `--spec-draft-n-max` is unset
+/// (`common_params_speculative_draft::n_max`, checked at master `972b5fc`,
+/// 2026-10-12). `need_n_rs_seq` reuses it as the rollback snapshot count.
+pub const DEFAULT_MTP_DRAFT_N: u32 = 3;
 
 impl Default for EstimateOptions {
   fn default() -> Self {
@@ -99,6 +120,9 @@ impl Default for EstimateOptions {
       cache_type_k: CacheType::F16,
       cache_type_v: CacheType::F16,
       n_gpu_layers: None,
+      mtp_active: false,
+      n_seq: DEFAULT_N_SEQ,
+      mtp_draft_n: DEFAULT_MTP_DRAFT_N,
     }
   }
 }
@@ -261,10 +285,12 @@ fn deepseek4_kv_bytes(header: &GgufHeader, ctx: u64) -> u64 {
     .saturating_mul(BYTES_PER_ELEM)
 }
 
-/// Closed-form KV cache bytes:
+/// Context-memory bytes: the KV cache plus, for a recurrent/attention hybrid,
+/// the recurrent layers' fixed state. The KV term is closed-form,
 /// `2 (K+V) * n_layers * n_kv_heads * head_dim * ctx_len * bpe(cache_type)`,
-/// but with separate K and V terms because llama-server lets the two be set
-/// independently via `--cache-type-k` / `--cache-type-v`.
+/// with separate K and V terms because llama-server lets the two be set
+/// independently via `--cache-type-k` / `--cache-type-v`. The recurrent state
+/// is always f32 and does not grow with ctx.
 pub fn kv_bytes(header: &GgufHeader, arch: Option<&str>, opts: EstimateOptions) -> u64 {
   let Some(a) = arch else { return 0 };
   if a == "deepseek4" {
@@ -278,7 +304,7 @@ pub fn kv_bytes(header: &GgufHeader, arch: Option<&str>, opts: EstimateOptions) 
     // the K cache dtype.
     return scale_bytes(elements, opts.cache_type_k.bytes_per_elem());
   }
-  let Some(geom) = attention_geometry(header, a) else {
+  let Some(geom) = attention_geometry(header, a, opts.mtp_active) else {
     return 0;
   };
   // Sum KV elements per layer. Each layer can differ in KV-head count
@@ -307,7 +333,41 @@ pub fn kv_bytes(header: &GgufHeader, arch: Option<&str>, opts: EstimateOptions) 
     );
   }
   let bpe = opts.cache_type_k.bytes_per_elem() + opts.cache_type_v.bytes_per_elem();
-  scale_bytes(elements, bpe)
+  // Rollback snapshots only exist with MTP on. llama.cpp clamps them to 0
+  // for archs without recurrent rollback (Qwen3-Next among them), so this
+  // over-counts those; Qwen3.5 / Qwen3.5-MoE take them.
+  let rows_per_seq = if opts.mtp_active {
+    opts.mtp_draft_n.saturating_add(1)
+  } else {
+    1
+  };
+  let state = recurrent_state_bytes(header, a, geom.recurrent_layers)
+    .saturating_mul(u64::from(opts.n_seq.max(1)))
+    .saturating_mul(u64::from(rows_per_seq));
+  scale_bytes(elements, bpe).saturating_add(state)
+}
+
+/// The fixed f32 state a hybrid's recurrent layers hold for one sequence,
+/// sized like llama.cpp's `n_embd_r` (conv rows: `(conv_kernel - 1) × (inner +
+/// 2 × groups × state)`) plus `n_embd_s` (`state × inner`). That is the
+/// Mamba / gated-delta-net layout read from `ssm.*`; archs llama.cpp sizes from
+/// a linear-attention head dim instead (MiniMax-01, Kimi KDA) carry no `ssm.*`
+/// keys and price 0 here. llama.cpp keeps one per parallel sequence, times the
+/// rollback snapshots when MTP is on.
+fn recurrent_state_bytes(header: &GgufHeader, arch: &str, layers: u64) -> u64 {
+  let key = |k: &str| header.u64(&[format!("{arch}.ssm.{k}")]).unwrap_or(0);
+  let (state, inner) = (key("state_size"), key("inner_size"));
+  let conv = key("conv_kernel").saturating_sub(1).saturating_mul(
+    inner.saturating_add(
+      2u64
+        .saturating_mul(key("group_count"))
+        .saturating_mul(state),
+    ),
+  );
+  conv
+    .saturating_add(state.saturating_mul(inner))
+    .saturating_mul(4)
+    .saturating_mul(layers)
 }
 
 fn scale_bytes(elements: u128, bytes_per_elem: f64) -> u64 {
@@ -350,6 +410,8 @@ struct AttnGeometry {
   /// Per-layer sliding flag (`1` = sliding-window, `0` = full); empty
   /// when the arch has no per-layer pattern.
   swa_pattern: Vec<u64>,
+  /// How many layers hold a recurrent state instead of a KV cache.
+  recurrent_layers: u64,
 }
 
 impl AttnGeometry {
@@ -373,8 +435,9 @@ impl AttnGeometry {
 /// Sliding-window archs additionally expose `sliding_window` +
 /// `sliding_window_pattern` (1 = sliding) and a smaller `*_swa` head dim,
 /// which cap those layers' KV at the window. A hybrid's recurrent layers get
-/// zero KV heads (see [`recurrent_layers`]).
-fn attention_geometry(header: &GgufHeader, arch: &str) -> Option<AttnGeometry> {
+/// zero KV heads (see [`hybrid_layers`]), and so do its MTP layers unless MTP
+/// is on.
+fn attention_geometry(header: &GgufHeader, arch: &str, mtp_active: bool) -> Option<AttnGeometry> {
   let a = arch;
   let n_layers = header.u64(&[format!("{a}.block_count")])?;
   let n_heads = header.u64(&[format!("{a}.attention.head_count")])?;
@@ -403,11 +466,15 @@ fn attention_geometry(header: &GgufHeader, arch: &str) -> Option<AttnGeometry> {
   let has_indexer = header
     .get(&format!("{a}.attention.indexer.key_length"))
     .is_some();
-  if let Some(recurrent) = recurrent_layers(header, a, n_layers).filter(|_| !has_indexer) {
-    for (heads, is_recurrent) in kv_heads.iter_mut().zip(recurrent) {
-      if is_recurrent {
+  let mut recurrent_layers = 0;
+  if let Some(hybrid) = hybrid_layers(header, a, n_layers).filter(|_| !has_indexer) {
+    for (il, heads) in kv_heads.iter_mut().enumerate() {
+      let is_mtp = il as u64 >= hybrid.trunk;
+      let is_recurrent = hybrid.recurrent.get(il).copied().unwrap_or(false);
+      if is_recurrent || (is_mtp && !mtp_active) {
         *heads = 0;
       }
+      recurrent_layers += u64::from(is_recurrent);
     }
   }
   let swa_pattern =
@@ -419,7 +486,19 @@ fn attention_geometry(header: &GgufHeader, arch: &str) -> Option<AttnGeometry> {
     swa_window,
     kv_heads,
     swa_pattern,
+    recurrent_layers,
   })
+}
+
+/// The layer split of a recurrent/attention hybrid.
+struct HybridLayers {
+  /// Per layer, whether it keeps a fixed-size recurrent state instead of a
+  /// KV cache. Always false past `trunk`.
+  recurrent: Vec<bool>,
+  /// Layers before the MTP blocks. llama.cpp's main context caches only
+  /// these; the MTP blocks after them are cached by the draft context, at
+  /// the full window, and only with MTP on.
+  trunk: u64,
 }
 
 /// Which layers of a recurrent/attention hybrid keep a fixed-size recurrent
@@ -427,9 +506,10 @@ fn attention_geometry(header: &GgufHeader, arch: &str) -> Option<AttnGeometry> {
 /// layers rather than writing a zero `head_count_kv` (the Qwen3-Next /
 /// Qwen3.5 line). Follows llama.cpp's `is_recr`: the `recurrent_layers` flags,
 /// else every layer but each `full_attention_interval`-th when that key is
-/// present. Only trunk layers count: with MTP on, the draft context caches the
-/// MTP layers after them at the full window.
-fn recurrent_layers(header: &GgufHeader, arch: &str, n_layers: u64) -> Option<Vec<bool>> {
+/// present. Without either key every layer stays priced, where llama.cpp
+/// would assume an interval of 4: over-counting an unknown shape is the safe
+/// side.
+fn hybrid_layers(header: &GgufHeader, arch: &str, n_layers: u64) -> Option<HybridLayers> {
   let flagged: Vec<bool> = match header.get(&format!("{arch}.attention.recurrent_layers")) {
     Some(GgufValue::Array(flags)) => (0..n_layers as usize)
       .map(|il| flags.get(il).and_then(GgufValue::as_bool) == Some(true))
@@ -446,13 +526,12 @@ fn recurrent_layers(header: &GgufHeader, arch: &str, n_layers: u64) -> Option<Ve
     .u64(&[format!("{arch}.nextn_predict_layers")])
     .unwrap_or(0);
   let trunk = n_layers.saturating_sub(nextn);
-  Some(
-    flagged
-      .into_iter()
-      .enumerate()
-      .map(|(il, recurrent)| recurrent && (il as u64) < trunk)
-      .collect(),
-  )
+  let recurrent = flagged
+    .into_iter()
+    .enumerate()
+    .map(|(il, recurrent)| recurrent && (il as u64) < trunk)
+    .collect();
+  Some(HybridLayers { recurrent, trunk })
 }
 
 /// A metadata value that may be a per-layer array or a single scalar,
@@ -512,38 +591,78 @@ mod tests {
     assert_eq!(kv, expected);
   }
 
-  /// KV bytes at 1000 tokens, f16, for a hybrid header: 4 KV heads of 256,
-  /// full attention on every 4th trunk block, one trailing MTP block.
-  fn hybrid_kv(arch: &str, block_count: u64, extra: &[(&str, GgufValue)]) -> u64 {
+  /// KV bytes at 1000 tokens, f16, for a hybrid header with 4 KV heads of
+  /// 256 plus `keys` (arch-prefixed), at the default 4 sequences.
+  fn hybrid_kv(arch: &str, block_count: u64, keys: &[(&str, GgufValue)], mtp_active: bool) -> u64 {
+    let opts = EstimateOptions {
+      mtp_active,
+      ..EstimateOptions::default()
+    };
+    hybrid_kv_with(arch, block_count, keys, opts)
+  }
+
+  /// [`hybrid_kv`] with every option but the 1000-token ctx left to `opts`.
+  fn hybrid_kv_with(
+    arch: &str,
+    block_count: u64,
+    keys: &[(&str, GgufValue)],
+    opts: EstimateOptions,
+  ) -> u64 {
     let mut builder = FixtureBuilder::new()
       .with_arch(arch)
       .with_block_count(block_count)
       .with_head_count(24)
       .with_head_count_kv(4)
-      .with_kv(&format!("{arch}.attention.key_length"), GgufValue::U32(256))
-      .with_kv(
-        &format!("{arch}.full_attention_interval"),
-        GgufValue::U32(4),
-      )
-      .with_kv(&format!("{arch}.nextn_predict_layers"), GgufValue::U32(1));
-    for (key, value) in extra {
+      .with_kv(&format!("{arch}.attention.key_length"), GgufValue::U32(256));
+    for (key, value) in keys {
       builder = builder.with_kv(&format!("{arch}.{key}"), value.clone());
     }
     let opts = EstimateOptions {
       ctx_len: 1000,
-      ..EstimateOptions::default()
+      ..opts
     };
     kv_bytes(&parse(builder.build()), Some(arch), opts)
+  }
+
+  /// Full attention on every 4th trunk block, one trailing MTP block.
+  fn interval_and_mtp() -> Vec<(&'static str, GgufValue)> {
+    vec![
+      ("full_attention_interval", GgufValue::U32(4)),
+      ("nextn_predict_layers", GgufValue::U32(1)),
+    ]
+  }
+
+  fn with_keys(
+    mut keys: Vec<(&'static str, GgufValue)>,
+    extra: impl IntoIterator<Item = (&'static str, GgufValue)>,
+  ) -> Vec<(&'static str, GgufValue)> {
+    keys.extend(extra);
+    keys
   }
 
   const HYBRID_LAYER_KV: u64 = 2 * 4 * 256 * 1000 * 2;
 
   #[test]
-  fn kv_bytes_prices_a_hybrids_attention_and_mtp_layers() {
+  fn kv_bytes_prices_a_hybrids_mtp_layer_only_with_mtp_on() {
     // Shaped like Qwen3.8-27B: 16 of the 64 trunk blocks are attention, the
-    // other 48 hold a fixed-size recurrent state, and the MTP block is not
-    // recurrent.
-    assert_eq!(hybrid_kv("qwen35", 65, &[]), 17 * HYBRID_LAYER_KV);
+    // other 48 hold a fixed-size recurrent state. The MTP block is cached by
+    // the draft context, which exists only with MTP on.
+    let keys = interval_and_mtp();
+    assert_eq!(hybrid_kv("qwen35", 65, &keys, false), 16 * HYBRID_LAYER_KV);
+    assert_eq!(hybrid_kv("qwen35", 65, &keys, true), 17 * HYBRID_LAYER_KV);
+  }
+
+  #[test]
+  fn kv_bytes_prices_a_hybrid_without_mtp_blocks() {
+    let keys = [("full_attention_interval", GgufValue::U32(4))];
+    assert_eq!(hybrid_kv("qwen35", 32, &keys, false), 8 * HYBRID_LAYER_KV);
+    assert_eq!(hybrid_kv("qwen35", 32, &keys, true), 8 * HYBRID_LAYER_KV);
+  }
+
+  #[test]
+  fn kv_bytes_prices_every_layer_of_a_hybrid_that_names_no_attention_layers() {
+    let keys = [("nextn_predict_layers", GgufValue::U32(1))];
+    assert_eq!(hybrid_kv("qwen35", 9, &keys, false), 9 * HYBRID_LAYER_KV);
   }
 
   #[test]
@@ -552,16 +671,84 @@ mod tests {
     // make layer 1 attention, which trusting the interval would under-price.
     let flags = [true, false, true, false, true, true, true, false, false];
     let recurrent = GgufValue::Array(flags.iter().map(|f| GgufValue::Bool(*f)).collect());
-    assert_eq!(
-      hybrid_kv("qwen35", 9, &[("attention.recurrent_layers", recurrent)]),
-      4 * HYBRID_LAYER_KV
+    let keys = with_keys(
+      interval_and_mtp(),
+      [("attention.recurrent_layers", recurrent)],
     );
+    assert_eq!(hybrid_kv("qwen35", 9, &keys, true), 4 * HYBRID_LAYER_KV);
+  }
+
+  #[test]
+  fn kv_bytes_broadcasts_a_scalar_recurrent_flag_to_the_trunk() {
+    let keys = with_keys(
+      interval_and_mtp(),
+      [("attention.recurrent_layers", GgufValue::Bool(true))],
+    );
+    assert_eq!(hybrid_kv("qwen35", 9, &keys, true), HYBRID_LAYER_KV);
+    assert_eq!(hybrid_kv("qwen35", 9, &keys, false), 0);
+  }
+
+  /// Qwen3.5-4B's recurrent geometry: 128 × 4096 state plus 3 conv rows of
+  /// 4096 + 2 × 16 × 128.
+  fn qwen35_4b_ssm() -> [(&'static str, GgufValue); 4] {
+    [
+      ("ssm.state_size", GgufValue::U32(128)),
+      ("ssm.inner_size", GgufValue::U32(4096)),
+      ("ssm.conv_kernel", GgufValue::U32(4)),
+      ("ssm.group_count", GgufValue::U32(16)),
+    ]
+  }
+
+  /// One recurrent layer's f32 state for one sequence, at [`qwen35_4b_ssm`].
+  const QWEN35_4B_STATE: u64 = (128 * 4096 + 3 * (4096 + 2 * 16 * 128)) * 4;
+
+  #[test]
+  fn kv_bytes_adds_a_recurrent_state_per_sequence() {
+    // 24 recurrent layers × 4 sequences. llama.cpp logs 201.00 MiB of
+    // recurrent memory for the real Qwen3.5-4B-MTP header at `--parallel 4`.
+    let keys = with_keys(interval_and_mtp(), qwen35_4b_ssm());
+    assert_eq!(
+      hybrid_kv("qwen35", 33, &keys, false),
+      8 * HYBRID_LAYER_KV + 24 * 4 * QWEN35_4B_STATE
+    );
+    assert_eq!(24 * 4 * QWEN35_4B_STATE, 201 * 1024 * 1024);
+  }
+
+  #[test]
+  fn kv_bytes_adds_a_rollback_snapshot_per_draft_token_with_mtp_on() {
+    // llama.cpp sizes the recurrent memory at `n_seq × (1 + draft_n)` rows
+    // with MTP on: 603.00 MiB measured at `--spec-draft-n-max 2`.
+    let keys = with_keys(interval_and_mtp(), qwen35_4b_ssm());
+    let state = 24 * 4 * QWEN35_4B_STATE;
+    let mtp = |mtp_draft_n| {
+      let opts = EstimateOptions {
+        mtp_active: true,
+        mtp_draft_n,
+        ..EstimateOptions::default()
+      };
+      hybrid_kv_with("qwen35", 33, &keys, opts)
+    };
+    assert_eq!(mtp(2), 9 * HYBRID_LAYER_KV + 3 * state);
+    assert_eq!(3 * state, 603 * 1024 * 1024);
+    assert_eq!(mtp(DEFAULT_MTP_DRAFT_N), 9 * HYBRID_LAYER_KV + 4 * state);
+  }
+
+  #[test]
+  fn kv_bytes_keeps_a_dense_models_mtp_layer_priced_with_mtp_off() {
+    let keys = [("nextn_predict_layers", GgufValue::U32(1))];
+    assert_eq!(hybrid_kv("glm4moe", 9, &keys, false), 9 * HYBRID_LAYER_KV);
   }
 
   #[test]
   fn kv_bytes_prices_every_layer_of_a_hybrid_with_an_indexer() {
-    let indexer = ("attention.indexer.key_length", GgufValue::U32(128));
-    assert_eq!(hybrid_kv("qwen4exp", 9, &[indexer]), 9 * HYBRID_LAYER_KV);
+    // Every layer keeps its KV, which covers the unmodeled indexer cache and
+    // the recurrent state, so neither the split nor the state term applies.
+    let keys = with_keys(
+      with_keys(interval_and_mtp(), qwen35_4b_ssm()),
+      [("attention.indexer.key_length", GgufValue::U32(128))],
+    );
+    assert_eq!(hybrid_kv("qwen4exp", 9, &keys, false), 9 * HYBRID_LAYER_KV);
+    assert_eq!(hybrid_kv("qwen4exp", 9, &keys, true), 9 * HYBRID_LAYER_KV);
   }
 
   #[test]

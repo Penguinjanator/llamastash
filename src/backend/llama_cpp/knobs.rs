@@ -347,7 +347,7 @@ pub const KNOBS: &[KnobDef] = &[
   KnobDef {
     id: "mtp-draft-n",
     flag: Some("--spec-draft-n-max"),
-    concept: None,
+    concept: Some(Concept::MtpDraftTokens),
     kind: KnobKind::U32 { max: None },
     auto: None,
     group: Group::Speculation,

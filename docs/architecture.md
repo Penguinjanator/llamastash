@@ -114,7 +114,7 @@ one.
 |---|---|
 | `KnobDef` | id, the backend's own `flag`, `kind`, `aliases`, `group`, label/help, `Emit`, cycle `Ring`, `fallback` layer, `volatile` |
 | `KnobId` | a knob's identity — its persistence key, wire key, and (by default) its flag minus the dashes |
-| `Concept` | a small closed set naming the ~8 ideas backends genuinely share, so a value survives a backend switch and gets one neutral CLI alias |
+| `Concept` | a small closed set naming the ~9 ideas backends genuinely share, so a value survives a backend switch and gets one neutral CLI alias |
 | `KnobKind` | `U32{max} \| F32{min,max} \| Bool \| Enum{choices} \| OpenEnum{choices,shape} \| Ratio \| Str` — drives parsing, validation, and the editing affordance |
 | `AutoKind` | what a knob's `auto` *means*: `Delegate` (the engine's fitter decides) or `Capability` (resolved from a runtime property of the model) |
 | `Emit` | `FlagValue \| BareFlagWhenTrue \| FlagOnOff \| Custom` — how a set value becomes launch input |
