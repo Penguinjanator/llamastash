@@ -952,13 +952,7 @@ fn json_body(
       &[
         ("launch", Value::String(id.clone())),
         ("model", value_opt(model)),
-        (
-          "port",
-          match port {
-            Some(p) => Value::from(p),
-            None => Value::Null,
-          },
-        ),
+        ("port", value_opt(port)),
         ("live", Value::Bool(live_entry.is_some())),
       ],
       &entry.totals.summary,
@@ -967,15 +961,7 @@ fn json_body(
   }
 
   json_object(|map| {
-    map.insert(
-      "generated_at_ms".into(),
-      Value::from(
-        SystemTime::now()
-          .duration_since(UNIX_EPOCH)
-          .map(|d| d.as_millis() as u64)
-          .unwrap_or(0),
-      ),
-    );
+    map.insert("generated_at_ms".into(), Value::from(now_ms()));
     map.insert("scope".into(), Value::Object(scope_block));
     map.insert(
       "summary".into(),
@@ -1020,11 +1006,22 @@ pub(crate) fn json_object(build: impl FnOnce(&mut Map<String, Value>)) -> Value 
   Value::Object(map)
 }
 
-fn value_opt(value: Option<String>) -> Value {
+/// A JSON string, or `null` when there is nothing to name. An absent value
+/// keeps its key, so a client never tells a missing field from an unset one.
+pub(crate) fn value_opt<T: Into<Value>>(value: Option<T>) -> Value {
   match value {
-    Some(v) => Value::String(v),
+    Some(v) => v.into(),
     None => Value::Null,
   }
+}
+
+/// Milliseconds since the Unix epoch, the stamp both metrics routes print as
+/// `generated_at_ms`.
+pub(crate) fn now_ms() -> u64 {
+  SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|d| d.as_millis() as u64)
+    .unwrap_or(0)
 }
 
 /// One metric name's HELP/TYPE text and its samples, in print order.

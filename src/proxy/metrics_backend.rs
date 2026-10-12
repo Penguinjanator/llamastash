@@ -17,14 +17,16 @@
 //! Plan: docs/plans/2026-10-11-001-feat-proxy-metrics-plan.md.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use futures::{future::join_all, StreamExt};
 use hyper::body::Incoming;
 use hyper::Request;
 use serde_json::{Map, Value};
 
-use super::metrics::{self, escape, live_launches, Document, Format, LiveLaunch, Parsed};
+use super::metrics::{
+  self, escape, live_launches, now_ms, value_opt, Document, Format, LiveLaunch, Parsed,
+};
 use super::router::ProxyResponse;
 use super::state::ProxyState;
 
@@ -356,20 +358,8 @@ fn split_labels(text: &str) -> Vec<&str> {
 /// series are documented by the engine, not restated here.
 fn json_body(scrapes: &[Scrape], parsed: &Parsed) -> Value {
   let mut scope = Map::new();
-  scope.insert(
-    "model".into(),
-    match &parsed.scope.name {
-      Some(name) => Value::String(name.clone()),
-      None => Value::Null,
-    },
-  );
-  scope.insert(
-    "launch".into(),
-    match &parsed.scope.launch {
-      Some(launch) => Value::String(launch.clone()),
-      None => Value::Null,
-    },
-  );
+  scope.insert("model".into(), value_opt(parsed.scope.name.clone()));
+  scope.insert("launch".into(), value_opt(parsed.scope.launch.clone()));
   let backends = scrapes
     .iter()
     .map(|scrape| {
@@ -377,21 +367,9 @@ fn json_body(scrapes: &[Scrape], parsed: &Parsed) -> Value {
         entry.insert("launch".into(), Value::String(scrape.launch.clone()));
         entry.insert("model".into(), Value::String(scrape.model.clone()));
         entry.insert("url".into(), Value::String(scrape.url.clone()));
-        entry.insert(
-          "status".into(),
-          match scrape.status {
-            Some(status) => Value::from(status),
-            None => Value::Null,
-          },
-        );
+        entry.insert("status".into(), value_opt(scrape.status));
         entry.insert("ok".into(), Value::Bool(scrape.available()));
-        entry.insert(
-          "error".into(),
-          match &scrape.error {
-            Some(error) => Value::String(error.clone()),
-            None => Value::Null,
-          },
-        );
+        entry.insert("error".into(), value_opt(scrape.error.clone()));
         entry.insert("truncated".into(), Value::Bool(scrape.truncated));
         entry.insert("series".into(), Value::from(scrape.series));
         entry.insert("skipped".into(), Value::from(scrape.skipped));
@@ -400,15 +378,7 @@ fn json_body(scrapes: &[Scrape], parsed: &Parsed) -> Value {
     })
     .collect::<Vec<_>>();
   metrics::json_object(|entry| {
-    entry.insert(
-      "generated_at_ms".into(),
-      Value::from(
-        SystemTime::now()
-          .duration_since(UNIX_EPOCH)
-          .map(|d| d.as_millis() as u64)
-          .unwrap_or(0),
-      ),
-    );
+    entry.insert("generated_at_ms".into(), Value::from(now_ms()));
     entry.insert("scope".into(), Value::Object(scope));
     entry.insert("backends".into(), Value::Array(backends));
   })
