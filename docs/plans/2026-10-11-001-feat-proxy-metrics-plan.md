@@ -267,12 +267,22 @@ is not the same as zero. `/metrics` gains `llamastash:hosts_in_flight` and keeps
 `Tok/s last` is dropped from the strip and from the CLI summary block; `tokens_per_second_last`
 stays in the JSON and in the rows.
 
-Scoping follows the launch, not the model name. A running model row in the TUI is one
-launch, so the Requests tab takes that launch's id and shows that launch's rows and
-counters only, never another launch of the same path. `requests <launch-ref>` already
-works that way (`LogScope::Launch`) and keeps it. Where a launch has no distinct id to
-scope by (a managed multiplexer that files requests under the model), the figures cover
-everything filed under that model since daemon start, and `docs/usage.md` says so.
+Scoping rule, same in all three surfaces (TUI strip, CLI, `/metrics`): a **launch** scope is
+strict and a **model** scope is the whole-model aggregate.
+
+- A launch scope means only that launch's rows and only that launch's counters. A running
+  model row in the TUI is one launch, so the Requests tab takes that launch's id, and never
+  another launch's numbers. `requests L3` already does this through `LogScope::Launch`, and
+  `?launch=<ref>` on the metrics route must do the same: no model-filed totals merged into a
+  launch summary, and `status --json` per-launch `request_stats` stops folding in requests
+  filed under the model.
+- A model scope (`requests <model>`, the model row in the TUI, `?model=<ref>`) keeps
+  everything filed under that model since daemon start, including rows of launches that have
+  since stopped and the retained totals for the last 16 retired launches. A dashboard scrape
+  and `llamastash requests <model>` agree line for line.
+- Where requests are filed under the model with no distinct launch id (a managed
+  multiplexer), a launch view is the model aggregate by necessity, and `docs/usage.md` says
+  so.
 
 ## Verification
 
