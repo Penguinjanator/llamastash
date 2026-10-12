@@ -37,6 +37,10 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 - The memory gate priced every layer of a hybrid Qwen model (Qwen3-Next, Qwen3.5, Qwen3.8-27B) as holding a KV cache, but only one layer in four has one, so these models were refused at windows they fit. Qwen3.8-27B Q4_K_M at 64K with a `q8_0` cache drops from 26.5 GiB to about 20 GiB.
 - The same hybrids' MTP layers are priced only when MTP is on, and their fixed recurrent state is now counted once per `--parallel` sequence, times one more per drafted token with MTP on.
 
+### Security
+
+- quinn-proto 0.11.15 → 0.11.19, clearing five advisories: two memory-exhaustion guard bypasses ([RUSTSEC-2026-0341](https://rustsec.org/advisories/RUSTSEC-2026-0341), [RUSTSEC-2026-0342](https://rustsec.org/advisories/RUSTSEC-2026-0342)), unbounded growth of pending connection-ID retirements ([RUSTSEC-2026-0339](https://rustsec.org/advisories/RUSTSEC-2026-0339)), and two remotely triggerable panics ([RUSTSEC-2026-0338](https://rustsec.org/advisories/RUSTSEC-2026-0338), [RUSTSEC-2026-0340](https://rustsec.org/advisories/RUSTSEC-2026-0340)). Transitive via reqwest's optional HTTP/3 support, which nothing here enables, so the crate sits in `Cargo.lock` without ever being compiled. Lockfile-only.
+
 ## [0.6.1] — 2026-10-02
 
 A patch release for `integrations`. It keeps the key order of the tool configs it edits instead of sorting them, and a generic entry like Halogen can now declare the image input and reasoning effort levels it accepts, so pi, OpenCode, Zed and Codex get them like they do for a GGUF model.
