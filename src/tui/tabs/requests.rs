@@ -1,11 +1,12 @@
 //! Requests tab — the proxy requests of the focused model.
 //!
 //! A summary strip on top (totals and averages the daemon computed) and
-//! below it a table of requests, newest first. Table columns have a width
-//! and a rank; as the pane narrows the higher-rank ones drop out. The two
-//! free-text columns are the exception: `Note` grows into the spare width
-//! only up to `MAX_NOTE_W` and wraps onto continuation lines beyond it,
-//! and `Route`, which is last, takes whatever `Note` left.
+//! below it a table of requests, newest first, one row per line. Table
+//! columns have a width and a rank; as the pane narrows the higher-rank
+//! ones drop out. The two free-text columns are the exception: `Note`
+//! grows into the spare width and cuts to its first words with an
+//! ellipsis when the text is longer, and `Route`, which is last, keeps its
+//! own width.
 
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -15,8 +16,7 @@ use ratatui::Frame;
 
 use crate::proxy::request_log::{RequestCells, RequestRow, RequestSummary};
 use crate::theme::Palette;
-use crate::tui::columns::{self, cell, Column};
-use crate::util::wrap::wrap_cells;
+use crate::tui::columns::{self, cell, cell_words, Column};
 
 /// Rows asked for on each poll. More than any pane shows at once, so a
 /// scroll has something to move through.
@@ -27,12 +27,7 @@ const NONE: &str = "—";
 const COL_SEP_W: usize = 1;
 /// The least `Note` is worth showing at.
 const MIN_NOTE_W: usize = 12;
-/// The widest `Note` grows to. A refused auto-start carries the engine's
-/// whole cause, so an uncapped `Note` would push every figure off the pane
-/// on the one row where the numbers matter most; past this it wraps.
-const MAX_NOTE_W: usize = 48;
-/// `Route`'s own width. It is the last column, so it also takes the spare
-/// width `Note` did not use.
+/// `Route`'s own width. It is the last column, and `Note` takes the spare.
 const ROUTE_W: usize = 16;
 /// Gap between two figures on the summary strip.
 const SUMMARY_GAP: usize = 3;
@@ -47,6 +42,7 @@ enum ColumnId {
   In,
   Out,
   Client,
+  RequestFor,
   Note,
   Route,
 }
@@ -106,6 +102,15 @@ const COLUMNS: &[Column<ColumnId>] = &[
     rank: 100,
   },
   Column {
+    id: ColumnId::RequestFor,
+    label: "Request for",
+    // Fits a model name; a longer one cuts with an ellipsis. This is what
+    // an alias or a fallback answered for, so it reads differently from the
+    // model the row belongs to.
+    width: 14,
+    rank: 90,
+  },
+  Column {
     id: ColumnId::Note,
     label: "Note",
     width: MIN_NOTE_W,
@@ -158,8 +163,22 @@ impl RequestsTabState {
   pub fn set(&mut self, scope: RequestsScope, summary: RequestSummary, rows: Vec<RequestRow>) {
     self.scope = Some(scope);
     self.summary = summary;
+    // A poll that brings newer requests must not slide the table out from
+    // under a scroll, or a keypress reads as doing nothing: hold the row on
+    // top, and follow the newest only while nothing is scrolled past.
+    let anchor = match self.scroll_offset {
+      0 => None,
+      _ => self.rows.get(self.scroll_offset).map(|row| row.seq),
+    };
     self.rows = rows;
-    self.scroll_offset = self.scroll_offset.min(self.rows.len().saturating_sub(1));
+    self.scroll_offset = match anchor {
+      Some(seq) => self
+        .rows
+        .iter()
+        .position(|row| row.seq == seq)
+        .unwrap_or_else(|| self.rows.len().saturating_sub(1)),
+      None => 0,
+    };
   }
 
   /// Drop what is shown, scroll included, when focus moves to a row the
@@ -209,14 +228,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &RequestsTabState, palet
     let offset = state
       .scroll_offset
       .min(state.rows.len().saturating_sub(room));
-    // A wrapped note costs more than one line, so the page is counted in
-    // lines, not rows: a long note takes room from the rows below it.
     lines.extend(
       state
         .rows
         .iter()
         .skip(offset)
-        .flat_map(|row| row_lines(row, &layout, palette))
+        .map(|row| row_line(row, &layout, palette))
         .take(room),
     );
   }
@@ -255,60 +272,33 @@ fn summary_lines(summary: &RequestSummary, width: usize, palette: &Palette) -> V
   lines
 }
 
-/// The columns one render pass shows, plus the widths the two flexible
-/// columns got: `Note` up to [`MAX_NOTE_W`] (0 when it does not show) and
-/// `Route`, which takes the spare width `Note` left.
+/// The columns one render pass shows, plus the width the flexible `Note`
+/// column got (0 when it does not show). `Route` keeps its own width.
 struct ColumnLayout {
   visible: Vec<&'static Column<ColumnId>>,
   note_w: usize,
-  route_w: usize,
 }
 
 impl ColumnLayout {
   fn width_of(&self, column: &Column<ColumnId>) -> usize {
-    match column.id {
-      ColumnId::Note => self.note_w,
-      ColumnId::Route => self.route_w.max(column.width),
-      _ => column.width,
+    if column.id == ColumnId::Note {
+      self.note_w
+    } else {
+      column.width
     }
-  }
-
-  /// Cells of every visible column before `Note`, each padded and followed
-  /// by its separator: the indent a wrapped note continues at.
-  fn note_indent(&self) -> usize {
-    self
-      .visible
-      .iter()
-      .take_while(|c| c.id != ColumnId::Note)
-      .map(|c| self.width_of(c) + COL_SEP_W)
-      .sum()
   }
 }
 
 fn layout_columns(content_w: usize) -> ColumnLayout {
   let (visible, spent) = columns::fit(COLUMNS, content_w, COL_SEP_W);
-  // The separator `fit` counted after the last column is the absorber's
-  // to use too.
-  let mut spare = content_w.saturating_sub(spent) + COL_SEP_W;
+  // The separator `fit` counted after the last column is the absorber's to use too.
+  let spare = content_w.saturating_sub(spent) + COL_SEP_W;
   let note_w = if visible.iter().any(|c| c.id == ColumnId::Note) {
-    let grow = spare.min(MAX_NOTE_W - MIN_NOTE_W);
-    spare -= grow;
-    MIN_NOTE_W + grow
+    MIN_NOTE_W + spare
   } else {
     0
   };
-  // `Route` is admitted last of all but `Client`, so whenever it shows it
-  // is the right-most column.
-  let route_w = if visible.iter().any(|c| c.id == ColumnId::Route) {
-    ROUTE_W + spare
-  } else {
-    0
-  };
-  ColumnLayout {
-    visible,
-    note_w,
-    route_w,
-  }
+  ColumnLayout { visible, note_w }
 }
 
 fn header_line(layout: &ColumnLayout, palette: &Palette) -> Line<'static> {
@@ -323,49 +313,30 @@ fn header_line(layout: &ColumnLayout, palette: &Palette) -> Line<'static> {
   ))
 }
 
-/// One row, as one line per wrapped note chunk. Only `Note` wraps; a
-/// continuation line is the indent plus the next chunk, with nothing after
-/// it, because `Route` belongs to the row's first line.
-fn row_lines(row: &RequestRow, layout: &ColumnLayout, palette: &Palette) -> Vec<Line<'static>> {
+/// One row on one line. A `Note` longer than its column keeps its first
+/// words and ends in an ellipsis, so a long engine cause never costs the
+/// rows below it a line.
+fn row_line(row: &RequestRow, layout: &ColumnLayout, palette: &Palette) -> Line<'static> {
   let cells = row.cells(NONE);
-  let chunks = wrap_cells(cells.note.as_str(), layout.note_w);
-  let mut lines = Vec::with_capacity(chunks.len());
-  for (i, chunk) in chunks.into_iter().enumerate() {
-    if i > 0 {
-      lines.push(Line::from(Span::styled(
-        format!(
-          "{}{} ",
-          " ".repeat(layout.note_indent()),
-          cell(&chunk, layout.note_w)
-        ),
-        palette.muted_style(),
-      )));
-      continue;
-    }
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(layout.visible.len());
-    for c in &layout.visible {
-      let text = format!(
-        "{} ",
-        cell(
-          if c.id == ColumnId::Note {
-            chunk.as_str()
-          } else {
-            column_value(c.id, &cells)
-          },
-          layout.width_of(c),
-        )
-      );
-      let style = match c.id {
-        ColumnId::Status if row.is_error() => palette.error_style(),
-        ColumnId::Status if row.status.is_some() => palette.success_style(),
-        ColumnId::Note => palette.muted_style(),
-        _ => palette.text_style(),
-      };
-      spans.push(Span::styled(text, style));
-    }
-    lines.push(Line::from(spans));
+  let mut spans: Vec<Span<'static>> = Vec::with_capacity(layout.visible.len());
+  for c in &layout.visible {
+    let text = format!(
+      "{} ",
+      if c.id == ColumnId::Note {
+        cell_words(&cells.note, layout.note_w)
+      } else {
+        cell(column_value(c.id, &cells), layout.width_of(c))
+      }
+    );
+    let style = match c.id {
+      ColumnId::Status if row.is_error() => palette.error_style(),
+      ColumnId::Status if row.status.is_some() => palette.success_style(),
+      ColumnId::Note => palette.muted_style(),
+      _ => palette.text_style(),
+    };
+    spans.push(Span::styled(text, style));
   }
-  lines
+  Line::from(spans)
 }
 
 fn column_value(id: ColumnId, cells: &RequestCells) -> &str {
@@ -377,9 +348,10 @@ fn column_value(id: ColumnId, cells: &RequestCells) -> &str {
     ColumnId::In => &cells.tokens_in,
     ColumnId::Out => &cells.tokens_out,
     ColumnId::Ttfb => &cells.ttfb,
-    ColumnId::Route => &cells.route,
     ColumnId::Client => &cells.client,
+    ColumnId::RequestFor => &cells.request_for,
     ColumnId::Note => &cells.note,
+    ColumnId::Route => &cells.route,
   }
 }
 
@@ -441,14 +413,38 @@ mod tests {
   fn columns_drop_by_rank_as_the_pane_narrows() {
     // Each column costs its width plus one separator. Running totals in
     // rank order: Time 9, Code 14, Tok/s 21, Total 29, TTFB 37, In 44,
-    // Out 51, Note 64, Route 81, Client 103.
+    // Out 51, Note 64, Route 81, Request for 96, Client 118.
     let full = [
-      "Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Client", "Note", "Route",
+      "Time",
+      "Code",
+      "Tok/s",
+      "Total",
+      "TTFB",
+      "In",
+      "Out",
+      "Client",
+      "Request for",
+      "Note",
+      "Route",
     ];
-    assert_eq!(labels(103), full);
+    assert_eq!(labels(118), full);
     // Client ranks lowest of all, so it is the first to go.
+    let no_client = [
+      "Time",
+      "Code",
+      "Tok/s",
+      "Total",
+      "TTFB",
+      "In",
+      "Out",
+      "Request for",
+      "Note",
+      "Route",
+    ];
+    assert_eq!(labels(117), no_client);
+    assert_eq!(labels(96), no_client);
     assert_eq!(
-      labels(102),
+      labels(95),
       vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Note", "Route"]
     );
     assert_eq!(
@@ -457,6 +453,10 @@ mod tests {
     );
     assert_eq!(
       labels(80),
+      vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Note"]
+    );
+    assert_eq!(
+      labels(64),
       vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Note"]
     );
     assert_eq!(
@@ -481,7 +481,7 @@ mod tests {
   }
 
   #[test]
-  fn note_and_route_split_the_spare_width() {
+  fn note_absorbs_the_spare_width() {
     // The visible columns plus their separators fill the pane, with one
     // cell of slack for the separator after the last column.
     for width in [88usize, 100, 110, 120, 160, 200] {
@@ -492,19 +492,21 @@ mod tests {
         .map(|c| layout.width_of(c) + COL_SEP_W)
         .sum();
       assert_eq!(spent, width + 1, "width {width}");
-      assert!(layout.note_w <= MAX_NOTE_W, "width {width}");
-      assert!(layout.route_w >= ROUTE_W, "width {width}");
+      assert!(layout.note_w >= MIN_NOTE_W, "width {width}");
     }
-    // A pane wide enough for `Note` past its cap leaves the rest to
-    // `Route`, which is last.
+    // A wide pane gives `Note` everything past the fixed columns, so a long
+    // engine cause shows more; `Route` keeps its own width.
     let wide = layout_columns(200);
-    assert_eq!(wide.note_w, MAX_NOTE_W);
-    assert!(wide.route_w > ROUTE_W);
+    assert!(wide.note_w > 60, "{}", wide.note_w);
+    let route = wide
+      .visible
+      .iter()
+      .find(|c| c.id == ColumnId::Route)
+      .expect("route column");
+    assert_eq!(wide.width_of(route), ROUTE_W);
     // At the width `Route` just fits the only spare cell is the separator
     // after the last column, and `Note` grows first.
-    let tight = layout_columns(81);
-    assert_eq!(tight.note_w, MIN_NOTE_W + 1);
-    assert_eq!(tight.route_w, ROUTE_W);
+    assert_eq!(layout_columns(81).note_w, MIN_NOTE_W + 1);
     // Too narrow for `Note`: it gets nothing and the row ends earlier.
     assert_eq!(layout_columns(63).note_w, 0);
   }
@@ -544,7 +546,13 @@ mod tests {
         requests: 2,
         ..RequestSummary::default()
       },
-      vec![row(2), row(1)],
+      vec![
+        RequestRow {
+          requested_model: Some("asked-7b".to_string()),
+          ..row(2)
+        },
+        row(1),
+      ],
     );
     let lines = rendered(&state, 120, 8);
     assert!(lines[0].starts_with("Requests 2"), "{lines:?}");
@@ -556,7 +564,9 @@ mod tests {
       .expect("header row");
     assert_eq!(lines[header - 1], "");
     assert!(lines[header].ends_with("Route"), "{lines:?}");
+    assert!(lines[header].contains("Request for"), "{lines:?}");
     assert!(lines[header + 1].contains("200  39.6   1.2s"), "{lines:?}");
+    assert!(lines[header + 1].contains("asked-7b"), "{lines:?}");
     assert!(lines[header + 1].contains("chat/completions"), "{lines:?}");
     // Two rows, newest (`seq` 2, one second later) first.
     assert_eq!(&lines[header + 1][..8], row(2).cells(NONE).time);
@@ -565,8 +575,7 @@ mod tests {
   }
 
   #[test]
-  fn a_long_note_wraps_under_its_own_column() {
-    let long = "launch_failed: auto-start of Qwen3.8-27B failed: could not allocate the KV cache";
+  fn a_long_note_keeps_its_first_words() {
     let mut state = RequestsTabState::default();
     state.set(
       RequestsScope::Model("/m/a.gguf".to_string()),
@@ -585,27 +594,17 @@ mod tests {
       }],
     );
     let lines = rendered(&state, 120, 10);
-    let layout = layout_columns(120);
-    let wrapped = wrap_cells(long, layout.note_w);
-    assert!(wrapped.len() > 1, "the note must wrap, not truncate");
-    // A continuation line is the indent plus the next chunk and nothing
-    // after it: `Route` belongs to the row's first line.
     let header = lines
       .iter()
       .position(|l| l.starts_with("Time     Code Tok/s  Total"))
       .expect("header row");
-    let indent = layout.note_indent();
-    for (i, chunk) in wrapped.iter().enumerate().skip(1) {
-      // Chunk 0 is on the row's own line, one line below the header.
-      let line = lines[header + 1 + i].trim_end();
-      let before = line.chars().take_while(|c| *c == ' ').count();
-      assert_eq!(before, indent, "{line:?}");
-      assert_eq!(
-        line.chars().count(),
-        indent + chunk.chars().count(),
-        "{line:?}"
-      );
-    }
+    let ellipsis = crate::tui::glyphs::active().ellipsis();
+    let row_line = lines[header + 1].trim_end();
+    assert!(row_line.contains("launch_failed:"), "{row_line:?}");
+    assert!(row_line.contains(ellipsis), "{row_line:?}");
+    assert!(!row_line.contains("KV cache"), "{row_line:?}");
+    // One row is one line: nothing follows it but the empty rows below.
+    assert_eq!(lines[header + 2], "");
   }
 
   #[test]
@@ -656,7 +655,7 @@ mod tests {
   }
 
   #[test]
-  fn a_wrapped_note_at_the_bottom_of_the_page_still_indents() {
+  fn a_long_note_costs_no_extra_line() {
     let rows: Vec<RequestRow> = (1..=6)
       .rev()
       .map(|seq| RequestRow {
@@ -668,7 +667,6 @@ mod tests {
         ..row(seq)
       })
       .collect();
-    let note = rows[0].cells(NONE).note.clone();
     let mut state = RequestsTabState::default();
     state.set(
       RequestsScope::Model("/m/a.gguf".to_string()),
@@ -678,36 +676,24 @@ mod tests {
     for _ in 0..50 {
       state.scroll_down();
     }
-    let layout = layout_columns(200);
-    let chunks = wrap_cells(&note, layout.note_w);
-    assert_eq!(chunks.len(), 2, "one continuation line: {chunks:?}");
-    // A page is counted in lines, so the two rows that fit cost four lines
-    // and the pane ends on a continuation line, with the older row cut off.
-    let lines = rendered(&state, 200, 7);
+    let ellipsis = crate::tui::glyphs::active().ellipsis();
+    // The page is counted in rows now, so the last page ends on the oldest
+    // request and every line under the header is a row of its own.
+    let lines = rendered(&state, 120, 7);
     let header = lines
       .iter()
       .position(|l| l.starts_with("Time     Code Tok/s  Total"))
       .expect("header row");
-    assert_eq!(&lines[header + 1][..8], row(4).cells(NONE).time);
-    assert!(lines[header + 1].contains("launch_failed:"), "{lines:?}");
-    let cut_off = row(2).cells(NONE).time;
-    assert!(
-      !lines.iter().any(|l| l.starts_with(cut_off.as_str())),
-      "the third row does not fit: {lines:?}"
+    let rows_shown = &lines[header + 1..];
+    assert!(rows_shown.len() >= 2, "{lines:?}");
+    assert!(rows_shown[0].contains(ellipsis), "{lines:?}");
+    assert_eq!(
+      &rows_shown[rows_shown.len() - 1][..8],
+      row(1).cells(NONE).time
     );
-    // Both rows that fit are two lines: each continuation sits at the
-    // note column's indent, and the last one is the bottom of the pane.
-    for start in [header + 1, header + 3] {
-      let line = lines[start + 1].trim_end();
-      let before = line.chars().take_while(|c| *c == ' ').count();
-      assert_eq!(before, layout.note_indent(), "{line:?}");
-      assert_eq!(
-        line.chars().count(),
-        before + chunks[1].chars().count(),
-        "{line:?}"
-      );
+    for line in rows_shown {
+      assert!(line.starts_with(|c: char| c.is_ascii_digit()), "{line:?}");
     }
-    assert_eq!(header + 4, lines.len() - 1, "{lines:?}");
   }
 
   #[test]
@@ -724,9 +710,44 @@ mod tests {
       RequestSummary::default(),
       (1..=4).rev().map(row).collect(),
     );
-    assert_eq!(state.scroll_offset, 3);
+    // The row on top (seq 2) is still there, so it stays on top.
+    assert_eq!(state.scroll_offset, 2);
+    state.scroll_offset = 3;
+    state.set(
+      RequestsScope::Model("/m/a.gguf".to_string()),
+      RequestSummary::default(),
+      vec![row(9)],
+    );
+    assert_eq!(state.scroll_offset, 0);
     state.clear();
     assert_eq!(state.scroll_offset, 0);
     assert_eq!(state.scope, None);
+  }
+
+  #[test]
+  fn a_poll_holds_the_top_row_and_follows_the_newest_only_at_the_top() {
+    let scope = || RequestsScope::Model("/m/a.gguf".to_string());
+    let mut state = RequestsTabState::default();
+    state.set(
+      scope(),
+      RequestSummary::default(),
+      (1..=10).rev().map(row).collect(),
+    );
+    state.scroll_down();
+    let top = state.rows[state.scroll_offset].seq;
+    state.set(
+      scope(),
+      RequestSummary::default(),
+      (1..=11).rev().map(row).collect(),
+    );
+    assert_eq!(state.rows[state.scroll_offset].seq, top);
+    state.scroll_offset = 0;
+    state.set(
+      scope(),
+      RequestSummary::default(),
+      (1..=12).rev().map(row).collect(),
+    );
+    assert_eq!(state.scroll_offset, 0);
+    assert_eq!(state.rows[0].seq, 12, "at the top the newest leads");
   }
 }

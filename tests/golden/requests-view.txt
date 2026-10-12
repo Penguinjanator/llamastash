@@ -21,10 +21,10 @@
 │                                                                            ││ Auto-starts 2   Unloaded 1             │
 │                                                                            ││                                        │
 │                                                                            ││ Time     Code Tok/s  Total   TTFB      │
+│                                                                            ││ HH:MM:SS 200  41.3   4.3s    182ms     │
 │                                                                            ││ HH:MM:SS 200  —      —       182ms     │
 │                                                                            ││ HH:MM:SS 200  —      —       182ms     │
 │                                                                            ││ HH:MM:SS 200  —      4.3s    182ms     │
 │                                                                            ││ HH:MM:SS 503  —      96ms    —         │
 │                                                                            ││ HH:MM:SS 200  41.3   36.0s   31.9s     │
-│                                                                            ││ HH:MM:SS 200  41.3   4.3s    182ms     │
 └ ◌ launching · ◐ loading · ● ready · ▲ error · ○ stopped · ⇪ external ──────┘└────────────────────────────────────────┘

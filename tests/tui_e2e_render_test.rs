@@ -278,11 +278,11 @@ fn requests_view_golden_render_matches_fixture() {
 #[cfg_attr(target_os = "macos", ignore = "fixture uses Linux key glyphs")]
 #[test]
 fn requests_view_wide_golden_render_matches_fixture() {
-  // The wide frame is the only golden that shows `Client`, `Note`
-  // and `Route`, and the only one where a long note wraps onto a
-  // continuation line instead of being dropped with the column.
+  // The wide frame is the only golden that shows `Request for`, `Note`
+  // and `Route`, and the only one where a long note is cut to its first
+  // words with an ellipsis instead of being dropped with the column.
   let mut app = seeded_requests_view_app();
-  let rendered = mask_clock_times(&render_to_lines_at(&mut app, 280, 30).join("\n"));
+  let rendered = mask_clock_times(&render_to_lines_at(&mut app, 330, 30).join("\n"));
   assert_golden_text(rendered + "\n", "tests/golden/requests-view-wide.txt");
 }
 
@@ -445,8 +445,9 @@ fn seeded_logs_view_app() -> App {
 
 /// Dashboard with the right pane focused on the Requests tab of the
 /// running launch: a served request, one that auto-started the model and
-/// unloaded another for it, a failed auto-start, a client that hung up,
-/// and two still streaming from two peers of one host.
+/// unloaded another for it, a refused auto-start, a client that hung up,
+/// a fallback that answered for another model, and two still streaming
+/// from two peers of one host.
 fn seeded_requests_view_app() -> App {
   use llamastash::proxy::request_log::{RequestRow, RequestState, RequestSummary};
   use llamastash::tui::tabs::requests::RequestsScope;
@@ -473,6 +474,12 @@ fn seeded_requests_view_app() -> App {
     ..RequestRow::default()
   };
   let rows = vec![
+    RequestRow {
+      fallback: Some("launch_failed".into()),
+      requested_model: Some("qwen-70b".into()),
+      client: Some("127.0.0.1:53477".into()),
+      ..row(7)
+    },
     RequestRow {
       state: RequestState::InFlight,
       duration_ms: None,

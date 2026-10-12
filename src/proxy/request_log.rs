@@ -167,6 +167,9 @@ pub struct RequestCells {
   /// The route without its `/v1/` prefix, which every logged route has.
   pub route: String,
   pub model: String,
+  /// The `model` the client sent. Differs from `model` on an alias or a
+  /// fallback, where something else answered.
+  pub request_for: String,
   pub launch: String,
   pub client: String,
   /// See [`RequestRow::note`]. Empty for a plain served request.
@@ -209,6 +212,7 @@ impl RequestRow {
         .unwrap_or(&self.route)
         .to_string(),
       model: or_none(self.model.clone().or_else(|| self.requested_model.clone())),
+      request_for: or_none(self.requested_model.clone()),
       launch: or_none(self.launch_id.clone()),
       client: or_none(self.client.clone()),
       note: self.note(),
@@ -237,10 +241,7 @@ impl RequestRow {
       parts.push(format!("unloaded {}", self.evicted.join(" ")));
     }
     if let Some(reason) = &self.fallback {
-      parts.push(match &self.requested_model {
-        Some(asked) => format!("fallback ({reason}) for {asked}"),
-        None => format!("fallback ({reason})"),
-      });
+      parts.push(format!("fallback ({reason})"));
     }
     if let Some(error) = &self.error {
       parts.push(match &self.cause {
@@ -1500,10 +1501,7 @@ mod tests {
       requested_model: Some("big".to_string()),
       ..base.clone()
     };
-    assert_eq!(
-      fallback.note(),
-      "auto-start, fallback (launch_failed) for big"
-    );
+    assert_eq!(fallback.note(), "auto-start, fallback (launch_failed)");
     let failed = RequestRow {
       status: Some(503),
       auto_start: true,

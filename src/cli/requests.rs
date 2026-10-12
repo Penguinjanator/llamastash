@@ -88,7 +88,7 @@ fn requests_human(body: &Value, one_model: bool) -> String {
   if !one_model {
     header.push("MODEL");
   }
-  header.extend(["LAUNCH", "CLIENT", "NOTE", "ROUTE"]);
+  header.extend(["LAUNCH", "CLIENT", "REQUEST FOR", "NOTE", "ROUTE"]);
   let table: Vec<Vec<String>> = rows.iter().map(|r| cells_for(r, one_model)).collect();
   let table = wrap_notes(&header, table);
   out.push_str(&format::table(&header, &table));
@@ -154,6 +154,7 @@ fn cells_for(row: &RequestRow, one_model: bool) -> Vec<String> {
   cells.extend([
     c.launch,
     c.client,
+    c.request_for,
     if c.note.is_empty() {
       NONE.to_string()
     } else {
@@ -237,7 +238,7 @@ mod tests {
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(
       lines[0],
-      "TIME\tCODE\tTOK/S\tTOTAL\tTTFB\tIN\tOUT\tMODEL\tLAUNCH\tCLIENT\tNOTE\tROUTE"
+      "TIME\tCODE\tTOK/S\tTOTAL\tTTFB\tIN\tOUT\tMODEL\tLAUNCH\tCLIENT\tREQUEST FOR\tNOTE\tROUTE"
     );
     assert_eq!(lines.len(), 2);
     let cells: Vec<&str> = lines[1].split('\t').collect();
@@ -253,6 +254,7 @@ mod tests {
         "Qwen3.8-27B",
         "L1",
         "127.0.0.1:5000",
+        "qwen",
         "-",
         "chat/completions",
       ]
@@ -263,7 +265,7 @@ mod tests {
   fn a_model_filter_drops_the_model_column() {
     let out = piped(&[row()], true);
     assert!(!out.lines().next().unwrap().contains("MODEL"));
-    assert_eq!(out.lines().nth(1).unwrap().split('\t').count(), 11);
+    assert_eq!(out.lines().nth(1).unwrap().split('\t').count(), 12);
   }
 
   #[test]
@@ -287,8 +289,9 @@ mod tests {
     assert_eq!(cells[4], "-");
     assert_eq!(cells[7], "qwen");
     assert_eq!(cells[8], "-");
-    assert_eq!(cells[10], "model_not_found");
-    assert_eq!(cells[11], "chat/completions");
+    assert_eq!(cells[10], "qwen");
+    assert_eq!(cells[11], "model_not_found");
+    assert_eq!(cells[12], "chat/completions");
   }
 
   /// Terminal rendering, with the process-wide color flag restored. It
@@ -348,8 +351,8 @@ mod tests {
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(lines.len(), 2, "{lines:?}");
     let cells: Vec<&str> = lines[1].split('\t').collect();
-    assert_eq!(cells.len(), 12);
-    assert!(cells[10].ends_with("lower --ctx-size"), "{}", cells[10]);
+    assert_eq!(cells.len(), 13);
+    assert!(cells[11].ends_with("lower --ctx-size"), "{}", cells[11]);
   }
 
   #[test]

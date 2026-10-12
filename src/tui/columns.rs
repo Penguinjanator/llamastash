@@ -1,6 +1,8 @@
 //! Fixed-width table columns that drop out by rank as a pane narrows.
 //! Shared by the Models list and the Requests tab.
 
+use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
+
 /// One data column. `rank` decides which columns survive under width
 /// pressure (lower = stickier — see [`fit`]); the order columns are
 /// declared in is the left-to-right display order, so visible columns
@@ -72,6 +74,48 @@ pub(crate) fn cell(s: &str, w: usize) -> String {
   }
 }
 
+/// Like [`cell`], but a cut lands on a word boundary where one falls inside
+/// the limit, so free prose reads as its first words rather than a mid-word
+/// fragment. Only falls back to a mid-word cut when no whole word fits.
+pub(crate) fn cell_words(s: &str, w: usize) -> String {
+  if w == 0 {
+    return String::new();
+  }
+  if s.width() <= w {
+    return cell(s, w);
+  }
+  let ellipsis = crate::tui::glyphs::active().ellipsis();
+  let budget = w.saturating_sub(ellipsis.width());
+  let mut kept = String::new();
+  let mut used = 0usize;
+  for word in s.split_whitespace() {
+    let gap = usize::from(!kept.is_empty());
+    let cells = word.width();
+    if used + gap + cells > budget {
+      break;
+    }
+    if gap > 0 {
+      kept.push(' ');
+    }
+    kept.push_str(word);
+    used += gap + cells;
+  }
+  if kept.is_empty() {
+    let mut hard = String::new();
+    let mut hard_w = 0usize;
+    for ch in s.chars() {
+      let cells = ch.width().unwrap_or(0);
+      if hard_w + cells > budget {
+        break;
+      }
+      hard.push(ch);
+      hard_w += cells;
+    }
+    kept = hard;
+  }
+  cell(&format!("{kept}{ellipsis}"), w)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -100,6 +144,26 @@ mod tests {
   fn ids(budget: usize) -> (Vec<char>, usize) {
     let (cols, spent) = fit(COLS, budget, 1);
     (cols.iter().map(|c| c.id).collect(), spent)
+  }
+
+  #[test]
+  fn cell_words_cuts_at_a_word_boundary() {
+    let ell = crate::tui::glyphs::active().ellipsis();
+    assert_eq!(cell_words("in flight", 12).trim_end(), "in flight");
+    assert_eq!(
+      cell_words("auto-start, unloaded L3", 16).trim_end(),
+      format!("auto-start,{ell}")
+    );
+    assert_eq!(
+      cell_words("unloaded L3 L4 L5", 16).trim_end(),
+      format!("unloaded L3 L4{ell}")
+    );
+    // No whole word fits, so it cuts mid-token.
+    assert_eq!(
+      cell_words("supercalifragilistic expialidocious", 12).trim_end(),
+      format!("supercalifr{ell}")
+    );
+    assert_eq!(cell_words("anything at all", 0), "");
   }
 
   #[test]
