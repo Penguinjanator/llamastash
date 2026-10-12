@@ -1490,10 +1490,18 @@ Counters, monotonic since daemon start:
 | `llamastash:request_errors_total` | `model` | rows `RequestRow::is_error()` |
 | `llamastash:prompt_tokens_total` | `model` | |
 | `llamastash:completion_tokens_total` | `model` | |
-| `llamastash:request_duration_seconds_total` | `model` | sum of finished durations; mean = `rate(…_total) / rate(llamastash:requests_total)` |
+| `llamastash:request_duration_seconds_total` | `model` | sum of finished durations |
+| `llamastash:request_duration_seconds_count` | `model` | how many requests that sum and the one below cover; mean = `rate(…_total) / rate(…_count)` |
 | `llamastash:request_ttft_seconds_total` | `model` | sum of time-to-first-byte |
 | `llamastash:auto_starts_total` | `model` | requests that spawned the launch |
 | `llamastash:evictions_total` | `model` | launches unloaded to make room |
+
+The two latency sums cover only requests the proxy could time — a completed
+successful response with both a total duration and a first byte — so the count
+they divide by is `llamastash:request_duration_seconds_count`, not
+`llamastash:requests_total`. A failed or cancelled request moves the request count
+and neither sum, and dividing by the request count reads the mean low by exactly
+that traffic.
 
 Gauges: `llamastash:requests_in_flight{model}`, `llamastash:hosts_in_flight{model}`
 (distinct client hosts with a request in flight right now), `llamastash:request_duration_seconds_avg{model}`,

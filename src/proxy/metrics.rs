@@ -802,6 +802,17 @@ fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, live: Cli
     &labels,
     totals.ttfb_ms_sum as f64 / 1000.0,
   );
+  // The denominator of both sums, and of the two averages below. It is not
+  // `llamastash:requests_total`: an error or a client that hung up finished a
+  // request the sums never counted, so dividing by the request count reads the
+  // mean low by exactly as much as the traffic that failed.
+  doc.sample(
+    "llamastash:request_duration_seconds_count",
+    "Requests the duration and first-byte totals are over",
+    "counter",
+    &labels,
+    totals.timed as f64,
+  );
   doc.sample(
     "llamastash:auto_starts_total",
     "Requests that started a model launch",
@@ -1463,6 +1474,66 @@ mod tests {
     assert!(text.contains("llamastash:request_tokens_per_second{model=\"m1\"} 40\n"));
     // No `?launch=1`, so no per-launch series.
     assert!(!text.contains("llamastash:launch_"));
+  }
+
+  /// The value of one printed sample line, by its `name{labels}` head.
+  fn sample_value(text: &str, head: &str) -> f64 {
+    text
+      .lines()
+      .find(|line| line.starts_with(head))
+      .unwrap_or_else(|| panic!("{head} is not in the scrape:\n{text}"))
+      .rsplit(' ')
+      .next()
+      .and_then(|last| last.parse().ok())
+      .expect("a numeric value")
+  }
+
+  /// Both latency sums hold fewer requests than `requests_total` counts, so the
+  /// denominator has to travel with them: dividing a sum by the request count
+  /// reads the mean low by exactly the traffic that failed.
+  #[test]
+  fn metrics_exports_the_count_the_latency_sums_divide_by() {
+    let log = RequestLog::new();
+    // A duration big enough that the two candidate denominators give different
+    // numbers.
+    let mut slow = log.begin("/v1/chat/completions", None);
+    slow.set_model("m1", "/models/a.gguf");
+    slow.set_launch("L1");
+    slow.set_status(200);
+    slow.mark_first_byte();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    slow.finish(RequestState::Done, Usage::default());
+    // A finished request that was never timed: the client hung up.
+    let mut hung = log.begin("/v1/chat/completions", None);
+    hung.set_model("m1", "/models/a.gguf");
+    hung.set_launch("L1");
+    hung.set_status(200);
+    hung.finish(RequestState::ClientClosed, Usage::default());
+    let snap = log.snapshot();
+    let mut doc = Document::new(true);
+    render(&mut doc, &snap, &[], &Scope::default(), 1, 2);
+    let text = doc.render();
+    assert!(
+      text.contains("llamastash:requests_total{model=\"m1\"} 2\n"),
+      "{text}"
+    );
+    assert!(
+      text.contains("llamastash:request_duration_seconds_count{model=\"m1\"} 1\n"),
+      "{text}"
+    );
+    let sum = sample_value(
+      &text,
+      r#"llamastash:request_duration_seconds_total{model="m1"}"#,
+    );
+    let avg = sample_value(
+      &text,
+      r#"llamastash:request_duration_seconds_avg{model="m1"}"#,
+    );
+    assert!(sum > 0.0, "the timed request is in the sum:\n{text}");
+    assert_eq!(
+      avg, sum,
+      "the mean is the sum over the count, not over the request total:\n{text}"
+    );
   }
 
   #[test]

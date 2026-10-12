@@ -787,6 +787,7 @@ impl RequestLog {
       summary: totals.summary(),
       duration_ms_sum: totals.duration_ms_sum,
       ttfb_ms_sum: totals.ttfb_ms_sum,
+      timed: totals.timed,
     };
     let mut models: Vec<ScopeTotals> = inner
       .by_model
@@ -851,6 +852,10 @@ pub struct ScopeTotals {
   pub summary: RequestSummary,
   pub duration_ms_sum: u64,
   pub ttfb_ms_sum: u64,
+  /// How many requests the two sums above cover. Not `summary.requests`: a sum
+  /// only holds a request the proxy could time, so a mean has to divide by this,
+  /// and an error or a cancellation moves the request count but neither sum.
+  pub timed: u64,
 }
 
 /// A launch's totals, and whether the launch is still running.
