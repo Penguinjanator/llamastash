@@ -642,6 +642,57 @@ mod tests {
   }
 
   #[test]
+  fn a_wrapped_note_at_the_bottom_of_the_page_still_indents() {
+    let rows: Vec<RequestRow> = (1..=6)
+      .rev()
+      .map(|seq| RequestRow {
+        status: Some(503),
+        error: Some("launch_failed".to_string()),
+        cause: Some(
+          "auto-start of Qwen3.8-27B failed: could not allocate the KV cache".to_string(),
+        ),
+        ..row(seq)
+      })
+      .collect();
+    let note = rows[0].cells(NONE).note.clone();
+    let mut state = RequestsTabState::default();
+    state.set("/m/a.gguf".to_string(), RequestSummary::default(), rows);
+    for _ in 0..50 {
+      state.scroll_down();
+    }
+    let layout = layout_columns(200);
+    let chunks = wrap_cells(&note, layout.note_w);
+    assert_eq!(chunks.len(), 2, "one continuation line: {chunks:?}");
+    // A page is counted in lines, so the two rows that fit cost four lines
+    // and the pane ends on a continuation line, with the older row cut off.
+    let lines = rendered(&state, 200, 7);
+    let header = lines
+      .iter()
+      .position(|l| l.starts_with("Time     Code Tok/s  Total"))
+      .expect("header row");
+    assert_eq!(&lines[header + 1][..8], row(4).cells(NONE).time);
+    assert!(lines[header + 1].contains("launch_failed:"), "{lines:?}");
+    let cut_off = row(2).cells(NONE).time;
+    assert!(
+      !lines.iter().any(|l| l.starts_with(cut_off.as_str())),
+      "the third row does not fit: {lines:?}"
+    );
+    // Both rows that fit are two lines: each continuation sits at the
+    // note column's indent, and the last one is the bottom of the pane.
+    for start in [header + 1, header + 3] {
+      let line = lines[start + 1].trim_end();
+      let before = line.chars().take_while(|c| *c == ' ').count();
+      assert_eq!(before, layout.note_indent(), "{line:?}");
+      assert_eq!(
+        line.chars().count(),
+        before + chunks[1].chars().count(),
+        "{line:?}"
+      );
+    }
+    assert_eq!(header + 4, lines.len() - 1, "{lines:?}");
+  }
+
+  #[test]
   fn set_clamps_the_scroll_and_clear_resets_it() {
     let mut state = RequestsTabState::default();
     state.set(
