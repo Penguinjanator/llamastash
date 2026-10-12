@@ -31,7 +31,7 @@ use std::sync::Mutex;
 
 use crate::daemon::host_metrics::HostMetricsSnapshot;
 use crate::gguf::header::GgufHeader;
-use crate::gguf::memory::{kv_bytes, parse_cache_type, EstimateOptions};
+use crate::gguf::memory::{kv_bytes, parse_cache_type, EstimateOptions, DEFAULT_N_SEQ};
 use crate::launch::headroom::{admissible_bytes, overhead_band_bytes, PoolKind};
 
 /// One in-flight launch's hold on the budget, keyed by `launch_id`.
@@ -498,6 +498,10 @@ pub fn project_demand(
     // total against the combined pool free — so `n_gpu_layers` would be
     // ignored downstream. Left unset rather than threaded in.
     n_gpu_layers: None,
+    mtp_active,
+    n_seq: knobs
+      .u32_by_concept(backend_id, crate::launch::knobs::Concept::MaxConcurrency)
+      .unwrap_or(DEFAULT_N_SEQ),
   };
   resident_weight_bytes
     .saturating_add(kv_bytes(header, arch, opts))
@@ -923,5 +927,66 @@ mod tests {
       53 * GIB + band + (53 * GIB / 6),
       "MTP-active demand adds the ~16.7% draft-head band"
     );
+  }
+
+  /// A hybrid's demand follows the launch: the MTP block's KV only with MTP
+  /// on, and one recurrent state per `--parallel` sequence.
+  #[test]
+  fn project_demand_prices_a_hybrid_per_launch() {
+    use crate::gguf::header::{read_reader, HeaderReadOptions};
+    use crate::gguf::test_fixtures::FixtureBuilder;
+    use crate::launch::knobs::{Concept, KnobSet, KnobValue, Scalar};
+
+    // 9 blocks: attention on 3 and 7, recurrent on the other 6 trunk
+    // blocks, block 8 is MTP.
+    let mut builder = FixtureBuilder::new()
+      .with_arch("qwen35")
+      .with_block_count(9)
+      .with_head_count(24)
+      .with_head_count_kv(4);
+    for (key, value) in [
+      ("attention.key_length", 256),
+      ("full_attention_interval", 4),
+      ("nextn_predict_layers", 1),
+      ("ssm.state_size", 128),
+      ("ssm.inner_size", 4096),
+    ] {
+      builder = builder.with_kv(
+        &format!("qwen35.{key}"),
+        crate::gguf::header::GgufValue::U32(value),
+      );
+    }
+    let header = read_reader(
+      std::io::Cursor::new(builder.build()),
+      HeaderReadOptions::default(),
+    )
+    .unwrap()
+    .header;
+    let demand = |knobs: &KnobSet, mtp: bool| {
+      project_demand(
+        &header,
+        Some("qwen35"),
+        knobs,
+        crate::backend::DEFAULT_BACKEND_ID,
+        1000,
+        "cpu_only",
+        0,
+        mtp,
+      )
+    };
+    let layer_kv = 2 * 4 * 256 * 1000 * 2;
+    let state = 128 * 4096 * 4 * 6;
+
+    let auto = KnobSet::new();
+    assert_eq!(demand(&auto, false), 2 * layer_kv + 4 * state);
+    assert_eq!(demand(&auto, true), 3 * layer_kv + 4 * state);
+
+    let mut single = KnobSet::new();
+    assert!(single.set_by_concept(
+      crate::backend::DEFAULT_BACKEND_ID,
+      Concept::MaxConcurrency,
+      KnobValue::Set(Scalar::U32(1)),
+    ));
+    assert_eq!(demand(&single, false), 2 * layer_kv + state);
   }
 }
