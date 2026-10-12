@@ -449,7 +449,8 @@ async fn backends_status(ctx: &MethodContext) -> Value {
   let mut rows = Vec::new();
   for b in Backends::all() {
     let accelerators = b.status_accelerators(ctx, &device_accels).await;
-    let labels = server_labels(b.id(), &catalog, &accelerators);
+    let mut labels = server_labels(b.id(), &catalog, &accelerators);
+    labels.extend(b.status_server_labels());
     let mut row = backend_row(
       b.id(),
       b.lifecycle().label(),
@@ -617,6 +618,32 @@ mod tests {
 
   fn ctx() -> MethodContext {
     MethodContext::new(ShutdownToken::new())
+  }
+
+  #[test]
+  fn server_labels_fall_back_from_label_to_accelerators_to_binary_name() {
+    let srv = |backend: &str, binary: &str, label: Option<&str>| crate::backend::Server {
+      id: format!("{backend}-{binary}"),
+      backend_id: backend.into(),
+      binary: PathBuf::from(binary),
+      name: String::new(),
+      devices: Vec::new(),
+      caps: Default::default(),
+      label: label.map(String::from),
+    };
+    let catalog = [
+      srv("alpha", "/a/rocm/server", Some("rocm")),
+      srv("beta", "/b/engine", None),
+      srv("alpha", "/a/cpu/server", Some("cpu")),
+    ];
+    let accels = vec!["cpu".to_string(), "npu".to_string()];
+    assert_eq!(
+      super::server_labels("alpha", &catalog, &accels),
+      ["rocm", "cpu"]
+    );
+    assert_eq!(super::server_labels("beta", &catalog, &accels), ["cpu|npu"]);
+    assert_eq!(super::server_labels("beta", &catalog, &[]), ["engine"]);
+    assert!(super::server_labels("gamma", &catalog, &accels).is_empty());
   }
 
   /// A delegated-lemonade snapshot the way `start_delegated_lemonade`

@@ -292,11 +292,12 @@ pub struct StatusSnapshot {
   /// parse the IPC and the CLI see identical shapes. `Value::Null`
   /// when talking to a daemon that omits the field.
   pub proxy: Value,
-  /// Backends block — array of `{id, lifecycle, installed, accelerators}`
+  /// Backends block — array of
+  /// `{id, lifecycle, installed, accelerators, server_labels}`.
   /// Verbatim copy of the daemon's wire shape; `Value::Null`
   /// against a daemon that predates the field.
   pub backends: Value,
-  /// Server catalog — array of `{id, backend_id, binary, name, devices}` (a
+  /// Server catalog — array of `{id, backend_id, binary, name, devices, label?}` (a
   /// build/binary of a backend with its probed `--device` targets). Verbatim
   /// copy of the daemon's wire shape; `Value::Null` on an older daemon.
   pub servers: Value,

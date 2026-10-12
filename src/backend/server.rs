@@ -221,8 +221,23 @@ pub struct ServerConfig {
   pub binary: PathBuf,
   /// Optional display-name override (`<backend>-<name>`); auto-derived when
   /// unset.
-  #[serde(default)]
+  #[serde(default, deserialize_with = "server_name")]
   pub name: Option<String>,
+}
+
+/// A `servers[].name`, refused when it holds `|`: that is the separator
+/// `status` and the TUI put between server labels.
+fn server_name<'de, D>(de: D) -> Result<Option<String>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  let name = Option::<String>::deserialize(de)?;
+  if name.as_deref().is_some_and(|n| n.contains('|')) {
+    return Err(serde::de::Error::custom(
+      "server `name` must not contain `|`",
+    ));
+  }
+  Ok(name)
 }
 
 /// The compute-backend tag for a server, lower-cased for ids/display: the first
@@ -355,6 +370,54 @@ fn derive_servers(backend_id: &str, probed: Vec<(ServerSpec, Vec<Device>)>) -> V
   out
 }
 
+/// Fill in the labels [`derive_servers`] left unset, then make every label in
+/// the backend unique. A server whose probe failed is named by its build
+/// folder: its arch is unknown, so claiming the backend's deviceless
+/// accelerator would mislabel a GPU build whose `--list-devices` broke. One
+/// whose probe answered with no devices gets `deviceless`, or its build
+/// folder when another server already reads that way (two CPU builds), the
+/// way two unnamed builds of one arch do. A repeat after that gets `-2`,
+/// `-3` like the ids do, so two servers never read the same.
+fn finish_labels(
+  servers: &mut [Server],
+  probe_ok: &[bool],
+  deviceless: Option<super::Accelerator>,
+) {
+  let deviceless = deviceless.map(|a| a.label().to_string());
+  let mut filled = vec![false; servers.len()];
+  for (i, (server, ok)) in servers.iter_mut().zip(probe_ok).enumerate() {
+    if server.label.is_none() {
+      server.label = if *ok {
+        filled[i] = true;
+        deviceless.clone()
+      } else {
+        Some(binary_dir_tag(&server.binary))
+      };
+    }
+  }
+  if let Some(d) = &deviceless {
+    let readers = servers
+      .iter()
+      .filter(|s| s.label.as_ref() == Some(d))
+      .count();
+    if readers > 1 {
+      for (server, _) in servers.iter_mut().zip(&filled).filter(|(_, f)| **f) {
+        server.label = Some(binary_dir_tag(&server.binary));
+      }
+    }
+  }
+  let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+  for label in servers.iter_mut().filter_map(|s| s.label.as_mut()) {
+    let base = label.clone();
+    let mut n = 2;
+    while used.contains(label.as_str()) {
+      *label = format!("{base}-{n}");
+      n += 1;
+    }
+    used.insert(label.clone());
+  }
+}
+
 /// Build the neutral server catalog: every backend's configured servers, each
 /// probed for devices, with derived ids. Runs in a blocking context (each
 /// `probe_devices` may shell out to `--list-devices`). Names no backend — the
@@ -363,11 +426,14 @@ pub fn build_server_catalog(ctx: &MethodContext) -> Vec<Server> {
   let mut out = Vec::new();
   for backend in Backends::all() {
     let backend_id = backend.id().to_string();
+    let mut probe_ok = Vec::new();
     let probed: Vec<(ServerSpec, Vec<Device>)> = backend
       .configured_servers(ctx)
       .into_iter()
       .map(|spec| {
         let devices = backend.probe_devices(&spec.binary);
+        probe_ok.push(devices.is_some());
+        let devices = devices.unwrap_or_default();
         #[cfg(debug_assertions)]
         let devices = debug_fake_multi_gpu(devices);
         (spec, devices)
@@ -378,13 +444,10 @@ pub fn build_server_catalog(ctx: &MethodContext) -> Vec<Server> {
     // never cached across runs — a rebuild in place changes the answer while
     // the path stays the same.
     let mut servers = derive_servers(&backend_id, probed);
-    let deviceless = backend.deviceless_accelerator();
     for server in &mut servers {
       server.caps = backend.probe_caps(&server.binary);
-      if server.label.is_none() {
-        server.label = deviceless.map(|a| a.label().to_string());
-      }
     }
+    finish_labels(&mut servers, &probe_ok, backend.deviceless_accelerator());
     out.extend(servers);
   }
   out
@@ -401,6 +464,7 @@ pub fn config_server_catalog(config: &crate::config::Config) -> Vec<Server> {
   let mut out = Vec::new();
   for backend in Backends::all() {
     let backend_id = backend.id().to_string();
+    let mut probe_ok = Vec::new();
     let probed: Vec<(ServerSpec, Vec<Device>)> = backend
       .config_servers(config)
       .into_iter()
@@ -411,6 +475,8 @@ pub fn config_server_catalog(config: &crate::config::Config) -> Vec<Server> {
           return None;
         }
         let devices = backend.probe_devices(&resolved);
+        probe_ok.push(devices.is_some());
+        let devices = devices.unwrap_or_default();
         Some((
           ServerSpec {
             binary: resolved,
@@ -421,10 +487,7 @@ pub fn config_server_catalog(config: &crate::config::Config) -> Vec<Server> {
       })
       .collect();
     let mut servers = derive_servers(&backend_id, probed);
-    let deviceless = backend.deviceless_accelerator();
-    for server in servers.iter_mut().filter(|s| s.label.is_none()) {
-      server.label = deviceless.map(|a| a.label().to_string());
-    }
+    finish_labels(&mut servers, &probe_ok, backend.deviceless_accelerator());
     out.extend(servers);
   }
   out
@@ -769,6 +832,63 @@ mod tests {
     assert_eq!(label(&servers, 3).as_deref(), Some("build-rocm7"));
     // Device-less: the catalog builder fills in the backend's own answer.
     assert_eq!(label(&servers, 4), None);
+  }
+
+  #[test]
+  fn finished_labels_tell_a_failed_probe_from_a_gpu_less_build_and_never_repeat() {
+    let servers = |specs: Vec<(ServerSpec, Vec<Device>)>| derive_servers("enginex", specs);
+    let mut mixed = servers(vec![
+      (spec("/a/build-cpu/bin/llama-server", None), vec![]),
+      (spec("/a/build-rocm/bin/llama-server", None), vec![]),
+      (
+        spec("/x/build-cuda/llama-server", None),
+        vec![dev("CUDA0", "CUDA")],
+      ),
+      (
+        spec("/y/build-cuda/llama-server", None),
+        vec![dev("CUDA0", "CUDA")],
+      ),
+    ]);
+    // The ROCm build's probe failed: unknown arch, so its folder, not `cpu`.
+    finish_labels(
+      &mut mixed,
+      &[true, false, true, true],
+      Some(super::super::Accelerator::Cpu),
+    );
+    let labels =
+      |list: &[Server]| -> Vec<String> { list.iter().map(|x| x.label.clone().unwrap()).collect() };
+    assert_eq!(
+      labels(&mixed),
+      ["cpu", "build-rocm", "build-cuda", "build-cuda-2"]
+    );
+
+    // Two GPU-less builds read as their folders, like two unnamed ROCm builds.
+    let mut cpus = servers(vec![
+      (spec("/a/build-cpu/bin/llama-server", None), vec![]),
+      (spec("/a/build-avx2/bin/llama-server", None), vec![]),
+    ]);
+    finish_labels(
+      &mut cpus,
+      &[true, true],
+      Some(super::super::Accelerator::Cpu),
+    );
+    assert_eq!(labels(&cpus), ["build-cpu", "build-avx2"]);
+
+    // A backend without a probe keeps an empty answer unlabelled, for `status`
+    // to fill from its accelerators.
+    let mut unprobed = servers(vec![(spec("/l/lemond", None), vec![])]);
+    finish_labels(&mut unprobed, &[true], None);
+    assert_eq!(unprobed[0].label, None);
+  }
+
+  #[test]
+  fn a_server_name_with_the_label_separator_is_refused() {
+    let ok: Result<ServerConfig, _> =
+      serde_json::from_value(serde_json::json!({"binary": "/b", "name": "fa"}));
+    assert_eq!(ok.unwrap().name.as_deref(), Some("fa"));
+    let bad: Result<ServerConfig, _> =
+      serde_json::from_value(serde_json::json!({"binary": "/b", "name": "a|b"}));
+    assert!(bad.unwrap_err().to_string().contains('|'));
   }
 
   #[test]

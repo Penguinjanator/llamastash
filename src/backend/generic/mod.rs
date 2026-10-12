@@ -251,6 +251,18 @@ impl Backend for GenericBackend {
     Vec::new()
   }
 
+  fn status_server_labels(&self) -> Vec<String> {
+    // A `model:` entry is a catalog server and is labelled there; one without
+    // is its own row and never reaches the catalog.
+    let mut names: Vec<String> = all_entries()
+      .iter()
+      .filter(|e| e.server.model.is_none())
+      .map(|e| e.server.name.clone())
+      .collect();
+    names.sort();
+    names
+  }
+
   fn identify(&self, path: &Path, _header_bytes: &[u8]) -> ModelIdentity {
     self.synthetic_identity(path).unwrap_or_else(|| {
       ModelIdentity::Backend(BackendModelId {
@@ -584,6 +596,28 @@ mod tests {
       ..Default::default()
     };
     GenericBackend::new().install_config(&config).unwrap();
+  }
+
+  /// `status` names an entry without `model:` (it never reaches the server
+  /// catalog) and leaves a `model:` entry to the catalog; the host's GPUs are
+  /// never the backend's accelerators.
+  #[tokio::test]
+  async fn status_names_row_entries_and_claims_no_host_accelerators() {
+    use crate::backend::{Accelerator, Backend};
+    install(
+      "servers:\n  \
+       - {name: st-row, binary: /b, ready: /h}\n  \
+       - {name: st-server, model: \"x*\", binary: /b, ready: /h, args: [\"{model}\"]}\n",
+    );
+    let labels = GenericBackend::new().status_server_labels();
+    assert!(labels.contains(&"st-row".to_string()), "{labels:?}");
+    assert!(!labels.contains(&"st-server".to_string()), "{labels:?}");
+    let ctx =
+      crate::daemon::context::MethodContext::new(crate::daemon::shutdown::ShutdownToken::new());
+    let accels = GenericBackend::new()
+      .status_accelerators(&ctx, &[Accelerator::Rocm, Accelerator::Vulkan])
+      .await;
+    assert!(accels.is_empty(), "{accels:?}");
   }
 
   /// `modes` limits what an entry serves; without it every mode passes and the

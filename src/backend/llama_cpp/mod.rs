@@ -369,7 +369,7 @@ impl Backend for LlamaCppBackend {
     config.backend.llamacpp.servers.clone()
   }
 
-  fn probe_devices(&self, binary: &Path) -> Vec<super::Device> {
+  fn probe_devices(&self, binary: &Path) -> Option<Vec<super::Device>> {
     list_devices::probe_devices(binary)
   }
 

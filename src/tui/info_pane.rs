@@ -205,8 +205,9 @@ fn server_row<'a>(app: &'a App, budget: usize, palette: &'a Palette) -> Line<'a>
         + e.labels.len().saturating_sub(1)
     })
     .collect();
+  let floors: Vec<usize> = entries.iter().map(|e| e.id.width()).collect();
   let room = budget.saturating_sub(sep.width() * entries.len().saturating_sub(1));
-  let widths = fair_widths(&natural, room);
+  let widths = fair_widths(&natural, &floors, room);
   let mut spans = vec![Span::styled(LABEL_SERVER, palette.label_style())];
   for (i, entry) in entries.iter().enumerate() {
     if i > 0 {
@@ -221,25 +222,30 @@ fn server_row<'a>(app: &'a App, budget: usize, palette: &'a Palette) -> Line<'a>
   Line::from(spans)
 }
 
-/// Split `room` columns across entries wanting `natural` widths: an entry that
-/// fits in an equal share keeps its natural width, and what it leaves over
-/// goes to the longer ones, so one short entry doesn't strand free columns.
-fn fair_widths(natural: &[usize], room: usize) -> Vec<usize> {
-  let mut out = vec![0; natural.len()];
+/// Split `room` columns across entries wanting `natural` widths. Each entry
+/// first gets its `floor` (its backend id), so a crowded row still names every
+/// backend. The rest is shared fairly: an entry whose remaining want fits an
+/// equal share takes just that, and what it leaves over goes to the longer
+/// ones, so one short entry doesn't strand free columns.
+fn fair_widths(natural: &[usize], floors: &[usize], room: usize) -> Vec<usize> {
+  let mut out = floors.to_vec();
+  let Some(mut left) = room.checked_sub(floors.iter().sum()) else {
+    return out;
+  };
+  let want = |i: usize| natural[i].saturating_sub(floors[i]);
   let mut open: Vec<usize> = (0..natural.len()).collect();
-  let mut left = room;
   loop {
     let share = left / open.len().max(1);
-    let (fits, rest): (Vec<usize>, Vec<usize>) = open.iter().partition(|&&i| natural[i] <= share);
+    let (fits, rest): (Vec<usize>, Vec<usize>) = open.iter().partition(|&&i| want(i) <= share);
     if fits.is_empty() {
       for &i in &rest {
-        out[i] = share;
+        out[i] += share;
       }
       return out;
     }
     for &i in &fits {
-      out[i] = natural[i];
-      left -= natural[i];
+      out[i] += want(i);
+      left -= want(i);
     }
     if rest.is_empty() {
       return out;
@@ -249,19 +255,21 @@ fn fair_widths(natural: &[usize], room: usize) -> Vec<usize> {
 }
 
 /// Spans for one `<id> (<a>|<b>)` entry fitted to `budget` columns. The id
-/// and parentheses always survive; labels fill what is left and the last one
-/// that doesn't fit is right-ellipsised. `highlight` is the label index to
-/// paint in the success colour.
+/// always survives; labels fill what is left and the last one that doesn't
+/// fit is right-ellipsised. With no room for even one label cell the entry is
+/// the bare id rather than empty parentheses. `highlight` is the label index
+/// to paint in the success colour.
 fn server_entry_spans<'a>(
   entry: &crate::tui::app::BackendServers,
   highlight: Option<usize>,
   budget: usize,
   palette: &'a Palette,
 ) -> Vec<Span<'a>> {
-  let mut spans = vec![
-    Span::styled(entry.id.clone(), palette.text_style()),
-    Span::styled(" (", palette.muted_style()),
-  ];
+  let id = Span::styled(entry.id.clone(), palette.text_style());
+  if budget < entry.id.width() + 4 {
+    return vec![id];
+  }
+  let mut spans = vec![id, Span::styled(" (", palette.muted_style())];
   let mut room = budget.saturating_sub(entry.id.width() + 3);
   for (i, label) in entry.labels.iter().enumerate() {
     if room == 0 {
@@ -806,11 +814,41 @@ mod tests {
 
   #[test]
   fn fair_widths_hands_a_short_entrys_slack_to_the_long_one() {
-    assert_eq!(fair_widths(&[30, 10], 40), vec![30, 10]);
-    assert_eq!(fair_widths(&[40, 10], 40), vec![30, 10]);
-    assert_eq!(fair_widths(&[40, 40], 40), vec![20, 20]);
-    assert_eq!(fair_widths(&[40, 8, 40], 40), vec![16, 8, 16]);
-    assert_eq!(fair_widths(&[], 40), Vec::<usize>::new());
+    assert_eq!(fair_widths(&[30, 10], &[0, 0], 40), vec![30, 10]);
+    assert_eq!(fair_widths(&[40, 10], &[0, 0], 40), vec![30, 10]);
+    assert_eq!(fair_widths(&[40, 40], &[0, 0], 40), vec![20, 20]);
+    assert_eq!(fair_widths(&[40, 8, 40], &[0, 0, 0], 40), vec![16, 8, 16]);
+    assert_eq!(fair_widths(&[], &[], 40), Vec::<usize>::new());
+  }
+
+  #[test]
+  fn fair_widths_gives_every_entry_its_floor_first() {
+    // Four 8-wide ids in 40 columns: an equal 10 each would leave the long
+    // entries 2 label columns; floors first keep every id whole.
+    assert_eq!(
+      fair_widths(&[30, 30, 30, 30], &[8, 8, 8, 8], 40),
+      vec![10, 10, 10, 10]
+    );
+    assert_eq!(fair_widths(&[30, 12], &[8, 8], 30), vec![18, 12]);
+    // Too narrow for every id: floors win and the row clips.
+    assert_eq!(fair_widths(&[30, 30], &[8, 8], 10), vec![8, 8]);
+  }
+
+  #[test]
+  fn server_entry_without_room_for_a_label_is_the_bare_id() {
+    let app = App::new(AppOptions::default());
+    let palette = app.palette();
+    let entry = backend("llamacpp", &["rocm", "vulkan"]);
+    let text = |budget: usize| -> String {
+      server_entry_spans(&entry, None, budget, palette)
+        .iter()
+        .map(|s| s.content.to_string())
+        .collect()
+    };
+    assert_eq!(text(8), "llamacpp");
+    assert_eq!(text(11), "llamacpp");
+    assert_eq!(text(12), "llamacpp (…)");
+    assert_eq!(text(40), "llamacpp (rocm|vulkan)");
   }
 
   #[test]

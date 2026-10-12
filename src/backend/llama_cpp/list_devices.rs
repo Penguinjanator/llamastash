@@ -150,8 +150,8 @@ fn is_selector(s: &str) -> bool {
 /// each parsed [`BinaryDevice`] to a [`crate::backend::Device`] (the selector's
 /// prefix becomes `gpu_backend`); the owning binary is carried by the
 /// [`crate::backend::Server`] this feeds, not the device.
-pub fn probe_devices(binary: &Path) -> Vec<crate::backend::Device> {
-  probe(binary)
+pub fn probe_devices(binary: &Path) -> Option<Vec<crate::backend::Device>> {
+  let devices = probe(binary)?
     .into_iter()
     .map(|d| crate::backend::Device {
       selector: d.selector,
@@ -160,30 +160,39 @@ pub fn probe_devices(binary: &Path) -> Vec<crate::backend::Device> {
       total_mib: d.total_mib,
       free_mib: d.free_mib,
     })
-    .collect()
+    .collect();
+  Some(devices)
 }
 
-/// Run `<binary> --list-devices` and parse the result. Returns an
-/// empty vec on any failure (missing binary, non-zero exit, timeout) —
-/// a binary that can't enumerate just contributes nothing to the
-/// catalog rather than failing the whole probe.
-pub fn probe(binary: &Path) -> Vec<BinaryDevice> {
+/// Run `<binary> --list-devices` and parse the result. `None` on any failure
+/// (missing binary, non-zero exit, timeout) — a binary that can't enumerate
+/// contributes no devices to the catalog rather than failing the whole probe,
+/// and its caller can tell that apart from a build that has no GPU.
+pub fn probe(binary: &Path) -> Option<Vec<BinaryDevice>> {
   let mut cmd = Command::new(binary);
   // The unified app takes server flags behind `serve`; `llama --list-devices`
   // is an unknown command.
   cmd.args(super::serve_prefix(binary));
   cmd.arg("--list-devices");
   match crate::util::process::run_with_drain_and_timeout(cmd, LIST_DEVICES_TIMEOUT) {
-    Ok(out) => {
+    Ok(out) if out.status.success() => {
       let stdout = String::from_utf8_lossy(&out.stdout);
-      parse_list_devices(&stdout)
+      Some(parse_list_devices(&stdout))
+    }
+    Ok(out) => {
+      log::warn!(
+        "`{} --list-devices` exited {}; contributing no devices",
+        binary.display(),
+        out.status
+      );
+      None
     }
     Err(e) => {
       log::warn!(
         "`{} --list-devices` failed: {e:?}; contributing no devices",
         binary.display()
       );
-      Vec::new()
+      None
     }
   }
 }

@@ -561,7 +561,7 @@ pub fn status_human(snap: &StatusSnapshot) -> String {
     }
   }
 
-  // Backends section: installed state + accelerators per backend.
+  // Backends section: installed state + server labels per backend.
   if let Some(block) = backends_human(&snap.backends, tty) {
     out.push_str(&block);
   }
@@ -1414,6 +1414,29 @@ mod tests {
     // JSON render mirrors the daemon shape verbatim.
     let json = status_json(&snap);
     assert_eq!(json["backends"], backends);
+  }
+
+  #[test]
+  fn tty_backends_section_pads_id_and_state_into_columns() {
+    let backends = serde_json::json!([
+      { "id": "llamacpp", "installed": true, "server_labels": ["rocm", "vulkan"] },
+      { "id": "lemonade", "installed": false, "accelerators": ["cpu", "npu"], "umbrella": "disabled" },
+      { "id": "gen", "installed": true, "server_labels": ["gufo"] },
+    ]);
+    let _g = ColorGuard::set(true);
+    let human = console::strip_ansi_codes(&backends_human(&backends, true).unwrap()).to_string();
+    assert!(
+      human.contains("  llamacpp ✓ installed    rocm|vulkan\n"),
+      "{human}"
+    );
+    assert!(
+      human.contains("  lemonade not installed  cpu|npu  (umbrella: disabled)\n"),
+      "{human}"
+    );
+    assert!(
+      human.contains("  gen      ✓ installed    gufo\n"),
+      "{human}"
+    );
   }
 
   #[test]
