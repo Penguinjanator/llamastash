@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -655,10 +655,7 @@ impl RequestLog {
   /// `route` is stored uncut: the router logs only the fixed paths it
   /// matches exactly, so a client cannot make it long.
   pub fn begin(&self, route: &str, client: Option<SocketAddr>) -> RequestRecord {
-    let started_at_ms = SystemTime::now()
-      .duration_since(UNIX_EPOCH)
-      .map(|d| d.as_millis() as u64)
-      .unwrap_or(0);
+    let started_at_ms = crate::util::datetime::now_ms();
     let mut inner = self.lock();
     inner.next_seq += 1;
     let row = RequestRow {
