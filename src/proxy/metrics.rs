@@ -922,7 +922,7 @@ fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, live: &Cl
   // request the sums never counted, so dividing by the request count reads the
   // mean low by exactly as much as the traffic that failed.
   doc.sample(
-    "llamastash:request_duration_seconds_count",
+    "llamastash:request_timed_total",
     "Requests the duration and first-byte totals are over",
     "counter",
     &labels,
@@ -1793,7 +1793,7 @@ mod tests {
       "{text}"
     );
     assert!(
-      text.contains("llamastash:request_duration_seconds_count{model=\"m1\"} 1\n"),
+      text.contains("llamastash:request_timed_total{model=\"m1\"} 1\n"),
       "{text}"
     );
     let sum = sample_value(
