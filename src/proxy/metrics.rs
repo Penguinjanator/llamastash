@@ -26,7 +26,8 @@ use hyper::{Request, Response, StatusCode};
 use serde_json::{Map, Value};
 
 use super::request_log::{
-  clamp_limit, Clients, LogScope, LogSnapshot, RequestLog, RequestSummary, ScopeTotals, CAPACITY,
+  clamp_limit, Clients, LaunchTotals, LogScope, LogSnapshot, RequestLog, RequestSummary,
+  ScopeTotals, CAPACITY,
 };
 use super::route;
 use super::router::{self, ProxyResponse};
@@ -605,16 +606,37 @@ fn render(
   // cuts anything: the same model has to print the same value in a scoped and an
   // unscoped scrape, or the two series read as two models.
   let labels = model_labels(&snapshot.models);
-  let models: Vec<&ScopeTotals> = snapshot
-    .models
-    .iter()
-    .filter(|m| scope.keeps_model(&m.key))
-    .collect();
-  for totals in models {
-    let label = &labels[&totals.key];
-    let live_clients =
-      snapshot.in_flight(|row| row.model_path.as_deref() == Some(totals.key.as_str()));
-    model_series(doc, label, totals, live_clients);
+  // The series that carry a `model` label. A launch scope is strict, exactly as
+  // the JSON summary is: the scrape prints that launch's own figures, not
+  // everything every launch of its model has served since daemon start.
+  let scoped: Vec<(String, &ScopeTotals, Clients)> = match &scope.launch {
+    Some(id) => snapshot
+      .launches
+      .iter()
+      .filter(|entry| entry.totals.key == *id)
+      .map(|entry| {
+        (
+          launch_label(&labels, live, snapshot, entry),
+          &entry.totals,
+          snapshot.in_flight(|row| row.launch_id.as_deref() == Some(id.as_str())),
+        )
+      })
+      .collect(),
+    None => snapshot
+      .models
+      .iter()
+      .filter(|m| scope.keeps_model(&m.key))
+      .map(|totals| {
+        (
+          labels[&totals.key].clone(),
+          totals,
+          snapshot.in_flight(|row| row.model_path.as_deref() == Some(totals.key.as_str())),
+        )
+      })
+      .collect(),
+  };
+  for (label, totals, live_clients) in scoped {
+    model_series(doc, &label, totals, live_clients);
   }
 
   // Requests the proxy answered without ever reaching a model (an unknown model
@@ -628,6 +650,12 @@ fn render(
     return;
   }
   for entry in live {
+    // The scope is the response: a scrape that named one model or one launch
+    // describes that scope, and a launch from outside it in the body would say
+    // the scope held something it does not.
+    if !scope.keeps_launch(&entry.id, Some(&entry.path)) {
+      continue;
+    }
     doc.sample(
       "llamastash:launch_info",
       "Live model launches, labelled by launch and model",
@@ -642,22 +670,10 @@ fn render(
   }
   for totals in &snapshot.launches {
     let id = &totals.totals.key;
-    let path = live
-      .iter()
-      .find(|l| &l.id == id)
-      .map(|l| l.path.as_str())
-      .or_else(|| snapshot.launch_path(id));
-    if !scope.keeps_launch(id, path) {
+    if !scope.keeps_launch(id, launch_path(live, snapshot, id)) {
       continue;
     }
-    // The same label the per-model series print, so a join on `model` matches
-    // when two models share a display name and both fell back to their paths.
-    let label = path
-      .and_then(|p| labels.get(p))
-      .cloned()
-      .or_else(|| totals.totals.label.clone())
-      .or_else(|| live.iter().find(|l| &l.id == id).map(|l| l.model.clone()))
-      .unwrap_or_else(|| "unknown".to_string());
+    let label = launch_label(&labels, live, snapshot, totals);
     let per_launch_labels = [("launch", id.as_str()), ("model", label.as_str())];
     let s = &totals.totals.summary;
     doc.sample(
@@ -872,6 +888,35 @@ fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, live: Cli
 /// not carry two samples with the same label set, so a shared name falls back to
 /// the catalog path for the models that collide. Callers pass the whole log, so
 /// the pick does not depend on what a scope happens to include.
+/// The catalog path one launch served: the registry's answer for a live launch,
+/// then the rows of a retired one. `None` when neither can say.
+fn launch_path<'a>(live: &'a [LiveLaunch], snapshot: &'a LogSnapshot, id: &str) -> Option<&'a str> {
+  live
+    .iter()
+    .find(|l| l.id == id)
+    .map(|l| l.path.as_str())
+    .or_else(|| snapshot.launch_path(id))
+}
+
+/// The `model` label a launch's series print: the value the per-model series
+/// already use for the model it served, so a join on `model` matches when two
+/// models share a display name and both fell back to their paths; then the name
+/// its own rows carried, then the registry's, then `unknown`.
+fn launch_label(
+  labels: &HashMap<String, String>,
+  live: &[LiveLaunch],
+  snapshot: &LogSnapshot,
+  entry: &LaunchTotals,
+) -> String {
+  let id = entry.totals.key.as_str();
+  launch_path(live, snapshot, id)
+    .and_then(|p| labels.get(p))
+    .cloned()
+    .or_else(|| entry.totals.label.clone())
+    .or_else(|| live.iter().find(|l| l.id == id).map(|l| l.model.clone()))
+    .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn model_labels(models: &[ScopeTotals]) -> HashMap<String, String> {
   let mut counts: HashMap<String, usize> = HashMap::new();
   for totals in models {
@@ -1562,6 +1607,92 @@ mod tests {
       "{text}"
     );
     assert!(!text.contains("launch=\"L2\""));
+  }
+
+  /// A launch scope is strict in the text as well as in the summary: the
+  /// `model`-labelled series carry that launch's own figures, so an earlier
+  /// launch of the same model is not counted in.
+  #[test]
+  fn metrics_a_launch_scope_prints_that_launchs_own_figures() {
+    let log = RequestLog::new();
+    // Two launches of one model, so the whole-model figures cannot be mistaken
+    // for the launch's own.
+    request(&log, "/models/a.gguf", "L1", 10, 3);
+    request(&log, "/models/a.gguf", "L2", 1, 1);
+    request(&log, "/models/a.gguf", "L2", 1, 1);
+    let snap = log.snapshot();
+    let scope = Scope {
+      log: LogScope::Launch { id: "L1".into() },
+      path: Some("/models/a.gguf".into()),
+      launch: Some("L1".into()),
+      name: Some("m1".into()),
+      per_launch: true,
+    };
+    let mut doc = Document::new(true);
+    render(&mut doc, &snap, &[], &scope, 1, 2);
+    let text = doc.render();
+    // The model as a whole served 3 requests and 12 prompt tokens; this launch
+    // served one and 10.
+    assert!(
+      text.contains("llamastash:requests_total{model=\"m1\"} 1\n"),
+      "the model series must be the launch's own:\n{text}"
+    );
+    assert!(
+      text.contains("llamastash:prompt_tokens_total{model=\"m1\"} 10\n"),
+      "{text}"
+    );
+    assert!(
+      text.contains("llamastash:launch_requests_total{launch=\"L1\",model=\"m1\"} 1\n"),
+      "{text}"
+    );
+    // The other launch is outside the scope, so nothing of it is in the body.
+    assert!(!text.contains("launch=\"L2\""), "{text}");
+  }
+
+  /// `launch_info` describes the scope like every other series: a scrape that
+  /// named one model does not list the daemon's other live launches.
+  #[test]
+  fn metrics_launch_info_respects_the_scope() {
+    let log = RequestLog::new();
+    request(&log, "/models/a.gguf", "L1", 10, 3);
+    request(&log, "/models/b.gguf", "L2", 1, 1);
+    let live = [
+      LiveLaunch {
+        id: "L1".into(),
+        model: "m1".into(),
+        path: "/models/a.gguf".into(),
+        port: 1111,
+        ready: true,
+      },
+      LiveLaunch {
+        id: "L2".into(),
+        model: "m2".into(),
+        path: "/models/b.gguf".into(),
+        port: 1112,
+        ready: true,
+      },
+    ];
+    let snap = log.snapshot();
+    let scope = Scope {
+      log: LogScope::Model {
+        path: "/models/a.gguf".into(),
+      },
+      path: Some("/models/a.gguf".into()),
+      launch: None,
+      name: Some("m1".into()),
+      per_launch: true,
+    };
+    let mut doc = Document::new(true);
+    render(&mut doc, &snap, &live, &scope, 1, 2);
+    let text = doc.render();
+    assert!(
+      text.contains("llamastash:launch_info{launch=\"L1\",model=\"m1\",port=\"1111\"} 1\n"),
+      "{text}"
+    );
+    assert!(
+      !text.contains("launch=\"L2\""),
+      "one model's scrape lists one launch:\n{text}"
+    );
   }
 
   #[test]

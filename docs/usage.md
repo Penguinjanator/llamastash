@@ -1518,13 +1518,16 @@ JSON shape is unchanged, because `summary` already counted those requests.
 
 The per-launch series are opt-in because they multiply every series above by the
 number of launches a model has had. Ask for them with `?launch=1`:
-`llamastash:launch_info{launch,model,port}` (gauge 1, live launches only),
+`llamastash:launch_info{launch,model,port}` (gauge 1, one per live launch the scope
+keeps),
 `llamastash:launch_requests_total{launch,model}`,
 `llamastash:launch_request_errors_total{launch,model}`,
 `llamastash:launch_prompt_tokens_total{launch,model}`,
 `llamastash:launch_completion_tokens_total{launch,model}`,
 `llamastash:launch_requests_in_flight{launch,model}`. A concrete `?launch=<ref>` scopes
-to that launch and turns the same series on for it. A launch that has stopped keeps its
+to that launch and turns the same series on for it — and the `model`-labelled series carry
+that launch's own figures then, the same ones `summary` reports, not everything every launch
+of the model has served since daemon start. A launch that has stopped keeps its
 totals until 16 newer retirements push it out, but prints no
 `launch_requests_in_flight`: in-flight is a live quantity and a stopped launch has
 nothing still running. There is no per-launch host series: one metric name carries one
