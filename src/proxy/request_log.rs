@@ -503,7 +503,7 @@ impl Totals {
       tokens_per_second_session: None,
       tokens_per_second_last: self.tps_last,
       // The client figures count rows, which a set of totals no longer holds.
-      // `RequestLog::tail`, `launch_summary` and `snapshot` fill them in.
+      // `RequestLog::tail` and `snapshot` fill them in.
       hosts: None,
       connections: None,
       live_hosts: None,
@@ -725,23 +725,18 @@ impl RequestLog {
   }
 
   /// Summary of the requests one launch served, live first then retired.
+  ///
+  /// This is [`Self::tail`] on a launch scope with no rows asked for, so the
+  /// stamping `tail` does reaches the per-launch surfaces too.
   pub fn launch_summary(&self, launch_id: &str) -> RequestSummary {
-    let inner = self.lock();
-    let mut summary = Self::launch_totals(&inner, launch_id)
-      .map(Totals::summary)
-      .unwrap_or_default();
-    // Strictly the launch's own rows: a request filed under the model that
-    // never reached this launch belongs to the model's figures, not here.
-    let mut counts = ClientPair::default();
-    for row in inner
-      .rows
-      .iter()
-      .filter(|row| row.launch_id.as_deref() == Some(launch_id))
-    {
-      counts.add(row);
-    }
-    counts.stamp(&mut summary);
-    summary
+    self
+      .tail(
+        LogScope::Launch {
+          id: launch_id.to_string(),
+        },
+        0,
+      )
+      .summary
   }
 
   /// Display name of the model `launch_id` served, or `None` when no finished
@@ -907,7 +902,9 @@ pub enum LogScope {
   All,
   /// One model's, across every launch that served it.
   Model { path: String },
-  /// One launch's, live or retired.
+  /// One launch's, live or retired. Strictly the launch's own rows: a request
+  /// filed under the model that never reached this launch belongs to the
+  /// model's figures, not here.
   Launch { id: String },
 }
 
@@ -1798,6 +1795,22 @@ mod tests {
         .requests,
       2
     );
+  }
+
+  /// `launch_summary` answers with `tail`'s summary for the same launch scope,
+  /// so a figure `tail` stamps cannot skip the per-launch surfaces.
+  #[test]
+  fn a_launch_summary_equals_the_launch_scope_tail_summary() {
+    let log = RequestLog::new();
+    let scope = |id: &str| LogScope::Launch { id: id.to_string() };
+    served_from(&log, "/m/a.gguf", "L1", "192.168.1.7:5001");
+    served(&log, "/m/b.gguf", "L1", Usage::default());
+    assert_eq!(log.launch_summary("L1"), log.tail(scope("L1"), 0).summary);
+
+    log.forget_launch("L1");
+    assert_eq!(log.launch_summary("L1"), log.tail(scope("L1"), 0).summary);
+    // A launch the log never heard of answers the same way on both paths.
+    assert_eq!(log.launch_summary("L9"), log.tail(scope("L9"), 0).summary);
   }
 
   #[test]
