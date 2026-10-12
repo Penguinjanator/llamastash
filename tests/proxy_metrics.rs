@@ -261,6 +261,49 @@ async fn metrics_a_live_launch_with_no_rows_scopes_to_its_zeros() {
   std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Two live launches of one model that has served nothing yet answer one model
+/// row carrying two launches, not two rows each claiming one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_two_idle_launches_of_one_model_answer_one_model_row() {
+  let dir = unique_temp("idle-pair-a");
+  let dir_b = unique_temp("idle-pair-b");
+  let registry = SupervisorRegistry::new();
+  let first = spawn_fake("/fixture/solo.gguf", &dir, false).await;
+  let second = spawn_fake("/fixture/solo.gguf", &dir_b, false).await;
+  registry.insert(registry.next_id(), first.clone()).await;
+  registry.insert(registry.next_id(), second.clone()).await;
+  let state = build_state(
+    vec![discovered("/fixture/solo.gguf", Some("solo"))],
+    registry,
+  )
+  .await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+
+  let (_status, _h, body) = http_get(addr, "/metrics?model=solo&format=json", &[]).await;
+  let v: Value = serde_json::from_slice(&body).expect("json");
+  let rows = v["models"].as_array().expect("models array");
+  assert_eq!(rows.len(), 1, "one row per model:\n{v}");
+  assert_eq!(rows[0]["launches"], 2, "{}", rows[0]);
+  assert_eq!(rows[0]["requests"], 0, "{}", rows[0]);
+
+  // The text form keeps one sample per label set, which is what makes it valid.
+  let (_status, _h, body) = http_get(addr, "/metrics?model=solo", &[]).await;
+  let out = text(body);
+  assert_eq!(
+    out
+      .matches("llamastash:requests_total{model=\"solo\"} 0\n")
+      .count(),
+    1,
+    "one sample per label set:\n{out}"
+  );
+
+  let _ = first.stop(Duration::from_secs(3)).await;
+  let _ = second.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+  std::fs::remove_dir_all(&dir_b).ok();
+}
+
 // --- /metrics ------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

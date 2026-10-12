@@ -239,6 +239,15 @@ fn accept_q(header: &str) -> (f32, f32) {
       }
     }
     if q <= 0.0 {
+      // A refusal is still an answer: it takes that type out of the running for
+      // the whole header, including against a wildcard. `text/plain;q=0, */*`
+      // means "not text", so the wildcard may not hand text back.
+      if syntax == "application/json" {
+        named.0 = true;
+      }
+      if syntax == "text/plain" || syntax == "text/*" {
+        named.1 = true;
+      }
       continue;
     }
     if syntax == "application/json" {
@@ -706,7 +715,7 @@ fn render(
     };
     if let Some(entry) = idle {
       scoped.push((
-        zero_model_label(entry, live),
+        zero_model_label(entry, live, snapshot),
         zero_totals(),
         Clients::default(),
       ));
@@ -983,13 +992,18 @@ fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, live: &Cl
 }
 
 /// The `model` label a live scope answers with before any row exists: the
-/// display name, or the catalog path when another live launch in the same
-/// scrape serves that name, which is the collision rule applied without any
-/// totals to consult.
-fn zero_model_label(entry: &LiveLaunch, live: &[LiveLaunch]) -> String {
+/// display name, or the catalog path when the name is already taken by another
+/// model. It consults the whole log, not just the live launches or what the
+/// scope happens to include, so a model keeps one label for its whole life
+/// however it is scraped. See `model_labels` for the same rule on the totals.
+fn zero_model_label(entry: &LiveLaunch, live: &[LiveLaunch], snapshot: &LogSnapshot) -> String {
   let clash = live
     .iter()
-    .any(|l| l.model == entry.model && l.path != entry.path);
+    .any(|l| l.model == entry.model && l.path != entry.path)
+    || snapshot
+      .models
+      .iter()
+      .any(|m| m.label.as_deref() == Some(entry.model.as_str()) && m.key != entry.path);
   if clash {
     entry.path.clone()
   } else {
@@ -1107,12 +1121,28 @@ fn json_body(
     }
     _ => Vec::new(),
   };
-  for entry in zero_live {
+  // One row per path however many live launches serve it, the way the totals
+  // loop below reports a model with several launches.
+  let mut zero_rows: Vec<(String, String, usize)> = Vec::new();
+  for entry in &zero_live {
+    match zero_rows
+      .iter_mut()
+      .find(|(_, path, _)| path == &entry.path)
+    {
+      Some((_, _, count)) => *count += 1,
+      None => zero_rows.push((
+        zero_model_label(entry, live, snapshot),
+        entry.path.clone(),
+        1,
+      )),
+    }
+  }
+  for (model, path, launches) in zero_rows {
     models.push(merged(
       &[
-        ("model", Value::String(entry.model.clone())),
-        ("path", Value::String(entry.path.clone())),
-        ("launches", Value::from(1)),
+        ("model", Value::String(model)),
+        ("path", Value::String(path)),
+        ("launches", Value::from(launches)),
       ],
       &RequestSummary::default(),
     ));
@@ -1576,6 +1606,33 @@ mod tests {
 
   /// An explicit `Accept` that only the JSON view satisfies must not be sent
   /// Prometheus text, and one that both satisfy must not pick JSON on its own.
+  /// A `q=0` is a refusal, not a missing entry: it takes that type out of the
+  /// running for the whole header, so a wildcard cannot hand it back.
+  #[test]
+  fn metrics_a_zero_q_refuses_the_type_it_names() {
+    assert_eq!(
+      format_of(Some("text/plain;q=0, */*")).unwrap(),
+      Format::Json,
+      "refusing text leaves the wildcard speaking only for JSON"
+    );
+    assert_eq!(
+      format_of(Some("application/json;q=0, */*")).unwrap(),
+      Format::Text,
+      "the mirror image"
+    );
+    assert_eq!(
+      format_of(Some("text/plain;q=0, application/json;q=0.3")).unwrap(),
+      Format::Json
+    );
+    assert!(
+      matches!(
+        format_of(Some("text/plain;q=0, application/json;q=0")),
+        Err(Reject::NotAcceptable(_))
+      ),
+      "refusing both candidates is no answer at all"
+    );
+  }
+
   #[test]
   fn metrics_accept_prefers_the_format_the_client_wants() {
     assert_eq!(
@@ -2055,6 +2112,44 @@ mod tests {
     ] {
       assert!(text.contains(line), "missing {line:?} in:\n{text}");
     }
+  }
+
+  /// A live model with no rows still takes its label from the whole log, not
+  /// from what the scope can see: a stopped model that already used the display
+  /// name keeps it, so the idle one answers under its path.
+  #[test]
+  fn metrics_an_idle_model_label_avoids_a_name_already_used_in_the_log() {
+    let log = RequestLog::new();
+    request_named(&log, "m", "/models/a.gguf", "L1", 10, 5);
+    log.forget_launch("L1");
+    let live = [LiveLaunch {
+      id: "L2".into(),
+      model: "m".into(),
+      path: "/models/b.gguf".into(),
+      port: 2222,
+      ready: true,
+    }];
+    let snap = log.snapshot();
+    let scope = Scope {
+      log: LogScope::Model {
+        path: "/models/b.gguf".into(),
+      },
+      path: Some("/models/b.gguf".into()),
+      name: Some("m".into()),
+      per_launch: false,
+      ..Scope::default()
+    };
+    let mut doc = Document::new(true);
+    render(&mut doc, &snap, &live, &scope, 1, 1);
+    let text = doc.render();
+    assert!(
+      text.contains("llamastash:requests_total{model=\"/models/b.gguf\"} 0\n"),
+      "the idle model answers under its path:\n{text}"
+    );
+    assert!(
+      !text.contains("{model=\"m\"} 0"),
+      "the zeros must not borrow the stopped model's label:\n{text}"
+    );
   }
 
   /// A scope naming a launch the daemon does not have keeps answering nothing

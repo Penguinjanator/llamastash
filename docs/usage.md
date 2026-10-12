@@ -1477,6 +1477,7 @@ survive a naive `curl` and a real Prometheus scraper alike.
 | `Accept: application/json, */*` | JSON (a wildcard loses the tie to the type that was named) |
 | `Accept: application/json;q=0.9, text/plain;q=0.5` | JSON (higher q wins) |
 | `Accept: application/json;q=0.9, text/plain;q=0.9` | Prometheus text (tie goes to text) |
+| `Accept: text/plain;q=0, */*` | JSON (a `q=0` refuses that type outright, so the wildcard is left speaking only for the other) |
 | `Accept: application/xml`, `image/*`, anything else | `406` with the OpenAI-shaped error envelope |
 | `?format=json` | JSON, regardless of `Accept` |
 | `?format=prometheus` | Prometheus text, regardless of `Accept` |
