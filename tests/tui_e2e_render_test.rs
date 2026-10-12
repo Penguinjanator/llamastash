@@ -278,8 +278,8 @@ fn requests_view_golden_render_matches_fixture() {
 #[cfg_attr(target_os = "macos", ignore = "fixture uses Linux key glyphs")]
 #[test]
 fn requests_view_wide_golden_render_matches_fixture() {
-  // The wide frame is the only golden that shows `Launch`, `Client`,
-  // `Note` and `Route`, and the only one where a long note wraps onto a
+  // The wide frame is the only golden that shows `Client`, `Note`
+  // and `Route`, and the only one where a long note wraps onto a
   // continuation line instead of being dropped with the column.
   let mut app = seeded_requests_view_app();
   let rendered = mask_clock_times(&render_to_lines_at(&mut app, 280, 30).join("\n"));

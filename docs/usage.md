@@ -2173,7 +2173,7 @@ The last tab of every model that has a launch. It shows that launch's proxy requ
 
 - The top lines are the launch's summary: requests, errors, live hosts and connections while anything is in flight, hosts and connections over the rows the log keeps, average total time and time to first byte, tok/s (average and session), tokens in and out, auto-starts, and launches unloaded to make room.
 - Below is the table, newest request first. `↑` / `↓` scroll it.
-- The columns are `Time`, `Code`, `Tok/s`, `Total`, `TTFB`, `In`, `Out`, `Launch`, `Client`, `Note` and `Route`. As the pane narrows they drop out in this order: `Client`, `Route`, `Note`, `Launch`, `Out`, `In`, `TTFB`, `Total`, `Tok/s`, `Code`, `Time`. `Note` takes the spare width up to 48 cells and wraps onto continuation lines beyond that; `Route`, which is last, takes what `Note` leaves.
+- The columns are `Time`, `Code`, `Tok/s`, `Total`, `TTFB`, `In`, `Out`, `Client`, `Note` and `Route`. As the pane narrows they drop out in this order: `Client`, `Route`, `Note`, `Out`, `In`, `TTFB`, `Total`, `Tok/s`, `Code`, `Time`. `Note` takes the spare width up to 48 cells and wraps onto continuation lines beyond that; `Route`, which is last, takes what `Note` leaves.
 
 ### Chat tab (`Focus::ChatInput`)
 

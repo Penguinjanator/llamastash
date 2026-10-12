@@ -46,7 +46,6 @@ enum ColumnId {
   Ttfb,
   In,
   Out,
-  Launch,
   Client,
   Note,
   Route,
@@ -56,8 +55,7 @@ enum ColumnId {
 /// position (see [`columns::fit`]): the figures that answer "what did this
 /// request cost" stay longest, `Client` is loopback for most setups and
 /// goes first, and `Route` follows it because the tab already implies one
-/// engine's routes. `Launch` ranks just under `Out` because with several
-/// launches of a model it is what separates a slow one from a healthy one.
+/// engine's routes.
 const COLUMNS: &[Column<ColumnId>] = &[
   Column {
     id: ColumnId::Time,
@@ -100,13 +98,6 @@ const COLUMNS: &[Column<ColumnId>] = &[
     label: "Out",
     width: 6,
     rank: 60,
-  },
-  Column {
-    id: ColumnId::Launch,
-    label: "Launch",
-    // Fits a launch id (`L3`) or a short launch name.
-    width: 6,
-    rank: 65,
   },
   Column {
     id: ColumnId::Client,
@@ -385,7 +376,6 @@ fn column_value(id: ColumnId, cells: &RequestCells) -> &str {
     ColumnId::Total => &cells.total,
     ColumnId::In => &cells.tokens_in,
     ColumnId::Out => &cells.tokens_out,
-    ColumnId::Launch => &cells.launch,
     ColumnId::Ttfb => &cells.ttfb,
     ColumnId::Route => &cells.route,
     ColumnId::Client => &cells.client,
@@ -451,27 +441,27 @@ mod tests {
   fn columns_drop_by_rank_as_the_pane_narrows() {
     // Each column costs its width plus one separator. Running totals in
     // rank order: Time 9, Code 14, Tok/s 21, Total 29, TTFB 37, In 44,
-    // Out 51, Launch 58, Note 71, Route 88, Client 110.
+    // Out 51, Note 64, Route 81, Client 103.
     let full = [
-      "Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Launch", "Client", "Note", "Route",
+      "Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Client", "Note", "Route",
     ];
-    assert_eq!(labels(110), full);
+    assert_eq!(labels(103), full);
     // Client ranks lowest of all, so it is the first to go.
     assert_eq!(
-      labels(109),
-      vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Launch", "Note", "Route"]
+      labels(102),
+      vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Note", "Route"]
     );
     assert_eq!(
-      labels(88),
-      vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Launch", "Note", "Route"]
+      labels(81),
+      vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Note", "Route"]
     );
     assert_eq!(
-      labels(87),
-      vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Launch", "Note"]
+      labels(80),
+      vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Note"]
     );
     assert_eq!(
-      labels(70),
-      vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Launch"]
+      labels(63),
+      vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out"]
     );
     assert_eq!(
       labels(57),
@@ -512,11 +502,11 @@ mod tests {
     assert!(wide.route_w > ROUTE_W);
     // At the width `Route` just fits the only spare cell is the separator
     // after the last column, and `Note` grows first.
-    let tight = layout_columns(88);
+    let tight = layout_columns(81);
     assert_eq!(tight.note_w, MIN_NOTE_W + 1);
     assert_eq!(tight.route_w, ROUTE_W);
     // Too narrow for `Note`: it gets nothing and the row ends earlier.
-    assert_eq!(layout_columns(70).note_w, 0);
+    assert_eq!(layout_columns(63).note_w, 0);
   }
 
   #[test]
@@ -566,7 +556,6 @@ mod tests {
       .expect("header row");
     assert_eq!(lines[header - 1], "");
     assert!(lines[header].ends_with("Route"), "{lines:?}");
-    assert!(lines[header].contains("Launch"), "{lines:?}");
     assert!(lines[header + 1].contains("200  39.6   1.2s"), "{lines:?}");
     assert!(lines[header + 1].contains("chat/completions"), "{lines:?}");
     // Two rows, newest (`seq` 2, one second later) first.
