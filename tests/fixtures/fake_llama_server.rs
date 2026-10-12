@@ -79,6 +79,9 @@ struct Args {
   metrics_delay_ms: u64,
   /// `--metrics-pad`: bytes of comment filler to append to the `/metrics` body.
   metrics_pad: usize,
+  /// `--metrics-cut`: make the `/metrics` body exactly this many bytes, ending
+  /// it with a sample line, so a reader with a smaller cap stops mid-sample.
+  metrics_cut: Option<usize>,
   /// `--metrics-status`: the status `GET /metrics` answers with, for an engine
   /// whose scrape succeeds with something other than `200`.
   metrics_status: Option<u16>,
@@ -142,6 +145,19 @@ fn print_fake_devices() {
   let _ = std::io::stdout().flush();
 }
 
+/// Pad `body` to exactly `len` bytes with one comment line of the width that
+/// fits, so the caller controls where the body ends without adding anything a
+/// parser would read.
+fn pad_to(body: &mut String, len: usize) {
+  let fill = len.saturating_sub(body.len());
+  if fill < 3 {
+    return;
+  }
+  body.push('#');
+  body.push_str(&".".repeat(fill - 2));
+  body.push('\n');
+}
+
 fn parse_args() -> Args {
   let mut args = std::env::args().skip(1);
   let mut host = String::from("127.0.0.1");
@@ -153,6 +169,7 @@ fn parse_args() -> Args {
   let mut metrics = false;
   let mut metrics_delay_ms: u64 = 0;
   let mut metrics_pad: usize = 0;
+  let mut metrics_cut: Option<usize> = None;
   let mut metrics_status: Option<u16> = None;
   let mut metrics_vllm = false;
   let mut health_delay_ms: u64 = 0;
@@ -176,6 +193,7 @@ fn parse_args() -> Args {
         metrics_delay_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0)
       }
       "--metrics-pad" => metrics_pad = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+      "--metrics-cut" => metrics_cut = args.next().and_then(|v| v.parse().ok()),
       "--metrics-status" => {
         metrics_status = args.next().and_then(|v| v.parse().ok());
       }
@@ -205,6 +223,7 @@ fn parse_args() -> Args {
     metrics,
     metrics_delay_ms,
     metrics_pad,
+    metrics_cut,
     metrics_status,
     metrics_vllm,
     health_delay_ms,
@@ -443,6 +462,15 @@ vllm:time_to_first_token_seconds_count{model_name=\"fake\"} 1\n",
           while body.len() < args.metrics_pad {
             body.push_str("# pad\n");
           }
+        }
+        if let Some(cut) = args.metrics_cut {
+          // The body ends mid-sample exactly at `cut`, so a reader capped below
+          // it is left holding half a sample: padding to just before the cut,
+          // then a sample line that runs past it.
+          let tail = "llamacpp:tail_series_total 987654\n";
+          pad_to(&mut body, cut.saturating_sub(tail.len() - 3));
+          body.push_str(tail);
+          body.truncate(cut);
         }
         write_response(
           &mut wr,

@@ -65,13 +65,14 @@ survive a naive `curl` and a real Prometheus scraper alike.
 | Request | Response |
 | --- | --- |
 | no `Accept` header | Prometheus text |
-| `Accept: */*` (what plain `curl` sends) | **Prometheus text** — a wildcard must never select JSON |
+| `Accept: */*` (what plain `curl` sends) | **Prometheus text** — a wildcard on its own must never select JSON |
 | `Accept: text/plain` or `text/plain; version=0.0.4; charset=utf-8` | Prometheus text |
 | `Accept: application/openmetrics-text; version=1.0.0,text/plain` | Prometheus text (OpenMetrics is served as text format 0.0.4) |
 | `Accept: application/json` | JSON |
+| `Accept: application/json, */*` | JSON (the named type beats the wildcard) |
 | `Accept: application/json;q=0.9, text/plain;q=0.5` | JSON (higher q wins) |
 | `Accept: application/json;q=0.9, text/plain;q=0.9` | Prometheus text (tie goes to text) |
-| `Accept: application/xml` | `406` with the OpenAI-shaped error envelope |
+| `Accept: application/xml`, `image/*`, `application/*` | `406` with the OpenAI-shaped error envelope |
 | `?format=json` | JSON, regardless of `Accept` |
 | `?format=prometheus` | Prometheus text, regardless of `Accept` |
 | `?format=<anything else>` | `400` naming the two accepted values |
@@ -80,8 +81,9 @@ Rules:
 
 - Only two candidates are matched: `application/json` and `text/plain`. A `;`
   parameter that is not `q` (e.g. `version=0.0.4`) does not affect the match.
-- Missing `q` is 1.0. `*/*` matches either candidate at its own q but loses a tie
-  against an explicit type.
+- Missing `q` is 1.0. `*/*` matches either candidate one step under its own q, so
+  it never outranks a type the client actually named, and a type that is neither
+  candidate is a `406` rather than a silent text answer.
 - `?format=` beats `Accept`. `Accept` beats the default (text).
 - Content types: `text/plain; version=0.0.4; charset=utf-8` and `application/json`.
 - `HEAD /metrics` is not routed (404), same as `/health`.
@@ -165,7 +167,7 @@ already returns, a client that parses one parses the other.
   `llamastash:backend_metrics_available` (1/0 — a 501 from llama.cpp without
   `--metrics` lands here), `llamastash:backend_metrics_series`,
   `llamastash:backend_metrics_scrape_duration_seconds`,
-  `llamastash:backend_metrics_skipped_total`.
+  `llamastash:backend_metrics_skipped` (this scrape's unparsed lines, not a running total).
 - `?model=<ref>` restricts the fan-out to one model.
 - JSON form (`Accept: application/json` or `?format=json`) returns
   `{"backends":[{"launch","model","url","status","ok","series","duration_ms","truncated","error"}]}`

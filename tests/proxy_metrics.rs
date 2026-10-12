@@ -403,9 +403,10 @@ async fn metrics_content_negotiation_matches_the_plan() {
     ),
     // A tie goes to text, so a scrape can never get JSON by accident.
     ("application/json;q=0.9, text/plain;q=0.9", text_ct),
-    // A wildcard of either type is "whatever you have", which is the text
-    // default: only an exact `application/json` asks for JSON.
-    ("application/*", text_ct),
+    // A wildcard is "whatever you have", one step below the type it travels
+    // with, so it never outranks a named one. Naming JSON alongside it is
+    // asking for JSON, and a plain scrape that names nothing still gets text.
+    ("application/json, */*", "application/json"),
     ("text/*", text_ct),
   ];
   for (accept, want) in cases {
@@ -423,6 +424,12 @@ async fn metrics_content_negotiation_matches_the_plan() {
     );
     assert!(!body.is_empty());
   }
+
+  // An explicitly empty `Accept:` is "no preference", not "nothing is
+  // acceptable": the default answer, not a 406.
+  let (status, headers, _) = http_get(addr, "/metrics", &[("Accept", "")]).await;
+  assert_eq!(status, 200);
+  assert_eq!(header_value(&headers, "content-type"), Some(text_ct));
 
   // `?format=` beats the header, in both directions.
   let (status, headers, _) = http_get(addr, "/metrics?format=json", &[("Accept", "*/*")]).await;
@@ -453,10 +460,15 @@ async fn metrics_content_negotiation_matches_the_plan() {
     .contains("prometheus"));
 
   // A header that matches neither candidate is a 406, in the same envelope.
-  let (status, _h, body) = http_get(addr, "/metrics", &[("Accept", "application/xml")]).await;
-  assert_eq!(status, 406);
-  let v: Value = serde_json::from_slice(&body).expect("json");
-  assert_eq!(v["error"]["type"], "not_acceptable");
+  // A wildcard is not a pass: `image/*` and `application/*` ask for something
+  // this route is not, and a scrape that cannot read the answer should find out
+  // instead of being served text it has to guess at.
+  for accept in ["application/xml", "image/*", "application/*"] {
+    let (status, _h, body) = http_get(addr, "/metrics", &[("Accept", accept)]).await;
+    assert_eq!(status, 406, "Accept: {accept}");
+    let v: Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(v["error"]["type"], "not_acceptable", "Accept: {accept}");
+  }
   // ...and `?format=json` overrides it, because a query is unambiguous.
   let (status, _, _) = http_get(
     addr,
@@ -541,7 +553,8 @@ async fn metrics_backend_merges_targets_and_isolates_one_that_refuses() {
     "llamastash:backend_metrics_series{{launch=\"{beta_id}\",model=\"beta\"}} 0"
   )));
   assert!(out.contains("llamastash:backend_metrics_scrape_duration_seconds{"));
-  assert!(out.contains("llamastash:backend_metrics_skipped_total{"));
+  // A gauge, not a running total: it counts this scrape's unparsed lines.
+  assert!(out.contains("llamastash:backend_metrics_skipped{"));
   // The proxy's own request numbers are not in this response.
   assert!(!out.contains("llamastash:requests_total"));
 
@@ -1034,6 +1047,51 @@ async fn metrics_a_launch_reference_that_matches_two_launches_is_a_400() {
 
   let _ = first.stop(Duration::from_secs(3)).await;
   let _ = second.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_backend_drops_a_sample_the_cap_cut_in_half() {
+  let dir = unique_temp("backend-cut");
+  let registry = SupervisorRegistry::new();
+  // The proxy keeps the first 4 MiB of a target's body; the fixture ends its
+  // body three bytes past that, with a sample line whose digits straddle the
+  // cut. The kept prefix therefore ends `llamacpp:tail_series_total 987`, which
+  // parses — as a figure the engine never printed.
+  let cut = 4 * 1024 * 1024 + 3;
+  let model = spawn_fake_with(
+    "/fixture/cut.gguf",
+    &dir,
+    &["--metrics", "--metrics-cut", &cut.to_string()],
+  )
+  .await;
+  let id = registry.next_id();
+  registry.insert(id.clone(), model.clone()).await;
+  let state = build_state(vec![discovered("/fixture/cut.gguf", Some("cut"))], registry).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+
+  let (_status, _headers, body) = http_get(addr, "/metrics/backend?format=json", &[]).await;
+  let v: Value = serde_json::from_slice(&body).expect("json");
+  let entry = &v["backends"][0];
+  assert_eq!(entry["truncated"], true, "{entry}");
+  assert_eq!(
+    entry["series"], 3,
+    "only the whole lines of the kept prefix are series: {entry}"
+  );
+
+  let (_status, _headers, body) = http_get(addr, "/metrics/backend", &[]).await;
+  let out = text(body);
+  assert!(
+    out.contains("llamacpp:prompt_tokens_total"),
+    "the whole lines before the cut are merged:\n{out}"
+  );
+  assert!(
+    !out.contains("llamacpp:tail_series_total"),
+    "a half-read sample is not a sample:\n{out}"
+  );
+
+  let _ = model.stop(Duration::from_secs(3)).await;
   shutdown_listener(shutdown, handle).await;
   std::fs::remove_dir_all(&dir).ok();
 }

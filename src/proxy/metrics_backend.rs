@@ -25,10 +25,11 @@ use hyper::Request;
 use serde_json::{Map, Value};
 
 use super::metrics::{
-  self, escape_label, live_launches, now_ms, value_opt, Document, Format, LiveLaunch, Parsed,
+  self, escape_label, live_launches, value_opt, Document, Format, LiveLaunch, Parsed,
 };
 use super::router::ProxyResponse;
 use super::state::ProxyState;
+use crate::util::datetime;
 
 /// Hard cap on one target's response, so a chatty engine cannot balloon the
 /// merged body.
@@ -54,6 +55,18 @@ struct Scrape {
   /// Lines this target printed that could not be parsed.
   skipped: u64,
   duration_ms: u64,
+}
+
+/// The text of a capped read. When the cap cut the body mid-line, the fragment
+/// after the last newline is dropped: a Prometheus body is line-based, and half
+/// a sample (`foo_total 12` of a real `foo_total 1234`) parses as a sample and
+/// prints a figure the engine never reported.
+fn capped_text(buf: Vec<u8>, truncated: bool) -> String {
+  let whole = match truncated {
+    true => buf.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1),
+    false => buf.len(),
+  };
+  String::from_utf8_lossy(&buf[..whole]).into_owned()
 }
 
 impl Scrape {
@@ -116,9 +129,9 @@ pub(crate) async fn serve(state: Arc<ProxyState>, req: Request<Incoming>) -> Pro
       scrape.duration_ms as f64 / 1000.0,
     );
     doc.sample(
-      "llamastash:backend_metrics_skipped_total",
+      "llamastash:backend_metrics_skipped",
       "Engine lines this scrape could not parse",
-      "counter",
+      "gauge",
       &labels,
       scrape.skipped as f64,
     );
@@ -131,9 +144,8 @@ fn targets(live: &[LiveLaunch], parsed: &Parsed) -> Vec<LiveLaunch> {
   live
     .iter()
     .filter(|l| l.ready)
-    .filter(|l| {
-      parsed.scope.keeps_model(&l.path) && parsed.scope.keeps_launch(&l.id, Some(&l.path))
-    })
+    // `keeps_launch` checks the served path too, so one call covers both.
+    .filter(|l| parsed.scope.keeps_launch(&l.id, Some(&l.path)))
     .cloned()
     .collect()
 }
@@ -207,12 +219,7 @@ async fn read_body(
       }
     }
   }
-  (
-    Some(status),
-    String::from_utf8_lossy(&buf).into_owned(),
-    truncated,
-    error,
-  )
+  (Some(status), capped_text(buf, truncated), truncated, error)
 }
 
 /// Fold one engine's Prometheus text into the merged document and count what
@@ -378,7 +385,7 @@ fn json_body(scrapes: &[Scrape], parsed: &Parsed) -> Value {
     })
     .collect::<Vec<_>>();
   metrics::json_object(|entry| {
-    entry.insert("generated_at_ms".into(), Value::from(now_ms()));
+    entry.insert("generated_at_ms".into(), Value::from(datetime::now_ms()));
     entry.insert("scope".into(), Value::Object(scope));
     entry.insert("backends".into(), Value::Array(backends));
   })
@@ -405,6 +412,30 @@ mod tests {
     };
     merge(&mut doc, &mut scrape);
     (doc.render(), scrape.series, scrape.skipped)
+  }
+
+  /// A capped read stops wherever the byte cap falls, and a Prometheus sample
+  /// is one line: the tail of a cut line is a fragment that parses, so it has to
+  /// go before anything reads the body.
+  #[test]
+  fn backend_drops_the_sample_a_cap_cut_in_half() {
+    let whole = "a_total 1\nb_total 222222\n";
+    // Cut three bytes into the second line: `b_total 222` would read as a real
+    // sample of a figure the engine never printed.
+    let cut = &whole.as_bytes()[.."a_total 1\nb_total 22".len()];
+    assert_eq!(capped_text(cut.to_vec(), true), "a_total 1\n");
+    // Nothing of the last line survived, so nothing of it is printed.
+    assert_eq!(
+      capped_text("a_total 1\nb_".as_bytes().to_vec(), true),
+      "a_total 1\n"
+    );
+    assert_eq!(capped_text("b_".as_bytes().to_vec(), true), "");
+    // Uncapped reads are untouched, trailing newline or not.
+    assert_eq!(capped_text(whole.as_bytes().to_vec(), false), whole);
+    assert_eq!(
+      capped_text("a_total 1\nb_total 2".as_bytes().to_vec(), false),
+      "a_total 1\nb_total 2"
+    );
   }
 
   #[test]

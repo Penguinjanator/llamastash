@@ -494,7 +494,10 @@ struct RequestsTailParams {
   #[serde(default)]
   model_path: Option<String>,
   /// Launch id (`L3`): one launch's rows and totals, live or recently stopped.
-  /// It wins over `model_path`, since a launch serves one model.
+  /// It outranks `model_path` because a launch serves one model, so the narrower
+  /// reference answers and nothing named is silently dropped. HTTP `/metrics` is
+  /// the stricter agent contract and refuses a `?launch=` that does not serve
+  /// its `?model=`; both call paths here name one reference at a time.
   #[serde(default)]
   launch_id: Option<String>,
   #[serde(default)]
@@ -1209,6 +1212,18 @@ mod tests {
       .result
       .unwrap();
     assert_eq!(both["summary"]["requests"], 1);
+    // Even when the two name different things: the launch is the answer, the
+    // way `llamastash requests L3` means that launch and not its model's other
+    // launches. HTTP `/metrics` refuses this pair; the CLI and TUI never send it.
+    let mismatch = call(Some(json!({"launch_id": "L2", "model_path": "/m/b.gguf"})))
+      .await
+      .result
+      .unwrap();
+    assert_eq!(mismatch["summary"]["requests"], 1, "{mismatch}");
+    assert_eq!(
+      mismatch["requests"].as_array().unwrap()[0]["launch_id"],
+      "L2"
+    );
     let nothing = call(Some(json!({"launch_id": "L9"}))).await.result.unwrap();
     assert_eq!(nothing["summary"]["requests"], 0);
     assert!(nothing["requests"].as_array().unwrap().is_empty());

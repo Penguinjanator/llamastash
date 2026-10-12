@@ -1458,22 +1458,26 @@ survive a naive `curl` and a real Prometheus scraper alike.
 
 | Request | Response |
 | --- | --- |
-| no `Accept` header | Prometheus text |
-| `Accept: */*` (what plain `curl` sends) | **Prometheus text** — a wildcard must never select JSON |
+| no `Accept` header, or an empty one | Prometheus text |
+| `Accept: */*` (what plain `curl` sends) | **Prometheus text** — a wildcard on its own never selects JSON |
 | `Accept: text/plain` or `text/plain; version=0.0.4; charset=utf-8` | Prometheus text |
 | `Accept: application/openmetrics-text; version=1.0.0,text/plain` | Prometheus text (OpenMetrics is served as text format 0.0.4) |
 | `Accept: application/json` | JSON |
+| `Accept: application/json, */*` | JSON (a wildcard loses the tie to the type that was named) |
 | `Accept: application/json;q=0.9, text/plain;q=0.5` | JSON (higher q wins) |
 | `Accept: application/json;q=0.9, text/plain;q=0.9` | Prometheus text (tie goes to text) |
-| `Accept: application/xml` | `406` with the OpenAI-shaped error envelope |
+| `Accept: application/xml`, `image/*`, anything else | `406` with the OpenAI-shaped error envelope |
 | `?format=json` | JSON, regardless of `Accept` |
 | `?format=prometheus` | Prometheus text, regardless of `Accept` |
 | `?format=<anything else>` | `400` naming the two accepted values |
 
 Only `application/json` and `text/plain` are matched, so a `;` parameter that is not
 `q` (a `version=0.0.4`, say) does not affect the match. A missing `q` is 1.0. Only an
-exact type selects its format, so any wildcard (`*/*`, `application/*`) gets the text
-default and a scrape can never receive JSON by accident. `?format=`
+exact type selects its format, and `*/*` accepts both a step under the q it carries, so
+a wildcard never wins over a named type and a scrape that does not name `application/json`
+can never receive JSON by accident. A type that is neither of the two — `image/*`,
+`application/xml` — asks for something the route is not, and is refused rather than
+answered in text. `?format=`
 beats `Accept`, and `Accept` beats the default, which is text. Responses carry
 `text/plain; version=0.0.4; charset=utf-8` or `application/json`.
 
@@ -1509,12 +1513,20 @@ Gauges: `llamastash:requests_in_flight{model}`, `llamastash:hosts_in_flight{mode
 (last reported), `llamastash:request_tokens_per_second_avg{model}`, `llamastash:models_loaded`,
 `llamastash:models_discovered`, `llamastash:request_log_rows`, `llamastash:request_log_capacity`,
 `llamastash:request_log_file_dropped_total`.
+`llamastash:route_requests_total` and the daemon gauges above that carry no `model` label
+describe the process rather than a scope, so a `?model=` / `?launch=` scrape prints them
+whole and their sum does not add up to the scoped `requests_total`.
 A request the proxy answered without reaching a model — an unknown model name, a body it
 could not read — belongs to no model, so `requests`, `errors` and `requests_in_flight`
 carry those under `model="none"` and `rate(llamastash:requests_total)` adds up to what
 `summary.requests` says. `hosts_in_flight` follows the same rule. Token and latency series
 need a model to be counted, so they never carry `none`. That label is text-format only; the
 JSON shape is unchanged, because `summary` already counted those requests.
+
+A `model` label is a display name while that name is unique and a catalog path once two
+models share it, so the second of two same-named models takes its first request, the
+first one's label switches to its path and its series splits in two — that is the
+collision rule working, not a restarted counter.
 
 The per-launch series are opt-in because they multiply every series above by the
 number of launches a model has had. Ask for them with `?launch=1`:
@@ -1577,7 +1589,8 @@ Beside the engine's samples sit four proxy-owned gauges, labelled `launch,model`
 `llamastash:backend_metrics_available` (1/0 — only a plain `200` is a 1, so a `501` from
 llama.cpp started without `--metrics` and a `404` both land here), `llamastash:backend_metrics_series`,
 `llamastash:backend_metrics_scrape_duration_seconds`,
-`llamastash:backend_metrics_skipped_total`.
+`llamastash:backend_metrics_skipped` (how many of this scrape's lines did not parse, for
+this scrape — not a running total, which is why it carries no `_total`).
 
 llama.cpp and SGLang need their flag before they serve anything: start with `--metrics`
 (llama.cpp) or `--enable-metrics` (SGLang), in a preset or on the command line. vLLM

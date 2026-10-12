@@ -17,9 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{HeaderMap, CONTENT_TYPE};
 use hyper::{Request, Response, StatusCode};
@@ -32,7 +30,9 @@ use super::request_log::{
 use super::route;
 use super::router::{self, ProxyResponse};
 use super::state::ProxyState;
+use crate::daemon::registry::LaunchId;
 use crate::daemon::supervisor::ManagedState;
+use crate::util::datetime;
 
 /// The media type a Prometheus scrape expects for text format 0.0.4.
 pub(crate) const TEXT_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -56,7 +56,8 @@ pub(crate) enum Reject {
   UnknownRef(String),
   /// `?model=` and `?launch=` name a model and a launch that does not serve it.
   ConflictingScope { model: String, launch: String },
-  /// The `Accept` header matched both candidates equally and cannot be settled.
+  /// A `?model=` reference that matches more than one model and cannot be
+  /// settled.
   Ambiguous(String),
   /// `?launch=` named a model more than one live launch is serving, so the
   /// reference has no single answer.
@@ -210,11 +211,13 @@ fn decode(raw: &str) -> String {
 /// Best `q` the two candidate types get from an `Accept` header, as
 /// `(json, text)` where `0.0` means not accepted.
 ///
-/// Only an exact `application/json` or `text/plain` selects its own format. A
-/// `;` parameter that is not `q` (`version=0.0.4`, `charset=…`) does not affect
-/// the match and a missing `q` is `1.0`. A wildcard — `*/*` or `application/*`
-/// — means "whatever you have", which is the text default; only an exact type
-/// asks for JSON, so a scraper can never receive JSON by accident.
+/// Only an exact `application/json` selects the JSON view, and a `text/plain`
+/// (or the `text/*` family) selects the text one. A `;` parameter that is not
+/// `q` (`version=0.0.4`, `charset=…`) does not affect the match and a missing
+/// `q` is `1.0`. `*/*` means "whatever you have": it accepts either candidate
+/// but never wins a tie, so a naive `curl` and a Prometheus scraper both get
+/// text. Anything else — `image/*`, `application/*` — asks for a family neither
+/// candidate is in, which is no answer at all.
 fn accept_q(header: &str) -> (f32, f32) {
   let mut best = (0.0f32, 0.0f32);
   for entry in header.split(',') {
@@ -237,18 +240,32 @@ fn accept_q(header: &str) -> (f32, f32) {
     if syntax == "application/json" {
       best.0 = best.0.max(q);
     }
-    if syntax == "text/plain" || syntax.ends_with("/*") {
+    if syntax == "text/plain" || syntax == "text/*" {
       best.1 = best.1.max(q);
+    }
+    if syntax == "*/*" {
+      // "Whatever you have": it accepts both candidates, one representable q
+      // below what it says, so it never wins against a type the client named and
+      // only ties when nothing else matched — and a tie goes to text. That is
+      // what a naive `curl`, a browser and a Prometheus scraper all expect.
+      let joined = below(q);
+      best.0 = best.0.max(joined);
+      best.1 = best.1.max(joined);
     }
   }
   best
 }
 
+/// The largest `f32` below `x`, so a wildcard accepts both candidates one step
+/// under the q it carries and so loses to that type outright.
+fn below(x: f32) -> f32 {
+  f32::from_bits(x.to_bits().wrapping_sub(1))
+}
+
 /// The response format: `?format=` beats `Accept`, which beats the default of
 /// Prometheus text. A wildcard must never select JSON, and a tie goes to text.
-pub(crate) fn choose_format(query: Option<&str>, headers: &HeaderMap) -> Result<Format, Reject> {
-  let q = Query::parse(query);
-  if let Some(format) = &q.format {
+pub(crate) fn choose_format(query: &Query, headers: &HeaderMap) -> Result<Format, Reject> {
+  if let Some(format) = &query.format {
     return match format.as_str() {
       "json" => Ok(Format::Json),
       "prometheus" => Ok(Format::Text),
@@ -258,6 +275,7 @@ pub(crate) fn choose_format(query: Option<&str>, headers: &HeaderMap) -> Result<
   let Some(accept) = headers
     .get(hyper::header::ACCEPT)
     .and_then(|v| v.to_str().ok())
+    .filter(|v| !v.trim().is_empty())
   else {
     return Ok(Format::Text);
   };
@@ -363,7 +381,7 @@ pub(crate) async fn live_launches(state: &ProxyState) -> Vec<LiveLaunch> {
 
 /// Sort key for a launch id: `L10` after `L2`.
 pub(crate) fn launch_order(id: &str) -> (u8, u64, &str) {
-  match id.strip_prefix('L').and_then(|n| n.parse::<u64>().ok()) {
+  match LaunchId(id.to_string()).counter() {
     Some(n) => (0, n, id),
     None => (1, 0, id),
   }
@@ -375,10 +393,9 @@ pub(crate) fn launch_order(id: &str) -> (u8, u64, &str) {
 /// [`live_launches`] snapshot, so one request asks the registry once.
 pub(crate) async fn resolve_scope(
   state: &ProxyState,
-  query: Option<&str>,
+  q: &Query,
   live: &[LiveLaunch],
 ) -> Result<Scope, Reject> {
-  let q = Query::parse(query);
   let mut scope = Scope {
     log: LogScope::All,
     per_launch: q.per_launch(),
@@ -526,14 +543,13 @@ pub(crate) async fn parse_request(
   req: &Request<Incoming>,
   live: &[LiveLaunch],
 ) -> Result<Parsed, Reject> {
-  let query = req.uri().query();
-  let format = choose_format(query, req.headers())?;
-  let scope = resolve_scope(state, query, live).await?;
-  let limit = Query::parse(query).limit();
+  let q = Query::parse(req.uri().query());
+  let format = choose_format(&q, req.headers())?;
+  let scope = resolve_scope(state, &q, live).await?;
   Ok(Parsed {
     format,
     scope,
-    limit,
+    limit: q.limit(),
   })
 }
 
@@ -1032,7 +1048,7 @@ fn json_body(
   }
 
   json_object(|map| {
-    map.insert("generated_at_ms".into(), Value::from(now_ms()));
+    map.insert("generated_at_ms".into(), Value::from(datetime::now_ms()));
     map.insert("scope".into(), Value::Object(scope_block));
     map.insert(
       "summary".into(),
@@ -1085,15 +1101,6 @@ pub(crate) fn value_opt<T: Into<Value>>(value: Option<T>) -> Value {
     Some(v) => v.into(),
     None => Value::Null,
   }
-}
-
-/// Milliseconds since the Unix epoch, the stamp both metrics routes print as
-/// `generated_at_ms`.
-pub(crate) fn now_ms() -> u64 {
-  SystemTime::now()
-    .duration_since(UNIX_EPOCH)
-    .map(|d| d.as_millis() as u64)
-    .unwrap_or(0)
 }
 
 /// One metric name's HELP/TYPE text and its samples, in print order.
@@ -1348,11 +1355,7 @@ pub(crate) fn text_response(body: String) -> ProxyResponse {
     Response::builder()
       .status(StatusCode::OK)
       .header(CONTENT_TYPE, TEXT_CONTENT_TYPE)
-      .body(
-        Full::new(Bytes::from(body))
-          .map_err(|never| match never {})
-          .boxed(),
-      )
+      .body(router::full_body(Bytes::from(body)))
       .expect("static text response must build"),
   )
 }
@@ -1360,17 +1363,7 @@ pub(crate) fn text_response(body: String) -> ProxyResponse {
 /// 200 OK with a JSON body built by one of these routes.
 pub(crate) fn json_response(body: Value) -> ProxyResponse {
   let bytes = serde_json::to_vec(&body).expect("json encoding of a built value cannot fail");
-  Ok(
-    Response::builder()
-      .status(StatusCode::OK)
-      .header(CONTENT_TYPE, "application/json")
-      .body(
-        Full::new(Bytes::from(bytes))
-          .map_err(|never| match never {})
-          .boxed(),
-      )
-      .expect("static headers always parse"),
-  )
+  Ok(router::json_response(StatusCode::OK, bytes))
 }
 
 #[cfg(test)]
@@ -1385,7 +1378,17 @@ mod tests {
     if let Some(a) = accept {
       headers.insert(hyper::header::ACCEPT, a.parse().unwrap());
     }
-    choose_format(None, &headers)
+    choose_format(&Query::default(), &headers)
+  }
+
+  /// `?format=` is read off the parsed query, the same `Query` the scope comes
+  /// from, so it is parsed exactly once per request.
+  fn format_of_query(query: &str, accept: Option<&str>) -> Result<Format, Reject> {
+    let mut headers = HeaderMap::new();
+    if let Some(a) = accept {
+      headers.insert(hyper::header::ACCEPT, a.parse().unwrap());
+    }
+    choose_format(&Query::parse(Some(query)), &headers)
   }
 
   #[test]
@@ -1404,47 +1407,100 @@ mod tests {
       .unwrap(),
       Format::Text
     );
-    // A wildcard never selects JSON, on either side.
-    assert_eq!(format_of(Some("application/*")).unwrap(), Format::Text);
+    // A wildcard never selects JSON on its own, and `application/*` is not a
+    // family either candidate is in.
     assert_eq!(format_of(Some("text/*")).unwrap(), Format::Text);
     assert_eq!(format_of(Some("*/*;q=0.5")).unwrap(), Format::Text);
+    assert!(matches!(
+      format_of(Some("application/*")),
+      Err(Reject::NotAcceptable(_))
+    ));
+    assert!(matches!(
+      format_of(Some("image/*")),
+      Err(Reject::NotAcceptable(_))
+    ));
+    assert!(matches!(
+      format_of(Some("application/xml")),
+      Err(Reject::NotAcceptable(_))
+    ));
     assert_eq!(format_of(Some("application/json")).unwrap(), Format::Json);
+    // A q that is not a number makes that entry no answer; the rest of the
+    // header still is.
+    assert!(matches!(
+      format_of(Some("application/json;q=x")),
+      Err(Reject::NotAcceptable(_))
+    ));
+    assert_eq!(
+      format_of(Some("application/json;q=, text/plain")).unwrap(),
+      Format::Text
+    );
+  }
+
+  /// An explicit `Accept` that only the JSON view satisfies must not be sent
+  /// Prometheus text, and one that both satisfy must not pick JSON on its own.
+  #[test]
+  fn metrics_accept_prefers_the_format_the_client_wants() {
     assert_eq!(
       format_of(Some("application/json;q=0.9, text/plain;q=0.5")).unwrap(),
       Format::Json
     );
     assert_eq!(
+      format_of(Some("application/json;q=0.5, text/plain;q=0.9")).unwrap(),
+      Format::Text
+    );
+    // Equal q, either order: the tie goes to text, so the JSON view is never
+    // what a client gets by accident.
+    assert_eq!(
       format_of(Some("application/json;q=0.9, text/plain;q=0.9")).unwrap(),
       Format::Text
     );
+    assert_eq!(
+      format_of(Some("text/plain;q=0.9, application/json;q=0.9")).unwrap(),
+      Format::Text
+    );
+    // A `*/*` accepts either view one step below the q it carries, so it never
+    // outranks a type the client actually named: naming JSON alongside the
+    // wildcard is asking for JSON, and a bare wildcard is no preference at all.
+    assert_eq!(
+      format_of(Some("*/*, application/json")).unwrap(),
+      Format::Json
+    );
+    assert_eq!(
+      format_of(Some("application/json, */*")).unwrap(),
+      Format::Json
+    );
+    assert_eq!(
+      format_of(Some("*/*;q=0.1, application/json;q=0.9")).unwrap(),
+      Format::Json
+    );
     assert!(matches!(
-      format_of(Some("application/xml")),
+      format_of(Some("application/xml, image/*")),
       Err(Reject::NotAcceptable(_))
     ));
+    // Spaces around the syntax and the q parameter are part of the grammar.
+    assert_eq!(
+      format_of(Some("application/json ; q = 0.9 , text/plain ; q = 0.1")).unwrap(),
+      Format::Json
+    );
   }
 
   #[test]
   fn metrics_format_query_beats_the_accept_header() {
-    let json = HeaderMap::from_iter([(hyper::header::ACCEPT, "*/*".parse().unwrap())]);
     assert_eq!(
-      choose_format(Some("format=json"), &json).unwrap(),
+      format_of_query("format=json", Some("*/*")).unwrap(),
       Format::Json
     );
     assert_eq!(
-      choose_format(Some("format=prometheus"), &json).unwrap(),
+      format_of_query("format=prometheus", Some("*/*")).unwrap(),
       Format::Text
     );
     assert!(matches!(
-      choose_format(Some("format=yaml"), &json),
+      format_of_query("format=yaml", Some("*/*")),
       Err(Reject::BadFormat(v)) if v == "yaml"
     ));
     // A `?format=` beats a header that would otherwise be refused outright.
     assert_eq!(
-      choose_format(
-        Some("format=prometheus"),
-        &HeaderMap::from_iter([(hyper::header::ACCEPT, "application/xml".parse().unwrap())])
-      )
-      .unwrap(),
+      format_of_query("format=prometheus", Some("application/xml")).unwrap(),
       Format::Text
     );
   }
