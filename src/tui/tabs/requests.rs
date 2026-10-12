@@ -542,7 +542,7 @@ mod tests {
       .join("\n");
     assert!(text.contains("Requests 12"), "{text}");
     assert!(text.contains("Avg total 1.2s"), "{text}");
-    assert!(text.contains("Tok/s avg —"), "{text}");
+    assert!(text.contains("Avg tok/s —"), "{text}");
   }
 
   #[test]

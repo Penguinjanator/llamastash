@@ -340,7 +340,7 @@ impl RequestSummary {
       ("Connections", num(self.connections)),
       ("Avg total", ms(self.avg_duration_ms)),
       ("Avg TTFB", ms(self.avg_ttfb_ms)),
-      ("Tok/s avg", tps(self.tokens_per_second_avg)),
+      ("Avg tok/s", tps(self.tokens_per_second_avg)),
     ])
     .chain(
       self
@@ -1636,7 +1636,7 @@ mod tests {
     assert_eq!(cells[0], ("Requests", "0".to_string()));
     assert_eq!(cells[2], ("Hosts", "—".to_string()));
     assert_eq!(cells[4], ("Avg total", "—".to_string()));
-    assert_eq!(cells[6], ("Tok/s avg", "—".to_string()));
+    assert_eq!(cells[6], ("Avg tok/s", "—".to_string()));
     let filled = RequestSummary {
       avg_duration_ms: Some(1_240),
       tokens_per_second_avg: Some(39.64),
