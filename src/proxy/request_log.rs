@@ -378,7 +378,7 @@ impl RequestSummary {
 /// count rows a scope still retains rather than the since-daemon-start
 /// totals, so they describe the table on screen and do not grow as the daemon
 /// ages.
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Clients {
   requests: u64,
   hosts: HashSet<String>,
@@ -841,6 +841,7 @@ impl RequestLog {
 /// One scope's totals as a `/metrics` scrape reads them: the summary
 /// `requests --json` returns, plus the sums behind its averages. A counter
 /// needs the total; a mean cannot be re-expanded into one.
+#[derive(Debug, Clone)]
 pub struct ScopeTotals {
   /// Catalog path for a model, launch id for a launch, empty for the whole log.
   pub key: String,

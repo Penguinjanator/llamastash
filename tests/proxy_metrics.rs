@@ -177,6 +177,90 @@ async fn live_port(addr: std::net::SocketAddr) -> u16 {
   v["launches"][0]["port"].as_u64().expect("port") as u16
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_a_live_launch_with_no_rows_scopes_to_its_zeros() {
+  let dir = unique_temp("scoped-zero");
+  let registry = SupervisorRegistry::new();
+  // A ready launch the proxy has never served: the state a fresh
+  // `daemon start --model` leaves behind.
+  let model = spawn_fake("/fixture/solo.gguf", &dir, false).await;
+  let launch_id = registry.next_id();
+  registry.insert(launch_id.clone(), model.clone()).await;
+  let state = build_state(
+    vec![discovered("/fixture/solo.gguf", Some("solo"))],
+    registry,
+  )
+  .await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+  let id = launch_id.as_str();
+
+  let (status, _h, body) = http_get(addr, &format!("/metrics?launch={id}"), &[]).await;
+  assert_eq!(status, 200);
+  let out = text(body);
+  let launch_line =
+    format!("llamastash:launch_requests_total{{launch=\"{id}\",model=\"solo\"}} 0\n");
+  for line in [
+    "llamastash:requests_in_flight{model=\"solo\"} 0\n",
+    "llamastash:requests_total{model=\"solo\"} 0\n",
+    "llamastash:prompt_tokens_total{model=\"solo\"} 0\n",
+    launch_line.as_str(),
+  ] {
+    assert!(out.contains(line), "missing {line:?} in:\n{out}");
+  }
+  // Averages have no figure to print from no rows, and the launch in-flight
+  // gauge stays a live-with-rows quantity.
+  assert!(!out.contains("request_duration_seconds_avg"), "{out}");
+  assert!(!out.contains("launch_requests_in_flight"), "{out}");
+  // The other launch's id space stays clean: nothing of a launch that does
+  // not exist is printed.
+  assert!(!out.contains("launch=\"L9\""), "{out}");
+
+  let (status, _h, body) = http_get(addr, "/metrics?model=solo", &[]).await;
+  assert_eq!(status, 200);
+  let out = text(body);
+  assert!(
+    out.contains("llamastash:requests_in_flight{model=\"solo\"} 0\n"),
+    "a model scope over an idle launch answers zero:\n{out}"
+  );
+  assert!(
+    !out.contains("llamastash:launch_"),
+    "a plain model scope adds no per-launch series:\n{out}"
+  );
+
+  // The JSON view agrees: the scoped summary and the launch entry carry
+  // zeros, not missing keys.
+  let (_status, _h, body) = http_get(addr, &format!("/metrics?launch={id}&format=json"), &[]).await;
+  let v: Value = serde_json::from_slice(&body).expect("json");
+  assert_eq!(v["summary"]["requests"], 0, "{v}");
+  assert_eq!(v["summary"]["errors"], 0, "{v}");
+  assert_eq!(v["summary"]["prompt_tokens"], 0, "{v}");
+  assert_eq!(v["scope"]["launch"], id, "{v}");
+  let entry = v["launches"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .find(|e| e["launch"] == id)
+    .expect("the live launch is in launches[]");
+  assert_eq!(entry["requests"], 0, "{entry}");
+  assert_eq!(entry["live"], true, "{entry}");
+  let model_entry = v["models"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .find(|e| e["model"] == "solo")
+    .expect("the live model is in models[]");
+  assert_eq!(model_entry["requests"], 0, "{model_entry}");
+
+  let (_status, _h, body) = http_get(addr, "/metrics?model=solo&format=json", &[]).await;
+  let v: Value = serde_json::from_slice(&body).expect("json");
+  assert_eq!(v["summary"]["requests"], 0, "{v}");
+  assert_eq!(v["scope"]["model"], "solo", "{v}");
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
 // --- /metrics ------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

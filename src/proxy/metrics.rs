@@ -214,12 +214,16 @@ fn decode(raw: &str) -> String {
 /// Only an exact `application/json` selects the JSON view, and a `text/plain`
 /// (or the `text/*` family) selects the text one. A `;` parameter that is not
 /// `q` (`version=0.0.4`, `charset=…`) does not affect the match and a missing
-/// `q` is `1.0`. `*/*` means "whatever you have": it accepts either candidate
-/// but never wins a tie, so a naive `curl` and a Prometheus scraper both get
-/// text. Anything else — `image/*`, `application/*` — asks for a family neither
-/// candidate is in, which is no answer at all.
+/// `q` is `1.0`. `*/*` means "whatever you have": it speaks only for a
+/// candidate the header never named by its own name, and then one step below
+/// the wildcard's own q, so a naive `curl` and a Prometheus scraper both get
+/// text without ever lifting a named type above the q it carried. Anything
+/// else — `image/*`, `application/*` — asks for a family neither candidate is
+/// in, which is no answer at all.
 fn accept_q(header: &str) -> (f32, f32) {
   let mut best = (0.0f32, 0.0f32);
+  let mut named = (false, false);
+  let mut wildcard: Option<f32> = None;
   for entry in header.split(',') {
     let mut parts = entry.trim().split(';');
     let Some(syntax) = parts.next().map(|s| s.trim().to_ascii_lowercase()) else {
@@ -238,18 +242,28 @@ fn accept_q(header: &str) -> (f32, f32) {
       continue;
     }
     if syntax == "application/json" {
+      named.0 = true;
       best.0 = best.0.max(q);
     }
     if syntax == "text/plain" || syntax == "text/*" {
+      named.1 = true;
       best.1 = best.1.max(q);
     }
     if syntax == "*/*" {
-      // "Whatever you have": it accepts both candidates, one representable q
-      // below what it says, so it never wins against a type the client named and
-      // only ties when nothing else matched — and a tie goes to text. That is
-      // what a naive `curl`, a browser and a Prometheus scraper all expect.
-      let joined = below(q);
+      wildcard = Some(wildcard.map_or(q, |w| w.max(q)));
+    }
+  }
+  // RFC 9110's specificity rule: a named `*/*` supplies its q only to a media
+  // type the header has no entry of its own for, and never raises one the
+  // client priced for itself — `text/plain;q=0.1, */*;q=0.5` must not smuggle
+  // text above JSON's own 0.3. One step below the wildcard's q keeps a bare
+  // `*/*` inside the tie that goes to text.
+  if let Some(w) = wildcard {
+    let joined = below(w);
+    if !named.0 {
       best.0 = best.0.max(joined);
+    }
+    if !named.1 {
       best.1 = best.1.max(joined);
     }
   }
@@ -650,7 +664,7 @@ fn render(
   // The series that carry a `model` label. A launch scope is strict, exactly as
   // the JSON summary is: the scrape prints that launch's own figures, not
   // everything every launch of its model has served since daemon start.
-  let scoped: Vec<(String, &ScopeTotals, Clients)> = match &scope.launch {
+  let mut scoped: Vec<(String, ScopeTotals, Clients)> = match &scope.launch {
     Some(id) => snapshot
       .launches
       .iter()
@@ -658,7 +672,7 @@ fn render(
       .map(|entry| {
         (
           launch_label(&labels, live, snapshot, entry),
-          &entry.totals,
+          entry.totals.clone(),
           snapshot.in_flight(|row| row.launch_id.as_deref() == Some(id.as_str())),
         )
       })
@@ -670,14 +684,36 @@ fn render(
       .map(|totals| {
         (
           labels[&totals.key].clone(),
-          totals,
+          totals.clone(),
           snapshot.in_flight(|row| row.model_path.as_deref() == Some(totals.key.as_str())),
         )
       })
       .collect(),
   };
-  for (label, totals, live_clients) in scoped {
-    model_series(doc, &label, totals, live_clients);
+  // A live scope with no rows recorded yet still answers with its zeros: an
+  // alerting rule on a loaded model's `requests_in_flight == 0` must see the
+  // zero, not a missing series. The label sets are the ones the same series
+  // print once rows exist, so nothing appears under a second label shape.
+  if scoped.is_empty() {
+    let idle = match &scope.launch {
+      Some(id) => live.iter().find(|l| &l.id == id),
+      None => match &scope.path {
+        Some(path) => live.iter().find(|l| &l.path == path),
+        None => live
+          .iter()
+          .find(|l| scope.name.as_deref() == Some(l.model.as_str())),
+      },
+    };
+    if let Some(entry) = idle {
+      scoped.push((
+        zero_model_label(entry, live),
+        zero_totals(),
+        Clients::default(),
+      ));
+    }
+  }
+  for (label, totals, live_clients) in &scoped {
+    model_series(doc, label, totals, live_clients);
   }
 
   // Requests the proxy answered without ever reaching a model (an unknown model
@@ -761,6 +797,28 @@ fn render(
       // on the JSON surfaces (`launches[]`, `requests_tail --launch`).
     }
   }
+  // A live launch named by `?launch=` that has no rows yet still answers with
+  // the per-launch counter that survives a launch stopping; the model-labelled
+  // series took their zeros from the scoped block above.
+  for entry in live {
+    if scope.launch.as_deref() != Some(entry.id.as_str()) {
+      continue;
+    }
+    if snapshot.launches.iter().any(|t| t.totals.key == entry.id) {
+      continue;
+    }
+    let per_launch_labels = [
+      ("launch", entry.id.as_str()),
+      ("model", entry.model.as_str()),
+    ];
+    doc.sample(
+      "llamastash:launch_requests_total",
+      "Requests one launch finished",
+      "counter",
+      &per_launch_labels,
+      0.0,
+    );
+  }
 }
 
 /// The `model` label value for a request that never reached one.
@@ -827,10 +885,10 @@ fn unattributed_series(doc: &mut Document, snapshot: &LogSnapshot) {
 }
 
 /// The counters and gauges that carry one `model` label.
-fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, live: Clients) {
+fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, live: &Clients) {
   let labels = [("model", label)];
   let s = &totals.summary;
-  core_series(doc, label, s.requests, s.errors, &live);
+  core_series(doc, label, s.requests, s.errors, live);
   doc.sample(
     "llamastash:prompt_tokens_total",
     "Prompt tokens the finished requests reported",
@@ -924,6 +982,34 @@ fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, live: Cli
   }
 }
 
+/// The `model` label a live scope answers with before any row exists: the
+/// display name, or the catalog path when another live launch in the same
+/// scrape serves that name, which is the collision rule applied without any
+/// totals to consult.
+fn zero_model_label(entry: &LiveLaunch, live: &[LiveLaunch]) -> String {
+  let clash = live
+    .iter()
+    .any(|l| l.model == entry.model && l.path != entry.path);
+  if clash {
+    entry.path.clone()
+  } else {
+    entry.model.clone()
+  }
+}
+
+/// The summary a scope with no recorded rows still answers with: every counter
+/// and sum at zero, no average computed from nothing.
+fn zero_totals() -> ScopeTotals {
+  ScopeTotals {
+    key: String::new(),
+    label: None,
+    summary: RequestSummary::default(),
+    duration_ms_sum: 0,
+    ttfb_ms_sum: 0,
+    timed: 0,
+  }
+}
+
 /// The `model` label value of each entry in `models`. Two models can share a
 /// display name (same-named GGUFs in different roots), and one metric name may
 /// not carry two samples with the same label set, so a shared name falls back to
@@ -996,6 +1082,41 @@ fn json_body(
   scope_block.insert("launch".into(), value_opt(scope.launch.clone()));
 
   let mut models = Vec::new();
+  // A live scope that no row has reached yet is answered the way the text
+  // scrape answers it: a zero row keyed by the live launch, not a missing one.
+  let zero_live: Vec<&LiveLaunch> = match &scope.launch {
+    Some(id)
+      if snapshot
+        .models
+        .iter()
+        .all(|m| Some(m.key.as_str()) != scope.path.as_deref()) =>
+    {
+      live.iter().filter(|l| &l.id == id).collect()
+    }
+    None
+      if scope.path.is_some()
+        && snapshot
+          .models
+          .iter()
+          .all(|m| Some(m.key.as_str()) != scope.path.as_deref()) =>
+    {
+      live
+        .iter()
+        .filter(|l| Some(l.path.as_str()) == scope.path.as_deref())
+        .collect()
+    }
+    _ => Vec::new(),
+  };
+  for entry in zero_live {
+    models.push(merged(
+      &[
+        ("model", Value::String(entry.model.clone())),
+        ("path", Value::String(entry.path.clone())),
+        ("launches", Value::from(1)),
+      ],
+      &RequestSummary::default(),
+    ));
+  }
   for totals in snapshot.models.iter().filter(|m| scope.keeps_model(&m.key)) {
     let launches = snapshot
       .launches
@@ -1020,6 +1141,23 @@ fn json_body(
   }
 
   let mut launches = Vec::new();
+  for entry in live {
+    if scope.launch.as_deref() != Some(entry.id.as_str()) {
+      continue;
+    }
+    if snapshot.launches.iter().any(|t| t.totals.key == entry.id) {
+      continue;
+    }
+    launches.push(merged(
+      &[
+        ("launch", Value::String(entry.id.clone())),
+        ("model", Value::String(entry.model.clone())),
+        ("port", Value::from(entry.port)),
+        ("live", Value::Bool(true)),
+      ],
+      &RequestSummary::default(),
+    ));
+  }
   for entry in &snapshot.launches {
     let id = &entry.totals.key;
     let live_entry = live.iter().find(|l| &l.id == id);
@@ -1473,6 +1611,18 @@ mod tests {
       format_of(Some("*/*;q=0.1, application/json;q=0.9")).unwrap(),
       Format::Json
     );
+    // A wildcard raises only a candidate the header never named, so it can
+    // never lift a named type above the q the client gave it: text is priced at
+    // 0.1, JSON at 0.3, and the `*;q=0.5` speaks for neither's own price.
+    assert_eq!(
+      format_of(Some("text/plain;q=0.1, */*;q=0.5, application/json;q=0.3")).unwrap(),
+      Format::Json
+    );
+    // The same rule through the `text/*` family form.
+    assert_eq!(
+      format_of(Some("text/*;q=0.1, */*;q=0.5, application/json;q=0.3")).unwrap(),
+      Format::Json
+    );
     assert!(matches!(
       format_of(Some("application/xml, image/*")),
       Err(Reject::NotAcceptable(_))
@@ -1831,6 +1981,101 @@ mod tests {
       "{text}"
     );
     drop(streaming);
+  }
+
+  /// A live launch that has not served a request yet answers its own scrape
+  /// with zeros, not with a missing series: an alerting rule written against a
+  /// loaded model must read `0`, and every label set stays the one that name
+  /// uses once rows exist.
+  #[test]
+  fn metrics_a_live_launch_with_no_rows_answers_its_zeros() {
+    let log = RequestLog::new();
+    let live = [LiveLaunch {
+      id: "L1".into(),
+      model: "m1".into(),
+      path: "/models/a.gguf".into(),
+      port: 1111,
+      ready: true,
+    }];
+    let snap = log.snapshot();
+    let scope = Scope {
+      log: LogScope::Launch { id: "L1".into() },
+      path: Some("/models/a.gguf".into()),
+      launch: Some("L1".into()),
+      name: Some("m1".into()),
+      per_launch: true,
+    };
+    let mut doc = Document::new(true);
+    render(&mut doc, &snap, &live, &scope, 1, 1);
+    let text = doc.render();
+    for line in [
+      "llamastash:requests_total{model=\"m1\"} 0\n",
+      "llamastash:requests_in_flight{model=\"m1\"} 0\n",
+      "llamastash:hosts_in_flight{model=\"m1\"} 0\n",
+      "llamastash:prompt_tokens_total{model=\"m1\"} 0\n",
+      "llamastash:launch_requests_total{launch=\"L1\",model=\"m1\"} 0\n",
+    ] {
+      assert!(text.contains(line), "missing {line:?} in:\n{text}");
+    }
+    // Averages stay omitted: a mean has no figure to print from no rows, and
+    // the launch gauge's absence still means "stopped", never "zero".
+    assert!(!text.contains("request_duration_seconds_avg"), "{text}");
+    assert!(!text.contains("launch_requests_in_flight"), "{text}");
+  }
+
+  /// The same zeros through the model scope: `?model=` names the live launch's
+  /// model, and the scrape prints that model's series at zero.
+  #[test]
+  fn metrics_a_live_model_with_no_rows_answers_its_zeros() {
+    let log = RequestLog::new();
+    let live = [LiveLaunch {
+      id: "L1".into(),
+      model: "m1".into(),
+      path: "/models/a.gguf".into(),
+      port: 1111,
+      ready: true,
+    }];
+    let snap = log.snapshot();
+    let scope = Scope {
+      log: LogScope::Model {
+        path: "/models/a.gguf".into(),
+      },
+      path: Some("/models/a.gguf".into()),
+      name: Some("m1".into()),
+      per_launch: true,
+      ..Scope::default()
+    };
+    let mut doc = Document::new(true);
+    render(&mut doc, &snap, &live, &scope, 1, 1);
+    let text = doc.render();
+    for line in [
+      "llamastash:requests_total{model=\"m1\"} 0\n",
+      "llamastash:requests_in_flight{model=\"m1\"} 0\n",
+      "llamastash:launch_info{launch=\"L1\",model=\"m1\",port=\"1111\"} 1\n",
+    ] {
+      assert!(text.contains(line), "missing {line:?} in:\n{text}");
+    }
+  }
+
+  /// A scope naming a launch the daemon does not have keeps answering nothing
+  /// but the daemon gauges: the zeros exist because the scope names a live
+  /// launch, not because a scrape asks nicely.
+  #[test]
+  fn metrics_an_unscoped_scrape_does_not_invent_per_launch_zeros() {
+    let log = RequestLog::new();
+    let live = [LiveLaunch {
+      id: "L1".into(),
+      model: "m1".into(),
+      path: "/models/a.gguf".into(),
+      port: 1111,
+      ready: true,
+    }];
+    let snap = log.snapshot();
+    let mut doc = Document::new(true);
+    render(&mut doc, &snap, &live, &Scope::default(), 1, 1);
+    let text = doc.render();
+    assert!(!text.contains("launch_requests_total"), "{text}");
+    assert!(!text.contains("model=\"m1\""), "{text}");
   }
 
   /// The `# HELP`, `# TYPE` and sample lines one metric name prints, verbatim.
