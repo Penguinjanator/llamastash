@@ -58,6 +58,8 @@ pub enum Concept {
   FlashAttn,
   /// Serving mode (chat / embedding / rerank).
   Mode,
+  /// Tokens drafted per speculative (MTP) step.
+  MtpDraftTokens,
 }
 
 impl Concept {
@@ -74,6 +76,7 @@ impl Concept {
       Concept::MaxConcurrency => "parallel",
       Concept::FlashAttn => "flash-attn",
       Concept::Mode => "mode",
+      Concept::MtpDraftTokens => "mtp-draft-n",
     }
   }
 }

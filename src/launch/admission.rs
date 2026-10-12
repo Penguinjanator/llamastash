@@ -505,7 +505,7 @@ pub fn project_demand(
       .u32_by_concept(backend_id, crate::launch::knobs::Concept::MaxConcurrency)
       .unwrap_or(DEFAULT_N_SEQ),
     mtp_draft_n: knobs
-      .u32(crate::launch::knobs::kid("mtp-draft-n"))
+      .u32_by_concept(backend_id, crate::launch::knobs::Concept::MtpDraftTokens)
       .unwrap_or(DEFAULT_MTP_DRAFT_N),
   };
   resident_weight_bytes
@@ -992,10 +992,11 @@ mod tests {
     assert_eq!(demand(&auto, true), 3 * layer_kv + 4 * state * 4);
 
     let mut draft_two = KnobSet::new();
-    draft_two.set(
-      crate::launch::knobs::kid("mtp-draft-n"),
+    assert!(draft_two.set_by_concept(
+      crate::backend::DEFAULT_BACKEND_ID,
+      Concept::MtpDraftTokens,
       KnobValue::Set(Scalar::U32(2)),
-    );
+    ));
     assert_eq!(demand(&draft_two, true), 3 * layer_kv + 4 * state * 3);
 
     let mut single = KnobSet::new();
