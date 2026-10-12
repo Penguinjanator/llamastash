@@ -507,7 +507,7 @@ backends
   lemonade  not installed  cpu|npu  (umbrella: disabled)
 ```
 
-A server reads as its configured `name:`, else the compute backends its device probe found (`rocm`, `rocm+vulkan`, `cpu` for a llama.cpp build whose probe lists no GPU), else its build folder when two unnamed builds share those or its `--list-devices` probe failed. A repeated label gets `-2`, `-3`. A generic entry reads as its `name:` with or without `model:`. A backend with no server shows its accelerators instead. The labels are `server_labels` on each `backends` row in `--json`, and the TUI Daemon panel's `server` row shows the same: `llamacpp (rocm|vulkan) · generic (gufo|halogen-flash-next)`, with the build a focused launch runs on in green when it isn't the default.
+A server reads as its configured `name:`, else the compute backends its device probe found (`rocm`, `rocm+vulkan`, `cpu` for a llama.cpp build whose probe lists no GPU), else its build folder when two unnamed builds share those or its `--list-devices` probe failed (the binary's file name for a flat install such as `/usr/bin/llama-server`). A repeated label gets `-2`, `-3`. A generic entry reads as its `name:` with or without `model:`. A backend with no server shows its accelerators instead. The labels are `server_labels` on each `backends` row in `--json`, and the TUI Daemon panel's `server` row shows the same: `llamacpp (rocm|vulkan) · generic (gufo|halogen-flash-next)`, with the build a focused launch runs on in green when it isn't the default.
 
 On a host where more than one GPU backend reports a device (e.g. an
 NVIDIA card seen via CUDA plus an AMD card via ROCm), `gpu` serialises

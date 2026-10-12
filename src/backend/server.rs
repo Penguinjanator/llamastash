@@ -248,6 +248,23 @@ fn server_gpu_tag(devices: &[Device]) -> Option<String> {
   devices.first().map(|d| d.gpu_backend.to_ascii_lowercase())
 }
 
+/// [`binary_dir_tag`] for a display label: a flat install (`/usr/bin/x`,
+/// `/usr/local/bin/x`) has no build folder, and `usr` or `local` names
+/// nothing, so it reads as the binary's own file name instead.
+fn label_dir_tag(binary: &Path) -> String {
+  let tag = binary_dir_tag(binary);
+  if !matches!(
+    tag.as_str(),
+    "bin" | "sbin" | "usr" | "local" | "opt" | "server"
+  ) {
+    return tag;
+  }
+  binary
+    .file_name()
+    .map(|n| n.to_string_lossy().into_owned())
+    .unwrap_or(tag)
+}
+
 /// Every distinct compute backend a server's devices reveal, lower-cased and
 /// joined with `+` in probe order (`rocm`, `rocm+vulkan`). `None` for a
 /// device-less server.
@@ -330,7 +347,7 @@ fn derive_servers(backend_id: &str, probed: Vec<(ServerSpec, Vec<Device>)>) -> V
     let label = match (&spec.name, &arch_labels[i]) {
       (Some(name), _) => Some(name.clone()),
       (None, Some(arch)) if label_counts.get(arch.as_str()) == Some(&1) => Some(arch.clone()),
-      (None, Some(_)) => Some(binary_dir_tag(&spec.binary)),
+      (None, Some(_)) => Some(label_dir_tag(&spec.binary)),
       (None, None) => None,
     };
     // The id suffix after `<backend>-`; `None` means the bare backend id (a
@@ -391,7 +408,7 @@ fn finish_labels(
         filled[i] = true;
         deviceless.clone()
       } else {
-        Some(binary_dir_tag(&server.binary))
+        Some(label_dir_tag(&server.binary))
       };
     }
   }
@@ -402,7 +419,7 @@ fn finish_labels(
       .count();
     if readers > 1 {
       for (server, _) in servers.iter_mut().zip(&filled).filter(|(_, f)| **f) {
-        server.label = Some(binary_dir_tag(&server.binary));
+        server.label = Some(label_dir_tag(&server.binary));
       }
     }
   }
@@ -879,6 +896,16 @@ mod tests {
     let mut unprobed = servers(vec![(spec("/l/lemond", None), vec![])]);
     finish_labels(&mut unprobed, &[true], None);
     assert_eq!(unprobed[0].label, None);
+  }
+
+  #[test]
+  fn a_flat_install_reads_as_its_binary_not_its_system_folder() {
+    let tag = |p: &str| label_dir_tag(Path::new(p));
+    assert_eq!(tag("/a/build-hip/bin/llama-server"), "build-hip");
+    assert_eq!(tag("/opt/llama-vulkan/llama-server"), "llama-vulkan");
+    assert_eq!(tag("/usr/bin/llama-server"), "llama-server");
+    assert_eq!(tag("/usr/local/bin/llama-server"), "llama-server");
+    assert_eq!(tag("/bin/false"), "false");
   }
 
   #[test]

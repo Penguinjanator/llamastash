@@ -201,6 +201,60 @@ pub fn probe(binary: &Path) -> Option<Vec<BinaryDevice>> {
 mod tests {
   use super::*;
 
+  /// A fake `llama-server` that prints one ROCm device and exits `code`.
+  #[cfg(unix)]
+  fn fake_binary(label: &str, code: i32) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = crate::test_support::unique_temp_dir("list-devices", label).join("build-hip/bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("llama-server");
+    std::fs::write(
+      &bin,
+      format!(
+        "#!/bin/sh\necho 'Available devices:'\necho '  ROCm0: AMD Radeon 8060S Graphics (126976 MiB, 120000 MiB free)'\nexit {code}\n"
+      ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+  }
+
+  /// A non-zero exit is a failed probe even when stdout listed devices, so a
+  /// broken build is never reported as one that answered.
+  #[cfg(unix)]
+  #[test]
+  fn a_non_zero_exit_is_a_failed_probe_even_with_devices_printed() {
+    let ok = probe_devices(&fake_binary("ok", 0)).expect("a clean exit answers");
+    assert_eq!(ok.len(), 1);
+    assert_eq!(ok[0].selector, "ROCm0");
+    assert!(probe_devices(&fake_binary("bad", 1)).is_none());
+    assert!(probe_devices(Path::new("/nonexistent/llama-server")).is_none());
+  }
+
+  /// The config-only (`doctor`) catalog labels servers the way the daemon's
+  /// does: probed arch, and the build folder for a probe that failed.
+  #[cfg(unix)]
+  #[test]
+  fn config_server_catalog_labels_like_the_daemon_catalog() {
+    let mut config = crate::config::Config::default();
+    config.backend.llamacpp.servers = vec![
+      crate::backend::ServerConfig {
+        binary: fake_binary("cfg-ok", 0),
+        name: None,
+      },
+      crate::backend::ServerConfig {
+        binary: fake_binary("cfg-bad", 1),
+        name: None,
+      },
+    ];
+    let labels: Vec<Option<String>> = crate::backend::config_server_catalog(&config)
+      .into_iter()
+      .filter(|s| s.backend_id == crate::backend::DEFAULT_BACKEND_ID)
+      .map(|s| s.label)
+      .collect();
+    assert_eq!(labels, [Some("rocm".into()), Some("build-hip".into())]);
+  }
+
   #[test]
   fn parses_vulkan_multi_device_block() {
     let out = "\

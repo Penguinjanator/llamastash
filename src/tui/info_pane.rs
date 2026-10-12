@@ -272,7 +272,8 @@ fn server_entry_spans<'a>(
   let mut spans = vec![id, Span::styled(" (", palette.muted_style())];
   let mut room = budget.saturating_sub(entry.id.width() + 3);
   for (i, label) in entry.labels.iter().enumerate() {
-    if room == 0 {
+    // A separator needs a label cell after it, or the row ends in `|)`.
+    if room == 0 || (i > 0 && room < 2) {
       break;
     }
     if i > 0 {
@@ -848,6 +849,10 @@ mod tests {
     assert_eq!(text(8), "llamacpp");
     assert_eq!(text(11), "llamacpp");
     assert_eq!(text(12), "llamacpp (…)");
+    // One column left after `rocm`: no room for a label after `|`.
+    assert_eq!(text(16), "llamacpp (rocm)");
+    assert_eq!(text(17), "llamacpp (rocm|…)");
+    assert_eq!(text(18), "llamacpp (rocm|v…)");
     assert_eq!(text(40), "llamacpp (rocm|vulkan)");
   }
 
