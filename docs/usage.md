@@ -1550,8 +1550,8 @@ kept once per metric name (first wins), and every engine sample line gains
 `model_name`, say) are left alone. One target that refuses, times out or answers
 nothing parseable never fails the response; unparsable lines are skipped and counted.
 Beside the engine's samples sit four proxy-owned gauges, labelled `model,launch`:
-`llamastash:backend_metrics_available` (1/0 — a `501` from llama.cpp started without
-`--metrics` lands here), `llamastash:backend_metrics_series`,
+`llamastash:backend_metrics_available` (1/0 — only a plain `200` is a 1, so a `501` from
+llama.cpp started without `--metrics` and a `404` both land here), `llamastash:backend_metrics_series`,
 `llamastash:backend_metrics_scrape_duration_seconds`,
 `llamastash:backend_metrics_skipped_total`.
 
