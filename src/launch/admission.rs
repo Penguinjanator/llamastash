@@ -31,7 +31,9 @@ use std::sync::Mutex;
 
 use crate::daemon::host_metrics::HostMetricsSnapshot;
 use crate::gguf::header::GgufHeader;
-use crate::gguf::memory::{kv_bytes, parse_cache_type, EstimateOptions, DEFAULT_N_SEQ};
+use crate::gguf::memory::{
+  kv_bytes, parse_cache_type, EstimateOptions, DEFAULT_MTP_DRAFT_N, DEFAULT_N_SEQ,
+};
 use crate::launch::headroom::{admissible_bytes, overhead_band_bytes, PoolKind};
 
 /// One in-flight launch's hold on the budget, keyed by `launch_id`.
@@ -502,6 +504,9 @@ pub fn project_demand(
     n_seq: knobs
       .u32_by_concept(backend_id, crate::launch::knobs::Concept::MaxConcurrency)
       .unwrap_or(DEFAULT_N_SEQ),
+    mtp_draft_n: knobs
+      .u32(crate::launch::knobs::kid("mtp-draft-n"))
+      .unwrap_or(DEFAULT_MTP_DRAFT_N),
   };
   resident_weight_bytes
     .saturating_add(kv_bytes(header, arch, opts))
@@ -516,7 +521,9 @@ pub fn project_demand(
 ///
 /// Calibrated from a measured idle delta of ~11% of weights (MTP on vs off on
 /// Qwen3.5-4B-MTP: +320 MiB on 2.7 GiB weights), rounded up to ~16.7%
-/// (`weights / 6`) to leave headroom for the active draft context under load.
+/// (`weights / 6`). The draft context's KV and a hybrid's rollback snapshots
+/// are priced in [`kv_bytes`], so the margin above the measured delta is now
+/// spare headroom for the draft compute buffers rather than its cache.
 /// A fraction of the **resident** weights, not the on-disk total: the draft
 /// head is an ordinary resident tensor, so it scales with what the engine
 /// holds rather than with what the file weighs. Zero when MTP is off.
@@ -930,7 +937,8 @@ mod tests {
   }
 
   /// A hybrid's demand follows the launch: the MTP block's KV only with MTP
-  /// on, and one recurrent state per `--parallel` sequence.
+  /// on, one recurrent state per `--parallel` sequence, and with MTP on one
+  /// more per drafted token.
   #[test]
   fn project_demand_prices_a_hybrid_per_launch() {
     use crate::gguf::header::{read_reader, HeaderReadOptions};
@@ -977,9 +985,18 @@ mod tests {
     let layer_kv = 2 * 4 * 256 * 1000 * 2;
     let state = 128 * 4096 * 4 * 6;
 
+    // With MTP on, llama.cpp adds a rollback snapshot per drafted token: 3
+    // when `mtp-draft-n` is unset.
     let auto = KnobSet::new();
     assert_eq!(demand(&auto, false), 2 * layer_kv + 4 * state);
-    assert_eq!(demand(&auto, true), 3 * layer_kv + 4 * state);
+    assert_eq!(demand(&auto, true), 3 * layer_kv + 4 * state * 4);
+
+    let mut draft_two = KnobSet::new();
+    draft_two.set(
+      crate::launch::knobs::kid("mtp-draft-n"),
+      KnobValue::Set(Scalar::U32(2)),
+    );
+    assert_eq!(demand(&draft_two, true), 3 * layer_kv + 4 * state * 3);
 
     let mut single = KnobSet::new();
     assert!(single.set_by_concept(
