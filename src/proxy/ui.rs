@@ -177,14 +177,7 @@ async fn collect_running(state: &Arc<ProxyState>) -> Vec<RunningEntry> {
     }
     let id = model.id().clone();
     let path_key = id.path.to_string_lossy().into_owned();
-    let name = by_path
-      .get(&path_key)
-      .map(|m| {
-        m.display_label
-          .clone()
-          .unwrap_or_else(|| crate::util::paths::model_display_name(&m.path))
-      })
-      .unwrap_or_else(|| crate::util::paths::model_display_name(&id.path));
+    let name = route::served_name_for_model(by_path.get(&path_key).copied(), &id.path);
     // Whether this model's backend serves a web UI. Uses the running model's
     // *actual* resolved backend (last_params tag, falling back to the routing
     // verdict) via `Backend::serves_web_ui`, so a compatible file force-run on a

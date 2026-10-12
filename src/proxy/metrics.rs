@@ -331,14 +331,7 @@ pub(crate) async fn live_launches(state: &ProxyState) -> Vec<LiveLaunch> {
       continue;
     }
     let path = model.id().path.to_string_lossy().into_owned();
-    let name = by_path
-      .get(&path)
-      .map(|m| {
-        m.display_label
-          .clone()
-          .unwrap_or_else(|| crate::util::paths::model_display_name(&m.path))
-      })
-      .unwrap_or_else(|| crate::util::paths::model_display_name(&model.id().path));
+    let name = route::served_name_for_model(by_path.get(&path).copied(), &model.id().path);
     let ready = matches!(model.state().await, ManagedState::Ready);
     out.push(LiveLaunch {
       id: launch_id.as_str().to_string(),
@@ -482,10 +475,7 @@ pub(crate) async fn resolve_model(
   if let Some(model) = route::index_catalog_by_path(&views).get(value).copied() {
     return Ok((
       value.to_string(),
-      model
-        .display_label
-        .clone()
-        .unwrap_or_else(|| crate::util::paths::model_display_name(&model.path)),
+      route::served_name_for_model(Some(model), &model.path),
     ));
   }
   match route::resolve_client_reference(state, rows.as_ref(), value) {
