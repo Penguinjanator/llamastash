@@ -157,7 +157,10 @@ mod tests {
   fn an_unset_engine_metrics_knob_emits_no_argv() {
     for (backend, knob) in [
       (crate::backend::DEFAULT_BACKEND_ID, "metrics"),
-      (crate::backend::sglang::SGLANG_BACKEND_ID, "enable-metrics"),
+      (
+        crate::test_support::backend_declaring("enable-metrics"),
+        "enable-metrics",
+      ),
     ] {
       let id = registry::resolve_id_for(backend, knob).expect("the knob is declared");
       assert!(
