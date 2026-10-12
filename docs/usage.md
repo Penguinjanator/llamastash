@@ -1538,7 +1538,8 @@ JSON shape is unchanged, because `summary` already counted those requests.
 A `model` label is a display name while that name is unique and a catalog path once two
 models share it, so the second of two same-named models takes its first request, the
 first one's label switches to its path and its series splits in two — that is the
-collision rule working, not a restarted counter.
+collision rule working, not a restarted counter. The JSON form does not apply the rule:
+every `model` field there is the display name, and `path` tells two same-named models apart.
 
 The per-launch series are opt-in because they multiply every series above by the
 number of launches a model has had. Ask for them with `?launch=1`:

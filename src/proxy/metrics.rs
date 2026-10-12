@@ -997,17 +997,25 @@ fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, live: &Cl
 /// scope happens to include, so a model keeps one label for its whole life
 /// however it is scraped. See `model_labels` for the same rule on the totals.
 fn zero_model_label(entry: &LiveLaunch, live: &[LiveLaunch], snapshot: &LogSnapshot) -> String {
-  let clash = live
+  let shared = live
     .iter()
     .any(|l| l.model == entry.model && l.path != entry.path)
     || snapshot
       .models
       .iter()
       .any(|m| m.label.as_deref() == Some(entry.model.as_str()) && m.key != entry.path);
-  if clash {
-    entry.path.clone()
+  label_or_path(&entry.model, &entry.path, shared)
+}
+
+/// The collision rule both label pickers apply: a model prints its display name
+/// unless another model shares it, or the name is `none`, which names the
+/// requests that reached no model. Either way two samples of one metric would
+/// land under one label set, so the catalog path stands in.
+fn label_or_path(name: &str, path: &str, shared: bool) -> String {
+  if shared || name == NO_MODEL {
+    path.to_string()
   } else {
-    entry.model.clone()
+    name.to_string()
   }
 }
 
@@ -1024,11 +1032,6 @@ fn zero_totals() -> ScopeTotals {
   }
 }
 
-/// The `model` label value of each entry in `models`. Two models can share a
-/// display name (same-named GGUFs in different roots), and one metric name may
-/// not carry two samples with the same label set, so a shared name falls back to
-/// the catalog path for the models that collide. Callers pass the whole log, so
-/// the pick does not depend on what a scope happens to include.
 /// The catalog path one launch served: the registry's answer for a live launch,
 /// then the rows of a retired one. `None` when neither can say.
 fn launch_path<'a>(live: &'a [LiveLaunch], snapshot: &'a LogSnapshot, id: &str) -> Option<&'a str> {
@@ -1058,6 +1061,11 @@ fn launch_label(
     .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// The `model` label value of each entry in `models`. Two models can share a
+/// display name (same-named GGUFs in different roots), and one metric name may
+/// not carry two samples with the same label set, so a shared name falls back to
+/// the catalog path for the models that collide. Callers pass the whole log, so
+/// the pick does not depend on what a scope happens to include.
 fn model_labels(models: &[ScopeTotals]) -> HashMap<String, String> {
   let mut counts: HashMap<String, usize> = HashMap::new();
   for totals in models {
@@ -1069,11 +1077,11 @@ fn model_labels(models: &[ScopeTotals]) -> HashMap<String, String> {
     .iter()
     .map(|totals| {
       let label = totals.label.clone().unwrap_or_else(|| totals.key.clone());
-      // `none` names the requests that reached no model, so a model displaying
-      // that name would put two samples of one metric under one label set.
-      let taken = label == NO_MODEL || counts.get(&label).copied().unwrap_or(0) > 1;
-      let out = if taken { totals.key.clone() } else { label };
-      (totals.key.clone(), out)
+      let shared = counts.get(&label).copied().unwrap_or(0) > 1;
+      (
+        totals.key.clone(),
+        label_or_path(&label, &totals.key, shared),
+      )
     })
     .collect()
 }
@@ -1122,7 +1130,9 @@ fn json_body(
     _ => Vec::new(),
   };
   // One row per path however many live launches serve it, the way the totals
-  // loop below reports a model with several launches.
+  // loop below reports a model with several launches. `model` is the display
+  // name, as on every other JSON row: `path` already tells two same-named models
+  // apart, and the collision rule exists for the text format's label sets.
   let mut zero_rows: Vec<(String, String, usize)> = Vec::new();
   for entry in &zero_live {
     match zero_rows
@@ -1130,11 +1140,7 @@ fn json_body(
       .find(|(_, path, _)| path == &entry.path)
     {
       Some((_, _, count)) => *count += 1,
-      None => zero_rows.push((
-        zero_model_label(entry, live, snapshot),
-        entry.path.clone(),
-        1,
-      )),
+      None => zero_rows.push((entry.model.clone(), entry.path.clone(), 1)),
     }
   }
   for (model, path, launches) in zero_rows {
@@ -2150,6 +2156,71 @@ mod tests {
       !text.contains("{model=\"m\"} 0"),
       "the zeros must not borrow the stopped model's label:\n{text}"
     );
+  }
+
+  /// `none` is the label of the requests no model answered, so an idle model
+  /// that displays as `none` answers under its path, as it will once it has rows.
+  #[test]
+  fn metrics_an_idle_model_named_none_answers_under_its_path() {
+    let log = RequestLog::new();
+    let live = [LiveLaunch {
+      id: "L1".into(),
+      model: NO_MODEL.into(),
+      path: "/models/none.gguf".into(),
+      port: 1111,
+      ready: true,
+    }];
+    let snap = log.snapshot();
+    let scope = Scope {
+      log: LogScope::Model {
+        path: "/models/none.gguf".into(),
+      },
+      path: Some("/models/none.gguf".into()),
+      name: Some(NO_MODEL.into()),
+      ..Scope::default()
+    };
+    let mut doc = Document::new(true);
+    render(&mut doc, &snap, &live, &scope, 1, 1);
+    let text = doc.render();
+    assert!(
+      text.contains("llamastash:requests_total{model=\"/models/none.gguf\"} 0\n"),
+      "{text}"
+    );
+    assert!(!text.contains("{model=\"none\"}"), "{text}");
+  }
+
+  /// JSON rows carry `path` beside `model`, so `model` stays the display name
+  /// on an idle row too, even where the text format falls back to the path.
+  #[test]
+  fn metrics_json_idle_row_keeps_the_display_name() {
+    let log = RequestLog::new();
+    request_named(&log, "m", "/models/a.gguf", "L1", 10, 5);
+    log.forget_launch("L1");
+    let live = [LiveLaunch {
+      id: "L2".into(),
+      model: "m".into(),
+      path: "/models/b.gguf".into(),
+      port: 2222,
+      ready: true,
+    }];
+    let snap = log.snapshot();
+    let parsed = Parsed {
+      format: Format::Json,
+      scope: Scope {
+        log: LogScope::Model {
+          path: "/models/b.gguf".into(),
+        },
+        path: Some("/models/b.gguf".into()),
+        name: Some("m".into()),
+        ..Scope::default()
+      },
+      limit: 10,
+    };
+    let body = json_body(&log, &snap, &live, &parsed, 1, 2);
+    let rows = body["models"].as_array().expect("models");
+    assert_eq!(rows.len(), 1, "{body}");
+    assert_eq!(rows[0]["model"], "m", "{body}");
+    assert_eq!(rows[0]["path"], "/models/b.gguf", "{body}");
   }
 
   /// A scope naming a launch the daemon does not have keeps answering nothing
