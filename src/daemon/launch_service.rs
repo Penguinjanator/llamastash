@@ -2040,6 +2040,7 @@ mod tests {
         free_mib: None,
       }],
       caps: Default::default(),
+      label: None,
     };
     let default = PathBuf::from("/bin/llama-server");
     let binary = pick_launch_binary(
@@ -2100,6 +2101,7 @@ mod tests {
       name: "llamacpp-rocm".into(),
       devices: vec![],
       caps: Default::default(),
+      label: None,
     };
     let default = PathBuf::from("/bin/llama-server");
     let binary = pick_launch_binary(
@@ -2724,6 +2726,7 @@ mod tests {
         name: "llamacpp-rocm".into(),
         devices: Vec::new(),
         caps: Default::default(),
+        label: None,
       }])
       .await;
     let parsed = StartParams {

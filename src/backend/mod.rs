@@ -594,6 +594,15 @@ pub trait Backend {
     Vec::new()
   }
 
+  /// What a server runs on when [`Self::probe_devices`] finds no GPU on it.
+  /// `None` (default) means "unknown": the backend has no device probe, so an
+  /// empty list says nothing, and the server's label falls back to the
+  /// backend's `status` accelerators. A backend whose probe is authoritative
+  /// (a build with no GPU devices is a CPU build) returns that accelerator.
+  fn deviceless_accelerator(&self) -> Option<Accelerator> {
+    None
+  }
+
   /// Probe one server binary for the **spellings it accepts**, for a flag whose
   /// name differs between builds of the same engine. Returned as an opaque
   /// string map that only the owning backend writes and reads — the generic
@@ -1244,6 +1253,10 @@ impl Backend for Backends {
 
   fn probe_devices(&self, binary: &Path) -> Vec<Device> {
     for_each_backend!(self, b => b.probe_devices(binary))
+  }
+
+  fn deviceless_accelerator(&self) -> Option<Accelerator> {
+    for_each_backend!(self, b => b.deviceless_accelerator())
   }
 
   fn probe_caps(&self, binary: &Path) -> std::collections::BTreeMap<String, String> {

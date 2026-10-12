@@ -241,6 +241,16 @@ impl Backend for GenericBackend {
     AcceleratorSupport::default()
   }
 
+  async fn status_accelerators(
+    &self,
+    _ctx: &MethodContext,
+    _device: &[super::Accelerator],
+  ) -> Vec<String> {
+    // Each entry runs whatever its own binary was built for, so the GPUs the
+    // llama.cpp probe found on this host say nothing about it.
+    Vec::new()
+  }
+
   fn identify(&self, path: &Path, _header_bytes: &[u8]) -> ModelIdentity {
     self.synthetic_identity(path).unwrap_or_else(|| {
       ModelIdentity::Backend(BackendModelId {

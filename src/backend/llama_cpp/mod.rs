@@ -373,6 +373,10 @@ impl Backend for LlamaCppBackend {
     list_devices::probe_devices(binary)
   }
 
+  fn deviceless_accelerator(&self) -> Option<super::Accelerator> {
+    Some(super::Accelerator::Cpu)
+  }
+
   fn probe_caps(&self, binary: &Path) -> std::collections::BTreeMap<String, String> {
     let mut caps = std::collections::BTreeMap::new();
     caps.insert(

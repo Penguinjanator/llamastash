@@ -432,17 +432,15 @@ async fn backends_status(ctx: &MethodContext) -> Value {
   // `--list-devices`). The default `status_accelerators` unions these into a
   // backend's static floor; a backend that probes its own installed
   // accelerators live (a managed multiplexer) overrides and ignores them.
-  let device_accels: Vec<crate::backend::Accelerator> = match ctx.launch.as_ref() {
-    Some(env) => env
-      .servers
-      .current()
-      .await
-      .iter()
-      .flat_map(|s| s.devices.iter())
-      .filter_map(|d| accelerator_from_selector(&d.selector))
-      .collect(),
+  let catalog: Vec<crate::backend::Server> = match ctx.launch.as_ref() {
+    Some(env) => env.servers.current().await.to_vec(),
     None => Vec::new(),
   };
+  let device_accels: Vec<crate::backend::Accelerator> = catalog
+    .iter()
+    .flat_map(|s| s.devices.iter())
+    .filter_map(|d| accelerator_from_selector(&d.selector))
+    .collect();
 
   // One row per registered backend, assembled generically from the backend's
   // status hooks (installed / enabled / accelerators / binary / extra). This
@@ -450,13 +448,16 @@ async fn backends_status(ctx: &MethodContext) -> Value {
   // registration alone — no edit here.
   let mut rows = Vec::new();
   for b in Backends::all() {
+    let accelerators = b.status_accelerators(ctx, &device_accels).await;
+    let labels = server_labels(b.id(), &catalog, &accelerators);
     let mut row = backend_row(
       b.id(),
       b.lifecycle().label(),
       b.installed(ctx),
-      b.status_accelerators(ctx, &device_accels).await,
+      accelerators,
     );
     if let Some(obj) = row.as_object_mut() {
+      obj.insert("server_labels".into(), json!(labels));
       if let Some(enabled) = b.status_enabled(ctx) {
         obj.insert("enabled".into(), json!(enabled));
       }
@@ -468,6 +469,29 @@ async fn backends_status(ctx: &MethodContext) -> Value {
     rows.push(row);
   }
   Value::Array(rows)
+}
+
+/// One display label per catalog server of `backend_id`, in catalog order.
+/// A server with no label of its own (no name, no device probe) reads as the
+/// backend's accelerators joined with `|`, else its binary's file name.
+fn server_labels(
+  backend_id: &str,
+  catalog: &[crate::backend::Server],
+  accelerators: &[String],
+) -> Vec<String> {
+  catalog
+    .iter()
+    .filter(|s| s.backend_id == backend_id)
+    .map(|s| match &s.label {
+      Some(l) => l.clone(),
+      None if !accelerators.is_empty() => accelerators.join("|"),
+      None => s
+        .binary
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| s.id.clone()),
+    })
+    .collect()
 }
 
 /// Attach a backend row's resolved `binary` path; absent when no binary

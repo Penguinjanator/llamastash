@@ -107,6 +107,13 @@ pub struct Server {
   /// catalog `doctor` builds (it never launches, so it skips the probe).
   #[serde(default)]
   pub caps: std::collections::BTreeMap<String, String>,
+  /// Short display label for `status` and the TUI: the configured `name:`,
+  /// else the compute backends its devices reveal (`rocm`, `rocm+vulkan`),
+  /// else the build directory when two unnamed builds share those, else the
+  /// backend's [`Backend::deviceless_accelerator`]. `None` when nothing names
+  /// it; `status` then falls back to the backend's accelerators.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub label: Option<String>,
 }
 
 impl Server {
@@ -226,6 +233,20 @@ fn server_gpu_tag(devices: &[Device]) -> Option<String> {
   devices.first().map(|d| d.gpu_backend.to_ascii_lowercase())
 }
 
+/// Every distinct compute backend a server's devices reveal, lower-cased and
+/// joined with `+` in probe order (`rocm`, `rocm+vulkan`). `None` for a
+/// device-less server.
+fn server_arch_label(devices: &[Device]) -> Option<String> {
+  let mut archs: Vec<String> = Vec::new();
+  for d in devices {
+    let a = d.gpu_backend.to_ascii_lowercase();
+    if !a.is_empty() && !archs.contains(&a) {
+      archs.push(a);
+    }
+  }
+  (!archs.is_empty()).then(|| archs.join("+"))
+}
+
 /// Basename of the binary's parent directory (`…/build-hip/bin/llama-server` →
 /// `build-hip`), the third-tier disambiguator when the gpu-backend tag collides.
 fn binary_dir_tag(binary: &Path) -> String {
@@ -274,9 +295,29 @@ fn derive_servers(backend_id: &str, probed: Vec<(ServerSpec, Vec<Device>)>) -> V
     *tag_counts.entry(tag.as_str()).or_insert(0) += 1;
   }
 
+  // Display labels collide on the full compute set, not the first device, so a
+  // `rocm+vulkan` build beside a `rocm` build keeps its arch label.
+  let arch_labels: Vec<Option<String>> = probed
+    .iter()
+    .map(|(spec, devices)| match spec.name {
+      Some(_) => None,
+      None => server_arch_label(devices),
+    })
+    .collect();
+  let mut label_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+  for l in arch_labels.iter().flatten() {
+    *label_counts.entry(l.as_str()).or_insert(0) += 1;
+  }
+
   let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
   let mut out = Vec::with_capacity(probed.len());
   for (i, (spec, devices)) in probed.into_iter().enumerate() {
+    let label = match (&spec.name, &arch_labels[i]) {
+      (Some(name), _) => Some(name.clone()),
+      (None, Some(arch)) if label_counts.get(arch.as_str()) == Some(&1) => Some(arch.clone()),
+      (None, Some(_)) => Some(binary_dir_tag(&spec.binary)),
+      (None, None) => None,
+    };
     // The id suffix after `<backend>-`; `None` means the bare backend id (a
     // device-less server whose compute type we can't name).
     let base: Option<String> = match &spec.name {
@@ -308,6 +349,7 @@ fn derive_servers(backend_id: &str, probed: Vec<(ServerSpec, Vec<Device>)>) -> V
       name: candidate,
       devices,
       caps: Default::default(),
+      label,
     });
   }
   out
@@ -336,8 +378,12 @@ pub fn build_server_catalog(ctx: &MethodContext) -> Vec<Server> {
     // never cached across runs — a rebuild in place changes the answer while
     // the path stays the same.
     let mut servers = derive_servers(&backend_id, probed);
+    let deviceless = backend.deviceless_accelerator();
     for server in &mut servers {
       server.caps = backend.probe_caps(&server.binary);
+      if server.label.is_none() {
+        server.label = deviceless.map(|a| a.label().to_string());
+      }
     }
     out.extend(servers);
   }
@@ -374,7 +420,12 @@ pub fn config_server_catalog(config: &crate::config::Config) -> Vec<Server> {
         ))
       })
       .collect();
-    out.extend(derive_servers(&backend_id, probed));
+    let mut servers = derive_servers(&backend_id, probed);
+    let deviceless = backend.deviceless_accelerator();
+    for server in servers.iter_mut().filter(|s| s.label.is_none()) {
+      server.label = deviceless.map(|a| a.label().to_string());
+    }
+    out.extend(servers);
   }
   out
 }
@@ -535,6 +586,7 @@ mod tests {
       name: id.to_string(),
       devices: Vec::new(),
       caps: Default::default(),
+      label: None,
     };
     let servers = [
       srv("llamacpp-rocm", "/b/rocm/llama-server"),
@@ -657,6 +709,7 @@ mod tests {
         ),
       ],
       caps: Default::default(),
+      label: None,
     };
     assert_eq!(server.devices.len(), 2, "both selectors stay selectable");
     assert_eq!(server.physical_device_count(), 1);
@@ -679,6 +732,43 @@ mod tests {
     );
     assert_eq!(servers[0].id, "llamacpp-rocm");
     assert_eq!(servers[1].id, "llamacpp-vulkan");
+  }
+
+  #[test]
+  fn labels_prefer_name_then_arch_then_build_dir() {
+    let label = |servers: &[Server], i: usize| servers[i].label.clone();
+    let servers = derive_servers(
+      "enginex",
+      vec![
+        (
+          spec("/a/cuda/llama-server", Some("cuda-fa")),
+          vec![dev("CUDA0", "CUDA")],
+        ),
+        (
+          spec("/a/multi/bin/llama-server", None),
+          vec![
+            dev("ROCm0", "ROCm"),
+            dev("Vulkan0", "Vulkan"),
+            dev("ROCm1", "ROCm"),
+          ],
+        ),
+        (
+          spec("/a/build-hip/bin/llama-server", None),
+          vec![dev("ROCm0", "ROCm")],
+        ),
+        (
+          spec("/a/build-rocm7/bin/llama-server", None),
+          vec![dev("ROCm0", "ROCm")],
+        ),
+        (spec("/a/cpu/llama-server", None), vec![]),
+      ],
+    );
+    assert_eq!(label(&servers, 0).as_deref(), Some("cuda-fa"));
+    assert_eq!(label(&servers, 1).as_deref(), Some("rocm+vulkan"));
+    assert_eq!(label(&servers, 2).as_deref(), Some("build-hip"));
+    assert_eq!(label(&servers, 3).as_deref(), Some("build-rocm7"));
+    // Device-less: the catalog builder fills in the backend's own answer.
+    assert_eq!(label(&servers, 4), None);
   }
 
   #[test]
