@@ -963,6 +963,81 @@ async fn metrics_an_ambiguous_model_scope_is_a_400_not_a_404() {
 
 // --- an engine that will not answer ---------------------------------------
 
+/// Two live launches of one model make a `?launch=<model-ref>` ambiguous: it
+/// names a model with two answers. Settling on whichever the registry reached
+/// first would print one launch's figures under a reference that meant both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_a_launch_reference_that_matches_two_launches_is_a_400() {
+  let dir = unique_temp("launch-ambiguous");
+  let registry = SupervisorRegistry::new();
+  let first = spawn_fake("/fixture/alpha.gguf", &dir, true).await;
+  let first_id = registry.next_id();
+  registry.insert(first_id.clone(), first.clone()).await;
+  let second = spawn_fake("/fixture/alpha.gguf", &dir, true).await;
+  let second_id = registry.next_id();
+  registry.insert(second_id.clone(), second.clone()).await;
+  let state = build_state(
+    vec![discovered("/fixture/alpha.gguf", Some("alpha"))],
+    registry,
+  )
+  .await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+
+  let (status, _headers, body) = http_get(addr, "/metrics?launch=/fixture/alpha.gguf", &[]).await;
+  assert_eq!(
+    status,
+    400,
+    "a reference two live launches answer for must not guess: {}",
+    text(body)
+  );
+  let v: Value = serde_json::from_slice(&body).expect("json");
+  assert_eq!(v["error"]["type"], "ambiguous_launch");
+  let message = v["error"]["message"].as_str().unwrap_or_default();
+  for id in [first_id.as_str(), second_id.as_str()] {
+    assert!(
+      message.contains(id),
+      "the answer names what to choose: {message}"
+    );
+  }
+  // The fan-out route scopes the same way and refuses the same way.
+  let (status, _headers, _body) = http_get(
+    addr,
+    "/metrics/backend?format=json&launch=/fixture/alpha.gguf",
+    &[("Accept", "*/*")],
+  )
+  .await;
+  assert_eq!(status, 400);
+
+  // Naming one launch outright works, and it is a strict scope: the request
+  // below lands in exactly one launch's figures, not in both.
+  drive_request(addr, "alpha").await;
+  let mut served = Vec::new();
+  for id in [first_id.as_str(), second_id.as_str()] {
+    let (status, _h, body) = http_get(addr, &format!("/metrics?launch={id}"), &[]).await;
+    assert_eq!(status, 200, "{}", text(body));
+    let out = text(body);
+    assert_eq!(
+      out
+        .matches(&format!(
+          "llamastash:launch_info{{launch=\"{id}\",model=\"alpha\""
+        ))
+        .count(),
+      1,
+      "a launch scope describes that launch:\n{out}"
+    );
+    served.push(out.contains("llamastash:requests_total{model=\"alpha\"} 1\n"));
+  }
+  assert_ne!(
+    served[0], served[1],
+    "exactly one of the two launches served the request"
+  );
+
+  let _ = first.stop(Duration::from_secs(3)).await;
+  let _ = second.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metrics_backend_skips_a_target_that_stops_answering_in_time() {
   let dir = unique_temp("backend-slow");

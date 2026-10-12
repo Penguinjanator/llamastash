@@ -1543,7 +1543,10 @@ means many series; every counter restarts from zero when the daemon does.
 entry, then a case-insensitive substring. `?launch=` matches a launch id (`L3`), live or
 retired, first, then a live launch's port, then the catalog path of a live launch.
 Nothing matches: `404` naming the value; a `?model=` substring that matches several
-models is a `400` saying so. Both together have to agree: a
+models is a `400` saying so. So is a `?launch=` model reference that more than one live
+launch answers for — a model launched twice has two sets of figures and guessing which you
+meant would print one launch's numbers under a reference that meant both — and the answer
+names the launch ids to choose between. Both together have to agree: a
 `?launch=` that is not a launch of the `?model=` you named is a `400` naming both.
 
 The JSON form is the `requests --json` body with a couple of blocks added: `scope`,

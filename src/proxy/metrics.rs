@@ -58,6 +58,12 @@ pub(crate) enum Reject {
   ConflictingScope { model: String, launch: String },
   /// The `Accept` header matched both candidates equally and cannot be settled.
   Ambiguous(String),
+  /// `?launch=` named a model more than one live launch is serving, so the
+  /// reference has no single answer.
+  AmbiguousLaunch {
+    value: String,
+    launches: Vec<String>,
+  },
 }
 
 impl Reject {
@@ -90,6 +96,15 @@ impl Reject {
         StatusCode::BAD_REQUEST,
         "ambiguous_model",
         &format!("`{v}` matches more than one model; scope it with a launch or a full path"),
+      ),
+      Reject::AmbiguousLaunch { value, launches } => router::error_response(
+        StatusCode::BAD_REQUEST,
+        "ambiguous_launch",
+        &format!(
+          "`{value}` is served by {} live launches ({}); name one by its id or port",
+          launches.len(),
+          launches.join(", ")
+        ),
       ),
     }
   }
@@ -455,11 +470,21 @@ async fn resolve_launch(
       return Ok((found.id.clone(), Some(found.path.clone())));
     }
   }
-  // A full catalog path is also a launch reference in practice: it names the
-  // one live launch of that model.
+  // A full catalog path is also a launch reference, and one live launch of that
+  // model is what it names. Two of them is the same ambiguity a fuzzy `?model=`
+  // is: settling on whichever the registry walked past first would report one
+  // launch's figures for a reference that meant both, so it is refused.
   if let Ok((path, _)) = resolve_model(state, value).await {
-    if let Some(found) = live.iter().find(|l| l.path == path) {
-      return Ok((found.id.clone(), Some(path)));
+    let matches: Vec<&LiveLaunch> = live.iter().filter(|l| l.path == path).collect();
+    match matches.as_slice() {
+      [] => {}
+      [only] => return Ok((only.id.clone(), Some(path))),
+      many => {
+        return Err(Reject::AmbiguousLaunch {
+          value: value.to_string(),
+          launches: many.iter().map(|l| l.id.clone()).collect(),
+        });
+      }
     }
   }
   Err(Reject::UnknownRef(value.to_string()))
