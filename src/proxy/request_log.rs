@@ -809,8 +809,23 @@ impl RequestRecord {
 
   /// Copy the row as it stands into the log, so a reader sees a request
   /// that is still waiting on a load or still streaming.
+  ///
+  /// A row that already names its model opens that model's totals entry here
+  /// rather than leaving it to [`Self::finish`]: the first request to a model is
+  /// the one that carries the whole load, and the per-model in-flight gauge
+  /// needs an entry to sit on while that request is still running.
   pub fn publish(&self) {
-    self.log.lock().store(&self.row);
+    let mut inner = self.log.lock();
+    inner.store(&self.row);
+    if let Some(path) = &self.row.model_path {
+      let totals = inner.by_model.entry(path.clone()).or_default();
+      // Only the label, not `Totals::add`: the request has not finished. The
+      // label has to be the display name now, or the first scrape of a model
+      // prints a different `model` value than every scrape after it.
+      if totals.label.is_none() {
+        totals.label = self.row.model.clone();
+      }
+    }
   }
 
   /// The proxy answered the request itself, with `error` (its error code
@@ -939,6 +954,23 @@ mod tests {
       log.tail(LogScope::All, 10).rows[0].model_path.as_deref(),
       Some("/m/a.gguf")
     );
+  }
+
+  #[test]
+  fn publishing_a_model_row_opens_its_totals_entry() {
+    let log = RequestLog::new();
+    let mut rec = log.begin(ROUTE, None);
+    rec.set_model("m", "/m/a.gguf");
+    rec.publish();
+    let snap = log.snapshot();
+    // The in-flight gauge only has a series to sit on once the model has an
+    // entry, and the entry has to carry the display name from the start or the
+    // first scrape of a model prints a different `model` than later ones.
+    assert_eq!(snap.models.len(), 1);
+    assert_eq!(snap.models[0].key, "/m/a.gguf");
+    assert_eq!(snap.models[0].label.as_deref(), Some("m"));
+    assert_eq!(snap.models[0].summary.requests, 0);
+    assert_eq!(snap.in_flight(|row| row.model_path.is_some()), 1);
   }
 
   #[test]

@@ -268,8 +268,9 @@ fn merge(doc: &mut Document, scrape: &mut Scrape) {
       }
       None => ours.clone(),
     };
-    doc.sample_raw(&name, labels, value);
-    scrape.series += 1;
+    if doc.sample_raw(&name, labels, value) {
+      scrape.series += 1;
+    }
   }
 }
 
@@ -489,6 +490,19 @@ mod tests {
       "# TYPE llamacpp:x untyped\nllamacpp:x{launch=\"L1\",model=\"m1\"} 4\n"
     );
     assert_eq!((series, skipped), (1, 0));
+  }
+
+  #[test]
+  fn backend_merge_counts_only_the_samples_that_survive() {
+    // A `NaN` line parses, so it is not a skipped line, but no sample lands, so
+    // the count a scraper divides by must not claim it did.
+    let (text, series, skipped) = merged("llamacpp:x nan\nllamacpp:y 1\n", "L1", "m1");
+    assert_eq!((series, skipped), (1, 0));
+    assert!(!text.contains("llamacpp:x"), "{text}");
+    assert!(
+      text.contains("llamacpp:y{launch=\"L1\",model=\"m1\"} 1"),
+      "{text}"
+    );
   }
 
   #[test]

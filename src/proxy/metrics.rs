@@ -402,11 +402,10 @@ pub(crate) async fn resolve_scope(
   }
 
   if let Some(value) = &q.model {
-    let (path, name) = resolve_model(state, value).await.map_err(|_| {
-      // A model reference that names nothing is a 404 naming the value; a
-      // substring that matches several models is the proxy's usual ambiguity.
-      Reject::UnknownRef(value.clone())
-    })?;
+    // Whatever `?model=` cannot settle is the answer the same reference gets
+    // everywhere else: a 404 naming the value, or the 400 that says several
+    // models matched.
+    let (path, name) = resolve_model(state, value).await?;
     // A launch scope and a model scope have to agree. A `?launch=` whose model
     // is not the one `?model=` names has no honest answer, and a half-empty body
     // would read as idle traffic rather than as the contradiction it is.
@@ -661,10 +660,12 @@ fn render(
     if !scope.keeps_launch(id, path) {
       continue;
     }
-    let label = totals
-      .totals
-      .label
-      .clone()
+    // The same label the per-model series print, so a join on `model` matches
+    // when two models share a display name and both fell back to their paths.
+    let label = path
+      .and_then(|p| labels.get(p))
+      .cloned()
+      .or_else(|| totals.totals.label.clone())
       .or_else(|| live.iter().find(|l| &l.id == id).map(|l| l.model.clone()))
       .unwrap_or_else(|| "unknown".to_string());
     let per_launch_labels = [("launch", id.as_str()), ("model", label.as_str())];
@@ -883,11 +884,10 @@ fn model_labels(models: &[ScopeTotals]) -> HashMap<String, String> {
     .iter()
     .map(|totals| {
       let label = totals.label.clone().unwrap_or_else(|| totals.key.clone());
-      let out = if counts.get(&label).copied().unwrap_or(0) > 1 {
-        totals.key.clone()
-      } else {
-        label
-      };
+      // `none` names the requests that reached no model, so a model displaying
+      // that name would put two samples of one metric under one label set.
+      let taken = label == NO_MODEL || counts.get(&label).copied().unwrap_or(0) > 1;
+      let out = if taken { totals.key.clone() } else { label };
       (totals.key.clone(), out)
     })
     .collect()
@@ -1119,12 +1119,14 @@ impl Document {
   }
 
   /// One sample taken verbatim from a scraped engine: `labels` is the text
-  /// between the braces, kept as the engine printed it.
-  pub(crate) fn sample_raw(&mut self, name: &str, labels: String, value: f64) {
+  /// between the braces, kept as the engine printed it. `false` when the value
+  /// was not a number a scraper can read, in which case nothing was stored.
+  pub(crate) fn sample_raw(&mut self, name: &str, labels: String, value: f64) -> bool {
     if !value.is_finite() {
-      return;
+      return false;
     }
     self.block(name).1.samples.push((labels, value));
+    true
   }
 
   /// How many samples landed in the document.
@@ -1324,8 +1326,20 @@ mod tests {
 
   /// One finished request, straight into a fresh log.
   fn request(log: &RequestLog, path: &str, launch: &str, prompt: u64, completion: u64) {
+    request_named(log, "m1", path, launch, prompt, completion);
+  }
+
+  /// As [`request`], with the display name the row carries.
+  fn request_named(
+    log: &RequestLog,
+    name: &str,
+    path: &str,
+    launch: &str,
+    prompt: u64,
+    completion: u64,
+  ) {
     let mut rec = log.begin("/v1/chat/completions", None);
-    rec.set_model("m1", path);
+    rec.set_model(name, path);
     rec.set_launch(launch);
     rec.set_status(200);
     rec.mark_first_byte();
@@ -1399,10 +1413,38 @@ mod tests {
     render(&mut doc, &snap, &[], &scope, 2, 2);
     let text = doc.render();
     assert_eq!(text.matches("llamastash:requests_total{model=").count(), 1);
-    // Both launches served the same model name in the fixture, so the launch
-    // series print it for whichever the scope keeps.
-    assert!(text.contains("llamastash:launch_requests_total{launch=\"L1\",model=\"m1\"} 1"));
+    // Both launches served a model displaying `m1`, so every series prints the
+    // catalog path instead, and the per-launch one prints the same value.
+    assert!(
+      text.contains("llamastash:launch_requests_total{launch=\"L1\",model=\"/models/a.gguf\"} 1"),
+      "{text}"
+    );
     assert!(!text.contains("launch=\"L2\""));
+  }
+
+  #[test]
+  fn metrics_an_in_flight_request_has_a_model_series_before_it_finishes() {
+    let log = RequestLog::new();
+    let mut rec = log.begin("/v1/chat/completions", None);
+    rec.set_model("m1", "/models/a.gguf");
+    rec.set_launch("L1");
+    rec.publish();
+    let snap = log.snapshot();
+    let mut doc = Document::new(true);
+    render(&mut doc, &snap, &[], &Scope::default(), 1, 1);
+    let text = doc.render();
+    // The record has to stay alive: dropping it finishes the row. The request
+    // that pays for a model load must read as busy work while it runs, or the
+    // first request to a model is invisible on a fresh daemon — the one case
+    // the gauge exists for.
+    assert!(
+      text.contains("llamastash:requests_in_flight{model=\"m1\"} 1\n"),
+      "{text}"
+    );
+    assert!(
+      text.contains("llamastash:requests_total{model=\"m1\"} 0\n"),
+      "{text}"
+    );
   }
 
   #[test]
@@ -1416,6 +1458,30 @@ mod tests {
     let text = doc.render();
     assert!(text.contains("llamastash:requests_total{model=\"/models/a/x.gguf\"} 1\n"));
     assert!(text.contains("llamastash:requests_total{model=\"/models/b/x.gguf\"} 1\n"));
+  }
+
+  #[test]
+  fn metrics_a_model_named_none_does_not_take_the_reserved_label() {
+    let log = RequestLog::new();
+    request_named(&log, "none", "/models/none.gguf", "L1", 1, 1);
+    rejected(&log, "/v1/chat/completions", 404);
+    let snap = log.snapshot();
+    let mut doc = Document::new(true);
+    render(&mut doc, &snap, &[], &Scope::default(), 1, 1);
+    let text = doc.render();
+    // `none` already belongs to the requests that reached no model, and one
+    // metric name cannot carry the same label set twice in a scrape.
+    assert!(
+      text.contains("llamastash:requests_total{model=\"/models/none.gguf\"} 1\n"),
+      "{text}"
+    );
+    assert_eq!(
+      text
+        .matches("llamastash:requests_total{model=\"none\"}")
+        .count(),
+      1,
+      "one metric name cannot carry a label set twice:\n{text}"
+    );
   }
 
   /// One finished request that reached no model: the proxy answered it itself.

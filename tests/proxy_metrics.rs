@@ -602,6 +602,58 @@ async fn metrics_backend_merges_targets_and_isolates_one_that_refuses() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_backend_treats_a_success_that_is_not_200_as_unavailable() {
+  let dir = unique_temp("backend-202");
+  let registry = SupervisorRegistry::new();
+  let model = spawn_fake_with(
+    "/fixture/partial.gguf",
+    &dir,
+    &["--metrics", "--metrics-status", "202"],
+  )
+  .await;
+  let id = registry.next_id();
+  registry.insert(id.clone(), model.clone()).await;
+  let state = build_state(
+    vec![discovered("/fixture/partial.gguf", Some("partial"))],
+    registry,
+  )
+  .await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+  let id = id.as_str();
+
+  let (status, _h, body) = http_get(addr, "/metrics/backend", &[]).await;
+  assert_eq!(status, 200, "one odd engine never fails the scrape");
+  let out = text(body);
+  assert!(
+    out.contains(&format!(
+      "llamastash:backend_metrics_available{{launch=\"{id}\",model=\"partial\"}} 0"
+    )),
+    "only a plain 200 counts as available:\n{out}"
+  );
+  assert!(
+    !out.contains("llamacpp:prompt_tokens_total"),
+    "a body from a target that is not available merges no series:\n{out}"
+  );
+
+  let (_s, _h, body) = http_get(addr, "/metrics/backend?format=json", &[]).await;
+  let v: Value = serde_json::from_slice(&body).expect("json");
+  assert_eq!(v["backends"][0]["status"], 202);
+  assert_eq!(v["backends"][0]["ok"], false);
+  assert_eq!(v["backends"][0]["series"], 0);
+  assert!(
+    v["backends"][0]["error"]
+      .as_str()
+      .unwrap_or_default()
+      .contains("202"),
+    "the one field has to say why there is nothing merged"
+  );
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metrics_backend_with_nothing_running_is_an_empty_success() {
   let dir = unique_temp("backend-empty");
   let registry = SupervisorRegistry::new();
@@ -782,6 +834,41 @@ async fn metrics_scope_values_are_percent_decoded() {
   assert_eq!(status, 404);
 
   let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_an_ambiguous_model_scope_is_a_400_not_a_404() {
+  let dir = unique_temp("model-ambiguous");
+  let state = build_state(
+    vec![
+      discovered("/m/qwen-coder-7b.gguf", None),
+      discovered("/m/qwen-coder-13b.gguf", None),
+    ],
+    SupervisorRegistry::new(),
+  )
+  .await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+
+  // `/v1/chat/completions` answers 400 for a reference two models share, and
+  // reading it here as "nothing matches" would send the caller off hunting for a
+  // model that is plainly in the catalog.
+  let (status, _headers, body) = http_get(addr, "/metrics?model=qwen-coder", &[]).await;
+  assert_eq!(status, 400, "{}", text(body));
+  let v: Value = serde_json::from_slice(&body).expect("json");
+  assert_eq!(v["error"]["type"], "ambiguous_model");
+
+  // A reference that names nothing is still the 404 it always was.
+  let (status, _headers, body) = http_get(addr, "/metrics?model=definitely-absent", &[]).await;
+  assert_eq!(status, 404);
+  let v: Value = serde_json::from_slice(&body).expect("json");
+  assert_eq!(v["error"]["type"], "not_found");
+  assert_eq!(
+    v["error"]["message"].as_str().unwrap_or_default(),
+    "no model or launch matches `definitely-absent`"
+  );
+
   shutdown_listener(shutdown, handle).await;
   std::fs::remove_dir_all(&dir).ok();
 }

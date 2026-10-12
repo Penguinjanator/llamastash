@@ -1520,11 +1520,13 @@ nothing still running. `?launch=1` grows with the number of launches a daemon ha
 served, so a long-lived daemon means many series; every counter restarts from zero when
 the daemon does.
 
-`?model=<ref>` and `?launch=<ref>` narrow the response to one model or one launch. A
-reference is matched as a launch id (`L3`), then a port, then an exact catalog path,
-then a case-insensitive display-name substring, which is the same order
-`llamastash requests <ref>` uses. Nothing matches: `404` naming the value; a substring
-that matches several models is a `400` saying so. Both together have to agree: a
+`?model=<ref>` and `?launch=<ref>` narrow the response to one model or one launch.
+`?model=` matches an exact catalog path first, then the reference rules
+`/v1/chat/completions` uses: a name that owns one model outright, a `proxy.aliases`
+entry, then a case-insensitive substring. `?launch=` matches a launch id (`L3`), live or
+retired, first, then a live launch's port, then the catalog path of a live launch.
+Nothing matches: `404` naming the value; a `?model=` substring that matches several
+models is a `400` saying so. Both together have to agree: a
 `?launch=` that is not a launch of the `?model=` you named is a `400` naming both.
 
 The JSON form is the `requests --json` body with a couple of blocks added: `scope`,
@@ -1551,7 +1553,7 @@ kept once per metric name (first wins), and every engine sample line gains
 `model`: the proxy's own value replaces it, because a sample cannot carry the same
 label twice and still be scraped. One target that refuses, times out or answers
 nothing parseable never fails the response; unparsable lines are skipped and counted.
-Beside the engine's samples sit four proxy-owned gauges, labelled `model,launch`:
+Beside the engine's samples sit four proxy-owned gauges, labelled `launch,model`:
 `llamastash:backend_metrics_available` (1/0 — only a plain `200` is a 1, so a `501` from
 llama.cpp started without `--metrics` and a `404` both land here), `llamastash:backend_metrics_series`,
 `llamastash:backend_metrics_scrape_duration_seconds`,

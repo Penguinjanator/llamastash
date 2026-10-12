@@ -20,6 +20,8 @@
 //!   `not_supported_error` body, which is how a server started without the flag
 //!   behaves. Two servers, one with the flag and one without, give a fan-out test
 //!   a working target and a refusing one.)
+//! - `--metrics-status <N>` (test-only — the status `GET /metrics` answers with,
+//!   standing in for an engine that answers success-but-not-`200`.)
 //! - `--health-delay-ms <N>` (test-only — returns 503 until N ms
 //!   after process start, then 200; lets tests exercise the
 //!   Loading → Ready transition deterministically)
@@ -72,6 +74,9 @@ struct Args {
   metrics_delay_ms: u64,
   /// `--metrics-pad`: bytes of comment filler to append to the `/metrics` body.
   metrics_pad: usize,
+  /// `--metrics-status`: the status `GET /metrics` answers with, for an engine
+  /// whose scrape succeeds with something other than `200`.
+  metrics_status: Option<u16>,
   health_delay_ms: u64,
   trap_sigterm: bool,
   // Only read under cfg(unix): Windows has no SIGTERM to delay.
@@ -140,6 +145,7 @@ fn parse_args() -> Args {
   let mut metrics = false;
   let mut metrics_delay_ms: u64 = 0;
   let mut metrics_pad: usize = 0;
+  let mut metrics_status: Option<u16> = None;
   let mut health_delay_ms: u64 = 0;
   let mut trap_sigterm = false;
   let mut sigterm_exit_delay_ms = None;
@@ -161,6 +167,9 @@ fn parse_args() -> Args {
         metrics_delay_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0)
       }
       "--metrics-pad" => metrics_pad = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+      "--metrics-status" => {
+        metrics_status = args.next().and_then(|v| v.parse().ok());
+      }
       "--spec-type" => spec_mtp = args.next().as_deref() == Some("draft-mtp"),
       "--health-delay-ms" => {
         health_delay_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -186,6 +195,7 @@ fn parse_args() -> Args {
     metrics,
     metrics_delay_ms,
     metrics_pad,
+    metrics_status,
     health_delay_ms,
     trap_sigterm,
     sigterm_exit_delay_ms,
@@ -408,7 +418,13 @@ llamacpp:requests_processing 0\n",
             body.push_str("# pad\n");
           }
         }
-        write_response(&mut wr, 200, "text/plain; version=0.0.4", body.as_bytes()).await?;
+        write_response(
+          &mut wr,
+          args.metrics_status.unwrap_or(200),
+          "text/plain; version=0.0.4",
+          body.as_bytes(),
+        )
+        .await?;
       } else {
         write_response(
           &mut wr,
