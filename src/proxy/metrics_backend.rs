@@ -55,9 +55,10 @@ struct Scrape {
 }
 
 impl Scrape {
-  /// Whether the target gave a Prometheus document worth merging.
+  /// Whether the target gave a Prometheus document worth merging. Only a plain
+  /// `200` counts, the same bar the `error` field keys on.
   fn available(&self) -> bool {
-    self.error.is_none() && self.status.is_some_and(|s| s < 300)
+    self.error.is_none() && self.status == Some(200)
   }
 
   fn labels(&self) -> Vec<(&str, &str)> {
@@ -70,15 +71,16 @@ impl Scrape {
 
 /// `GET /metrics/backend`.
 pub(crate) async fn serve(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyResponse {
-  let parsed = match metrics::parse_request(&state, &req).await {
+  let live = live_launches(&state).await;
+  let parsed = match metrics::parse_request(&state, &req, &live).await {
     Ok(parsed) => parsed,
     Err(reject) => return reject.into_response(),
   };
-  let targets = targets(&state, &parsed).await;
+  let targets = targets(&live, &parsed);
   let mut scrapes = join_all(targets.into_iter().map(|target| scrape(&state, target))).await;
   // The per-target counts come from parsing each engine's text, so the text is
-  // parsed whichever form the caller asked for; JSON reports the counts and hands
-  // back the raw engine text beside them.
+  // parsed whichever form the caller asked for; the JSON form reports those
+  // counts and leaves the engine's own text out.
   let mut doc = Document::new(false);
   for scrape in &mut scrapes {
     if scrape.available() {
@@ -123,14 +125,14 @@ pub(crate) async fn serve(state: Arc<ProxyState>, req: Request<Incoming>) -> Pro
 }
 
 /// The launches to scrape: Ready, serving a model, inside the request's scope.
-async fn targets(state: &ProxyState, parsed: &Parsed) -> Vec<LiveLaunch> {
-  live_launches(state)
-    .await
-    .into_iter()
+fn targets(live: &[LiveLaunch], parsed: &Parsed) -> Vec<LiveLaunch> {
+  live
+    .iter()
     .filter(|l| l.ready)
     .filter(|l| {
       parsed.scope.keeps_model(&l.path) && parsed.scope.keeps_launch(&l.id, Some(&l.path))
     })
+    .cloned()
     .collect()
 }
 
@@ -150,7 +152,7 @@ async fn scrape(state: &ProxyState, target: LiveLaunch) -> Scrape {
     ),
     Ok((status, text, truncated, error)) => (status, text, truncated, error),
   };
-  // A non-2xx answer is a refusal rather than a scrape, so `error` says that too:
+  // A non-200 answer is a refusal rather than a scrape, so `error` says that too:
   // one field tells a scraper why a target has no series, without reading `status`
   // and the body together.
   let error = error.or_else(|| {
@@ -348,9 +350,9 @@ fn split_labels(text: &str) -> Vec<&str> {
   out
 }
 
-/// The JSON view: one entry per target with its own status and the raw engine
-/// text, since an engine's series are documented by the engine, not restated
-/// here.
+/// The JSON view: one entry per target with its own status and the counts parsed
+/// from its text. The engine's metric text is not part of it — an engine's
+/// series are documented by the engine, not restated here.
 fn json_body(scrapes: &[Scrape], parsed: &Parsed) -> Value {
   let mut scope = Map::new();
   scope.insert(
@@ -441,10 +443,10 @@ mod tests {
       Some(("llamacpp:tokens_predicted_total".to_string(), None, 42.0))
     );
     let (name, labels, value) = parse_sample(
-      r#"vllm:time_to_first_token_seconds_sum{model="x",finish="a\"b"} 1.5 1700000000"#,
+      r#"llamacpp:time_to_first_token_seconds_sum{model="x",finish="a\"b"} 1.5 1700000000"#,
     )
     .expect("parses");
-    assert_eq!(name, "vllm:time_to_first_token_seconds_sum");
+    assert_eq!(name, "llamacpp:time_to_first_token_seconds_sum");
     assert_eq!(labels.unwrap(), r#"model="x",finish="a\"b""#);
     assert_eq!(value, 1.5);
     assert!(parse_sample("not a metric").is_none());

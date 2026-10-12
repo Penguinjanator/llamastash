@@ -67,6 +67,11 @@ struct Args {
   mode: Mode,
   /// Set with `--metrics`; decides whether `GET /metrics` serves text or 501.
   metrics: bool,
+  /// `--metrics-delay-ms`: milliseconds to stall before answering `GET /metrics`,
+  /// standing in for an engine that is wedged or still loading.
+  metrics_delay_ms: u64,
+  /// `--metrics-pad`: bytes of comment filler to append to the `/metrics` body.
+  metrics_pad: usize,
   health_delay_ms: u64,
   trap_sigterm: bool,
   // Only read under cfg(unix): Windows has no SIGTERM to delay.
@@ -133,6 +138,8 @@ fn parse_args() -> Args {
   let mut fit_ctx: Option<u32> = None;
   let mut mode = Mode::Chat;
   let mut metrics = false;
+  let mut metrics_delay_ms: u64 = 0;
+  let mut metrics_pad: usize = 0;
   let mut health_delay_ms: u64 = 0;
   let mut trap_sigterm = false;
   let mut sigterm_exit_delay_ms = None;
@@ -150,6 +157,10 @@ fn parse_args() -> Args {
       "--embeddings" => mode = Mode::Embedding,
       "--reranking" => mode = Mode::Rerank,
       "--metrics" => metrics = true,
+      "--metrics-delay-ms" => {
+        metrics_delay_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0)
+      }
+      "--metrics-pad" => metrics_pad = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
       "--spec-type" => spec_mtp = args.next().as_deref() == Some("draft-mtp"),
       "--health-delay-ms" => {
         health_delay_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -173,6 +184,8 @@ fn parse_args() -> Args {
     fit_ctx,
     mode,
     metrics,
+    metrics_delay_ms,
+    metrics_pad,
     health_delay_ms,
     trap_sigterm,
     sigterm_exit_delay_ms,
@@ -372,9 +385,13 @@ async fn handle(
       // Real `llama-server` only serves `/metrics` when started with `--metrics`;
       // without the flag the endpoint answers 501 and points at the flag.
       if args.metrics {
+        if args.metrics_delay_ms > 0 {
+          std::thread::sleep(std::time::Duration::from_millis(args.metrics_delay_ms));
+        }
         // The names and shapes are llama.cpp's: `<unit>_total` counters plus
         // gauges, one label-free sample each, `# HELP` then `# TYPE`.
-        let body = "# HELP llamacpp:prompt_tokens_total Number of prompt tokens processed.\n\
+        let mut body = String::from(
+          "# HELP llamacpp:prompt_tokens_total Number of prompt tokens processed.\n\
 # TYPE llamacpp:prompt_tokens_total counter\n\
 llamacpp:prompt_tokens_total 21\n\
 # HELP llamacpp:predicted_tokens_total Number of predicted tokens.\n\
@@ -382,7 +399,15 @@ llamacpp:prompt_tokens_total 21\n\
 llamacpp:predicted_tokens_total{model_name=\"fake\"} 7\n\
 # HELP llamacpp:requests_processing Number of requests currently being processed.\n\
 # TYPE llamacpp:requests_processing gauge\n\
-llamacpp:requests_processing 0\n";
+llamacpp:requests_processing 0\n",
+        );
+        if args.metrics_pad > 0 {
+          // Filler is a comment line: it parses as nothing and only shows up in
+          // the size, which is what a scraper's cap is about.
+          while body.len() < args.metrics_pad {
+            body.push_str("# pad\n");
+          }
+        }
         write_response(&mut wr, 200, "text/plain; version=0.0.4", body.as_bytes()).await?;
       } else {
         write_response(

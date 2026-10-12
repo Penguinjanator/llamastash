@@ -7,9 +7,9 @@
 //! The route never contacts a backend; the engines' own numbers are the
 //! separate [`super::metrics_backend`] route.
 //!
-//! Metric names are `llamastash:*`, matching the `llamacpp:` / `vllm:` /
-//! `sglang:` names the engines behind us export. There are no `gen_ai.*`
-//! aliases, no histograms, and one label set per metric name. `model` and
+//! Metric names are `llamastash:*`, one prefix of our own beside whatever the
+//! engines behind us export; theirs come through the backend route untouched.
+//! There are no `gen_ai.*` aliases, no histograms, and one label set per metric name. `model` and
 //! `route` are the only labels a default scrape carries; the per-launch series
 //! are opt-in with `?launch=1` because launch ids are never reused.
 //!
@@ -53,6 +53,8 @@ pub(crate) enum Reject {
   NotAcceptable(String),
   /// `?model=` / `?launch=` named no model and no launch.
   UnknownRef(String),
+  /// `?model=` and `?launch=` name a model and a launch that does not serve it.
+  ConflictingScope { model: String, launch: String },
   /// The `Accept` header matched both candidates equally and cannot be settled.
   Ambiguous(String),
 }
@@ -77,6 +79,11 @@ impl Reject {
         StatusCode::NOT_FOUND,
         "not_found",
         &format!("no model or launch matches `{v}`"),
+      ),
+      Reject::ConflictingScope { model, launch } => router::error_response(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        &format!("launch `{launch}` does not serve model `{model}`"),
       ),
       Reject::Ambiguous(v) => router::error_response(
         StatusCode::BAD_REQUEST,
@@ -153,37 +160,45 @@ fn pairs(query: Option<&str>) -> Vec<(String, String)> {
     .collect()
 }
 
-/// The minimal percent-decoding a query value needs (`%20`, `%2F`, `+`).
+/// Percent-decode one query token: `%XX` runs (a multi-byte character is a run
+/// of them), `+` for a space, `%2B` for a literal plus. A stray `%` that does
+/// not start a hex pair is kept.
 fn decode(raw: &str) -> String {
   let bytes = raw.as_bytes();
-  let mut out = String::with_capacity(bytes.len());
+  let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
   let mut i = 0;
   while i < bytes.len() {
-    match bytes[i] {
-      b'+' => out.push(' '),
-      b'%' if i + 2 < bytes.len() => {
-        let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
-        match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
-          Some(byte) => {
-            out.push(if byte.is_ascii() { byte as char } else { '?' });
-            i += 2;
-          }
-          None => out.push('%'),
-        }
+    let escaped = if bytes[i] == b'%' && i + 2 < bytes.len() {
+      std::str::from_utf8(&bytes[i + 1..i + 3])
+        .ok()
+        .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+    } else {
+      None
+    };
+    match escaped {
+      Some(byte) => {
+        out.push(byte);
+        i += 3;
       }
-      _ => out.push(bytes[i] as char),
+      None => {
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+      }
     }
-    i += 1;
   }
-  out
+  // A decoded value can be arbitrary bytes; lossy keeps the route answering
+  // rather than failing on a malformed escape.
+  String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Best `q` the two candidate types get from an `Accept` header, as
 /// `(json, text)` where `0.0` means not accepted.
 ///
-/// Only `application/json` and `text/plain` are candidates. A `;` parameter
-/// that is not `q` (`version=0.0.4`, `charset=…`) does not affect the match,
-/// a missing `q` is `1.0`, and `*/*` accepts both candidates at its own `q`.
+/// Only an exact `application/json` or `text/plain` selects its own format. A
+/// `;` parameter that is not `q` (`version=0.0.4`, `charset=…`) does not affect
+/// the match and a missing `q` is `1.0`. A wildcard — `*/*` or `application/*`
+/// — means "whatever you have", which is the text default; only an exact type
+/// asks for JSON, so a scraper can never receive JSON by accident.
 fn accept_q(header: &str) -> (f32, f32) {
   let mut best = (0.0f32, 0.0f32);
   for entry in header.split(',') {
@@ -203,15 +218,10 @@ fn accept_q(header: &str) -> (f32, f32) {
     if q <= 0.0 {
       continue;
     }
-    let matches = |candidate: &str| {
-      syntax == "*/*"
-        || syntax == candidate
-        || syntax == format!("{}/*", candidate.split('/').next().unwrap_or(""))
-    };
-    if matches("application/json") {
+    if syntax == "application/json" {
       best.0 = best.0.max(q);
     }
-    if matches("text/plain") {
+    if syntax == "text/plain" || syntax.ends_with("/*") {
       best.1 = best.1.max(q);
     }
   }
@@ -298,6 +308,7 @@ impl Scope {
 }
 
 /// One live launch as a metrics scrape sees it.
+#[derive(Clone)]
 pub(crate) struct LiveLaunch {
   pub(crate) id: String,
   /// Display name of the model it serves.
@@ -351,10 +362,12 @@ pub(crate) fn launch_order(id: &str) -> (u8, u64, &str) {
 
 /// Resolve `?model=` / `?launch=` into a [`Scope`], in the order the plan sets:
 /// launch id, port, exact catalog path, then a case-insensitive display-name
-/// match through the proxy's own reference resolver.
+/// match through the proxy's own reference resolver. `live` is the caller's
+/// [`live_launches`] snapshot, so one request asks the registry once.
 pub(crate) async fn resolve_scope(
   state: &ProxyState,
   query: Option<&str>,
+  live: &[LiveLaunch],
 ) -> Result<Scope, Reject> {
   let q = Query::parse(query);
   let mut scope = Scope {
@@ -362,11 +375,10 @@ pub(crate) async fn resolve_scope(
     per_launch: q.per_launch(),
     ..Scope::default()
   };
-  let snapshot = state.ctx.requests.snapshot();
-  let live = live_launches(state).await;
 
   if let Some(value) = q.launch_ref() {
-    let (id, path) = resolve_launch(state, &snapshot, &live, value).await?;
+    let snapshot = state.ctx.requests.snapshot();
+    let (id, path) = resolve_launch(state, &snapshot, live, value).await?;
     scope.launch = Some(id);
     scope.path = path;
     // Naming one launch is also asking for its series.
@@ -395,12 +407,19 @@ pub(crate) async fn resolve_scope(
       // substring that matches several models is the proxy's usual ambiguity.
       Reject::UnknownRef(value.clone())
     })?;
+    // A launch scope and a model scope have to agree. A `?launch=` whose model
+    // is not the one `?model=` names has no honest answer, and a half-empty body
+    // would read as idle traffic rather than as the contradiction it is.
+    if let (Some(launch_value), Some(served)) = (q.launch_ref(), scope.path.as_ref()) {
+      if served != &path {
+        return Err(Reject::ConflictingScope {
+          model: value.clone(),
+          launch: launch_value.to_string(),
+        });
+      }
+    }
     if scope.launch.is_none() {
       scope.log = LogScope::Model { path: path.clone() };
-    } else {
-      // Both given: the launch scope is narrower, and the model narrows the
-      // per-model series. A mismatch leaves the per-model series empty.
-      scope.path = Some(path.clone());
     }
     scope.name = Some(name);
     scope.path = Some(path);
@@ -490,10 +509,11 @@ pub(crate) struct Parsed {
 pub(crate) async fn parse_request(
   state: &ProxyState,
   req: &Request<Incoming>,
+  live: &[LiveLaunch],
 ) -> Result<Parsed, Reject> {
   let query = req.uri().query();
   let format = choose_format(query, req.headers())?;
-  let scope = resolve_scope(state, query).await?;
+  let scope = resolve_scope(state, query, live).await?;
   let limit = Query::parse(query).limit();
   Ok(Parsed {
     format,
@@ -504,12 +524,12 @@ pub(crate) async fn parse_request(
 
 /// `GET /metrics`.
 pub(crate) async fn serve(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyResponse {
-  let parsed = match parse_request(&state, &req).await {
+  let live = live_launches(&state).await;
+  let parsed = match parse_request(&state, &req, &live).await {
     Ok(parsed) => parsed,
     Err(reject) => return reject.into_response(),
   };
   let snapshot = state.ctx.requests.snapshot();
-  let live = live_launches(&state).await;
   let loaded = live.iter().filter(|l| l.ready).count();
   let discovered = state.ctx.catalog.len().await;
   if parsed.format == Format::Json {
@@ -592,17 +612,27 @@ fn render(
     );
   }
 
+  // The `model` label value of every model in the log, settled before the scope
+  // cuts anything: the same model has to print the same value in a scoped and an
+  // unscoped scrape, or the two series read as two models.
+  let labels = model_labels(&snapshot.models);
   let models: Vec<&ScopeTotals> = snapshot
     .models
     .iter()
     .filter(|m| scope.keeps_model(&m.key))
     .collect();
-  let labels = model_labels(&models);
   for totals in models {
     let label = &labels[&totals.key];
     let in_flight =
       snapshot.in_flight(|row| row.model_path.as_deref() == Some(totals.key.as_str()));
     model_series(doc, label, totals, in_flight);
+  }
+
+  // Requests the proxy answered without ever reaching a model (an unknown model
+  // name, an unreadable body). They are in `summary` but under no model, so an
+  // unscoped scrape gives them their own series instead of dropping them.
+  if scope.path.is_none() && scope.launch.is_none() {
+    unattributed_series(doc, snapshot);
   }
 
   if !scope.per_launch {
@@ -637,7 +667,6 @@ fn render(
       .clone()
       .or_else(|| live.iter().find(|l| &l.id == id).map(|l| l.model.clone()))
       .unwrap_or_else(|| "unknown".to_string());
-    let in_flight = snapshot.in_flight(|row| row.launch_id.as_deref() == Some(id.as_str()));
     let per_launch_labels = [("launch", id.as_str()), ("model", label.as_str())];
     let s = &totals.totals.summary;
     doc.sample(
@@ -668,14 +697,67 @@ fn render(
       &per_launch_labels,
       s.completion_tokens as f64,
     );
-    doc.sample(
-      "llamastash:launch_requests_in_flight",
-      "Requests one launch is still serving",
-      "gauge",
-      &per_launch_labels,
-      in_flight as f64,
-    );
+    // In-flight is a live quantity: a stopped launch has none, and printing the
+    // zero would read as a request that never finished.
+    if totals.live {
+      let in_flight = snapshot.in_flight(|row| row.launch_id.as_deref() == Some(id.as_str()));
+      doc.sample(
+        "llamastash:launch_requests_in_flight",
+        "Requests one launch is still serving",
+        "gauge",
+        &per_launch_labels,
+        in_flight as f64,
+      );
+    }
   }
+}
+
+/// The `model` label value for a request that never reached one.
+const NO_MODEL: &str = "none";
+
+/// Series for the requests no model answered, as `model="none"`. Everything
+/// the log holds for a model is attributed to it, so the unattributed share is
+/// the whole log minus the models; a request still in flight before any model
+/// is picked is counted there too.
+fn unattributed_series(doc: &mut Document, snapshot: &LogSnapshot) {
+  let attributed_requests: u64 = snapshot.models.iter().map(|m| m.summary.requests).sum();
+  let attributed_errors: u64 = snapshot.models.iter().map(|m| m.summary.errors).sum();
+  let requests = snapshot
+    .all
+    .summary
+    .requests
+    .saturating_sub(attributed_requests);
+  let in_flight = snapshot.in_flight(|row| row.model_path.is_none());
+  if requests == 0 && in_flight == 0 {
+    return;
+  }
+  let errors = snapshot
+    .all
+    .summary
+    .errors
+    .saturating_sub(attributed_errors);
+  let labels = [("model", NO_MODEL)];
+  doc.sample(
+    "llamastash:requests_total",
+    "Requests the proxy finished, since daemon start",
+    "counter",
+    &labels,
+    requests as f64,
+  );
+  doc.sample(
+    "llamastash:request_errors_total",
+    "Finished requests that failed or were cut short",
+    "counter",
+    &labels,
+    errors as f64,
+  );
+  doc.sample(
+    "llamastash:requests_in_flight",
+    "Requests the proxy is still serving",
+    "gauge",
+    &labels,
+    in_flight as f64,
+  );
 }
 
 /// The counters and gauges that carry one `model` label.
@@ -785,11 +867,12 @@ fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, in_flight
   }
 }
 
-/// The `model` label value of each entry in view. Two models can share a display
-/// name (same-named GGUFs in different roots), and one metric name may not carry
-/// two samples with the same label set, so a shared name falls back to the
-/// catalog path for the models that collide.
-fn model_labels(models: &[&ScopeTotals]) -> HashMap<String, String> {
+/// The `model` label value of each entry in `models`. Two models can share a
+/// display name (same-named GGUFs in different roots), and one metric name may
+/// not carry two samples with the same label set, so a shared name falls back to
+/// the catalog path for the models that collide. Callers pass the whole log, so
+/// the pick does not depend on what a scope happens to include.
+fn model_labels(models: &[ScopeTotals]) -> HashMap<String, String> {
   let mut counts: HashMap<String, usize> = HashMap::new();
   for totals in models {
     *counts
@@ -867,7 +950,7 @@ fn json_body(
       .label
       .clone()
       .or_else(|| live_entry.map(|l| l.model.clone()));
-    let mut body = merged(
+    let body = merged(
       &[
         ("launch", Value::String(id.clone())),
         ("model", value_opt(model)),
@@ -882,11 +965,6 @@ fn json_body(
       ],
       &entry.totals.summary,
     );
-    if let Some(port) = port {
-      body
-        .as_object_mut()
-        .map(|map| map.insert("port".into(), Value::from(port)));
-    }
     launches.push(body);
   }
 
@@ -1148,6 +1226,7 @@ mod tests {
   use super::*;
   use crate::proxy::request_log::RequestState;
   use crate::proxy::usage_tap::Usage;
+  use std::collections::BTreeSet;
 
   fn format_of(accept: Option<&str>) -> Result<Format, Reject> {
     let mut headers = HeaderMap::new();
@@ -1173,6 +1252,10 @@ mod tests {
       .unwrap(),
       Format::Text
     );
+    // A wildcard never selects JSON, on either side.
+    assert_eq!(format_of(Some("application/*")).unwrap(), Format::Text);
+    assert_eq!(format_of(Some("text/*")).unwrap(), Format::Text);
+    assert_eq!(format_of(Some("*/*;q=0.5")).unwrap(), Format::Text);
     assert_eq!(format_of(Some("application/json")).unwrap(), Format::Json);
     assert_eq!(
       format_of(Some("application/json;q=0.9, text/plain;q=0.5")).unwrap(),
@@ -1225,6 +1308,16 @@ mod tests {
     // A percent-escaped space and `+` come back decoded.
     let escaped = Query::parse(Some("model=qwen3%204b%2Fq4"));
     assert_eq!(escaped.model.as_deref(), Some("qwen3 4b/q4"));
+    // A multi-byte character is a run of escapes and has to survive whole, and
+    // `%2B` stays a literal plus while a bare `+` is a space.
+    let unicode = Query::parse(Some("model=caf%C3%A9+%2Bx&launch=L2%20b"));
+    assert_eq!(unicode.model.as_deref(), Some("caf\u{e9} +x"));
+    assert_eq!(unicode.launch.as_deref(), Some("L2 b"));
+    // A `%` that starts no hex pair is itself.
+    assert_eq!(
+      Query::parse(Some("model=100%off")).model.as_deref(),
+      Some("100%off")
+    );
     assert_eq!(Query::parse(None).limit(), DEFAULT_TAIL);
     assert_eq!(Query::parse(Some("limit=99999")).limit(), CAPACITY);
   }
@@ -1323,6 +1416,188 @@ mod tests {
     let text = doc.render();
     assert!(text.contains("llamastash:requests_total{model=\"/models/a/x.gguf\"} 1\n"));
     assert!(text.contains("llamastash:requests_total{model=\"/models/b/x.gguf\"} 1\n"));
+  }
+
+  /// One finished request that reached no model: the proxy answered it itself.
+  fn rejected(log: &RequestLog, route: &str, status: u16) {
+    let mut rec = log.begin(route, None);
+    rec.set_status(status);
+    rec.finish(RequestState::Done, Usage::default());
+  }
+
+  #[test]
+  fn metrics_unattributed_requests_get_a_model_none_series() {
+    let log = RequestLog::new();
+    request(&log, "/models/a.gguf", "L1", 10, 3);
+    rejected(&log, "/v1/chat/completions", 404);
+    let snap = log.snapshot();
+    let mut doc = Document::new(true);
+    render(&mut doc, &snap, &[], &Scope::default(), 1, 1);
+    let text = doc.render();
+    for line in [
+      "llamastash:requests_total{model=\"none\"} 1\n",
+      "llamastash:request_errors_total{model=\"none\"} 1\n",
+      "llamastash:requests_in_flight{model=\"none\"} 0\n",
+      "llamastash:requests_total{model=\"m1\"} 1\n",
+    ] {
+      assert!(text.contains(line), "missing {line:?} in:\n{text}");
+    }
+
+    // A model scope answers for that model, so the unattributed share sits
+    // outside it; the log-wide totals stay in `summary` either way.
+    let scope = Scope {
+      log: LogScope::Model {
+        path: "/models/a.gguf".into(),
+      },
+      path: Some("/models/a.gguf".into()),
+      name: Some("m1".into()),
+      ..Scope::default()
+    };
+    let mut scoped = Document::new(true);
+    render(&mut scoped, &snap, &[], &scope, 1, 1);
+    let scoped_text = scoped.render();
+    assert!(
+      !scoped_text.contains("model=\"none\""),
+      "a model scope is that model's numbers:\n{scoped_text}"
+    );
+    assert!(scoped_text.contains("llamastash:requests_total{model=\"m1\"} 1\n"));
+  }
+
+  #[test]
+  fn metrics_no_model_none_series_when_everything_is_attributed() {
+    let log = RequestLog::new();
+    request(&log, "/models/a.gguf", "L1", 1, 1);
+    let snap = log.snapshot();
+    let mut doc = Document::new(true);
+    render(&mut doc, &snap, &[], &Scope::default(), 1, 1);
+    // Nothing to say, so no zero-filled series beside the real ones.
+    assert!(!doc.render().contains("model=\"none\""));
+  }
+
+  #[test]
+  fn metrics_model_label_does_not_change_with_the_scope() {
+    // Two models that share a display name, so both print as their catalog path.
+    let log = RequestLog::new();
+    request(&log, "/models/a/x.gguf", "L1", 1, 1);
+    request(&log, "/models/b/x.gguf", "L2", 2, 1);
+    let snap = log.snapshot();
+    let render_with = |scope: Scope| {
+      let mut doc = Document::new(true);
+      render(&mut doc, &snap, &[], &scope, 2, 2);
+      doc.render()
+    };
+    let unscoped = render_with(Scope::default());
+    let scoped = render_with(Scope {
+      log: LogScope::Model {
+        path: "/models/a/x.gguf".into(),
+      },
+      path: Some("/models/a/x.gguf".into()),
+      ..Scope::default()
+    });
+    let want = "llamastash:requests_total{model=\"/models/a/x.gguf\"} 1\n";
+    assert!(unscoped.contains(want), "unscoped:\n{unscoped}");
+    assert!(scoped.contains(want), "scoped:\n{scoped}");
+    assert!(
+      !scoped.contains("{model=\"m1\"}"),
+      "scoping to one of two colliding names must not rename it back:\n{scoped}"
+    );
+  }
+
+  #[test]
+  fn metrics_retired_launches_keep_totals_but_not_the_in_flight_gauge() {
+    let log = RequestLog::new();
+    request(&log, "/models/a.gguf", "L1", 1, 1);
+    log.forget_launch("L1");
+    let snap = log.snapshot();
+    let mut doc = Document::new(true);
+    render(
+      &mut doc,
+      &snap,
+      &[],
+      &Scope {
+        per_launch: true,
+        ..Scope::default()
+      },
+      0,
+      1,
+    );
+    let text = doc.render();
+    assert!(
+      text.contains("llamastash:launch_requests_total{launch=\"L1\",model=\"m1\"} 1\n"),
+      "a stopped launch keeps its totals:\n{text}"
+    );
+    // In-flight is a live quantity, so a stopped launch prints no zero for it.
+    assert!(
+      !text.contains("llamastash:launch_requests_in_flight"),
+      "in-flight is live-only:\n{text}"
+    );
+    assert!(
+      !text.contains("llamastash:launch_info"),
+      "live-only:\n{text}"
+    );
+  }
+
+  /// Every `llamastash:*` name the two metrics modules can emit, read from the
+  /// module source ahead of its test module.
+  fn emitted_series_names() -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for module in ["metrics.rs", "metrics_backend.rs"] {
+      let path = format!("{}/src/proxy/{module}", env!("CARGO_MANIFEST_DIR"));
+      let src = std::fs::read_to_string(&path).expect("module source");
+      let src = src.split("#[cfg(test)]").next().unwrap_or(&src);
+      let mut rest = src;
+      while let Some(at) = rest.find("\"llamastash:") {
+        rest = &rest[at + 1..];
+        names.insert(
+          rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_'))
+            .collect(),
+        );
+      }
+    }
+    names
+  }
+
+  /// Every `llamastash:*` name `docs/usage.md` lists in its two Metrics sections.
+  fn documented_series_names() -> BTreeSet<String> {
+    let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/usage.md"))
+      .expect("usage.md");
+    let start = doc
+      .find("### Metrics (`/metrics`)")
+      .expect("a Metrics section");
+    let rest = &doc[start..];
+    let end = rest
+      .find("### Ollama-compat surface")
+      .expect("a section after the two Metrics ones");
+    let section = &rest[..end];
+    let mut names = BTreeSet::new();
+    let mut at = 0;
+    while let Some(found) = section[at..].find("llamastash:") {
+      let from = at + found + "llamastash:".len();
+      names.insert(format!(
+        "llamastash:{}",
+        section[from..]
+          .chars()
+          .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_'))
+          .collect::<String>()
+      ));
+      at = from;
+    }
+    names
+  }
+
+  #[test]
+  fn metrics_series_names_match_the_docs() {
+    let emitted = emitted_series_names();
+    let documented = documented_series_names();
+    let undocumented: Vec<&String> = emitted.difference(&documented).collect();
+    let never_emitted: Vec<&String> = documented.difference(&emitted).collect();
+    assert!(
+      undocumented.is_empty() && never_emitted.is_empty(),
+      "docs/usage.md and the code disagree; undocumented {undocumented:?}, \
+       listed but never emitted {never_emitted:?}"
+    );
   }
 
   #[test]

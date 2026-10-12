@@ -82,14 +82,28 @@ async fn spawn_fake(
   log_dir: &Path,
   metrics: bool,
 ) -> llamastash::daemon::supervisor::ManagedModel {
+  spawn_fake_with(
+    catalog_path,
+    log_dir,
+    if metrics { &["--metrics"] } else { &[] },
+  )
+  .await
+}
+
+/// As [`spawn_fake`], with the fixture's own extra flags passed through.
+async fn spawn_fake_with(
+  catalog_path: &str,
+  log_dir: &Path,
+  extras: &[&str],
+) -> llamastash::daemon::supervisor::ManagedModel {
   let port = allocate_port();
   let id = ModelId {
     path: PathBuf::from(catalog_path),
     header_blake3: [0u8; 32],
   };
   let mut params = LaunchParams::new(PathBuf::from(catalog_path), LaunchMode::Chat);
-  if metrics {
-    params.extras = vec![OsString::from("--metrics")];
+  if !extras.is_empty() {
+    params.extras = extras.iter().map(OsString::from).collect();
   }
   let plan = LlamaCppBackend::new().process_spec(&params, port, fake_binary(), fast_probe());
   let model = supervisor_spawn(ManagedSpawn {
@@ -389,7 +403,10 @@ async fn metrics_content_negotiation_matches_the_plan() {
     ),
     // A tie goes to text, so a scrape can never get JSON by accident.
     ("application/json;q=0.9, text/plain;q=0.9", text_ct),
-    ("application/*", "application/json"),
+    // A wildcard of either type is "whatever you have", which is the text
+    // default: only an exact `application/json` asks for JSON.
+    ("application/*", text_ct),
+    ("text/*", text_ct),
   ];
   for (accept, want) in cases {
     let headers: Vec<(&str, &str)> = if accept.is_empty() {
@@ -601,6 +618,268 @@ async fn metrics_backend_with_nothing_running_is_an_empty_success() {
   let v: Value = serde_json::from_slice(&body).expect("json");
   assert_eq!(v["backends"].as_array().unwrap().len(), 0);
 
+  shutdown_listener(shutdown, handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+// --- what a scrape is, and what a scope means -----------------------------
+
+/// The `llamastash:request_log_rows` gauge from a text scrape.
+async fn logged_rows(addr: std::net::SocketAddr) -> u64 {
+  let (_status, _headers, body) = http_get(addr, "/metrics", &[]).await;
+  text(body)
+    .lines()
+    .find(|line| line.starts_with("llamastash:request_log_rows "))
+    .and_then(|line| line.rsplit(' ').next())
+    .and_then(|value| value.parse().ok())
+    .expect("the row-count gauge is always emitted")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_scrapes_are_not_logged_as_requests() {
+  let dir = unique_temp("scrape-unlogged");
+  let registry = SupervisorRegistry::new();
+  let model = spawn_fake("/fixture/solo.gguf", &dir, true).await;
+  registry.insert(registry.next_id(), model.clone()).await;
+  let state = build_state(
+    vec![discovered("/fixture/solo.gguf", Some("solo"))],
+    registry,
+  )
+  .await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+
+  drive_request(addr, "solo").await;
+  assert_eq!(logged_rows(addr).await, 1);
+
+  for path in [
+    "/metrics",
+    "/metrics?format=json",
+    "/metrics/backend",
+    "/metrics/backend?format=json",
+  ] {
+    let (status, _headers, _body) = http_get(addr, path, &[]).await;
+    assert_eq!(status, 200, "{path}");
+  }
+
+  // A scrape reads the numbers; it is not traffic. Otherwise every Prometheus
+  // poll would land in the log it reports and bury the real requests.
+  assert_eq!(
+    logged_rows(addr).await,
+    1,
+    "four scrapes must not add a row each"
+  );
+  let (_status, _headers, body) = http_get(addr, "/metrics", &[]).await;
+  let out = text(body);
+  assert!(
+    !out.contains("route=\"/metrics"),
+    "the metrics routes are not a forwarded route:\n{out}"
+  );
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_contradictory_scope_is_a_400_naming_both() {
+  let dir = unique_temp("scope-conflict");
+  let registry = SupervisorRegistry::new();
+  let alpha = spawn_fake("/fixture/alpha.gguf", &dir, true).await;
+  let alpha_id = registry.next_id();
+  registry.insert(alpha_id.clone(), alpha.clone()).await;
+  let beta = spawn_fake("/fixture/beta.gguf", &dir, true).await;
+  let beta_id = registry.next_id();
+  registry.insert(beta_id.clone(), beta.clone()).await;
+  let state = build_state(
+    vec![
+      discovered("/fixture/alpha.gguf", Some("alpha")),
+      discovered("/fixture/beta.gguf", Some("beta")),
+    ],
+    registry,
+  )
+  .await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+
+  // A `?model=` with a `?launch=` of a different model has no honest answer, and
+  // an empty body would read as idle traffic instead of as the mistake it is.
+  for route in ["/metrics", "/metrics/backend"] {
+    for (model, launch) in [("alpha", beta_id.as_str()), ("beta", alpha_id.as_str())] {
+      let scope = format!("model={model}&launch={launch}");
+      let (status, _headers, body) = http_get(addr, &format!("{route}?{scope}"), &[]).await;
+      assert_eq!(status, 400, "{route}?{scope}: {}", text(body));
+      let v: Value = serde_json::from_slice(&body).expect("an error body");
+      let message = v["error"]["message"].as_str().unwrap_or_default();
+      assert_eq!(v["error"]["type"], "invalid_request");
+      assert!(
+        message.contains(model) && message.contains(launch),
+        "the error has to name both values, got: {message}"
+      );
+    }
+  }
+
+  // A pair that does belong together is still just a scope.
+  drive_request(addr, "alpha").await;
+  for scope in [
+    format!("model=alpha&launch={}", alpha_id.as_str()),
+    format!("model=alpha&launch={}", live_port_of(addr, "alpha").await),
+  ] {
+    let (status, _headers, _body) = http_get(addr, &format!("/metrics?{scope}"), &[]).await;
+    assert_eq!(status, 200, "{scope}");
+  }
+
+  let _ = alpha.stop(Duration::from_secs(3)).await;
+  let _ = beta.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The port the JSON view reported for one launch.
+async fn live_port_of(addr: std::net::SocketAddr, model: &str) -> u16 {
+  let (_status, _headers, body) = http_get(addr, "/metrics?format=json&launch=1", &[]).await;
+  let v: Value = serde_json::from_slice(&body).expect("json");
+  v["launches"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .find(|row| row["model"] == model)
+    .and_then(|row| row["port"].as_u64())
+    .expect("a live launch for that model") as u16
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_scope_values_are_percent_decoded() {
+  let dir = unique_temp("query-decode");
+  let registry = SupervisorRegistry::new();
+  let model = spawn_fake("/fixture/cafe.gguf", &dir, true).await;
+  registry.insert(registry.next_id(), model.clone()).await;
+  let label = "caf\u{e9} +x";
+  let state = build_state(
+    vec![discovered("/fixture/cafe.gguf", Some(label))],
+    registry,
+  )
+  .await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+  drive_request(addr, label).await;
+
+  // The same display name as a scraper would send it: the accented character as
+  // two escapes, the space as `%20`, the literal plus as `%2B`.
+  let (status, _headers, body) = http_get(addr, "/metrics?model=caf%C3%A9%20%2Bx", &[]).await;
+  assert_eq!(
+    status,
+    200,
+    "an escaped reference has to resolve: {}",
+    text(body)
+  );
+  let out = text(body);
+  assert!(
+    out.contains("llamastash:requests_total{model=\"caf\u{e9} +x\"} 1"),
+    "the label is the decoded name:\n{out}"
+  );
+
+  // A bare `+` in a query is a space, so that one names `caf\u{e9} x` and matches
+  // nothing: the decoded value is what gets matched, not the raw text.
+  let (status, _headers, _body) = http_get(addr, "/metrics?model=caf%C3%A9+x", &[]).await;
+  assert_eq!(status, 404);
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+// --- an engine that will not answer ---------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_backend_skips_a_target_that_stops_answering_in_time() {
+  let dir = unique_temp("backend-slow");
+  let registry = SupervisorRegistry::new();
+  // The fan-out gives each engine 2 s; this one answers at 3 s, which is what a
+  // wedged or still-loading engine looks like from outside.
+  let model = spawn_fake_with(
+    "/fixture/slow.gguf",
+    &dir,
+    &["--metrics", "--metrics-delay-ms", "3000"],
+  )
+  .await;
+  let id = registry.next_id();
+  registry.insert(id.clone(), model.clone()).await;
+  let state = build_state(
+    vec![discovered("/fixture/slow.gguf", Some("slow"))],
+    registry,
+  )
+  .await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+
+  let started = std::time::Instant::now();
+  let (status, _headers, body) = http_get(addr, "/metrics/backend?format=json", &[]).await;
+  let took = started.elapsed();
+  assert_eq!(status, 200, "one wedged engine is not a failed scrape");
+  assert!(
+    took >= Duration::from_millis(1_500) && took < Duration::from_secs(10),
+    "the scrape waits its own patience and then gives up: {took:?}"
+  );
+  let v: Value = serde_json::from_slice(&body).expect("json");
+  let entry = &v["backends"][0];
+  assert_eq!(entry["ok"], false);
+  assert!(
+    entry["error"]
+      .as_str()
+      .unwrap_or_default()
+      .contains("timed out after 2 s"),
+    "{entry}"
+  );
+  assert!(
+    entry["status"].is_null(),
+    "nothing came back, so there is no status: {entry}"
+  );
+  assert_eq!(entry["series"], 0);
+
+  let (_status, _headers, body) = http_get(addr, "/metrics/backend", &[]).await;
+  let out = text(body);
+  assert!(
+    !out.contains("llamacpp:"),
+    "a target that never answered contributes no series:\n{out}"
+  );
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_backend_caps_a_target_that_sends_too_much() {
+  let dir = unique_temp("backend-huge");
+  let registry = SupervisorRegistry::new();
+  // 5 MiB of body against a 4 MiB cap: the series are in the kept prefix, so the
+  // target still counts, but the read stops at the cap.
+  let model = spawn_fake_with(
+    "/fixture/huge.gguf",
+    &dir,
+    &["--metrics", "--metrics-pad", "5242880"],
+  )
+  .await;
+  let id = registry.next_id();
+  registry.insert(id.clone(), model.clone()).await;
+  let state = build_state(
+    vec![discovered("/fixture/huge.gguf", Some("huge"))],
+    registry,
+  )
+  .await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+
+  let (_status, _headers, body) = http_get(addr, "/metrics/backend?format=json", &[]).await;
+  let v: Value = serde_json::from_slice(&body).expect("json");
+  let entry = &v["backends"][0];
+  assert_eq!(entry["ok"], true, "the prefix it sent is still a scrape");
+  assert_eq!(entry["truncated"], true, "{entry}");
+  assert_eq!(entry["series"], 3, "{entry}");
+
+  let (_status, _headers, body) = http_get(addr, "/metrics/backend", &[]).await;
+  assert!(
+    text(body).contains("llamacpp:prompt_tokens_total"),
+    "the kept prefix is merged"
+  );
+
+  let _ = model.stop(Duration::from_secs(3)).await;
   shutdown_listener(shutdown, handle).await;
   std::fs::remove_dir_all(&dir).ok();
 }

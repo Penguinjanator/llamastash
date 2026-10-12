@@ -1469,7 +1469,9 @@ survive a naive `curl` and a real Prometheus scraper alike.
 | `?format=<anything else>` | `400` naming the two accepted values |
 
 Only `application/json` and `text/plain` are matched, so a `;` parameter that is not
-`q` (a `version=0.0.4`, say) does not affect the match. A missing `q` is 1.0. `?format=`
+`q` (a `version=0.0.4`, say) does not affect the match. A missing `q` is 1.0. Only an
+exact type selects its format, so any wildcard (`*/*`, `application/*`) gets the text
+default and a scrape can never receive JSON by accident. `?format=`
 beats `Accept`, and `Accept` beats the default, which is text. Responses carry
 `text/plain; version=0.0.4; charset=utf-8` or `application/json`.
 
@@ -1496,6 +1498,12 @@ Gauges: `llamastash:requests_in_flight{model}`, `llamastash:request_duration_sec
 (last reported), `llamastash:request_tokens_per_second_avg{model}`, `llamastash:models_loaded`,
 `llamastash:models_discovered`, `llamastash:request_log_rows`, `llamastash:request_log_capacity`,
 `llamastash:request_log_file_dropped_total`.
+A request the proxy answered without reaching a model — an unknown model name, a body it
+could not read — belongs to no model, so `requests`, `errors` and `requests_in_flight`
+carry those under `model="none"` and `rate(llamastash:requests_total)` adds up to what
+`summary.requests` says. Token and latency series need a model to be counted, so they
+never carry `none`. That label is text-format only; the JSON shape is unchanged, because
+`summary` already counted those requests.
 
 The per-launch series are opt-in because they multiply every series above by the
 number of launches a model has had. Ask for them with `?launch=1`:
@@ -1504,14 +1512,20 @@ number of launches a model has had. Ask for them with `?launch=1`:
 `llamastash:launch_request_errors_total{launch,model}`,
 `llamastash:launch_prompt_tokens_total{launch,model}`,
 `llamastash:launch_completion_tokens_total{launch,model}`,
-`llamastash:launch_requests_in_flight{launch,model}`. A launch that has stopped keeps
-its series until 16 newer retirements push it out.
+`llamastash:launch_requests_in_flight{launch,model}`. A concrete `?launch=<ref>` scopes
+to that launch and turns the same series on for it. A launch that has stopped keeps its
+totals until 16 newer retirements push it out, but prints no
+`launch_requests_in_flight`: in-flight is a live quantity and a stopped launch has
+nothing still running. `?launch=1` grows with the number of launches a daemon has
+served, so a long-lived daemon means many series; every counter restarts from zero when
+the daemon does.
 
 `?model=<ref>` and `?launch=<ref>` narrow the response to one model or one launch. A
 reference is matched as a launch id (`L3`), then a port, then an exact catalog path,
 then a case-insensitive display-name substring, which is the same order
 `llamastash requests <ref>` uses. Nothing matches: `404` naming the value; a substring
-that matches several models is a `400` saying so.
+that matches several models is a `400` saying so. Both together have to agree: a
+`?launch=` that is not a launch of the `?model=` you named is a `400` naming both.
 
 The JSON form is the `requests --json` body with a couple of blocks added: `scope`,
 `summary`, `models`, `launches`, and `requests` (the same array
