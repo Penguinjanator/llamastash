@@ -449,21 +449,21 @@ mod tests {
     );
   }
 
-  /// vLLM and SGLang declare a family under one name and print every sample
-  /// under a derived one. Keying the block on the sample line's name instead
-  /// loses the declared type — a histogram and a counter both come out `untyped`
-  /// to anything that reads `# TYPE` — so the family has to survive while the
-  /// sample keeps the name the engine printed.
+  /// An engine can declare a family under one name and print every sample under
+  /// a derived one. Keying the block on the sample line's name instead loses the
+  /// declared type — a histogram and a counter both come out `untyped` to
+  /// anything that reads `# TYPE` — so the family has to survive while the sample
+  /// keeps the name the engine printed.
   #[test]
   fn backend_merge_keeps_a_declared_family_for_derived_sample_names() {
     let engine = concat!(
-      "# HELP vllm:prompt_tokens prompt tokens\n",
-      "# TYPE vllm:prompt_tokens counter\n",
-      "vllm:prompt_tokens_total 21\n",
-      "# TYPE vllm:ttft histogram\n",
-      "vllm:ttft_bucket{le=\"0.1\"} 1\n",
-      "vllm:ttft_sum 0.05\n",
-      "vllm:ttft_count 1\n",
+      "# HELP llamacpp:prompt_tokens prompt tokens\n",
+      "# TYPE llamacpp:prompt_tokens counter\n",
+      "llamacpp:prompt_tokens_total 21\n",
+      "# TYPE llamacpp:time_to_first_token_seconds histogram\n",
+      "llamacpp:time_to_first_token_seconds_bucket{le=\"0.1\"} 1\n",
+      "llamacpp:time_to_first_token_seconds_sum 0.05\n",
+      "llamacpp:time_to_first_token_seconds_count 1\n",
       "# TYPE llamacpp:finished_total counter\n",
       "llamacpp:finished_total 3\n",
     );
@@ -472,13 +472,13 @@ mod tests {
     assert_eq!(
       text,
       concat!(
-        "# HELP vllm:prompt_tokens prompt tokens\n",
-        "# TYPE vllm:prompt_tokens counter\n",
-        "vllm:prompt_tokens_total{launch=\"L1\",model=\"m1\"} 21\n",
-        "# TYPE vllm:ttft histogram\n",
-        "vllm:ttft_bucket{le=\"0.1\",launch=\"L1\",model=\"m1\"} 1\n",
-        "vllm:ttft_sum{launch=\"L1\",model=\"m1\"} 0.05\n",
-        "vllm:ttft_count{launch=\"L1\",model=\"m1\"} 1\n",
+        "# HELP llamacpp:prompt_tokens prompt tokens\n",
+        "# TYPE llamacpp:prompt_tokens counter\n",
+        "llamacpp:prompt_tokens_total{launch=\"L1\",model=\"m1\"} 21\n",
+        "# TYPE llamacpp:time_to_first_token_seconds histogram\n",
+        "llamacpp:time_to_first_token_seconds_bucket{le=\"0.1\",launch=\"L1\",model=\"m1\"} 1\n",
+        "llamacpp:time_to_first_token_seconds_sum{launch=\"L1\",model=\"m1\"} 0.05\n",
+        "llamacpp:time_to_first_token_seconds_count{launch=\"L1\",model=\"m1\"} 1\n",
         // A name the engine declared and sampled identically — every llama.cpp
         // counter — stays under its own name, `untyped` only where nothing said
         // otherwise.

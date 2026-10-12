@@ -1120,11 +1120,10 @@ impl Block {
 /// One sample line of a block.
 struct Sample {
   /// What this sample appends to the block's name when it prints, normally
-  /// nothing. An engine that declares one family and prints its samples under a
-  /// derived name — `# TYPE vllm:ttft histogram` with `vllm:ttft_bucket`,
-  /// `vllm:ttft_sum` and `vllm:ttft_count` — has to keep the sample's own name
-  /// while `# TYPE` prints the family's once, or the samples land in a block of
-  /// their own and every one of them reads as `untyped`.
+  /// nothing. An engine that declares one family and prints its samples under
+  /// derived names has to keep each sample's own name while `# TYPE` prints the
+  /// family's once, or the samples land in blocks of their own and every one of
+  /// them reads as `untyped`.
   suffix: &'static str,
   /// The label text between the braces, in wire form; empty when there are none.
   labels: String,
@@ -1175,12 +1174,12 @@ impl Document {
 
   /// The block one scraped sample belongs to, and what that sample appends to
   /// the block's name when it prints. The sample's own name wins when that is
-  /// what was declared — llama.cpp prints names that match its `# TYPE` lines,
-  /// including `foo_total` counters, and those stay byte-identical. Otherwise a
-  /// declared family one Prometheus suffix short of the sample's name does,
-  /// which is how vLLM and SGLang declare `vllm:prompt_tokens` and print
-  /// `vllm:prompt_tokens_total`. Anything else gets a block of its own, keyed
-  /// and printed under the name the engine used.
+  /// what was declared — an engine that prints the names its own `# TYPE` lines
+  /// declare, `foo_total` counters included, stays byte-identical. Otherwise a
+  /// declared family that is one Prometheus suffix short of the sample's name
+  /// does, which is the shape of a family declared once and printed suffixed.
+  /// Anything else gets a block of its own, keyed and printed under the name the
+  /// engine used.
   fn scrape_block(&mut self, name: &str) -> (usize, &'static str) {
     if let Some(at) = self.index.get(name) {
       return (*at, "");
@@ -2153,6 +2152,64 @@ mod tests {
       "# HELP llamacpp:x first help\n# TYPE llamacpp:x counter\nllamacpp:x 5\n"
     );
     assert_eq!(doc.samples(), 1);
+  }
+
+  /// An engine may declare a family under one name and print its samples under
+  /// suffixed ones — a `prompt_tokens_total` sample under the declared
+  /// `prompt_tokens`. The sample keeps the name the engine printed and inherits
+  /// the family's type: a counter that arrives under a suffixed name is still a
+  /// counter, so the text prints one `# TYPE` naming one family.
+  #[test]
+  fn metrics_an_engine_keeps_the_family_a_suffixed_sample_belongs_to() {
+    let mut doc = Document::new(true);
+    doc.declare(
+      "engine:prompt_tokens",
+      Some("prompt tokens"),
+      Some("counter"),
+    );
+    doc.sample_raw("engine:prompt_tokens_total", String::new(), 4.0);
+    doc.sample(
+      "llamastash:prompt_tokens_total",
+      "prompt tokens",
+      "counter",
+      &[("model", "m1")],
+      4.0,
+    );
+    assert_eq!(
+      doc.render(),
+      concat!(
+        "# HELP engine:prompt_tokens prompt tokens\n",
+        "# TYPE engine:prompt_tokens counter\n",
+        "engine:prompt_tokens_total 4\n",
+        // Our own counter is a separate family and declares itself, HELP and
+        // TYPE included.
+        "# HELP llamastash:prompt_tokens_total prompt tokens\n",
+        "# TYPE llamastash:prompt_tokens_total counter\n",
+        "llamastash:prompt_tokens_total{model=\"m1\"} 4\n",
+      )
+    );
+  }
+
+  /// The type an engine declared holds for every name under that family. A
+  /// histogram prints `_sum` and `_count` samples like a summary does, and
+  /// calling them `untyped` because their own name was never declared makes the
+  /// whole family unusable to a scrape that only ingests typed series.
+  #[test]
+  fn metrics_an_engine_keeps_the_metric_type_it_declared() {
+    let mut doc = Document::new(false);
+    doc.declare("engine:ttft", None, Some("histogram"));
+    doc.sample_raw("engine:ttft_bucket", "le=\"0.1\"".to_string(), 1.0);
+    doc.sample_raw("engine:ttft_sum", String::new(), 0.05);
+    doc.sample_raw("engine:ttft_count", String::new(), 1.0);
+    assert_eq!(
+      doc.render(),
+      concat!(
+        "# TYPE engine:ttft histogram\n",
+        "engine:ttft_bucket{le=\"0.1\"} 1\n",
+        "engine:ttft_sum 0.05\n",
+        "engine:ttft_count 1\n",
+      )
+    );
   }
 
   #[test]
