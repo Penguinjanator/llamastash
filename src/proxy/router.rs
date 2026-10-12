@@ -984,11 +984,6 @@ pub(crate) fn json_response(
 /// `Infallible`; `map_err` widens it (via the `From<Infallible>`
 /// blanket impl) so non-streaming arms share the streaming arm's
 /// body alias.
-/// Wrap an in-memory `Bytes` payload as a `BoxBody` whose error
-/// type is the wider `BodyError` alias. `Full`'s native error is
-/// `Infallible`; `map_err` widens it (via the `From<Infallible>`
-/// blanket impl) so non-streaming arms share the streaming arm's
-/// body alias.
 pub(crate) fn full_body(bytes: Bytes) -> BoxBody<Bytes, BodyError> {
   Full::new(bytes).map_err(|never| match never {}).boxed()
 }
