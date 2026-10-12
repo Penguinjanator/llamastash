@@ -21,7 +21,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ### Changed
 
-- **The request tables reordered.** `llamastash requests` and the Requests tab now read Time, Code, Tok/s, Total, TTFB, In, Out, Model, Launch, Client, Note, Route, and the tab gained the `Launch` column the CLI already had. A note longer than its column wraps onto continuation lines instead of pushing the figures out of view; piped output still keeps one line per request with the whole note in its field.
+- `llamastash requests` and the Requests tab now read Time, Code, Tok/s, Total, TTFB, In, Out, Model, Launch, Client, Note, Route, and the tab gained the `Launch` column the CLI already had; a note longer than its column wraps onto continuation lines on a terminal, while piped output keeps one tab-separated line per request with the whole note in its field.
 - A preset lookup no longer reads a model header on the daemon's async worker thread, so a slow disk cannot stall the control-plane calls queued behind it. ([#99](https://github.com/llamastash/llamastash/pull/99))
 - `/api/show` reads `<model>@<launch>` the way the chat surfaces do: the launch name is a pointer to a running launch, and a name that does not exist falls back to that model's unnamed launch. It used to answer `404` for anything containing an `@`. ([#99](https://github.com/llamastash/llamastash/pull/99))
 - The proxy reads the model catalog through one shared snapshot instead of copying every row for every request, so routing a request no longer allocates in proportion to how many models are on disk. ([#99](https://github.com/llamastash/llamastash/pull/99))

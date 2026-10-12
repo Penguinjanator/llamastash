@@ -537,7 +537,7 @@ TIME      CODE  TOK/S  TOTAL  TTFB   IN  OUT  MODEL                         LAUN
 - `TOTAL` is the time from the proxy receiving the request to the end of the response. `TTFB` is the time to the first response body byte, which includes any model load.
 - `IN` / `OUT` are prompt and generated tokens. `TOK/S` is the generation speed. A leading `~` marks a speed the proxy estimated because the model's server reported none.
 - `NOTE` says what happened beyond the status code: `auto-start` (this request started the model), `unloaded L3` (launches unloaded to make room), `fallback (<reason>) for <model>`, `client closed`, `upstream error`, `loading model`, `in flight`, or the proxy's own error and its message (`launch_failed: auto-start of ...`).
-- On a terminal a summary block is printed above the table, and a `NOTE` longer than 60 cells wraps onto continuation lines under its column rather than running off the screen. Piped output is the header plus one tab-separated line per request with the whole note in its field, and the `MODEL` column is dropped when `model-ref` names one model or one launch.
+- On a terminal the table is padded: a summary block prints above it, and a `NOTE` longer than 60 cells wraps onto continuation lines under its column rather than running off the screen. The wrap belongs to that padded layout, so `--no-colors`, `NO_COLOR`, or piped stdout prints the header plus one tab-separated line per request with the whole note in its field. The `MODEL` column is dropped when `model-ref` names one model or one launch.
 
 `--json` emits `{ "summary": {...}, "requests": [...] }`. Every key of a request is always present; a value the proxy does not have is `null`:
 
@@ -1547,7 +1547,9 @@ it fetches `http://127.0.0.1:<port>/metrics` in parallel, with a 2 s timeout and
 4 MiB body cap per target, and merges the text into one document: `# HELP` and `# TYPE`
 kept once per metric name (first wins), and every engine sample line gains
 `launch="L3"` and `model="<name>"` labels. The engine's own labels (vLLM's
-`model_name`, say) are left alone. One target that refuses, times out or answers
+`model_name`, say) are left alone, except an engine label already called `launch` or
+`model`: the proxy's own value replaces it, because a sample cannot carry the same
+label twice and still be scraped. One target that refuses, times out or answers
 nothing parseable never fails the response; unparsable lines are skipped and counted.
 Beside the engine's samples sit four proxy-owned gauges, labelled `model,launch`:
 `llamastash:backend_metrics_available` (1/0 — only a plain `200` is a 1, so a `501` from
@@ -2015,7 +2017,7 @@ Knob set, grouped into labelled clusters in display order:
 | Attention & KV cache                         | `flash_attn`, `cache_type_k`, `cache_type_v`       |
 | Throughput                                   | `threads`, `parallel`, `batch_size`, `ubatch_size` |
 | Memory loading                               | `load_mode`                                        |
-| Advanced                                     | `rope_freq_scale`, `keep`, `metrics`, `extras`                |
+| Advanced                                     | `rope_freq_scale`, `keep`, `metrics`, `extras`     |
 
 Groups are ordered by how often a knob is typically changed; related
 knobs sit together. (This display order is independent of the order
