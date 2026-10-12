@@ -23,6 +23,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ### Changed
 
+- `status` and the TUI Daemon panel name each backend's servers (`llamacpp (rocm|vulkan) · generic (gufo|halogen)`) instead of host accelerators or binary paths. ([#107](https://github.com/llamastash/llamastash/pull/107))
 - `Tok/s last` is gone from the `requests` summary block and the Requests tab, where the session speed is the one worth reading; the field stays in `--json` and in the row table. ([#109](https://github.com/llamastash/llamastash/pull/109))
 - `llamastash requests` and the Requests tab now read Time, Code, Tok/s, Total, TTFB, In, Out, Model, Launch, Client, Note, Route, and the tab gained the `Launch` column the CLI already had; a note longer than its column wraps onto continuation lines on a terminal, while piped output keeps one tab-separated line per request with the whole note in its field. ([#109](https://github.com/llamastash/llamastash/pull/109))
 - A preset lookup no longer reads a model header on the daemon's async worker thread, so a slow disk cannot stall the control-plane calls queued behind it. ([#99](https://github.com/llamastash/llamastash/pull/99))

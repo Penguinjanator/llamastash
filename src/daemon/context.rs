@@ -425,6 +425,7 @@ mod tests {
           name: "s".into(),
           devices: Vec::new(),
           caps: Default::default(),
+          label: None,
         }])
         .await;
     });

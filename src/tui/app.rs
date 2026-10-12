@@ -219,20 +219,20 @@ pub struct DaemonInfo {
   /// `None` when talking to a pre-Unit-5 daemon that omits the
   /// field — info_pane renders the proxy row as `proxy   —` in that case.
   pub proxy: Option<ProxyInfo>,
-  /// One entry per *enabled* backend whose `status.backends` row
-  /// carries a resolved `binary` path. The Daemon panel's server row
-  /// renders every non-llamacpp entry alongside the default
-  /// `llama-server` (llamacpp's binary already rides `server_path`),
-  /// tagged with the backend id — new backends appear with no
-  /// per-backend TUI code.
-  pub backend_binaries: Vec<BackendBinary>,
+  /// One entry per *enabled* backend with at least one server, from the
+  /// `status.backends` rows. The Daemon panel's server row renders each as
+  /// `<id> (<label>|<label>)`, so new backends appear with no per-backend TUI
+  /// code.
+  pub backend_servers: Vec<BackendServers>,
 }
 
-/// One backend's resolved binary from the `status.backends` array.
+/// One backend's server labels from the `status.backends` array, in catalog
+/// order (`["rocm", "vulkan"]`). Before the server catalog is probed, the
+/// resolved binary's file name stands in.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackendBinary {
+pub struct BackendServers {
   pub id: String,
-  pub binary: String,
+  pub labels: Vec<String>,
 }
 
 /// Wire shape of the proxy listener block surfaced via the IPC
@@ -548,15 +548,15 @@ pub struct StartModelArgs {
   pub preset: Option<String>,
 }
 
-/// The binary + compute-backend label a focused running model launched on
-/// when it uses a **non-default** server build. Returned by
-/// [`App::focused_override_device`] so the daemon-pane `server` row can swap
-/// to the override build. Owned (not a borrow into `servers`) so the render
-/// path can hold it across the immutable-borrow boundary.
-#[derive(Debug, Clone)]
+/// Which server a focused running model launched on when it uses a
+/// **non-default** build: its backend and its position among that backend's
+/// catalog servers, which is also its index in the backend's `server_labels`.
+/// Returned by [`App::focused_override_device`] so the daemon-pane `server`
+/// row can highlight that label.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverrideServer {
-  pub binary: PathBuf,
-  pub backend: String,
+  pub backend_id: String,
+  pub index: usize,
 }
 
 /// How alarming a confirm prompt is, so the overlay can tone its
@@ -1120,12 +1120,11 @@ impl App {
       // (`body["proxy"]`) but on the same daemon-info struct so the
       // info_pane can render both in one block.
       let proxy = body.get("proxy").and_then(parse_proxy_info);
-      // The backends rows (also a sibling field): every enabled
-      // backend's resolved binary, for the server row. A row with no
-      // `enabled` field counts as enabled (llamacpp has no off switch);
-      // an explicit `enabled: false` (e.g. lemonade without
-      // `--lemonade`) is dropped.
-      let backend_binaries: Vec<BackendBinary> = body
+      // The backends rows (also a sibling field): every enabled backend's
+      // server labels, for the server row. A row with no `enabled` field
+      // counts as enabled (llamacpp has no off switch); an explicit
+      // `enabled: false` (e.g. lemonade without `--lemonade`) is dropped.
+      let backend_servers: Vec<BackendServers> = body
         .get("backends")
         .and_then(Value::as_array)
         .map(|rows| {
@@ -1133,9 +1132,22 @@ impl App {
             .iter()
             .filter(|r| r.get("enabled").and_then(Value::as_bool).unwrap_or(true))
             .filter_map(|r| {
-              Some(BackendBinary {
+              let mut labels: Vec<String> = r
+                .get("server_labels")
+                .and_then(Value::as_array)
+                .map(|a| {
+                  a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+                })
+                .unwrap_or_default();
+              if labels.is_empty() {
+                let binary = Path::new(r.get("binary").and_then(Value::as_str)?);
+                labels.push(binary.file_name()?.to_string_lossy().into_owned());
+              }
+              Some(BackendServers {
                 id: r.get("id").and_then(Value::as_str)?.to_string(),
-                binary: r.get("binary").and_then(Value::as_str)?.to_string(),
+                labels,
               })
             })
             .collect()
@@ -1157,7 +1169,7 @@ impl App {
           .and_then(Value::as_str)
           .map(String::from),
         proxy,
-        backend_binaries,
+        backend_servers,
       };
       // First-observation toast on `port_in_use`. Only fires when the
       // last *observed* status was something other than `port_in_use`
@@ -1708,8 +1720,8 @@ impl App {
     }
   }
 
-  /// Binary + compute-backend label for the focused running model's device
-  /// override, when it runs on a **non-default** server binary. Resolves the
+  /// The server the focused running model's device override runs on, when it
+  /// is a **non-default** server binary. Resolves the
   /// row's `--device` selector against the server catalog (the owning server
   /// carries the binary). `None` when the focused row has no selector or
   /// resolves to the daemon's default server.
@@ -1725,20 +1737,23 @@ impl App {
       .servers
       .iter()
       .find(|s| s.devices.iter().any(|d| d.selector == selector))?;
-    let device = server.devices.iter().find(|d| d.selector == selector)?;
     let is_default = self
       .daemon_info
       .server_path
       .as_deref()
       .is_some_and(|def| server.binary == Path::new(def));
     if is_default {
-      None
-    } else {
-      Some(OverrideServer {
-        binary: server.binary.clone(),
-        backend: device.gpu_backend.clone(),
-      })
+      return None;
     }
+    let index = self
+      .servers
+      .iter()
+      .filter(|s| s.backend_id == server.backend_id)
+      .position(|s| s.id == server.id)?;
+    Some(OverrideServer {
+      backend_id: server.backend_id.clone(),
+      index,
+    })
   }
 
   /// Servers compatible with `path`'s model, priority-ordered: for each backend
@@ -3290,6 +3305,7 @@ mod tests {
       name: "test".into(),
       devices,
       caps: Default::default(),
+      label: None,
     }
   }
 
@@ -3330,8 +3346,13 @@ mod tests {
     let dev = app
       .focused_override_device()
       .expect("non-default binary must surface as an override");
-    assert_eq!(dev.binary, PathBuf::from("/opt/cuda/llama-server"));
-    assert_eq!(dev.backend, "CUDA");
+    assert_eq!(
+      dev,
+      OverrideServer {
+        backend_id: "llamacpp".into(),
+        index: 1,
+      }
+    );
   }
 
   #[test]
@@ -3491,6 +3512,7 @@ mod tests {
         name: "lemonade".into(),
         devices: Vec::new(),
         caps: Default::default(),
+        label: None,
       },
     ];
     let servers = app.compatible_servers(Path::new("/m/qwen.gguf"));
@@ -4310,30 +4332,31 @@ mod tests {
   }
 
   #[test]
-  fn ingest_status_collects_enabled_backend_binaries() {
+  fn ingest_status_collects_enabled_backend_servers() {
     let mut app = App::new(AppOptions::default());
     app.ingest_status(&json!({
       "daemon": {"pid": 1},
       "backends": [
         // No `enabled` field → counts as enabled (llamacpp).
-        {"id": "llamacpp", "binary": "/usr/bin/llama-server"},
-        {"id": "lemonade", "enabled": true, "binary": "/usr/bin/lemond"},
-        // Disabled rows drop out even with a binary.
-        {"id": "future", "enabled": false, "binary": "/usr/bin/future"},
-        // No binary resolved → no entry.
+        {"id": "llamacpp", "binary": "/usr/bin/llama-server", "server_labels": ["rocm", "vulkan"]},
+        // Catalog not probed yet → the binary's file name stands in.
+        {"id": "lemonade", "enabled": true, "binary": "/usr/bin/lemond", "server_labels": []},
+        // Disabled rows drop out even with servers.
+        {"id": "future", "enabled": false, "binary": "/usr/bin/future", "server_labels": ["x"]},
+        // No server and no binary → no entry.
         {"id": "ghost", "enabled": true},
       ],
     }));
     assert_eq!(
-      app.daemon_info.backend_binaries,
+      app.daemon_info.backend_servers,
       vec![
-        BackendBinary {
+        BackendServers {
           id: "llamacpp".into(),
-          binary: "/usr/bin/llama-server".into()
+          labels: vec!["rocm".into(), "vulkan".into()],
         },
-        BackendBinary {
+        BackendServers {
           id: "lemonade".into(),
-          binary: "/usr/bin/lemond".into()
+          labels: vec!["lemond".into()],
         },
       ]
     );

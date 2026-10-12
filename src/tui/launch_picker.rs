@@ -1804,6 +1804,7 @@ mod tests {
       name: id.into(),
       devices,
       caps: Default::default(),
+      label: None,
     }
   }
 

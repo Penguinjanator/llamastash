@@ -554,6 +554,7 @@ mod tests {
         free_mib: Some(24000),
       }],
       caps: Default::default(),
+      label: None,
     }
   }
 

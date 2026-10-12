@@ -498,6 +498,17 @@ Each row also carries `request_stats`: totals of the proxy requests that launch 
 
 The `proxy` block is documented in detail under [Proxy → Is the proxy up?](#is-the-proxy-up).
 
+The `backends` section lists every backend with its install state and its servers, joined with `|`:
+
+```
+backends
+  llamacpp  ✓ installed    rocm|vulkan
+  generic   ✓ installed    gufo|halogen-flash-next
+  lemonade  not installed  cpu|npu  (umbrella: disabled)
+```
+
+A server reads as its configured `name:`, else the compute backends its device probe found (`rocm`, `rocm+vulkan`, `cpu` for a llama.cpp build whose probe lists no GPU), else its build folder when two unnamed builds share those or its `--list-devices` probe failed (the binary's file name for a flat install such as `/usr/bin/llama-server`). A repeated label gets `-2`, `-3`. A generic entry reads as its `name:` with or without `model:`. A backend with no server shows its accelerators instead. The labels are `server_labels` on each `backends` row in `--json`, and the TUI Daemon panel's `server` row shows the same: `llamacpp (rocm|vulkan) · generic (gufo|halogen-flash-next)`, with the build a focused launch runs on in green when it isn't the default.
+
 On a host where more than one GPU backend reports a device (e.g. an
 NVIDIA card seen via CUDA plus an AMD card via ROCm), `gpu` serialises
 as a `multi` snapshot (`{"backend":"multi","devices":[…]}`) and the
@@ -870,7 +881,7 @@ Two shapes:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `name` | yes | Server id suffix (`generic-<name>`) with `model`; the row's model id without it. No `@`, `/` or spaces. |
+| `name` | yes | Server id suffix (`generic-<name>`) with `model`; the row's model id without it. No `@`, `/`, `|` or spaces. |
 | `binary` | yes | Absolute or `~/` path. |
 | `ready` | yes | HTTP path that returns 200 once the model is loaded (gufo `/ready`, llama-server `/health`, Halogen `/v1/models`). |
 | `model` | no | Catalog GGUF(s) this entry runs, as above. Requires `{model}` in `args` or `env`. |

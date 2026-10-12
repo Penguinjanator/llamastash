@@ -369,8 +369,12 @@ impl Backend for LlamaCppBackend {
     config.backend.llamacpp.servers.clone()
   }
 
-  fn probe_devices(&self, binary: &Path) -> Vec<super::Device> {
+  fn probe_devices(&self, binary: &Path) -> Option<Vec<super::Device>> {
     list_devices::probe_devices(binary)
+  }
+
+  fn deviceless_accelerator(&self) -> Option<super::Accelerator> {
+    Some(super::Accelerator::Cpu)
   }
 
   fn probe_caps(&self, binary: &Path) -> std::collections::BTreeMap<String, String> {
