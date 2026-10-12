@@ -26,7 +26,7 @@ use hyper::{Request, Response, StatusCode};
 use serde_json::{Map, Value};
 
 use super::request_log::{
-  LogScope, LogSnapshot, RequestLog, RequestSummary, ScopeTotals, CAPACITY, DEFAULT_TAIL,
+  Clients, LogScope, LogSnapshot, RequestLog, RequestSummary, ScopeTotals, CAPACITY, DEFAULT_TAIL,
 };
 use super::route;
 use super::router::{self, ProxyResponse};
@@ -622,9 +622,9 @@ fn render(
     .collect();
   for totals in models {
     let label = &labels[&totals.key];
-    let in_flight =
+    let live_clients =
       snapshot.in_flight(|row| row.model_path.as_deref() == Some(totals.key.as_str()));
-    model_series(doc, label, totals, in_flight);
+    model_series(doc, label, totals, live_clients);
   }
 
   // Requests the proxy answered without ever reaching a model (an unknown model
@@ -701,14 +701,17 @@ fn render(
     // In-flight is a live quantity: a stopped launch has none, and printing the
     // zero would read as a request that never finished.
     if totals.live {
-      let in_flight = snapshot.in_flight(|row| row.launch_id.as_deref() == Some(id.as_str()));
+      let running = snapshot.in_flight(|row| row.launch_id.as_deref() == Some(id.as_str()));
       doc.sample(
         "llamastash:launch_requests_in_flight",
         "Requests one launch is still serving",
         "gauge",
         &per_launch_labels,
-        in_flight as f64,
+        running.requests() as f64,
       );
+      // No per-launch host gauge: one metric name carries one label set, and
+      // `hosts_in_flight` already carries `model`. A launch's live hosts are
+      // on the JSON surfaces (`launches[]`, `requests_tail --launch`).
     }
   }
 }
@@ -729,7 +732,7 @@ fn unattributed_series(doc: &mut Document, snapshot: &LogSnapshot) {
     .requests
     .saturating_sub(attributed_requests);
   let in_flight = snapshot.in_flight(|row| row.model_path.is_none());
-  if requests == 0 && in_flight == 0 {
+  if requests == 0 && in_flight.requests() == 0 {
     return;
   }
   let errors = snapshot
@@ -757,12 +760,19 @@ fn unattributed_series(doc: &mut Document, snapshot: &LogSnapshot) {
     "Requests the proxy is still serving",
     "gauge",
     &labels,
-    in_flight as f64,
+    in_flight.requests() as f64,
+  );
+  doc.sample(
+    "llamastash:hosts_in_flight",
+    "Distinct client hosts the proxy is serving right now",
+    "gauge",
+    &labels,
+    in_flight.hosts() as f64,
   );
 }
 
 /// The counters and gauges that carry one `model` label.
-fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, in_flight: u64) {
+fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, live: Clients) {
   let labels = [("model", label)];
   let s = &totals.summary;
   doc.sample(
@@ -826,7 +836,14 @@ fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, in_flight
     "Requests the proxy is still serving",
     "gauge",
     &labels,
-    in_flight as f64,
+    live.requests() as f64,
+  );
+  doc.sample(
+    "llamastash:hosts_in_flight",
+    "Distinct client hosts the proxy is serving right now",
+    "gauge",
+    &labels,
+    live.hosts() as f64,
   );
   // A gauge with no figure yet has no sample; the metric is then omitted whole
   // rather than printed as a made-up zero.
@@ -1381,6 +1398,7 @@ mod tests {
     assert!(text.contains("llamastash:prompt_tokens_total{model=\"m1\"} 10\n"));
     assert!(text.contains("llamastash:route_requests_total{route=\"/v1/chat/completions\"} 1\n"));
     assert!(text.contains("llamastash:requests_in_flight{model=\"m1\"} 0\n"));
+    assert!(text.contains("llamastash:hosts_in_flight{model=\"m1\"} 0\n"));
     assert!(text.contains("llamastash:models_loaded 1\n"));
     assert!(text.contains("llamastash:request_log_capacity 1000\n"));
     // A finished successful request has a duration and a first byte, so both
@@ -1448,6 +1466,39 @@ mod tests {
   }
 
   #[test]
+  fn metrics_in_flight_requests_from_one_host_are_one_host() {
+    let log = RequestLog::new();
+    // Two tools on one machine, each with a request still streaming. The
+    // records have to stay alive: dropping one finishes the row.
+    let streaming: Vec<crate::proxy::request_log::RequestRecord> = [5001u16, 5002]
+      .into_iter()
+      .map(|port| {
+        let mut rec = log.begin(
+          "/v1/chat/completions",
+          Some(format!("127.0.0.1:{port}").parse().unwrap()),
+        );
+        rec.set_model("m1", "/models/a.gguf");
+        rec.set_launch("L1");
+        rec.publish();
+        rec
+      })
+      .collect();
+    let snap = log.snapshot();
+    let mut doc = Document::new(true);
+    render(&mut doc, &snap, &[], &Scope::default(), 1, 1);
+    let text = doc.render();
+    assert!(
+      text.contains("llamastash:requests_in_flight{model=\"m1\"} 2\n"),
+      "{text}"
+    );
+    assert!(
+      text.contains("llamastash:hosts_in_flight{model=\"m1\"} 1\n"),
+      "{text}"
+    );
+    drop(streaming);
+  }
+
+  #[test]
   fn metrics_colliding_model_names_fall_back_to_paths() {
     let log = RequestLog::new();
     request(&log, "/models/a/x.gguf", "L1", 1, 1);
@@ -1504,6 +1555,7 @@ mod tests {
       "llamastash:requests_total{model=\"none\"} 1\n",
       "llamastash:request_errors_total{model=\"none\"} 1\n",
       "llamastash:requests_in_flight{model=\"none\"} 0\n",
+      "llamastash:hosts_in_flight{model=\"none\"} 0\n",
       "llamastash:requests_total{model=\"m1\"} 1\n",
     ] {
       assert!(text.contains(line), "missing {line:?} in:\n{text}");
@@ -1596,6 +1648,12 @@ mod tests {
     assert!(
       !text.contains("llamastash:launch_requests_in_flight"),
       "in-flight is live-only:\n{text}"
+    );
+    // Hosts are a live quantity too, and one metric name carries one label
+    // set, so there is no per-launch host series to print.
+    assert!(
+      !text.contains("hosts_in_flight{launch"),
+      "no per-launch host series:\n{text}"
     );
     assert!(
       !text.contains("llamastash:launch_info"),

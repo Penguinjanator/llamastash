@@ -443,9 +443,10 @@ fn seeded_logs_view_app() -> App {
 /// Dashboard with the right pane focused on the Requests tab of the
 /// running launch: a served request, one that auto-started the model and
 /// unloaded another for it, a failed auto-start, a client that hung up,
-/// and one still streaming.
+/// and two still streaming from two peers of one host.
 fn seeded_requests_view_app() -> App {
   use llamastash::proxy::request_log::{RequestRow, RequestState, RequestSummary};
+  use llamastash::tui::tabs::requests::RequestsScope;
   let mut app = seeded_dashboard_app();
   app.focus = Focus::RightPane;
   app.right_tab = RightTab::Requests;
@@ -478,6 +479,15 @@ fn seeded_requests_view_app() -> App {
       ..row(5)
     },
     RequestRow {
+      state: RequestState::InFlight,
+      client: Some("127.0.0.1:53498".into()),
+      duration_ms: None,
+      prompt_tokens: None,
+      completion_tokens: None,
+      tokens_per_second: None,
+      ..row(6)
+    },
+    RequestRow {
       state: RequestState::ClientClosed,
       prompt_tokens: None,
       completion_tokens: None,
@@ -486,6 +496,7 @@ fn seeded_requests_view_app() -> App {
       ..row(4)
     },
     RequestRow {
+      client: Some("192.168.1.42:51820".into()),
       status: Some(503),
       launch_id: None,
       auto_start: true,
@@ -512,10 +523,16 @@ fn seeded_requests_view_app() -> App {
     row(1),
   ];
   app.requests.set(
-    "/m/x/qwen-7b.gguf".into(),
+    RequestsScope::Launch("L1".into()),
     RequestSummary {
-      requests: 4,
+      requests: 6,
       errors: 1,
+      // Two hosts, four peers; both live requests share one host but not
+      // one peer, so the live pair prints as `1/2`.
+      hosts: Some(2),
+      connections: Some(4),
+      live_hosts: Some(1),
+      live_connections: Some(2),
       avg_duration_ms: Some(20_165),
       avg_ttfb_ms: Some(16_026),
       tokens_per_second_avg: Some(41.27),

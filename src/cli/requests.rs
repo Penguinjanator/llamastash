@@ -168,7 +168,7 @@ fn cells_for(row: &RequestRow, one_model: bool) -> Vec<String> {
 mod tests {
   use super::*;
   use crate::cli::resolve::running_rows_in;
-  use crate::proxy::request_log::RequestState;
+  use crate::proxy::request_log::{RequestState, RequestSummary};
 
   #[test]
   fn a_reference_that_names_a_launch_scopes_to_that_launch() {
@@ -355,5 +355,65 @@ mod tests {
   #[test]
   fn an_empty_log_says_so() {
     assert_eq!(piped(&[], false), "(no requests logged)\n");
+  }
+
+  /// Terminal rendering of a whole tail, summary block included.
+  fn summary_on_terminal(summary: RequestSummary) -> String {
+    let body = json!(Tail {
+      summary,
+      rows: vec![row()],
+    });
+    let _lock = crate::cli::test_lock::serialize();
+    let prior = console::colors_enabled();
+    console::set_colors_enabled(true);
+    let out = requests_human(&body, false);
+    console::set_colors_enabled(prior);
+    console::strip_ansi_codes(&out).to_string()
+  }
+
+  #[test]
+  fn the_summary_block_prints_the_clients_of_the_scope_and_a_live_pair() {
+    let live = RequestSummary {
+      requests: 3,
+      hosts: Some(2),
+      connections: Some(3),
+      live_hosts: Some(1),
+      live_connections: Some(2),
+      tokens_per_second_last: Some(41.3),
+      ..RequestSummary::default()
+    };
+    let strip = summary_on_terminal(live.clone());
+    assert!(strip.contains("Live  1/2"), "{strip}");
+    assert!(strip.contains("Hosts  2"), "{strip}");
+    assert!(strip.contains("Connections  3"), "{strip}");
+    // The newest speed is the row table's business, not the summary's.
+    assert!(!strip.contains("Tok/s last"), "{strip}");
+
+    // One host, one peer: one number, not a pair.
+    let one_number = summary_on_terminal(RequestSummary {
+      live_hosts: Some(2),
+      live_connections: Some(2),
+      ..live.clone()
+    });
+    assert!(one_number.contains("Live  2"), "{one_number}");
+
+    // Nothing in flight: no Live line at all.
+    let idle = summary_on_terminal(RequestSummary {
+      live_hosts: Some(0),
+      live_connections: Some(0),
+      ..live
+    });
+    assert!(!idle.contains("Live"), "{idle}");
+
+    // An older daemon that never computed them: placeholders, not zeros.
+    let predates = summary_on_terminal(RequestSummary {
+      hosts: None,
+      connections: None,
+      live_hosts: None,
+      live_connections: None,
+      ..RequestSummary::default()
+    });
+    assert!(predates.contains("Hosts  -"), "{predates}");
+    assert!(predates.contains("Connections  -"), "{predates}");
   }
 }

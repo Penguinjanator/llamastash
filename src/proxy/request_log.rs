@@ -9,7 +9,7 @@
 //! have been pushed out. The ring and the totals are lost when the daemon
 //! stops. [`RequestLog::write_to`] also appends each finished row to a file.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -290,8 +290,21 @@ pub struct RequestSummary {
   /// the average. Set for a model scope only; `None` for the whole log and
   /// for a scope no request has reported a speed for yet.
   pub tokens_per_second_session: Option<f64>,
-  /// The most recent speed a request reported.
+  /// The most recent speed a request reported. Kept in the JSON and in the
+  /// row table, but no longer on the summary strips: the session figure says
+  /// the same thing about what is running now.
   pub tokens_per_second_last: Option<f64>,
+  /// Distinct client IPs among the rows the scope retains. Loopback tools
+  /// all share `127.0.0.1`, so this counts machines and reads 1 until a LAN
+  /// bind; [`Self::connections`] is the figure that counts tools.
+  pub hosts: Option<u64>,
+  /// Distinct client peers on `ip:port` among the retained rows — what one
+  /// tool's live connection looks like to the proxy.
+  pub connections: Option<u64>,
+  /// [`Self::hosts`] over the requests in flight right now.
+  pub live_hosts: Option<u64>,
+  /// [`Self::connections`] over the requests in flight right now.
+  pub live_connections: Option<u64>,
   pub prompt_tokens: u64,
   pub completion_tokens: u64,
   /// Requests that started the model.
@@ -309,21 +322,26 @@ impl RequestSummary {
       v.map(|t| format!("{t:.1}"))
         .unwrap_or_else(|| none.to_string())
     };
+    let num = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_else(|| none.to_string());
     vec![
       ("Requests", self.requests.to_string()),
       ("Errors", self.errors.to_string()),
+    ]
+    .into_iter()
+    .chain(self.live_cell())
+    .chain([
+      ("Hosts", num(self.hosts)),
+      ("Connections", num(self.connections)),
       ("Avg total", ms(self.avg_duration_ms)),
       ("Avg TTFB", ms(self.avg_ttfb_ms)),
       ("Tok/s avg", tps(self.tokens_per_second_avg)),
-    ]
-    .into_iter()
+    ])
     .chain(
       self
         .tokens_per_second_session
         .map(|t| ("Tok/s session", format!("{t:.1}"))),
     )
     .chain([
-      ("Tok/s last", tps(self.tokens_per_second_last)),
       ("Tokens in", fmt_count(self.prompt_tokens)),
       ("Tokens out", fmt_count(self.completion_tokens)),
       ("Auto-starts", self.auto_starts.to_string()),
@@ -331,6 +349,97 @@ impl RequestSummary {
     ])
     .collect()
   }
+
+  /// The in-flight pair as one cell: `Live N` when every host in flight is on
+  /// one connection and `Live N/M` when they differ (an agent runner with two
+  /// tools open reads `1/2`). Absent when nothing is in flight, so an idle
+  /// launch's strip looks the way it did before the figure existed, and
+  /// absent from a daemon that never computed it.
+  fn live_cell(&self) -> Option<(&'static str, String)> {
+    let (hosts, connections) = (self.live_hosts?, self.live_connections?);
+    (hosts > 0 || connections > 0).then(|| {
+      let text = if hosts == connections {
+        hosts.to_string()
+      } else {
+        format!("{hosts}/{connections}")
+      };
+      ("Live", text)
+    })
+  }
+}
+
+/// How many hosts and `ip:port` peers a set of rows came from. Both figures
+/// count rows a scope still retains rather than the since-daemon-start
+/// totals, so they describe the table on screen and do not grow as the daemon
+/// ages.
+#[derive(Default)]
+pub struct Clients {
+  requests: u64,
+  hosts: HashSet<String>,
+  connections: HashSet<String>,
+}
+
+impl Clients {
+  fn add(&mut self, row: &RequestRow) {
+    self.requests += 1;
+    let Some(client) = &row.client else {
+      return;
+    };
+    self.connections.insert(client.clone());
+    self.hosts.insert(client_host(client).to_string());
+  }
+
+  /// Rows counted, in flight ones included.
+  pub fn requests(&self) -> u64 {
+    self.requests
+  }
+
+  /// Distinct client IPs.
+  pub fn hosts(&self) -> u64 {
+    self.hosts.len() as u64
+  }
+
+  /// Distinct `ip:port` peers.
+  pub fn connections(&self) -> u64 {
+    self.connections.len() as u64
+  }
+}
+
+/// [`Clients`] of a scope and the same over its in-flight rows.
+#[derive(Default)]
+struct ClientPair {
+  all: Clients,
+  live: Clients,
+}
+
+impl ClientPair {
+  fn add(&mut self, row: &RequestRow) {
+    self.all.add(row);
+    if row.state == RequestState::InFlight {
+      self.live.add(row);
+    }
+  }
+
+  /// Stamp the four client figures onto `summary`. A daemon that computes
+  /// them always answers, so an empty scope reads `Some(0)`; only an older
+  /// daemon leaves them `None`.
+  fn stamp(&self, summary: &mut RequestSummary) {
+    summary.hosts = Some(self.all.hosts());
+    summary.connections = Some(self.all.connections());
+    summary.live_hosts = Some(self.live.hosts());
+    summary.live_connections = Some(self.live.connections());
+  }
+}
+
+/// The address part of a client string, which is always a `SocketAddr`'s text
+/// (`127.0.0.1:5000`, `[::1]:5000`). Anything that does not carry a port is
+/// its own host.
+fn client_host(client: &str) -> &str {
+  let host = match client.rsplit_once(':') {
+    Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty() => host,
+    _ => client,
+  };
+  host.trim_matches(&['[', ']'][..])
 }
 
 #[derive(Debug, Clone, Default)]
@@ -393,6 +502,12 @@ impl Totals {
       // totals has no notion of "the newest launch".
       tokens_per_second_session: None,
       tokens_per_second_last: self.tps_last,
+      // The client figures count rows, which a set of totals no longer holds.
+      // `RequestLog::tail`, `launch_summary` and `snapshot` fill them in.
+      hosts: None,
+      connections: None,
+      live_hosts: None,
+      live_connections: None,
       prompt_tokens: self.prompt_tokens,
       completion_tokens: self.completion_tokens,
       auto_starts: self.auto_starts,
@@ -565,6 +680,11 @@ impl RequestLog {
     let inner = self.lock();
     let totals = inner.totals(&scope);
     let mut summary = totals.map(Totals::summary).unwrap_or_default();
+    let mut counts = ClientPair::default();
+    for row in inner.rows.iter().filter(|row| scope.matches(row)) {
+      counts.add(row);
+    }
+    counts.stamp(&mut summary);
     // The speed of the newest launch that served this model, so a model
     // reloaded at a different speed shows both numbers.
     if let LogScope::Model { .. } = scope {
@@ -606,9 +726,22 @@ impl RequestLog {
 
   /// Summary of the requests one launch served, live first then retired.
   pub fn launch_summary(&self, launch_id: &str) -> RequestSummary {
-    Self::launch_totals(&self.lock(), launch_id)
+    let inner = self.lock();
+    let mut summary = Self::launch_totals(&inner, launch_id)
       .map(Totals::summary)
-      .unwrap_or_default()
+      .unwrap_or_default();
+    // Strictly the launch's own rows: a request filed under the model that
+    // never reached this launch belongs to the model's figures, not here.
+    let mut counts = ClientPair::default();
+    for row in inner
+      .rows
+      .iter()
+      .filter(|row| row.launch_id.as_deref() == Some(launch_id))
+    {
+      counts.add(row);
+    }
+    counts.stamp(&mut summary);
+    summary
   }
 
   /// Display name of the model `launch_id` served, or `None` when no finished
@@ -632,6 +765,21 @@ impl RequestLog {
   /// renders from this instead of holding the lock while it builds a body.
   pub fn snapshot(&self) -> LogSnapshot {
     let inner = self.lock();
+    // The client figures of every scope, in one pass over the ring, so a
+    // `/metrics` summary prints the same four numbers as `requests --json`
+    // of the same scope: both count these rows and nothing else.
+    let mut counts = ClientPair::default();
+    let mut model_counts: HashMap<&str, ClientPair> = HashMap::new();
+    let mut launch_counts: HashMap<&str, ClientPair> = HashMap::new();
+    for row in inner.rows.iter() {
+      counts.add(row);
+      if let Some(path) = row.model_path.as_deref() {
+        model_counts.entry(path).or_default().add(row);
+      }
+      if let Some(launch) = row.launch_id.as_deref() {
+        launch_counts.entry(launch).or_default().add(row);
+      }
+    }
     let view = |key: String, totals: &Totals| ScopeTotals {
       key,
       label: totals.label.clone(),
@@ -645,6 +793,15 @@ impl RequestLog {
       .map(|(path, totals)| view(path.clone(), totals))
       .collect();
     models.sort_by(|a, b| a.key.cmp(&b.key));
+    // A scope whose rows all left the ring has no counts of its own; zero is
+    // the answer, not "not computed".
+    let empty = ClientPair::default();
+    for model in &mut models {
+      model_counts
+        .get(model.key.as_str())
+        .unwrap_or(&empty)
+        .stamp(&mut model.summary);
+    }
     let mut launches: Vec<LaunchTotals> = inner
       .by_launch
       .iter()
@@ -658,6 +815,14 @@ impl RequestLog {
       totals: view(id.clone(), totals),
       live: false,
     }));
+    for launch in &mut launches {
+      launch_counts
+        .get(launch.totals.key.as_str())
+        .unwrap_or(&empty)
+        .stamp(&mut launch.totals.summary);
+    }
+    let mut all = view(String::new(), &inner.all);
+    counts.stamp(&mut all.summary);
     let mut routes: Vec<(String, u64)> = inner
       .by_route
       .iter()
@@ -666,7 +831,7 @@ impl RequestLog {
     routes.sort();
     LogSnapshot {
       rows: inner.rows.iter().cloned().collect(),
-      all: view(String::new(), &inner.all),
+      all,
       models,
       launches,
       routes,
@@ -708,13 +873,19 @@ pub struct LogSnapshot {
 }
 
 impl LogSnapshot {
-  /// Requests still waiting on a load or still streaming, for one scope.
-  pub fn in_flight(&self, mut pred: impl FnMut(&RequestRow) -> bool) -> u64 {
-    self
+  /// The in-flight rows one scope holds: how many there are, and how many
+  /// distinct hosts and peers they came from.
+  pub fn in_flight(&self, mut pred: impl FnMut(&RequestRow) -> bool) -> Clients {
+    let mut clients = Clients::default();
+    for row in self
       .rows
       .iter()
-      .filter(|row| row.state == RequestState::InFlight && pred(row))
-      .count() as u64
+      .filter(|row| row.state == RequestState::InFlight)
+      .filter(|row| pred(row))
+    {
+      clients.add(row);
+    }
+    clients
   }
 
   /// Catalog path a launch served, from the rows that carry both. A retired
@@ -924,6 +1095,28 @@ mod tests {
     seq
   }
 
+  /// One served request from one client peer.
+  fn served_from(log: &RequestLog, path: &str, launch: &str, client: &str) {
+    let mut rec = log.begin(ROUTE, Some(client.parse().unwrap()));
+    rec.set_model("m", path);
+    rec.set_launch(launch);
+    rec.set_status(200);
+    rec.mark_first_byte();
+    rec.finish(RequestState::Done, Usage::default());
+  }
+
+  /// A current daemon always answers the client questions, so an empty scope
+  /// reads computed zeros. `None` belongs to a daemon that never had them.
+  fn zeros() -> RequestSummary {
+    RequestSummary {
+      hosts: Some(0),
+      connections: Some(0),
+      live_hosts: Some(0),
+      live_connections: Some(0),
+      ..RequestSummary::default()
+    }
+  }
+
   #[test]
   fn begin_shows_an_in_flight_row_and_finish_completes_it() {
     let log = RequestLog::new();
@@ -970,7 +1163,107 @@ mod tests {
     assert_eq!(snap.models[0].key, "/m/a.gguf");
     assert_eq!(snap.models[0].label.as_deref(), Some("m"));
     assert_eq!(snap.models[0].summary.requests, 0);
-    assert_eq!(snap.in_flight(|row| row.model_path.is_some()), 1);
+    assert_eq!(snap.in_flight(|row| row.model_path.is_some()).requests(), 1);
+  }
+
+  #[test]
+  fn hosts_and_connections_count_the_clients_of_the_rows_a_scope_keeps() {
+    let log = RequestLog::new();
+    // Three finished requests over three peers from two hosts, then two
+    // requests still streaming from one host over two peers.
+    served_from(&log, "/m/a.gguf", "L1", "127.0.0.1:5001");
+    served_from(&log, "/m/a.gguf", "L1", "127.0.0.1:5002");
+    served_from(&log, "/m/a.gguf", "L2", "192.168.1.7:6001");
+    // The two live requests share a host but not a peer, which is the case
+    // the pair exists for: one machine, two tools talking. The records have
+    // to stay alive — dropping one finishes the row.
+    let streaming: Vec<RequestRecord> = [6002u16, 6003]
+      .into_iter()
+      .map(|port| {
+        let mut rec = log.begin(ROUTE, Some(format!("192.168.1.7:{port}").parse().unwrap()));
+        rec.set_model("m", "/m/a.gguf");
+        rec.set_launch("L2");
+        // Setters stay private to the record until the row is published.
+        rec.publish();
+        rec
+      })
+      .collect();
+
+    let s = log
+      .tail(
+        LogScope::Model {
+          path: "/m/a.gguf".to_string(),
+        },
+        0,
+      )
+      .summary;
+    assert_eq!((s.requests, s.hosts, s.connections), (3, Some(2), Some(5)));
+    assert_eq!((s.live_hosts, s.live_connections), (Some(1), Some(2)));
+
+    // A launch scope sees its own clients only: L1 never met the LAN host.
+    let l1 = log.launch_summary("L1");
+    assert_eq!(
+      (l1.hosts, l1.connections, l1.live_hosts, l1.live_connections),
+      (Some(1), Some(2), Some(0), Some(0))
+    );
+
+    // An IPv6 loopback is its own host, brackets and all.
+    served_from(&log, "/m/b.gguf", "L3", "[::1]:5001");
+    let all = log.tail(LogScope::All, 0).summary;
+    assert_eq!((all.hosts, all.connections), (Some(3), Some(6)));
+    drop(streaming);
+  }
+
+  #[test]
+  fn an_empty_scope_answers_zero_where_an_old_daemon_answers_nothing() {
+    let log = RequestLog::new();
+    let idle = log.tail(
+      LogScope::Model {
+        path: "/m/none.gguf".to_string(),
+      },
+      10,
+    );
+    assert_eq!(idle.summary, zeros());
+    assert_eq!(log.launch_summary("L9"), zeros());
+    // With nothing in flight the live pair is not displayed at all.
+    assert!(!idle
+      .summary
+      .cells("—")
+      .iter()
+      .any(|(label, _)| *label == "Live"));
+  }
+
+  #[test]
+  fn a_summary_from_an_older_daemon_leaves_the_client_figures_out() {
+    // The wire shape grew; a summary written before it grew must not read as
+    // "zero hosts", and must not gain a Live cell.
+    let old: RequestSummary = serde_json::from_str(r#"{"requests": 2}"#).unwrap();
+    assert_eq!((old.hosts, old.connections), (None, None));
+    assert_eq!((old.live_hosts, old.live_connections), (None, None));
+    let cells = old.cells("—");
+    assert_eq!(cells[2], ("Hosts", "—".to_string()));
+    assert!(!cells.iter().any(|(label, _)| *label == "Live"));
+  }
+
+  #[test]
+  fn the_live_pair_reads_as_one_number_when_hosts_and_peers_agree() {
+    let cells = |hosts, connections| {
+      RequestSummary {
+        live_hosts: Some(hosts),
+        live_connections: Some(connections),
+        ..RequestSummary::default()
+      }
+      .cells("—")
+    };
+    assert_eq!(
+      cells(2, 2).iter().find(|c| c.0 == "Live").unwrap().1,
+      "2".to_string()
+    );
+    assert_eq!(
+      cells(1, 2).iter().find(|c| c.0 == "Live").unwrap().1,
+      "1/2".to_string()
+    );
+    assert!(!cells(0, 0).iter().any(|c| c.0 == "Live"));
   }
 
   #[test]
@@ -1027,13 +1320,16 @@ mod tests {
       1
     );
     assert_eq!(
-      log.tail(
-        LogScope::Model {
-          path: "/m/none.gguf".to_string()
-        },
-        10
-      ),
-      Tail::default()
+      log
+        .tail(
+          LogScope::Model {
+            path: "/m/none.gguf".to_string()
+          },
+          10
+        )
+        .summary,
+      zeros(),
+      "a scope with no rows has no clients, not unknown ones"
     );
   }
 
@@ -1072,7 +1368,7 @@ mod tests {
     // The 503 never reached a launch, so the launch's totals leave it out.
     let l = log.launch_summary("L1");
     assert_eq!((l.requests, l.errors), (2, 0));
-    assert_eq!(log.launch_summary("L9"), RequestSummary::default());
+    assert_eq!(log.launch_summary("L9"), zeros());
   }
 
   #[test]
@@ -1332,8 +1628,9 @@ mod tests {
   fn summary_cells_use_the_placeholder_for_missing_figures() {
     let cells = RequestSummary::default().cells("—");
     assert_eq!(cells[0], ("Requests", "0".to_string()));
-    assert_eq!(cells[2], ("Avg total", "—".to_string()));
-    assert_eq!(cells[4], ("Tok/s avg", "—".to_string()));
+    assert_eq!(cells[2], ("Hosts", "—".to_string()));
+    assert_eq!(cells[4], ("Avg total", "—".to_string()));
+    assert_eq!(cells[6], ("Tok/s avg", "—".to_string()));
     let filled = RequestSummary {
       avg_duration_ms: Some(1_240),
       tokens_per_second_avg: Some(39.64),
@@ -1341,9 +1638,12 @@ mod tests {
       ..RequestSummary::default()
     };
     let filled_cells = filled.cells("—");
-    assert_eq!(filled_cells[2].1, "1.2s");
-    assert_eq!(filled_cells[4].1, "39.6");
-    assert_eq!(filled_cells[6].1, "12.3k");
+    assert_eq!(filled_cells[4].1, "1.2s");
+    assert_eq!(filled_cells[6].1, "39.6");
+    assert_eq!(filled_cells[7].1, "12.3k");
+    // The session speed is the newest one a stream reported, and the only
+    // speed on the strip besides the average.
+    assert!(!filled_cells.iter().any(|c| c.0 == "Tok/s last"));
   }
 
   #[tokio::test]
@@ -1512,7 +1812,7 @@ mod tests {
     }
     assert_eq!(
       log.launch_summary("L1"),
-      RequestSummary::default(),
+      zeros(),
       "the oldest of seventeen is pushed out"
     );
     for id in &ids[1..] {
@@ -1619,13 +1919,15 @@ mod tests {
     // A launch's series carries the model's own name, not the launch id.
     assert_eq!(log.launch_label("L1").as_deref(), Some("m"));
     assert_eq!(
-      log.tail(
-        LogScope::Launch {
-          id: "L9".to_string()
-        },
-        10
-      ),
-      Tail::default(),
+      log
+        .tail(
+          LogScope::Launch {
+            id: "L9".to_string()
+          },
+          10
+        )
+        .summary,
+      zeros(),
       "a launch that served nothing is an empty scope"
     );
   }

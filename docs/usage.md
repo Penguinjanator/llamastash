@@ -494,7 +494,7 @@ Snapshot of daemon health, managed launches, external (unmanaged) `llama-server`
 
 Each row in `models` carries `name` when the launch was started with `--name`, and `preset` when the launch resolved one — an explicit `--preset` / launch file / TUI preset stop, a `<model>@<preset>` auto-start address, or the model's config `default:`. Both keys are omitted, not nulled, when they don't apply; `preset` is the preset that actually launched this copy, unlike the sibling `default` field, which is the model's configured default either way. The human table has no MODEL column, so its NAME cell renders `<model>@<name>` for a named launch and the model alone otherwise: two different models both named `coder` stay tellable apart in the command you reach for to work out what to stop.
 
-Each row also carries `request_stats`: totals of the proxy requests that launch has served, dropped when the launch stops (for a model inside a managed multiplexer, the requests filed under the model since the daemon started) (`requests`, `errors`, `avg_duration_ms`, `avg_ttfb_ms`, `tokens_per_second_avg`, `tokens_per_second_last`, `prompt_tokens`, `completion_tokens`, `auto_starts`, `evictions`). Counts are `0` and averages `null` until the first request. Field meanings are under [`llamastash requests`](#llamastash-requests-model-ref).
+Each row also carries `request_stats`: totals of the proxy requests that launch has served, dropped when the launch stops (for a model inside a managed multiplexer, the requests filed under the model since the daemon started) (`requests`, `errors`, `avg_duration_ms`, `avg_ttfb_ms`, `tokens_per_second_avg`, `tokens_per_second_last`, `hosts`, `connections`, `live_hosts`, `live_connections`, `prompt_tokens`, `completion_tokens`, `auto_starts`, `evictions`). Counts are `0` and averages `null` until the first request. Field meanings are under [`llamastash requests`](#llamastash-requests-model-ref).
 
 The `proxy` block is documented in detail under [Proxy → Is the proxy up?](#is-the-proxy-up).
 
@@ -537,7 +537,7 @@ TIME      CODE  TOK/S  TOTAL  TTFB   IN  OUT  MODEL                         LAUN
 - `TOTAL` is the time from the proxy receiving the request to the end of the response. `TTFB` is the time to the first response body byte, which includes any model load.
 - `IN` / `OUT` are prompt and generated tokens. `TOK/S` is the generation speed. A leading `~` marks a speed the proxy estimated because the model's server reported none.
 - `NOTE` says what happened beyond the status code: `auto-start` (this request started the model), `unloaded L3` (launches unloaded to make room), `fallback (<reason>) for <model>`, `client closed`, `upstream error`, `loading model`, `in flight`, or the proxy's own error and its message (`launch_failed: auto-start of ...`).
-- On a terminal the table is padded: a summary block prints above it, and a `NOTE` longer than 60 cells wraps onto continuation lines under its column rather than running off the screen. The wrap belongs to that padded layout, so `--no-colors`, `NO_COLOR`, or piped stdout prints the header plus one tab-separated line per request with the whole note in its field. The `MODEL` column is dropped when `model-ref` names one model or one launch.
+- On a terminal the table is padded: a summary block prints above it, and a `NOTE` longer than 60 cells wraps onto continuation lines under its column rather than running off the screen. The block leads with `Requests`, `Errors`, `Hosts` and `Connections`, and puts a single `Live` line between the errors and the hosts only while something is in flight — one number when every host in flight is on one connection, `hosts/connections` when they differ (one agent runner with two tools open reads `1/2`). The rest is the averages, the token counts, auto-starts and unloads. The wrap belongs to that padded layout, so `--no-colors`, `NO_COLOR`, or piped stdout prints the header plus one tab-separated line per request with the whole note in its field. The `MODEL` column is dropped when `model-ref` names one model or one launch.
 
 `--json` emits `{ "summary": {...}, "requests": [...] }`. Every key of a request is always present; a value the proxy does not have is `null`:
 
@@ -569,7 +569,9 @@ TIME      CODE  TOK/S  TOTAL  TTFB   IN  OUT  MODEL                         LAUN
 
 `state` is `in_flight`, `done`, `client_closed` (the client went away before the response was complete) or `upstream_error` (the model's server dropped the connection mid-response). When the proxy answered the request itself, `error` is its error `code`, or its `type` when the error has no code (`model_not_found`, `model_required`, `launch_failed`, ...), and `cause` is the error message. When another model answered because the launch failed, the row is filed under the model that answered and `fallback` holds the reason.
 
-`summary` covers the same scope as the rows (one launch, one model, or everything) and counts finished requests since the daemon started, so it keeps counting requests whose rows have left the log. `errors` counts 4xx / 5xx answers and `upstream_error` rows; a client that hung up is not an error. The two averages cover completed 2xx / 3xx requests only. `tokens_per_second_avg` is the mean of the per-request speeds, estimated ones included. `tokens_per_second_session` is that mean for the model's newest launch alone, so a model you reloaded shows what it runs at now instead of a mean over every launch since the daemon started; it is present for a model scope only, and absent when no request has reported a speed. `tokens_per_second_last` is the most recent speed a request reported. `auto_starts` counts the requests that started the model; a request that waited on a load someone else started is not one, and neither is one whose launch was refused before it spawned. `evictions` counts the launches unloaded to make room.
+`summary` covers the same scope as the rows (one launch, one model, or everything) and counts finished requests since the daemon started, so it keeps counting requests whose rows have left the log. `errors` counts 4xx / 5xx answers and `upstream_error` rows; a client that hung up is not an error. The two averages cover completed 2xx / 3xx requests only. `tokens_per_second_avg` is the mean of the per-request speeds, estimated ones included. `tokens_per_second_session` is that mean for the model's newest launch alone, so a model you reloaded shows what it runs at now instead of a mean over every launch since the daemon started; it is present for a model scope only, and absent when no request has reported a speed. `tokens_per_second_last` is the most recent speed a request reported; it is in the JSON and the row table, not in the summary block a terminal prints, where the session figure says what is running now. `auto_starts` counts the requests that started the model; a request that waited on a load someone else started is not one, and neither is one whose launch was refused before it spawned. `evictions` counts the launches unloaded to make room.
+
+`hosts` and `connections` count who sent the requests: distinct client IPs, and distinct clients on `ip:port`. Connections is the figure that counts tools — three editors open on one machine is one host and three connections — while `hosts` counts machines, which on a loopback-only daemon is always 1 until you bind the proxy to the LAN. `live_hosts` and `live_connections` are the same two counts over the requests in flight right now. All four count the rows the log still keeps, so they describe the table on screen instead of growing since daemon start, and a launch's figures count only the requests that launch served. A summary from a daemon older than these fields leaves them out (JSON `null`), which is not the same answer as `0`.
 
 What is and is not recorded:
 
@@ -1493,7 +1495,8 @@ Counters, monotonic since daemon start:
 | `llamastash:auto_starts_total` | `model` | requests that spawned the launch |
 | `llamastash:evictions_total` | `model` | launches unloaded to make room |
 
-Gauges: `llamastash:requests_in_flight{model}`, `llamastash:request_duration_seconds_avg{model}`,
+Gauges: `llamastash:requests_in_flight{model}`, `llamastash:hosts_in_flight{model}`
+(distinct client hosts with a request in flight right now), `llamastash:request_duration_seconds_avg{model}`,
 `llamastash:request_ttft_seconds_avg{model}`, `llamastash:request_tokens_per_second{model}`
 (last reported), `llamastash:request_tokens_per_second_avg{model}`, `llamastash:models_loaded`,
 `llamastash:models_discovered`, `llamastash:request_log_rows`, `llamastash:request_log_capacity`,
@@ -1501,9 +1504,9 @@ Gauges: `llamastash:requests_in_flight{model}`, `llamastash:request_duration_sec
 A request the proxy answered without reaching a model — an unknown model name, a body it
 could not read — belongs to no model, so `requests`, `errors` and `requests_in_flight`
 carry those under `model="none"` and `rate(llamastash:requests_total)` adds up to what
-`summary.requests` says. Token and latency series need a model to be counted, so they
-never carry `none`. That label is text-format only; the JSON shape is unchanged, because
-`summary` already counted those requests.
+`summary.requests` says. `hosts_in_flight` follows the same rule. Token and latency series
+need a model to be counted, so they never carry `none`. That label is text-format only; the
+JSON shape is unchanged, because `summary` already counted those requests.
 
 The per-launch series are opt-in because they multiply every series above by the
 number of launches a model has had. Ask for them with `?launch=1`:
@@ -1516,9 +1519,11 @@ number of launches a model has had. Ask for them with `?launch=1`:
 to that launch and turns the same series on for it. A launch that has stopped keeps its
 totals until 16 newer retirements push it out, but prints no
 `launch_requests_in_flight`: in-flight is a live quantity and a stopped launch has
-nothing still running. `?launch=1` grows with the number of launches a daemon has
-served, so a long-lived daemon means many series; every counter restarts from zero when
-the daemon does.
+nothing still running. There is no per-launch host series: one metric name carries one
+label set, and `hosts_in_flight` already carries `model`, so a launch's live hosts live on
+the JSON surfaces instead (`status`'s `models[].request_stats`, and `requests L3 --json`).
+`?launch=1` grows with the number of launches a daemon has served, so a long-lived daemon
+means many series; every counter restarts from zero when the daemon does.
 
 `?model=<ref>` and `?launch=<ref>` narrow the response to one model or one launch.
 `?model=` matches an exact catalog path first, then the reference rules
@@ -2123,9 +2128,9 @@ inheritance is visible at the row level.
 
 ### Requests tab
 
-The last tab of every model that has a launch. It shows that model's proxy requests only: the same data as [`llamastash requests <model-ref>`](#llamastash-requests-model-ref), refreshed twice a second while the tab is open. The Chat, Embed and Rerank tabs talk to the launch's own port, so what they send does not appear here.
+The last tab of every model that has a launch. It shows that launch's proxy requests only — the same data as [`llamastash requests <launch-ref>`](#llamastash-requests-model-ref), refreshed twice a second while the tab is open, so an earlier launch of the same model is not counted in. A model resident in a managed multiplexer is the exception: its requests are filed under the model, not under a launch of their own, so that row shows the whole-model aggregate. The Chat, Embed and Rerank tabs talk to the launch's own port, so what they send does not appear here.
 
-- The top lines are the model's summary: requests, errors, average total time and time to first byte, tok/s (average and last), tokens in and out, auto-starts, and launches unloaded to make room.
+- The top lines are the launch's summary: requests, errors, live hosts and connections while anything is in flight, hosts and connections over the rows the log keeps, average total time and time to first byte, tok/s (average and session), tokens in and out, auto-starts, and launches unloaded to make room.
 - Below is the table, newest request first. `↑` / `↓` scroll it.
 - The columns are `Time`, `Code`, `Tok/s`, `Total`, `TTFB`, `In`, `Out`, `Launch`, `Client`, `Note` and `Route`. As the pane narrows they drop out in this order: `Client`, `Route`, `Note`, `Launch`, `Out`, `In`, `TTFB`, `Total`, `Tok/s`, `Code`, `Time`. `Note` takes the spare width up to 48 cells and wraps onto continuation lines beyond that; `Route`, which is last, takes what `Note` leaves.
 

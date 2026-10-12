@@ -24,6 +24,7 @@ use crate::tui::keybindings::{Action, Focus};
 use crate::tui::oai_client::{
   embed as oai_embed, rerank as oai_rerank, spawn_chat_stream, ChatStreamMsg,
 };
+use crate::tui::tabs::requests::RequestsScope;
 use crate::tui::tabs::rerank::RerankField;
 use crate::tui::tabs::RightTab;
 use crate::util::clipboard;
@@ -1974,10 +1975,10 @@ pub enum RefreshTick {
     launch_id: String,
     lines: Vec<String>,
   },
-  /// `requests_tail` body for `model_path`, from
+  /// `requests_tail` body for `scope`, from
   /// [`spawn_requests_poller`].
   Requests {
-    model_path: String,
+    scope: crate::tui::tabs::requests::RequestsScope,
     body: Value,
   },
   Disconnected,
@@ -2462,7 +2463,7 @@ pub async fn run(
   spawn_refresher(socket.clone(), events_tx.clone());
   let current_launch = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
   spawn_logs_poller(socket.clone(), current_launch.clone(), events_tx.clone());
-  let current_requests = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+  let current_requests = std::sync::Arc::new(std::sync::Mutex::new(None::<RequestsScope>));
   spawn_requests_poller(socket.clone(), current_requests.clone(), events_tx.clone());
   let writer_tx = spawn_writer(socket, daemon_opts, Some(events_tx.clone()));
 
@@ -2625,14 +2626,14 @@ fn apply_refresh(app: &mut App, tick: RefreshTick) {
         app.logs_state.set_tail(launch_id, lines);
       }
     }
-    RefreshTick::Requests { model_path, body } => {
+    RefreshTick::Requests { scope, body } => {
       mark_daemon_connected(app);
-      // Same race as Logs: keep the result only while the model it is
+      // Same race as Logs: keep the result only while the scope it is
       // for is still the focused one.
-      if requests_poll_target(app).as_deref() == Some(model_path.as_str()) {
+      if requests_poll_target(app).as_ref() == Some(&scope) {
         let tail: crate::proxy::request_log::Tail =
           serde_json::from_value(body).unwrap_or_default();
-        app.requests.set(model_path, tail.summary, tail.rows);
+        app.requests.set(scope, tail.summary, tail.rows);
       }
     }
     RefreshTick::Disconnected => {
@@ -2674,47 +2675,56 @@ fn writer_error_toast(method: &str, message: &str) -> String {
 /// stderr cadence; we just need them visibly fresh.
 const TAB_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// The model the Requests tab is showing, or `None` while the tab is
-/// closed. Nothing is polled then.
-fn requests_poll_target(app: &App) -> Option<String> {
+/// The scope the Requests tab is showing, which is the focused row's own
+/// launch, or its model when the row has no launch of its own to scope by —
+/// a model resident in a managed multiplexer, whose requests the proxy files
+/// under the model. `None` while the tab is closed or has no launch.
+fn requests_poll_target(app: &App) -> Option<RequestsScope> {
   if app.right_tab != RightTab::Requests {
     return None;
   }
-  app
-    .focused_managed()
-    .map(|m| m.path.to_string_lossy().into_owned())
+  let managed = app.focused_managed()?;
+  if managed
+    .backend
+    .as_deref()
+    .is_some_and(crate::backend::is_managed_multiplexer)
+  {
+    return Some(RequestsScope::Model(
+      managed.path.to_string_lossy().into_owned(),
+    ));
+  }
+  Some(RequestsScope::Launch(managed.launch_id.clone()))
 }
 
-/// Drop the Requests tab's data when it is for another model or the tab
-/// is closed, so one model's rows never sit under another's header, and
+/// Drop the Requests tab's data when it is for another row or the tab
+/// is closed, so one launch's rows never sit under another's header, and
 /// return what the poller should fetch next.
-fn sync_requests_tab(app: &mut App) -> Option<String> {
+fn sync_requests_tab(app: &mut App) -> Option<RequestsScope> {
   let target = requests_poll_target(app);
-  if app.requests.model_path != target {
+  if app.requests.scope != target {
     app.requests.clear();
   }
   target
 }
 
-/// Spawn a task that polls `requests_tail` for the model in `current`,
+/// Spawn a task that polls `requests_tail` for the scope in `current`,
 /// which is `None` while the Requests tab is closed.
 pub fn spawn_requests_poller(
   socket: PathBuf,
-  current: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+  current: std::sync::Arc<std::sync::Mutex<Option<RequestsScope>>>,
   tx: mpsc::Sender<Event>,
 ) {
   spawn_tab_poller(
     socket,
     current,
     tx,
-    |model_path| {
-      let params = json!({
-        "model_path": model_path,
-        "limit": crate::tui::tabs::requests::POLL_ROWS,
-      });
-      ("requests_tail", params)
+    |scope| {
+      (
+        "requests_tail",
+        scope.params(crate::tui::tabs::requests::POLL_ROWS),
+      )
     },
-    |model_path, body| RefreshTick::Requests { model_path, body },
+    |scope, body| RefreshTick::Requests { scope, body },
   );
 }
 
@@ -2751,12 +2761,12 @@ pub fn spawn_logs_poller(
 /// the IPC method `request` builds for whatever `current` names and send
 /// the response on as the tick `tick` makes of it. A `None` target skips
 /// the call.
-fn spawn_tab_poller(
+fn spawn_tab_poller<T: Clone + Send + 'static>(
   socket: PathBuf,
-  current: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+  current: std::sync::Arc<std::sync::Mutex<Option<T>>>,
   tx: mpsc::Sender<Event>,
-  request: fn(&str) -> (&'static str, Value),
-  tick: fn(String, Value) -> RefreshTick,
+  request: fn(&T) -> (&'static str, Value),
+  tick: fn(T, Value) -> RefreshTick,
 ) {
   tokio::spawn(async move {
     // Exponential backoff mirrors `spawn_refresher` so a daemon
@@ -5230,7 +5240,7 @@ mod tests {
     app
   }
 
-  fn requests_tick(model_path: &str, seqs: &[u64]) -> RefreshTick {
+  fn requests_tick(scope: RequestsScope, seqs: &[u64]) -> RefreshTick {
     let rows: Vec<Value> = seqs
       .iter()
       .map(|seq| {
@@ -5243,19 +5253,26 @@ mod tests {
       })
       .collect();
     RefreshTick::Requests {
-      model_path: model_path.to_string(),
+      scope,
       body: json!({
-        "model_path": model_path,
         "summary": {"requests": seqs.len()},
         "requests": rows,
       }),
     }
   }
 
+  fn launch_scope(id: &str) -> RequestsScope {
+    RequestsScope::Launch(id.to_string())
+  }
+
+  fn model_scope(path: &str) -> RequestsScope {
+    RequestsScope::Model(path.to_string())
+  }
+
   #[test]
   fn requests_are_polled_only_while_the_tab_is_open_on_a_launched_model() {
     let mut app = app_on_requests_tab();
-    assert_eq!(requests_poll_target(&app).as_deref(), Some("/m/qwen.gguf"));
+    assert_eq!(requests_poll_target(&app), Some(launch_scope("L-41100")));
     app.right_tab = RightTab::Logs;
     assert_eq!(requests_poll_target(&app), None, "another tab is open");
     app.right_tab = RightTab::Requests;
@@ -5265,46 +5282,76 @@ mod tests {
   }
 
   #[test]
-  fn a_requests_tick_fills_the_tab_for_the_focused_model_only() {
+  fn a_requests_tick_fills_the_tab_for_the_focused_launch_only() {
     let mut app = app_on_requests_tab();
-    apply_refresh(&mut app, requests_tick("/m/qwen.gguf", &[2, 1]));
-    assert_eq!(app.requests.model_path.as_deref(), Some("/m/qwen.gguf"));
+    apply_refresh(&mut app, requests_tick(launch_scope("L-41100"), &[2, 1]));
+    assert_eq!(app.requests.scope, Some(launch_scope("L-41100")));
     assert_eq!(app.requests.summary.requests, 2);
     assert_eq!(
       app.requests.rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
       vec![2, 1]
     );
-    // A poll that raced a focus change is for another model: dropped.
-    apply_refresh(&mut app, requests_tick("/m/phi.gguf", &[9]));
-    assert_eq!(app.requests.model_path.as_deref(), Some("/m/qwen.gguf"));
+    // A poll that raced a focus change is for another launch: dropped.
+    apply_refresh(&mut app, requests_tick(launch_scope("L-41101"), &[9]));
+    assert_eq!(app.requests.scope, Some(launch_scope("L-41100")));
     assert_eq!(app.requests.rows.len(), 2);
     // So is one that lands after the tab was left.
     app.right_tab = RightTab::Logs;
-    apply_refresh(&mut app, requests_tick("/m/qwen.gguf", &[3, 2, 1]));
+    apply_refresh(&mut app, requests_tick(launch_scope("L-41100"), &[3, 2, 1]));
+    assert_eq!(app.requests.rows.len(), 2);
+  }
+
+  /// A backend whose models are delegated to a shared umbrella, taken from
+  /// the registry so the test names no backend of its own.
+  fn managed_multiplexer_backend() -> String {
+    use crate::backend::Backend as _;
+    crate::backend::Backends::all()
+      .into_iter()
+      .find(|b| crate::backend::is_managed_multiplexer(b.id()))
+      .map(|b| b.id().to_string())
+      .expect("a managed multiplexer backend is registered")
+  }
+
+  #[test]
+  fn a_delegated_multiplexer_row_polls_its_model_not_the_umbrella() {
+    // The umbrella has no requests of its own to scope by: its models'
+    // requests are filed under the model path, so that is what the tab asks
+    // for. Keyed on the backend's lifecycle, not a backend id.
+    let mut app = app_on_requests_tab();
+    app.managed[0].backend = Some(managed_multiplexer_backend());
+    assert_eq!(
+      requests_poll_target(&app),
+      Some(model_scope("/m/qwen.gguf"))
+    );
+    apply_refresh(
+      &mut app,
+      requests_tick(model_scope("/m/qwen.gguf"), &[4, 3]),
+    );
+    assert_eq!(app.requests.scope, Some(model_scope("/m/qwen.gguf")));
     assert_eq!(app.requests.rows.len(), 2);
   }
 
   #[test]
-  fn moving_focus_or_closing_the_tab_drops_the_other_models_rows() {
+  fn moving_focus_or_closing_the_tab_drops_the_other_launches_rows() {
     let mut app = app_on_requests_tab();
     app
       .managed
       .push(ready_managed_for_events("/m/phi.gguf", 41101));
     app.clear_rows_cache();
-    assert_eq!(sync_requests_tab(&mut app).as_deref(), Some("/m/qwen.gguf"));
-    apply_refresh(&mut app, requests_tick("/m/qwen.gguf", &[2, 1]));
-    // Same model: the data stays across loop turns.
+    assert_eq!(sync_requests_tab(&mut app), Some(launch_scope("L-41100")));
+    apply_refresh(&mut app, requests_tick(launch_scope("L-41100"), &[2, 1]));
+    // Same launch: the data stays across loop turns.
     sync_requests_tab(&mut app);
     assert_eq!(app.requests.rows.len(), 2);
 
     // Rows: [TableHeader, Header(▶ Running), qwen, phi]. Focus the other
     // launched model: qwen's rows go at once, before phi's poll lands.
     app.list_cursor = 3;
-    assert_eq!(sync_requests_tab(&mut app).as_deref(), Some("/m/phi.gguf"));
+    assert_eq!(sync_requests_tab(&mut app), Some(launch_scope("L-41101")));
     assert!(app.requests.rows.is_empty());
-    assert_eq!(app.requests.model_path, None);
+    assert_eq!(app.requests.scope, None);
 
-    apply_refresh(&mut app, requests_tick("/m/phi.gguf", &[7]));
+    apply_refresh(&mut app, requests_tick(launch_scope("L-41101"), &[7]));
     app.right_tab = RightTab::Logs;
     assert_eq!(sync_requests_tab(&mut app), None);
     assert!(app.requests.rows.is_empty());
@@ -5316,7 +5363,7 @@ mod tests {
     apply_refresh(
       &mut app,
       RefreshTick::Requests {
-        model_path: "/m/qwen.gguf".into(),
+        scope: launch_scope("L-41100"),
         body: json!({"summary": "nope", "requests": 7}),
       },
     );
@@ -5327,7 +5374,10 @@ mod tests {
   #[test]
   fn arrows_scroll_the_requests_table() {
     let mut app = app_on_requests_tab();
-    apply_refresh(&mut app, requests_tick("/m/qwen.gguf", &[5, 4, 3, 2, 1]));
+    apply_refresh(
+      &mut app,
+      requests_tick(launch_scope("L-41100"), &[5, 4, 3, 2, 1]),
+    );
     pump_input(&mut app, key(KeyCode::Down, KeyModifiers::NONE));
     pump_input(&mut app, key(KeyCode::Down, KeyModifiers::NONE));
     assert_eq!(app.requests.scroll_offset, 2);

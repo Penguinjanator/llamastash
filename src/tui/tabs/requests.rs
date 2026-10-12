@@ -129,11 +129,11 @@ const COLUMNS: &[Column<ColumnId>] = &[
   },
 ];
 
-/// What the tab shows: the last poll's summary and rows for one model.
+/// What the tab shows: the last poll's summary and rows for one scope.
 #[derive(Debug, Clone, Default)]
 pub struct RequestsTabState {
-  /// Model the data belongs to. `None` until the first poll lands.
-  pub model_path: Option<String>,
+  /// Scope the data belongs to. `None` until the first poll lands.
+  pub scope: Option<RequestsScope>,
   pub summary: RequestSummary,
   /// Newest first.
   pub rows: Vec<RequestRow>,
@@ -141,16 +141,37 @@ pub struct RequestsTabState {
   pub scroll_offset: usize,
 }
 
+/// What the tab asks the daemon for. Normally one launch, because a running
+/// model row is one launch and its numbers must not come from another one.
+/// A managed multiplexer is the exception: its models run inside a shared
+/// umbrella and their requests are filed under the model, so that row polls
+/// its model and shows the whole-model aggregate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestsScope {
+  Launch(String),
+  Model(String),
+}
+
+impl RequestsScope {
+  /// The `requests_tail` params that ask for this scope.
+  pub fn params(&self, limit: usize) -> serde_json::Value {
+    match self {
+      Self::Launch(id) => serde_json::json!({ "launch_id": id, "limit": limit }),
+      Self::Model(path) => serde_json::json!({ "model_path": path, "limit": limit }),
+    }
+  }
+}
+
 impl RequestsTabState {
   /// Adopt a poll result.
-  pub fn set(&mut self, model_path: String, summary: RequestSummary, rows: Vec<RequestRow>) {
-    self.model_path = Some(model_path);
+  pub fn set(&mut self, scope: RequestsScope, summary: RequestSummary, rows: Vec<RequestRow>) {
+    self.scope = Some(scope);
     self.summary = summary;
     self.rows = rows;
     self.scroll_offset = self.scroll_offset.min(self.rows.len().saturating_sub(1));
   }
 
-  /// Drop what is shown, scroll included, when focus moves to a model the
+  /// Drop what is shown, scroll included, when focus moves to a row the
   /// data is not for.
   pub fn clear(&mut self) {
     *self = Self::default();
@@ -172,9 +193,9 @@ impl RequestsTabState {
 
 /// Render the tab body into `area`. The right pane owns the block.
 pub fn render(frame: &mut Frame<'_>, area: Rect, state: &RequestsTabState, palette: &Palette) {
-  // No poll has landed for this model yet. Zeros and "no requests" would
+  // No poll has landed for this scope yet. Zeros and "no requests" would
   // read as an answer.
-  if state.model_path.is_none() {
+  if state.scope.is_none() {
     let waiting = Line::from(Span::styled("loading", palette.muted_style()));
     frame.render_widget(Paragraph::new(waiting), area);
     return;
@@ -528,7 +549,7 @@ mod tests {
   fn renders_the_summary_then_the_table_newest_first() {
     let mut state = RequestsTabState::default();
     state.set(
-      "/m/a.gguf".to_string(),
+      RequestsScope::Model("/m/a.gguf".to_string()),
       RequestSummary {
         requests: 2,
         ..RequestSummary::default()
@@ -559,7 +580,7 @@ mod tests {
     let long = "launch_failed: auto-start of Qwen3.8-27B failed: could not allocate the KV cache";
     let mut state = RequestsTabState::default();
     state.set(
-      "/m/a.gguf".to_string(),
+      RequestsScope::Model("/m/a.gguf".to_string()),
       RequestSummary::default(),
       vec![RequestRow {
         seq: 1,
@@ -602,7 +623,7 @@ mod tests {
   fn an_empty_log_says_so_under_the_summary() {
     let mut state = RequestsTabState::default();
     state.set(
-      "/m/a.gguf".to_string(),
+      RequestsScope::Model("/m/a.gguf".to_string()),
       RequestSummary::default(),
       Vec::new(),
     );
@@ -627,7 +648,11 @@ mod tests {
   fn scroll_moves_toward_older_rows_and_stops_at_the_last_page() {
     let mut state = RequestsTabState::default();
     let rows: Vec<RequestRow> = (1..=10).rev().map(row).collect();
-    state.set("/m/a.gguf".to_string(), RequestSummary::default(), rows);
+    state.set(
+      RequestsScope::Model("/m/a.gguf".to_string()),
+      RequestSummary::default(),
+      rows,
+    );
     state.scroll_up();
     assert_eq!(state.scroll_offset, 0);
     for _ in 0..50 {
@@ -656,7 +681,11 @@ mod tests {
       .collect();
     let note = rows[0].cells(NONE).note.clone();
     let mut state = RequestsTabState::default();
-    state.set("/m/a.gguf".to_string(), RequestSummary::default(), rows);
+    state.set(
+      RequestsScope::Model("/m/a.gguf".to_string()),
+      RequestSummary::default(),
+      rows,
+    );
     for _ in 0..50 {
       state.scroll_down();
     }
@@ -696,19 +725,19 @@ mod tests {
   fn set_clamps_the_scroll_and_clear_resets_it() {
     let mut state = RequestsTabState::default();
     state.set(
-      "/m/a.gguf".to_string(),
+      RequestsScope::Model("/m/a.gguf".to_string()),
       RequestSummary::default(),
       (1..=10).rev().map(row).collect(),
     );
     state.scroll_offset = 8;
     state.set(
-      "/m/a.gguf".to_string(),
+      RequestsScope::Model("/m/a.gguf".to_string()),
       RequestSummary::default(),
       (1..=4).rev().map(row).collect(),
     );
     assert_eq!(state.scroll_offset, 3);
     state.clear();
     assert_eq!(state.scroll_offset, 0);
-    assert_eq!(state.model_path, None);
+    assert_eq!(state.scope, None);
   }
 }
