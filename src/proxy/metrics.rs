@@ -719,6 +719,42 @@ fn render(
 /// The `model` label value for a request that never reached one.
 const NO_MODEL: &str = "none";
 
+/// The four series that carry nothing but a `model` label: the two counters
+/// and the two in-flight gauges. One declaration because `Document` keeps the
+/// first HELP and TYPE written for a name, so a second copy of those strings
+/// could disagree with the one that rendered and stay invisible.
+fn core_series(doc: &mut Document, model: &str, requests: u64, errors: u64, live: &Clients) {
+  let labels = [("model", model)];
+  doc.sample(
+    "llamastash:requests_total",
+    "Requests the proxy finished, since daemon start",
+    "counter",
+    &labels,
+    requests as f64,
+  );
+  doc.sample(
+    "llamastash:request_errors_total",
+    "Finished requests that failed or were cut short",
+    "counter",
+    &labels,
+    errors as f64,
+  );
+  doc.sample(
+    "llamastash:requests_in_flight",
+    "Requests the proxy is still serving",
+    "gauge",
+    &labels,
+    live.requests() as f64,
+  );
+  doc.sample(
+    "llamastash:hosts_in_flight",
+    "Distinct client hosts the proxy is serving right now",
+    "gauge",
+    &labels,
+    live.hosts() as f64,
+  );
+}
+
 /// Series for the requests no model answered, as `model="none"`. Everything
 /// the log holds for a model is attributed to it, so the unattributed share is
 /// the whole log minus the models; a request still in flight before any model
@@ -740,55 +776,14 @@ fn unattributed_series(doc: &mut Document, snapshot: &LogSnapshot) {
     .summary
     .errors
     .saturating_sub(attributed_errors);
-  let labels = [("model", NO_MODEL)];
-  doc.sample(
-    "llamastash:requests_total",
-    "Requests the proxy finished, since daemon start",
-    "counter",
-    &labels,
-    requests as f64,
-  );
-  doc.sample(
-    "llamastash:request_errors_total",
-    "Finished requests that failed or were cut short",
-    "counter",
-    &labels,
-    errors as f64,
-  );
-  doc.sample(
-    "llamastash:requests_in_flight",
-    "Requests the proxy is still serving",
-    "gauge",
-    &labels,
-    in_flight.requests() as f64,
-  );
-  doc.sample(
-    "llamastash:hosts_in_flight",
-    "Distinct client hosts the proxy is serving right now",
-    "gauge",
-    &labels,
-    in_flight.hosts() as f64,
-  );
+  core_series(doc, NO_MODEL, requests, errors, &in_flight);
 }
 
 /// The counters and gauges that carry one `model` label.
 fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, live: Clients) {
   let labels = [("model", label)];
   let s = &totals.summary;
-  doc.sample(
-    "llamastash:requests_total",
-    "Requests the proxy finished, since daemon start",
-    "counter",
-    &labels,
-    s.requests as f64,
-  );
-  doc.sample(
-    "llamastash:request_errors_total",
-    "Finished requests that failed or were cut short",
-    "counter",
-    &labels,
-    s.errors as f64,
-  );
+  core_series(doc, label, s.requests, s.errors, &live);
   doc.sample(
     "llamastash:prompt_tokens_total",
     "Prompt tokens the finished requests reported",
@@ -830,20 +825,6 @@ fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, live: Cli
     "counter",
     &labels,
     s.evictions as f64,
-  );
-  doc.sample(
-    "llamastash:requests_in_flight",
-    "Requests the proxy is still serving",
-    "gauge",
-    &labels,
-    live.requests() as f64,
-  );
-  doc.sample(
-    "llamastash:hosts_in_flight",
-    "Distinct client hosts the proxy is serving right now",
-    "gauge",
-    &labels,
-    live.hosts() as f64,
   );
   // A gauge with no figure yet has no sample; the metric is then omitted whole
   // rather than printed as a made-up zero.
@@ -1496,6 +1477,85 @@ mod tests {
       "{text}"
     );
     drop(streaming);
+  }
+
+  /// The `# HELP`, `# TYPE` and sample lines one metric name prints, verbatim.
+  fn metric_block<'a>(text: &'a str, name: &str) -> Vec<&'a str> {
+    let lines: Vec<&str> = text.lines().collect();
+    let help = format!("# HELP {name} ");
+    let at = lines
+      .iter()
+      .position(|line| line.starts_with(&help))
+      .unwrap_or_else(|| panic!("{name} is not in the scrape:\n{text}"));
+    let rest = &lines[at + 2..];
+    let end = rest
+      .iter()
+      .position(|line| !line.starts_with(name))
+      .unwrap_or(rest.len());
+    lines[at..at + 2 + end].to_vec()
+  }
+
+  /// The four series that carry nothing but a `model` label print one
+  /// `# HELP`/`# TYPE` pair for both the attributed and the `none` copy.
+  #[test]
+  fn the_core_series_declare_one_help_and_type_for_both_model_labels() {
+    let log = RequestLog::new();
+    request(&log, "/models/a.gguf", "L1", 10, 3);
+    // One request still streaming on a model, one that has reached no model.
+    // Both records have to stay alive: dropping one finishes the row.
+    let mut on_model = log.begin(
+      "/v1/chat/completions",
+      Some("127.0.0.1:5001".parse().unwrap()),
+    );
+    on_model.set_model("m1", "/models/a.gguf");
+    on_model.set_launch("L1");
+    on_model.publish();
+    let no_model = log.begin(
+      "/v1/chat/completions",
+      Some("127.0.0.1:5002".parse().unwrap()),
+    );
+    no_model.publish();
+    let snap = log.snapshot();
+    let mut doc = Document::new(true);
+    render(&mut doc, &snap, &[], &Scope::default(), 1, 1);
+    let text = doc.render();
+
+    assert_eq!(
+      metric_block(&text, "llamastash:requests_total"),
+      [
+        "# HELP llamastash:requests_total Requests the proxy finished, since daemon start",
+        "# TYPE llamastash:requests_total counter",
+        "llamastash:requests_total{model=\"m1\"} 1",
+        "llamastash:requests_total{model=\"none\"} 0",
+      ]
+    );
+    assert_eq!(
+      metric_block(&text, "llamastash:request_errors_total"),
+      [
+        "# HELP llamastash:request_errors_total Finished requests that failed or were cut short",
+        "# TYPE llamastash:request_errors_total counter",
+        "llamastash:request_errors_total{model=\"m1\"} 0",
+        "llamastash:request_errors_total{model=\"none\"} 0",
+      ]
+    );
+    assert_eq!(
+      metric_block(&text, "llamastash:requests_in_flight"),
+      [
+        "# HELP llamastash:requests_in_flight Requests the proxy is still serving",
+        "# TYPE llamastash:requests_in_flight gauge",
+        "llamastash:requests_in_flight{model=\"m1\"} 1",
+        "llamastash:requests_in_flight{model=\"none\"} 1",
+      ]
+    );
+    assert_eq!(
+      metric_block(&text, "llamastash:hosts_in_flight"),
+      [
+        "# HELP llamastash:hosts_in_flight Distinct client hosts the proxy is serving right now",
+        "# TYPE llamastash:hosts_in_flight gauge",
+        "llamastash:hosts_in_flight{model=\"m1\"} 1",
+        "llamastash:hosts_in_flight{model=\"none\"} 1",
+      ]
+    );
   }
 
   #[test]
