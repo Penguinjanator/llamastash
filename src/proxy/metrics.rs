@@ -996,8 +996,9 @@ pub(crate) fn json_object(build: impl FnOnce(&mut Map<String, Value>)) -> Value 
   Value::Object(map)
 }
 
-/// A JSON string, or `null` when there is nothing to name. An absent value
-/// keeps its key, so a client never tells a missing field from an unset one.
+/// A JSON value for an `Option`: the value itself, or `null` when there is
+/// nothing to name. An absent value keeps its key, so a client never tells a
+/// missing field from an unset one.
 pub(crate) fn value_opt<T: Into<Value>>(value: Option<T>) -> Value {
   match value {
     Some(v) => v.into(),
