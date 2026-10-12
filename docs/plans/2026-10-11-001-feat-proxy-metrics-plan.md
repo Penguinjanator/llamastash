@@ -229,8 +229,50 @@ naming a launch resolves to its model. Fix that as part of this work:
 | U4 `/metrics/backend` | new `src/proxy/metrics_backend.rs`, `src/proxy/mod.rs`, `src/proxy/router.rs`, `tests/fixtures/fake_llama_server.rs` | U1, U3 | impl-2 |
 | U5 docs + changelog + TODO strikes | `docs/usage.md`, `docs/architecture.md`, `CHANGELOG.md`, `TODO.md`, this plan's checkboxes | all | split: the `requests`/knob lines with impl-1, the metrics lines with impl-2 |
 
+| U5 docs + changelog + TODO strikes | `docs/usage.md`, `docs/architecture.md`, `CHANGELOG.md`, `TODO.md`, this plan's checkboxes | all | split: the `requests`/knob lines with impl-1, the metrics lines with impl-2 |
+| U6 clients and parallel sessions in the request summary | `src/proxy/request_log.rs`, `src/proxy/metrics.rs`, `src/cli/requests.rs`, `src/tui/tabs/requests.rs`, `docs/usage.md`, `CHANGELOG.md` + their tests | U1, U3 | impl-3 |
+
 U1 and U2 touch no common file. U3 and U4 share `router.rs` and `mod.rs`, and both
-need U1's log API, so impl-2 runs after impl-1 lands.
+need U1's log API, so impl-2 runs after impl-1 lands. U6 shares `metrics.rs` and
+`request_log.rs` with U3/U4, so it runs after them.
+
+## Clients, connections and live traffic (U6, added after round 1)
+
+An agent runner looking at a launch needs to know whether anything is running right now
+and how many things are behind it. Four figures, all derived from the rows the scope
+retains (the last 1000), so the numbers always match the table on screen and nothing grows
+with daemon age:
+
+- **hosts** — distinct client IPs the scope served. On a loopback-only setup every local
+  tool is `127.0.0.1` (or `::1`), so this reads 1 until you bind a LAN; it counts machines.
+- **connections** — distinct client peers on `ip:port`, which is what a tool's live
+  connection looks like to the proxy. This is the figure that counts tools locally.
+- **live hosts** and **live connections** — the same two counts over the requests in flight
+  right now.
+
+Display rule, shared by the TUI strip and the CLI summary block through
+`RequestSummary::cells`:
+
+- drop the live pair entirely when both are zero, so an idle launch's strip is unchanged;
+- when live hosts equals live connections, show one field, `Live N`;
+- when they differ, show `Live N/M` (hosts/connections);
+- `Hosts` and `Connections` always show.
+
+`requests --json` gains `hosts`, `connections`, `live_hosts` and `live_connections` in
+`summary`. The four are `Option`s: absent means an older daemon never computed them, which
+is not the same as zero. `/metrics` gains `llamastash:hosts_in_flight` and keeps
+`requests_in_flight` as the connections figure, with the same label rules including
+`model="none"` and the `?launch=1` opt-in.
+
+`Tok/s last` is dropped from the strip and from the CLI summary block; `tokens_per_second_last`
+stays in the JSON and in the rows.
+
+Scoping follows the launch, not the model name. A running model row in the TUI is one
+launch, so the Requests tab takes that launch's id and shows that launch's rows and
+counters only, never another launch of the same path. `requests <launch-ref>` already
+works that way (`LogScope::Launch`) and keeps it. Where a launch has no distinct id to
+scope by (a managed multiplexer that files requests under the model), the figures cover
+everything filed under that model since daemon start, and `docs/usage.md` says so.
 
 ## Verification
 
