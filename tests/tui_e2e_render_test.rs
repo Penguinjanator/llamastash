@@ -80,7 +80,10 @@ fn seeded_dashboard_app() -> App {
     server_path: Some("/usr/local/bin/llama-server".into()),
     ipc_url: Some("http://127.0.0.1:48134".into()),
     proxy: None,
-    backend_binaries: Vec::new(),
+    backend_servers: vec![llamastash::tui::app::BackendServers {
+      id: "llamacpp".into(),
+      labels: vec!["cuda".into()],
+    }],
   };
   app.host_metrics = HostMetricsSnapshot {
     cpu_pct: 47.5,
@@ -546,10 +549,10 @@ fn dashboard_render_carries_key_landmarks() {
   assert!(frame.contains("GPU"));
   assert!(frame.contains("VRAM"));
   assert!(frame.contains("NVIDIA"));
-  // Daemon pane: server path + always-on proxy row. The build
+  // Daemon pane: server row + always-on proxy row. The build
   // version surfaces on the title bar (`render_title_left`) and is
   // no longer repeated on the info pane.
-  assert!(frame.contains("llama-server"));
+  assert!(frame.contains("llamacpp (cuda)"));
   assert!(
     frame.contains("proxy"),
     "proxy row missing from Daemon info pane: {frame}"

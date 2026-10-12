@@ -443,8 +443,8 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 
 ### Batch 7
 
-- [ ] `generic ✓ installed  rocm, vulkan` in LS status command out should show the name of the generic servers instead of rocm/vulkan. It should ideally show `<backendname> ✓ installed <cpu/rocm/cuda/vulkan/metal (name)>, ...`. Lets standardize this field. infer rocm/vulkan when no name?
-- [ ] `server  …/hip/bin/llama-server (rocm|vulkan) ·` section of TUI Daemon, needs a rehaul. Show names and arch instead of path `type (names|..) infer rocm/vulkan when no name?
+- [x] ~~`generic ✓ installed  rocm, vulkan` in LS status command out should show the name of the generic servers instead of rocm/vulkan. It should ideally show `<backendname> ✓ installed <cpu/rocm/cuda/vulkan/metal (name)>, ...`. Lets standardize this field. infer rocm/vulkan when no name?~~ — done: `status` shows each backend's server labels (`name:` → probed arch → build folder; `cpu` for a GPU-less llama.cpp build), and `--json` carries `backends[].server_labels`.
+- [x] ~~`server  …/hip/bin/llama-server (rocm|vulkan) ·` section of TUI Daemon, needs a rehaul. Show names and arch instead of path `type (names|..) infer rocm/vulkan when no name?~~ — done: the row reads `llamacpp (rocm|vulkan) · generic (gufo|…)`, with a focused launch's non-default build in green.
 
 ## Next
 

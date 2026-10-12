@@ -408,16 +408,36 @@ pub fn filter_rows(rows: &[CatalogRow], pattern: &str) -> Vec<CatalogRow> {
 /// for agents. RSS/CPU% are intentionally not surfaced here even when
 /// the per-PID sampler has primed them — they belong in a future
 /// `--detail` view rather than always-on columns.
-/// Render the `status.backends` array into a concise section:
-/// per backend, its install state + the accelerators it can run on this
-/// host. Returns `None` when the field is absent (older daemon) or empty so
-/// the caller skips the section entirely.
+/// Render the `status.backends` array into a concise section: per backend,
+/// its install state and the servers it can launch on (`rocm|vulkan`,
+/// `gufo|halogen`), or its accelerators when no server resolved. Returns
+/// `None` when the field is absent (older daemon) or empty so the caller skips
+/// the section entirely.
 fn backends_human(backends: &serde_json::Value, tty: bool) -> Option<String> {
   use crate::cli::{colors, format};
   let arr = backends.as_array()?;
   if arr.is_empty() {
     return None;
   }
+  let strings = |b: &serde_json::Value, key: &str| -> Vec<String> {
+    b.get(key)
+      .and_then(|v| v.as_array())
+      .map(|a| {
+        a.iter()
+          .filter_map(|x| x.as_str().map(String::from))
+          .collect()
+      })
+      .unwrap_or_default()
+  };
+  const INSTALLED: &str = "✓ installed";
+  const NOT_INSTALLED: &str = "not installed";
+  let id_width = arr
+    .iter()
+    .filter_map(|b| b.get("id").and_then(|v| v.as_str()))
+    .map(console::measure_text_width)
+    .max()
+    .unwrap_or(0);
+  let state_width = console::measure_text_width(NOT_INSTALLED);
   let mut out = String::new();
   if tty {
     out.push_str(&format::section_header("backends", None));
@@ -428,47 +448,49 @@ fn backends_human(backends: &serde_json::Value, tty: bool) -> Option<String> {
       .get("installed")
       .and_then(|v| v.as_bool())
       .unwrap_or(false);
-    let accel: Vec<&str> = b
-      .get("accelerators")
-      .and_then(|v| v.as_array())
-      .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
-      .unwrap_or_default();
-    let accel_str = if accel.is_empty() {
+    let mut labels = strings(b, "server_labels");
+    if labels.is_empty() {
+      labels = strings(b, "accelerators");
+    }
+    let labels_str = if labels.is_empty() {
       "—".to_string()
     } else {
-      accel.join(", ")
+      labels.join("|")
     };
     // Managed-multiplexer backends carry an `umbrella` health string
     // (running / starting / not running / disabled) that `installed` alone
-    // can't convey. Absent for process-per-model backends (llama.cpp).
+    // can't convey.
     let umbrella = b.get("umbrella").and_then(|v| v.as_str());
     if tty {
-      let state = if installed {
-        colors::success("installed")
+      let (state, plain) = if installed {
+        (colors::success("installed"), INSTALLED)
       } else {
-        colors::dim("not installed")
+        (colors::dim(NOT_INSTALLED), NOT_INSTALLED)
       };
+      let state_pad = " ".repeat(state_width.saturating_sub(console::measure_text_width(plain)));
       let umbrella_str = umbrella
         .map(|u| format!("  {}", colors::dim(&format!("(umbrella: {u})"))))
         .unwrap_or_default();
       out.push_str(&format!(
-        "  {} {}  {}{}\n",
+        "  {}{} {}{}  {}{}\n",
         console::style(id).bold(),
+        " ".repeat(id_width.saturating_sub(console::measure_text_width(id))),
         state,
-        colors::dim(&accel_str),
+        state_pad,
+        colors::dim(&labels_str),
         umbrella_str,
       ));
     } else {
       let state = if installed {
         "installed"
       } else {
-        "not installed"
+        NOT_INSTALLED
       };
       let umbrella_str = umbrella
         .map(|u| format!(" umbrella={u}"))
         .unwrap_or_default();
       out.push_str(&format!(
-        "backend {id}: {state} [{accel_str}]{umbrella_str}\n"
+        "backend {id}: {state} [{labels_str}]{umbrella_str}\n"
       ));
     }
   }
@@ -539,7 +561,7 @@ pub fn status_human(snap: &StatusSnapshot) -> String {
     }
   }
 
-  // Backends section: installed state + accelerators per backend.
+  // Backends section: installed state + server labels per backend.
   if let Some(block) = backends_human(&snap.backends, tty) {
     out.push_str(&block);
   }
@@ -1366,8 +1388,9 @@ mod tests {
     // one ships on this branch) — proves the renderer handles N backends,
     // the not-installed state, and the managed lifecycle generically.
     let backends = serde_json::json!([
-      { "id": "llamacpp", "lifecycle": "process_per_model", "installed": true, "accelerators": ["cpu", "vulkan"] },
-      { "id": "example", "lifecycle": "managed_multiplexer", "installed": false, "accelerators": ["cpu", "npu"] },
+      { "id": "llamacpp", "lifecycle": "process_per_model", "installed": true, "accelerators": ["cpu", "rocm", "vulkan"], "server_labels": ["rocm", "vulkan"] },
+      { "id": "example", "lifecycle": "managed_multiplexer", "installed": false, "accelerators": ["cpu", "npu"], "server_labels": [], "umbrella": "disabled" },
+      { "id": "other", "lifecycle": "process_per_model", "installed": false, "accelerators": [], "server_labels": [] },
     ]);
     let snap = StatusSnapshot {
       models: vec![],
@@ -1379,15 +1402,41 @@ mod tests {
       backends: backends.clone(),
       servers: Value::Null,
     };
-    // Human render: each backend's id, install state, and accelerators.
+    // Server labels win; a backend with none falls back to its accelerators,
+    // then to `—`.
     let human = status_human(&snap);
-    assert!(human.contains("llamacpp"), "human backends: {human}");
-    assert!(human.contains("installed"));
-    assert!(human.contains("not installed"));
-    assert!(human.contains("cpu, npu"));
+    assert!(
+      human.contains("backend llamacpp: installed [rocm|vulkan]\n"),
+      "human backends: {human}"
+    );
+    assert!(human.contains("backend example: not installed [cpu|npu] umbrella=disabled\n"));
+    assert!(human.contains("backend other: not installed [—]\n"));
     // JSON render mirrors the daemon shape verbatim.
     let json = status_json(&snap);
     assert_eq!(json["backends"], backends);
+  }
+
+  #[test]
+  fn tty_backends_section_pads_id_and_state_into_columns() {
+    let backends = serde_json::json!([
+      { "id": "llamacpp", "installed": true, "server_labels": ["rocm", "vulkan"] },
+      { "id": "lemonade", "installed": false, "accelerators": ["cpu", "npu"], "umbrella": "disabled" },
+      { "id": "gen", "installed": true, "server_labels": ["gufo"] },
+    ]);
+    let _g = ColorGuard::set(true);
+    let human = console::strip_ansi_codes(&backends_human(&backends, true).unwrap()).to_string();
+    assert!(
+      human.contains("  llamacpp ✓ installed    rocm|vulkan\n"),
+      "{human}"
+    );
+    assert!(
+      human.contains("  lemonade not installed  cpu|npu  (umbrella: disabled)\n"),
+      "{human}"
+    );
+    assert!(
+      human.contains("  gen      ✓ installed    gufo\n"),
+      "{human}"
+    );
   }
 
   #[test]

@@ -178,57 +178,12 @@ fn server_row<'a>(app: &'a App, budget: usize, palette: &'a Palette) -> Line<'a>
     }
   }
 
-  // When the cursor sits on a model running on a *non-default*
-  // `llama-server` binary, swap the row to that binary and paint it in
-  // the success colour so it's obvious the hovered launch is on a
-  // different backend than the daemon's default server. Multi-binary
-  // setups point CUDA / ROCm / Vulkan launches at separate builds, so
-  // moving the cursor lets the operator see which one each model uses.
-  if let Some(dev) = app.focused_override_device() {
-    // The backend tag comes from the catalog entry's own selector
-    // prefix (the hovered launch's binary), not `flavor_label` — that
-    // helper reports the *default* server's host-derived backend, which
-    // would mislabel an override build on a mixed-vendor host.
-    let flavor_chunk = format!(" ({})", dev.backend.to_lowercase());
-    let path = dev.binary.display().to_string();
-    let path_budget = budget.saturating_sub(flavor_chunk.width());
-    let path_truncated = crate::tui::fmt::truncate_start(&path, path_budget);
-    let path_style = palette
-      .success_style()
-      .add_modifier(ratatui::style::Modifier::BOLD);
-    return Line::from(vec![
-      Span::styled(LABEL_SERVER, palette.label_style()),
-      Span::styled(path_truncated, path_style),
-      Span::styled(flavor_chunk, palette.success_style()),
-    ]);
-  }
-
-  // Build one `(path, tag)` entry per backend. Prefer the neutral server
-  // catalog once probed — each backend's first server binary, tagged with its
-  // compute backends joined by `|` (`(rocm|vulkan)`) or the backend id when it
-  // exposes no devices (`(lemonade)`). Before the probe lands, fall
-  // back to the default `llama-server` + the per-backend binaries from
-  // `status.backends`. Every entry gets an equal share of the width; paths
-  // left-truncate (`…/`) so the binary name — the discriminating part —
-  // always survives.
-  let entries: Vec<(String, String)> = if !app.servers.is_empty() {
-    server_entries_by_backend(&app.servers)
-  } else if let Some(p) = app.daemon_info.server_path.as_deref() {
-    let flavor_chunk = match flavor_label(app) {
-      Some(f) => format!(" ({f})"),
-      None => String::new(),
-    };
-    let mut e = vec![(p.to_string(), flavor_chunk)];
-    for b in &app.daemon_info.backend_binaries {
-      if b.id != crate::backend::DEFAULT_BACKEND_ID {
-        e.push((b.binary.clone(), format!(" ({})", b.id)));
-      }
-    }
-    e
-  } else {
-    Vec::new()
-  };
-
+  // One `<backend> (<label>|<label>)` entry per enabled backend, labels from
+  // `status.backends[].server_labels` (configured name, else probed arch,
+  // else build folder). When the cursor sits on a model running on a
+  // *non-default* build, that build's label is painted in the success colour
+  // so the operator can see which build each launch uses.
+  let entries = &app.daemon_info.backend_servers;
   if entries.is_empty() {
     // No binary resolved: point the user at the override knobs instead of a
     // bare `—` — they can install llama.cpp or set the env / flag to fix it.
@@ -239,50 +194,109 @@ fn server_row<'a>(app: &'a App, budget: usize, palette: &'a Palette) -> Line<'a>
       Span::styled(trimmed, palette.error_style()),
     ]);
   }
+  let hovered = app.focused_override_device();
   let sep = crate::tui::glyphs::active().middot_sep();
-  let per_entry = equal_entry_budget(budget, entries.len(), sep.width());
+  let natural: Vec<usize> = entries
+    .iter()
+    .map(|e| {
+      e.id.width()
+        + 3
+        + e.labels.iter().map(|l| l.width()).sum::<usize>()
+        + e.labels.len().saturating_sub(1)
+    })
+    .collect();
+  let floors: Vec<usize> = entries.iter().map(|e| e.id.width()).collect();
+  let room = budget.saturating_sub(sep.width() * entries.len().saturating_sub(1));
+  let widths = fair_widths(&natural, &floors, room);
   let mut spans = vec![Span::styled(LABEL_SERVER, palette.label_style())];
-  for (i, (path, tag)) in entries.iter().enumerate() {
+  for (i, entry) in entries.iter().enumerate() {
     if i > 0 {
       spans.push(Span::styled(sep, palette.muted_style()));
     }
-    let path_truncated =
-      crate::tui::fmt::truncate_start(path, per_entry.saturating_sub(tag.width()));
-    spans.push(Span::styled(path_truncated, palette.text_style()));
-    spans.push(Span::styled(tag.clone(), palette.muted_style()));
+    let highlight = hovered
+      .as_ref()
+      .filter(|h| h.backend_id == entry.id)
+      .map(|h| h.index);
+    spans.extend(server_entry_spans(entry, highlight, widths[i], palette));
   }
   Line::from(spans)
 }
 
-/// One `(binary, tag)` per backend from the server catalog, in catalog order.
-/// `tag` is the backend's compute backends joined with `|` (`" (rocm|vulkan)"`),
-/// or `" (<backend id>)"` when its servers expose no probed devices. The binary
-/// is the backend's first server (its default build).
-fn server_entries_by_backend(servers: &[crate::backend::Server]) -> Vec<(String, String)> {
-  let mut out: Vec<(String, String)> = Vec::new();
-  let mut seen: Vec<&str> = Vec::new();
-  for s in servers {
-    if seen.contains(&s.backend_id.as_str()) {
-      continue;
-    }
-    seen.push(&s.backend_id);
-    let mut labels: Vec<String> = Vec::new();
-    for g in servers.iter().filter(|x| x.backend_id == s.backend_id) {
-      for d in &g.devices {
-        let lbl = d.gpu_backend.to_lowercase();
-        if !labels.contains(&lbl) {
-          labels.push(lbl);
-        }
+/// Split `room` columns across entries wanting `natural` widths. Each entry
+/// first gets its `floor` (its backend id), so a crowded row still names every
+/// backend. The rest is shared fairly: an entry whose remaining want fits an
+/// equal share takes just that, and what it leaves over goes to the longer
+/// ones, so one short entry doesn't strand free columns.
+fn fair_widths(natural: &[usize], floors: &[usize], room: usize) -> Vec<usize> {
+  let mut out = floors.to_vec();
+  let Some(mut left) = room.checked_sub(floors.iter().sum()) else {
+    return out;
+  };
+  let want = |i: usize| natural[i].saturating_sub(floors[i]);
+  let mut open: Vec<usize> = (0..natural.len()).collect();
+  loop {
+    let share = left / open.len().max(1);
+    let (fits, rest): (Vec<usize>, Vec<usize>) = open.iter().partition(|&&i| want(i) <= share);
+    if fits.is_empty() {
+      for &i in &rest {
+        out[i] += share;
       }
+      return out;
     }
-    let tag = if labels.is_empty() {
-      format!(" ({})", s.backend_id)
-    } else {
-      format!(" ({})", labels.join("|"))
-    };
-    out.push((s.binary.display().to_string(), tag));
+    for &i in &fits {
+      out[i] += want(i);
+      left -= want(i);
+    }
+    if rest.is_empty() {
+      return out;
+    }
+    open = rest;
   }
-  out
+}
+
+/// Spans for one `<id> (<a>|<b>)` entry fitted to `budget` columns. The id
+/// always survives; labels fill what is left and the last one that doesn't
+/// fit is right-ellipsised. With no room for even one label cell the entry is
+/// the bare id rather than empty parentheses. `highlight` is the label index
+/// to paint in the success colour.
+fn server_entry_spans<'a>(
+  entry: &crate::tui::app::BackendServers,
+  highlight: Option<usize>,
+  budget: usize,
+  palette: &'a Palette,
+) -> Vec<Span<'a>> {
+  let id = Span::styled(entry.id.clone(), palette.text_style());
+  if budget < entry.id.width() + 4 {
+    return vec![id];
+  }
+  let mut spans = vec![id, Span::styled(" (", palette.muted_style())];
+  let mut room = budget.saturating_sub(entry.id.width() + 3);
+  for (i, label) in entry.labels.iter().enumerate() {
+    // A separator needs a label cell after it, or the row ends in `|)`.
+    if room == 0 || (i > 0 && room < 2) {
+      break;
+    }
+    if i > 0 {
+      spans.push(Span::styled("|", palette.muted_style()));
+      room -= 1;
+    }
+    let shown = right_ellipsise(label, room);
+    room = room.saturating_sub(shown.width());
+    let style = if highlight == Some(i) {
+      palette
+        .success_style()
+        .add_modifier(ratatui::style::Modifier::BOLD)
+    } else {
+      palette.muted_style()
+    };
+    let truncated = shown != *label;
+    spans.push(Span::styled(shown, style));
+    if truncated {
+      break;
+    }
+  }
+  spans.push(Span::styled(")", palette.muted_style()));
+  spans
 }
 
 /// Render the daemon-start refusal in the server row. `err` carries
@@ -462,28 +476,6 @@ fn running_row<'a>(app: &'a App, budget: usize, palette: &'a Palette) -> Line<'a
     Span::styled(trimmed, palette.text_style()),
     Span::styled(suffix, palette.text_style()),
   ])
-}
-
-/// Backend → human-readable flavor tag used in the `server` row.
-///
-/// The tag reflects the llama.cpp backend the auto-installer picks for
-/// this host (see `init::install::gh_releases::pick_asset_suffix`). AMD
-/// is OS-dependent: Linux installs the ROCm build, but Windows installs
-/// the **Vulkan** build (ROCm's Windows support is too narrow to pick
-/// blindly), so labeling a Windows AMD server `rocm` is wrong.
-fn flavor_label(app: &App) -> Option<&'static str> {
-  use crate::daemon::host_metrics::GpuFlavor;
-  match app.host_metrics.flavor() {
-    GpuFlavor::Nvidia | GpuFlavor::Multi => Some("cuda"),
-    GpuFlavor::Amd => Some(if cfg!(target_os = "windows") {
-      "vulkan"
-    } else {
-      "rocm"
-    }),
-    GpuFlavor::AppleMetal => Some("metal"),
-    GpuFlavor::CpuOnly => Some("cpu"),
-    GpuFlavor::Unknown | GpuFlavor::Unsampled => None,
-  }
 }
 
 fn format_uptime(secs: u64) -> String {
@@ -730,12 +722,56 @@ mod tests {
     );
   }
 
+  fn backend(id: &str, labels: &[&str]) -> crate::tui::app::BackendServers {
+    crate::tui::app::BackendServers {
+      id: id.into(),
+      labels: labels.iter().map(|l| l.to_string()).collect(),
+    }
+  }
+
   #[test]
-  fn server_row_swaps_to_override_binary_for_focused_running_model() {
-    // Cursor on a model running on a non-default binary: the server
-    // row shows that binary (not the daemon default) plus the device's
-    // own backend tag, so the operator can see the hovered launch is on
-    // a different backend.
+  fn server_row_lists_each_backend_with_its_server_labels() {
+    let mut app = App::new(AppOptions::default());
+    app.daemon_info = DaemonInfo {
+      backend_servers: vec![
+        backend("llamacpp", &["rocm", "vulkan"]),
+        backend("enginex", &["gufo"]),
+      ],
+      ..Default::default()
+    };
+    let rows = render_lines(&app);
+    let server_row = rows.iter().find(|r| r.contains("server")).unwrap();
+    assert!(
+      server_row.contains("llamacpp (rocm|vulkan) · enginex (gufo)"),
+      "got: {server_row:?}"
+    );
+  }
+
+  #[test]
+  fn server_row_ellipsises_labels_but_keeps_backend_ids() {
+    let mut app = App::new(AppOptions::default());
+    app.daemon_info = DaemonInfo {
+      backend_servers: vec![
+        backend("llamacpp", &["rocm", "vulkan", "cuda-flash-attention"]),
+        backend("enginex", &["gufo", "halogen-flash-next"]),
+      ],
+      ..Default::default()
+    };
+    let rows = render_lines(&app);
+    let server_row = rows.iter().find(|r| r.contains("server")).unwrap();
+    assert!(
+      server_row.contains("llamacpp (rocm|"),
+      "got: {server_row:?}"
+    );
+    assert!(
+      server_row.contains(" · enginex (gufo|"),
+      "got: {server_row:?}"
+    );
+    assert!(server_row.contains("…)"), "got: {server_row:?}");
+  }
+
+  #[test]
+  fn server_row_highlights_the_label_of_a_focused_non_default_build() {
     let mut app = App::new(AppOptions::default());
     app.models = vec![fake_model("/m/a.gguf", "/m")];
     app.managed = vec![ManagedRow {
@@ -743,104 +779,81 @@ mod tests {
       path: PathBuf::from("/m/a.gguf"),
       port: 41100,
       state: SurfaceState::Ready,
-      device: Some("CUDA1".into()),
-      rss_bytes: None,
-      cpu_pct: None,
+      device: Some("Vulkan0".into()),
       ..Default::default()
     }];
-    app.daemon_info = DaemonInfo {
-      server_path: Some("/usr/bin/llama-server".into()),
-      ..Default::default()
-    };
-    app.servers = vec![crate::backend::Server {
-      id: "llamacpp-cuda".into(),
+    let srv = |binary: &str, selector: &str, gpu: &str| crate::backend::Server {
+      id: format!("llamacpp-{gpu}"),
       backend_id: "llamacpp".into(),
-      binary: PathBuf::from("/opt/cuda/llama-server"),
-      name: "llamacpp-cuda".into(),
+      binary: PathBuf::from(binary),
+      name: format!("llamacpp-{gpu}"),
       devices: vec![crate::backend::Device {
-        selector: "CUDA1".into(),
-        gpu_backend: "CUDA".into(),
-        name: "Test GPU".into(),
-        total_mib: Some(24576),
-        free_mib: Some(24000),
+        selector: selector.into(),
+        gpu_backend: gpu.into(),
+        ..Default::default()
       }],
       caps: Default::default(),
-    }];
+      label: Some(gpu.to_lowercase()),
+    };
+    app.servers = vec![
+      srv("/opt/rocm/llama-server", "ROCm0", "ROCm"),
+      srv("/opt/vulkan/llama-server", "Vulkan0", "Vulkan"),
+    ];
+    app.daemon_info = DaemonInfo {
+      server_path: Some("/opt/rocm/llama-server".into()),
+      backend_servers: vec![backend("llamacpp", &["rocm", "vulkan"])],
+      ..Default::default()
+    };
     // Rows: [TableHeader, Header(▶ Running), Model] — running row at 2.
     app.list_cursor = 2;
-    let rows = render_lines(&app);
-    let server_row = rows.iter().find(|r| r.contains("server")).unwrap();
-    assert!(
-      server_row.contains("/opt/cuda/llama-server"),
-      "expected override binary path, got: {server_row:?}"
-    );
-    assert!(
-      server_row.contains("(cuda)"),
-      "expected device-derived backend tag, got: {server_row:?}"
-    );
-    assert!(
-      !server_row.contains("/usr/bin/llama-server"),
-      "default path must not appear when an override is in effect: {server_row:?}"
-    );
+    let palette = app.palette();
+    let line = server_row(&app, 60, palette);
+    let span = |text: &str| line.spans.iter().find(|s| s.content == text).unwrap();
+    assert_eq!(span("vulkan").style.fg, palette.success_style().fg);
+    assert_ne!(span("rocm").style.fg, palette.success_style().fg);
   }
 
   #[test]
-  fn server_row_keeps_default_path_when_no_override() {
-    // Cursor on a header (no focused model) — the row renders the
-    // daemon's default binary, never an override.
-    let mut app = App::new(AppOptions::default());
-    app.models = vec![fake_model("/m/a.gguf", "/m")];
-    app.daemon_info = DaemonInfo {
-      server_path: Some("/usr/bin/llama-server".into()),
-      ..Default::default()
-    };
-    app.list_cursor = 0;
-    let rows = render_lines(&app);
-    let server_row = rows.iter().find(|r| r.contains("server")).unwrap();
-    assert!(
-      server_row.contains("/usr/bin/llama-server"),
-      "expected default path with no override, got: {server_row:?}"
-    );
+  fn fair_widths_hands_a_short_entrys_slack_to_the_long_one() {
+    assert_eq!(fair_widths(&[30, 10], &[0, 0], 40), vec![30, 10]);
+    assert_eq!(fair_widths(&[40, 10], &[0, 0], 40), vec![30, 10]);
+    assert_eq!(fair_widths(&[40, 40], &[0, 0], 40), vec![20, 20]);
+    assert_eq!(fair_widths(&[40, 8, 40], &[0, 0, 0], 40), vec![16, 8, 16]);
+    assert_eq!(fair_widths(&[], &[], 40), Vec::<usize>::new());
   }
 
   #[test]
-  fn server_row_lists_other_backend_binaries_with_equal_budget() {
-    use crate::tui::app::BackendBinary;
-    let mut app = App::new(AppOptions::default());
-    app.daemon_info = DaemonInfo {
-      server_path: Some("/usr/bin/llama-server".into()),
-      backend_binaries: vec![
-        // llamacpp's own entry is skipped (server_path already renders it).
-        BackendBinary {
-          id: "llamacpp".into(),
-          binary: "/usr/bin/llama-server".into(),
-        },
-        BackendBinary {
-          id: "lemonade".into(),
-          binary: "/usr/bin/lemond".into(),
-        },
-      ],
-      ..Default::default()
-    };
-    let rows = render_lines(&app);
-    let server_row = rows.iter().find(|r| r.contains("server")).unwrap();
-    assert!(
-      server_row.contains("llama-server"),
-      "default binary must render: {server_row:?}"
-    );
-    assert!(
-      server_row.contains("(lemonade)"),
-      "other backend gets its id tag: {server_row:?}"
-    );
-    assert!(
-      server_row.contains(" · "),
-      "entries must be separated: {server_row:?}"
-    );
+  fn fair_widths_gives_every_entry_its_floor_first() {
+    // Four 8-wide ids in 40 columns: an equal 10 each would leave the long
+    // entries 2 label columns; floors first keep every id whole.
     assert_eq!(
-      server_row.matches("llama-server").count(),
-      1,
-      "llamacpp must not render twice: {server_row:?}"
+      fair_widths(&[30, 30, 30, 30], &[8, 8, 8, 8], 40),
+      vec![10, 10, 10, 10]
     );
+    assert_eq!(fair_widths(&[30, 12], &[8, 8], 30), vec![18, 12]);
+    // Too narrow for every id: floors win and the row clips.
+    assert_eq!(fair_widths(&[30, 30], &[8, 8], 10), vec![8, 8]);
+  }
+
+  #[test]
+  fn server_entry_without_room_for_a_label_is_the_bare_id() {
+    let app = App::new(AppOptions::default());
+    let palette = app.palette();
+    let entry = backend("llamacpp", &["rocm", "vulkan"]);
+    let text = |budget: usize| -> String {
+      server_entry_spans(&entry, None, budget, palette)
+        .iter()
+        .map(|s| s.content.to_string())
+        .collect()
+    };
+    assert_eq!(text(8), "llamacpp");
+    assert_eq!(text(11), "llamacpp");
+    assert_eq!(text(12), "llamacpp (…)");
+    // One column left after `rocm`: no room for a label after `|`.
+    assert_eq!(text(16), "llamacpp (rocm)");
+    assert_eq!(text(17), "llamacpp (rocm|…)");
+    assert_eq!(text(18), "llamacpp (rocm|v…)");
+    assert_eq!(text(40), "llamacpp (rocm|vulkan)");
   }
 
   #[test]
@@ -849,83 +862,6 @@ mod tests {
     assert_eq!(equal_entry_budget(40, 2, 3), 18);
     assert_eq!(equal_entry_budget(0, 2, 3), 0);
     assert_eq!(equal_entry_budget(40, 0, 3), 40);
-  }
-
-  #[test]
-  fn server_row_emits_flavor_from_host_metrics_backend() {
-    let mut app = App::new(AppOptions::default());
-    app.daemon_info = DaemonInfo {
-      server_path: Some("/usr/bin/llama-server".into()),
-      ..Default::default()
-    };
-    app.host_metrics = HostMetricsSnapshot {
-      gpu_backend: "nvidia".into(),
-      ..Default::default()
-    };
-    let rows = render_lines(&app);
-    let server_row = rows.iter().find(|r| r.contains("server")).unwrap();
-    assert!(
-      server_row.contains("(cuda)"),
-      "expected `(cuda)` flavor on nvidia backend, got: {server_row:?}"
-    );
-  }
-
-  #[test]
-  fn server_row_picks_install_flavor_for_amd_backend() {
-    let mut app = App::new(AppOptions::default());
-    app.daemon_info = DaemonInfo {
-      server_path: Some("/usr/bin/llama-server".into()),
-      ..Default::default()
-    };
-    app.host_metrics = HostMetricsSnapshot {
-      gpu_backend: "amd".into(),
-      ..Default::default()
-    };
-    let rows = render_lines(&app);
-    let server_row = rows.iter().find(|r| r.contains("server")).unwrap();
-    // Windows AMD installs the Vulkan build, not ROCm (see flavor_label).
-    let expected = if cfg!(target_os = "windows") {
-      "(vulkan)"
-    } else {
-      "(rocm)"
-    };
-    assert!(server_row.contains(expected), "{server_row:?}");
-  }
-
-  #[test]
-  fn server_row_picks_metal_flavor_for_apple_metal_backend() {
-    let mut app = App::new(AppOptions::default());
-    app.daemon_info = DaemonInfo {
-      server_path: Some("/usr/bin/llama-server".into()),
-      ..Default::default()
-    };
-    app.host_metrics = HostMetricsSnapshot {
-      gpu_backend: "apple_metal".into(),
-      ..Default::default()
-    };
-    let rows = render_lines(&app);
-    let server_row = rows.iter().find(|r| r.contains("server")).unwrap();
-    assert!(server_row.contains("(metal)"), "{server_row:?}");
-  }
-
-  #[test]
-  fn server_row_omits_flavor_chunk_for_unsampled_backend() {
-    let mut app = App::new(AppOptions::default());
-    app.daemon_info = DaemonInfo {
-      server_path: Some("/usr/bin/llama-server".into()),
-      ..Default::default()
-    };
-    app.host_metrics = HostMetricsSnapshot {
-      gpu_backend: "unsampled".into(),
-      ..Default::default()
-    };
-    let rows = render_lines(&app);
-    let server_row = rows.iter().find(|r| r.contains("server")).unwrap();
-    // No parenthesised flavor chunk should appear yet.
-    assert!(
-      !server_row.contains('('),
-      "unsampled backend should suppress the flavor chunk: {server_row:?}"
-    );
   }
 
   #[test]
@@ -1061,7 +997,7 @@ mod tests {
     );
     assert!(
       !server_row.contains('('),
-      "flavor must be suppressed when binary is unresolved: {server_row:?}"
+      "no backend entry when no binary resolved: {server_row:?}"
     );
   }
 
@@ -1158,14 +1094,14 @@ mod tests {
     app.daemon_connected = true;
     app.daemon_start_error = Some("stale refusal".into());
     app.daemon_info = DaemonInfo {
-      server_path: Some("/usr/bin/llama-server".into()),
+      backend_servers: vec![backend("llamacpp", &["rocm"])],
       ..Default::default()
     };
     let rows = render_lines(&app);
     let server_row = rows.iter().find(|r| r.contains("server")).unwrap();
     assert!(
-      server_row.contains("/usr/bin/llama-server"),
-      "expected normal server path: {server_row:?}"
+      server_row.contains("llamacpp (rocm)"),
+      "expected normal server row: {server_row:?}"
     );
     assert!(
       !server_row.contains("stale refusal"),
@@ -1364,7 +1300,7 @@ mod tests {
     use crate::tui::app::ProxyInfo;
     let mut app = App::new(AppOptions::default());
     app.daemon_info = DaemonInfo {
-      server_path: Some("/usr/bin/llama-server".into()),
+      backend_servers: vec![backend("llamacpp", &["vulkan"])],
       proxy: Some(ProxyInfo {
         enabled: true,
         listen: Some("127.0.0.1:11434".into()),
@@ -1378,7 +1314,7 @@ mod tests {
     assert!(
       rows
         .iter()
-        .any(|r| r.contains("server") && r.contains("llama-server")),
+        .any(|r| r.contains("server") && r.contains("llamacpp (vulkan)")),
       "expected server row alongside the proxy row: {rows:#?}"
     );
     assert!(

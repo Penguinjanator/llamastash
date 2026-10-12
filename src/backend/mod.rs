@@ -587,11 +587,22 @@ pub trait Backend {
   }
 
   /// Probe one server binary for the GPU **devices** it can target (the exact
-  /// `--device` selectors it accepts). Default empty — a backend with no
+  /// `--device` selectors it accepts). `None` when the probe ran and failed
+  /// (missing binary, non-zero exit, timeout), so "no devices" and "couldn't
+  /// tell" stay apart. Default `Some(empty)` — a backend with no
   /// device-selection surface (Lemonade). llama.cpp overrides with its
   /// `--list-devices` probe.
-  fn probe_devices(&self, _binary: &Path) -> Vec<Device> {
-    Vec::new()
+  fn probe_devices(&self, _binary: &Path) -> Option<Vec<Device>> {
+    Some(Vec::new())
+  }
+
+  /// What a server runs on when [`Self::probe_devices`] answered with no
+  /// devices. `None` (default) means the empty answer says nothing (the
+  /// backend has no device probe), and the server's label falls back to the
+  /// backend's `status` accelerators. A backend whose successful probe lists
+  /// every GPU it can use returns what a build with none runs on.
+  fn deviceless_accelerator(&self) -> Option<Accelerator> {
+    None
   }
 
   /// Probe one server binary for the **spellings it accepts**, for a flag whose
@@ -735,6 +746,13 @@ pub trait Backend {
       acc.insert(*a);
     }
     acc.labels().into_iter().map(str::to_string).collect()
+  }
+
+  /// `status` labels for servers this backend runs outside the launch server
+  /// catalog — engines that serve their own catalog row rather than a GGUF
+  /// found on disk. Appended after the catalog servers' labels. Default none.
+  fn status_server_labels(&self) -> Vec<String> {
+    Vec::new()
   }
 
   /// Extra `status` row fields beyond id / lifecycle / installed / enabled /
@@ -1242,8 +1260,12 @@ impl Backend for Backends {
     for_each_backend!(self, b => b.config_servers(config))
   }
 
-  fn probe_devices(&self, binary: &Path) -> Vec<Device> {
+  fn probe_devices(&self, binary: &Path) -> Option<Vec<Device>> {
     for_each_backend!(self, b => b.probe_devices(binary))
+  }
+
+  fn deviceless_accelerator(&self) -> Option<Accelerator> {
+    for_each_backend!(self, b => b.deviceless_accelerator())
   }
 
   fn probe_caps(&self, binary: &Path) -> std::collections::BTreeMap<String, String> {
@@ -1306,6 +1328,10 @@ impl Backend for Backends {
 
   async fn status_accelerators(&self, ctx: &MethodContext, device: &[Accelerator]) -> Vec<String> {
     for_each_backend!(self, b => b.status_accelerators(ctx, device).await)
+  }
+
+  fn status_server_labels(&self) -> Vec<String> {
+    for_each_backend!(self, b => b.status_server_labels())
   }
 
   async fn status_extra(&self, ctx: &MethodContext) -> Vec<(String, serde_json::Value)> {

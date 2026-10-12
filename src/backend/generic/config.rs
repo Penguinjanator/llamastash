@@ -267,7 +267,7 @@ fn name_is_wellformed(name: &str) -> bool {
   !name.is_empty()
     && !name
       .chars()
-      .any(|c| c == '@' || c == '/' || c.is_whitespace() || c.is_control())
+      .any(|c| c == '@' || c == '/' || c == '|' || c.is_whitespace() || c.is_control())
 }
 
 impl GenericConfig {
@@ -289,7 +289,7 @@ impl GenericConfig {
       let entry = |msg: String| format!("backend.generic entry `{}`: {msg}", s.name);
       if !name_is_wellformed(&s.name) {
         return Err(entry(
-          "`name` must be non-empty with no `@`, `/` or whitespace".into(),
+          "`name` must be non-empty with no `@`, `/`, `|` or whitespace".into(),
         ));
       }
       if !names.insert(s.name.to_ascii_lowercase()) {
@@ -568,6 +568,7 @@ servers:
       ("{name: e, binary: /b, ready: /h, memory_gib: 0}", "memory_gib"),
       ("{name: e, binary: /b, ready: /h, args: [\"{foo}\"]}", "unknown placeholder"),
       ("{name: e@x, binary: /b, ready: /h}", "`name`"),
+      ("{name: \"e|x\", binary: /b, ready: /h}", "`name`"),
       ("{name: e, binary: rel/b, ready: /h}", "absolute"),
       ("{name: e, binary: /b, ready: /h, knobs: [{flag: --x, id: port}]}", "reserved"),
       (

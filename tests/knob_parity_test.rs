@@ -220,6 +220,7 @@ fn two_device_server(backend_id: &str) -> Vec<llamastash::backend::Server> {
     name: format!("{backend_id}-test"),
     devices: vec![device("D0"), device("D1")],
     caps: Default::default(),
+    label: None,
   }]
 }
 

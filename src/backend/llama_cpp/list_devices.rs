@@ -150,8 +150,8 @@ fn is_selector(s: &str) -> bool {
 /// each parsed [`BinaryDevice`] to a [`crate::backend::Device`] (the selector's
 /// prefix becomes `gpu_backend`); the owning binary is carried by the
 /// [`crate::backend::Server`] this feeds, not the device.
-pub fn probe_devices(binary: &Path) -> Vec<crate::backend::Device> {
-  probe(binary)
+pub fn probe_devices(binary: &Path) -> Option<Vec<crate::backend::Device>> {
+  let devices = probe(binary)?
     .into_iter()
     .map(|d| crate::backend::Device {
       selector: d.selector,
@@ -160,30 +160,39 @@ pub fn probe_devices(binary: &Path) -> Vec<crate::backend::Device> {
       total_mib: d.total_mib,
       free_mib: d.free_mib,
     })
-    .collect()
+    .collect();
+  Some(devices)
 }
 
-/// Run `<binary> --list-devices` and parse the result. Returns an
-/// empty vec on any failure (missing binary, non-zero exit, timeout) —
-/// a binary that can't enumerate just contributes nothing to the
-/// catalog rather than failing the whole probe.
-pub fn probe(binary: &Path) -> Vec<BinaryDevice> {
+/// Run `<binary> --list-devices` and parse the result. `None` on any failure
+/// (missing binary, non-zero exit, timeout) — a binary that can't enumerate
+/// contributes no devices to the catalog rather than failing the whole probe,
+/// and its caller can tell that apart from a build that has no GPU.
+pub fn probe(binary: &Path) -> Option<Vec<BinaryDevice>> {
   let mut cmd = Command::new(binary);
   // The unified app takes server flags behind `serve`; `llama --list-devices`
   // is an unknown command.
   cmd.args(super::serve_prefix(binary));
   cmd.arg("--list-devices");
   match crate::util::process::run_with_drain_and_timeout(cmd, LIST_DEVICES_TIMEOUT) {
-    Ok(out) => {
+    Ok(out) if out.status.success() => {
       let stdout = String::from_utf8_lossy(&out.stdout);
-      parse_list_devices(&stdout)
+      Some(parse_list_devices(&stdout))
+    }
+    Ok(out) => {
+      log::warn!(
+        "`{} --list-devices` exited {}; contributing no devices",
+        binary.display(),
+        out.status
+      );
+      None
     }
     Err(e) => {
       log::warn!(
         "`{} --list-devices` failed: {e:?}; contributing no devices",
         binary.display()
       );
-      Vec::new()
+      None
     }
   }
 }
@@ -191,6 +200,60 @@ pub fn probe(binary: &Path) -> Vec<BinaryDevice> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A fake `llama-server` that prints one ROCm device and exits `code`.
+  #[cfg(unix)]
+  fn fake_binary(label: &str, code: i32) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = crate::test_support::unique_temp_dir("list-devices", label).join("build-hip/bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("llama-server");
+    std::fs::write(
+      &bin,
+      format!(
+        "#!/bin/sh\necho 'Available devices:'\necho '  ROCm0: AMD Radeon 8060S Graphics (126976 MiB, 120000 MiB free)'\nexit {code}\n"
+      ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+  }
+
+  /// A non-zero exit is a failed probe even when stdout listed devices, so a
+  /// broken build is never reported as one that answered.
+  #[cfg(unix)]
+  #[test]
+  fn a_non_zero_exit_is_a_failed_probe_even_with_devices_printed() {
+    let ok = probe_devices(&fake_binary("ok", 0)).expect("a clean exit answers");
+    assert_eq!(ok.len(), 1);
+    assert_eq!(ok[0].selector, "ROCm0");
+    assert!(probe_devices(&fake_binary("bad", 1)).is_none());
+    assert!(probe_devices(Path::new("/nonexistent/llama-server")).is_none());
+  }
+
+  /// The config-only (`doctor`) catalog labels servers the way the daemon's
+  /// does: probed arch, and the build folder for a probe that failed.
+  #[cfg(unix)]
+  #[test]
+  fn config_server_catalog_labels_like_the_daemon_catalog() {
+    let mut config = crate::config::Config::default();
+    config.backend.llamacpp.servers = vec![
+      crate::backend::ServerConfig {
+        binary: fake_binary("cfg-ok", 0),
+        name: None,
+      },
+      crate::backend::ServerConfig {
+        binary: fake_binary("cfg-bad", 1),
+        name: None,
+      },
+    ];
+    let labels: Vec<Option<String>> = crate::backend::config_server_catalog(&config)
+      .into_iter()
+      .filter(|s| s.backend_id == crate::backend::DEFAULT_BACKEND_ID)
+      .map(|s| s.label)
+      .collect();
+    assert_eq!(labels, [Some("rocm".into()), Some("build-hip".into())]);
+  }
 
   #[test]
   fn parses_vulkan_multi_device_block() {

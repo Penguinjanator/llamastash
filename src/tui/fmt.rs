@@ -160,39 +160,13 @@ pub(crate) fn truncate_end(s: &str, max: usize) -> String {
   out
 }
 
-/// Truncate `s` to fit `budget` terminal columns from the **left**,
-/// prepending `…/` so the trailing component (the binary name, the
-/// launch id) stays visible. Returns the original string unmodified
-/// when it already fits.
-///
-/// Measures in unicode display width (`UnicodeWidthStr`), not char
-/// count: a CJK character occupies two cells, so on a CJK install
-/// prefix like `/Users/张伟/.../llama-server` char-count truncation
-/// would overflow the reserved budget and push a trailing chunk
-/// off-screen.
-pub(crate) fn truncate_start(s: &str, budget: usize) -> String {
-  if budget == 0 {
-    return String::new();
-  }
-  if s.width() <= budget {
-    return s.to_string();
-  }
-  let prefix = format!("{}/", crate::tui::glyphs::active().ellipsis());
-  let prefix_w = prefix.width();
-  if budget <= prefix_w {
-    return take_tail_by_width(s, budget);
-  }
-  let keep_budget = budget - prefix_w;
-  let tail = take_tail_by_width(s, keep_budget);
-  format!("{prefix}{tail}")
-}
-
 /// Truncate `s` to `budget` terminal columns by eliding the
 /// **middle**, so both ends survive. Filenames carry their identity
 /// at both ends — `tinyllamas/split/…-00002-of-00003.gguf` says which
 /// directory and which shard, where dropping either end does not.
 ///
-/// Width-based like [`truncate_start`], not char-count.
+/// Measures in unicode display width, not char count: a CJK character
+/// occupies two cells.
 pub(crate) fn truncate_middle(s: &str, budget: usize) -> String {
   if s.width() <= budget {
     return s.to_string();
@@ -619,37 +593,5 @@ mod tests {
     assert_eq!(take_head_by_width("张伟x", 3), "张");
     assert_eq!(take_head_by_width("张伟x", 4), "张伟");
     assert_eq!(take_head_by_width("abc", 0), "");
-  }
-
-  #[test]
-  fn truncate_start_pads_short_strings_unchanged() {
-    assert_eq!(truncate_start("ok", 10), "ok");
-    assert_eq!(truncate_start("", 10), "");
-  }
-
-  #[test]
-  fn truncate_start_left_truncates_long_paths() {
-    let truncated = truncate_start("/usr/local/lib/llama-cpp-cuda/bin/llama-server", 20);
-    assert!(truncated.starts_with("…/"));
-    assert!(truncated.ends_with("llama-server"));
-    assert!(truncated.width() <= 20);
-  }
-
-  #[test]
-  fn truncate_start_measures_in_display_columns_not_char_count() {
-    // CJK characters occupy two terminal cells each. A char-count
-    // implementation would let `/张伟/llama-server` (15 chars, 17
-    // cells) "fit" inside a 16-column budget; ratatui would then
-    // clip the flavor chunk that the caller appends. Width-based
-    // measurement keeps the truncated string inside the requested
-    // budget so the trailing chunk renders intact.
-    let s = "/usr/local/张伟/bin/llama-server";
-    let out = truncate_start(s, 20);
-    assert!(
-      out.width() <= 20,
-      "expected width <= 20, got {} for {out:?}",
-      out.width()
-    );
-    assert!(out.ends_with("llama-server"));
   }
 }
