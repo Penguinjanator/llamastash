@@ -22,6 +22,11 @@
 //!   a working target and a refusing one.)
 //! - `--metrics-status <N>` (test-only — the status `GET /metrics` answers with,
 //!   standing in for an engine that answers success-but-not-`200`.)
+//! - `--metrics-vllm` (test-only — append a vLLM-shaped section to that body: a
+//!   counter declared under one name and sampled under `<name>_total`, and a
+//!   histogram sampled as `_bucket`/`_sum`/`_count`. llama.cpp prints sample
+//!   names that match its own `# TYPE` lines, so only a second shape catches a
+//!   merge that keys a metric on the sample line instead of the declared family.)
 //! - `--health-delay-ms <N>` (test-only — returns 503 until N ms
 //!   after process start, then 200; lets tests exercise the
 //!   Loading → Ready transition deterministically)
@@ -77,6 +82,9 @@ struct Args {
   /// `--metrics-status`: the status `GET /metrics` answers with, for an engine
   /// whose scrape succeeds with something other than `200`.
   metrics_status: Option<u16>,
+  /// `--metrics-vllm`: also answer `GET /metrics` with a vLLM-shaped section,
+  /// where the sample names are the declared family name plus a suffix.
+  metrics_vllm: bool,
   health_delay_ms: u64,
   trap_sigterm: bool,
   // Only read under cfg(unix): Windows has no SIGTERM to delay.
@@ -146,6 +154,7 @@ fn parse_args() -> Args {
   let mut metrics_delay_ms: u64 = 0;
   let mut metrics_pad: usize = 0;
   let mut metrics_status: Option<u16> = None;
+  let mut metrics_vllm = false;
   let mut health_delay_ms: u64 = 0;
   let mut trap_sigterm = false;
   let mut sigterm_exit_delay_ms = None;
@@ -170,6 +179,7 @@ fn parse_args() -> Args {
       "--metrics-status" => {
         metrics_status = args.next().and_then(|v| v.parse().ok());
       }
+      "--metrics-vllm" => metrics_vllm = true,
       "--spec-type" => spec_mtp = args.next().as_deref() == Some("draft-mtp"),
       "--health-delay-ms" => {
         health_delay_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -196,6 +206,7 @@ fn parse_args() -> Args {
     metrics_delay_ms,
     metrics_pad,
     metrics_status,
+    metrics_vllm,
     health_delay_ms,
     trap_sigterm,
     sigterm_exit_delay_ms,
@@ -411,6 +422,21 @@ llamacpp:predicted_tokens_total{model_name=\"fake\"} 7\n\
 # TYPE llamacpp:requests_processing gauge\n\
 llamacpp:requests_processing 0\n",
         );
+        if args.metrics_vllm {
+          // vLLM declares a family and prints its samples under derived names —
+          // the one shape llama.cpp does not, and the one a merge that keys on
+          // the sample line's name gets wrong.
+          body.push_str(
+            "# HELP vllm:prompt_tokens Number of prompt tokens processed.\n\
+# TYPE vllm:prompt_tokens counter\n\
+vllm:prompt_tokens_total{model_name=\"fake\"} 21\n\
+# HELP vllm:time_to_first_token_seconds Histogram of time to first token.\n\
+# TYPE vllm:time_to_first_token_seconds histogram\n\
+vllm:time_to_first_token_seconds_bucket{model_name=\"fake\",le=\"0.1\"} 1\n\
+vllm:time_to_first_token_seconds_sum{model_name=\"fake\"} 0.05\n\
+vllm:time_to_first_token_seconds_count{model_name=\"fake\"} 1\n",
+          );
+        }
         if args.metrics_pad > 0 {
           // Filler is a comment line: it parses as nothing and only shows up in
           // the size, which is what a scraper's cap is about.

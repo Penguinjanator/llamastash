@@ -25,7 +25,7 @@ use hyper::Request;
 use serde_json::{Map, Value};
 
 use super::metrics::{
-  self, escape, live_launches, now_ms, value_opt, Document, Format, LiveLaunch, Parsed,
+  self, escape_label, live_launches, now_ms, value_opt, Document, Format, LiveLaunch, Parsed,
 };
 use super::router::ProxyResponse;
 use super::state::ProxyState;
@@ -221,8 +221,8 @@ async fn read_body(
 fn merge(doc: &mut Document, scrape: &mut Scrape) {
   let ours = format!(
     "launch=\"{}\",model=\"{}\"",
-    escape(&scrape.launch),
-    escape(&scrape.model)
+    escape_label(&scrape.launch),
+    escape_label(&scrape.model)
   );
   for line in scrape.text.lines() {
     let line = line.trim();
@@ -447,6 +447,46 @@ mod tests {
         "llamacpp:x{launch=\"L1\",model=\"m1\"} 2\n"
       )
     );
+  }
+
+  /// vLLM and SGLang declare a family under one name and print every sample
+  /// under a derived one. Keying the block on the sample line's name instead
+  /// loses the declared type — a histogram and a counter both come out `untyped`
+  /// to anything that reads `# TYPE` — so the family has to survive while the
+  /// sample keeps the name the engine printed.
+  #[test]
+  fn backend_merge_keeps_a_declared_family_for_derived_sample_names() {
+    let engine = concat!(
+      "# HELP vllm:prompt_tokens prompt tokens\n",
+      "# TYPE vllm:prompt_tokens counter\n",
+      "vllm:prompt_tokens_total 21\n",
+      "# TYPE vllm:ttft histogram\n",
+      "vllm:ttft_bucket{le=\"0.1\"} 1\n",
+      "vllm:ttft_sum 0.05\n",
+      "vllm:ttft_count 1\n",
+      "# TYPE llamacpp:finished_total counter\n",
+      "llamacpp:finished_total 3\n",
+    );
+    let (text, series, skipped) = merged(engine, "L1", "m1");
+    assert_eq!((series, skipped), (5, 0));
+    assert_eq!(
+      text,
+      concat!(
+        "# HELP vllm:prompt_tokens prompt tokens\n",
+        "# TYPE vllm:prompt_tokens counter\n",
+        "vllm:prompt_tokens_total{launch=\"L1\",model=\"m1\"} 21\n",
+        "# TYPE vllm:ttft histogram\n",
+        "vllm:ttft_bucket{le=\"0.1\",launch=\"L1\",model=\"m1\"} 1\n",
+        "vllm:ttft_sum{launch=\"L1\",model=\"m1\"} 0.05\n",
+        "vllm:ttft_count{launch=\"L1\",model=\"m1\"} 1\n",
+        // A name the engine declared and sampled identically — every llama.cpp
+        // counter — stays under its own name, `untyped` only where nothing said
+        // otherwise.
+        "# TYPE llamacpp:finished_total counter\n",
+        "llamacpp:finished_total{launch=\"L1\",model=\"m1\"} 3\n",
+      )
+    );
+    assert!(!text.contains("untyped"), "{text}");
   }
 
   #[test]

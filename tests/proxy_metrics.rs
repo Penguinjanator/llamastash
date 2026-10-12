@@ -601,6 +601,94 @@ async fn metrics_backend_merges_targets_and_isolates_one_that_refuses() {
   std::fs::remove_dir_all(&dir).ok();
 }
 
+/// vLLM and SGLang declare a metric family under one name and print every
+/// sample under a derived one (`foo_total`, `foo_bucket`, `foo_sum`, `foo_count`).
+/// `# TYPE` belongs to the family, so a merge that keys a metric on the sample
+/// line's name prints each derived name as its own `untyped` block, and every
+/// consumer that reads types — Grafana's heatmap picker among them — loses them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_backend_keeps_the_metric_type_an_engine_declared() {
+  let dir = unique_temp("backend-shape");
+  let registry = SupervisorRegistry::new();
+  let model = spawn_fake_with(
+    "/fixture/shaped.gguf",
+    &dir,
+    &["--metrics", "--metrics-vllm"],
+  )
+  .await;
+  let id = registry.next_id();
+  registry.insert(id.clone(), model.clone()).await;
+  let state = build_state(
+    vec![discovered("/fixture/shaped.gguf", Some("shaped"))],
+    registry,
+  )
+  .await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+  let id = id.as_str();
+
+  let (status, _headers, body) = http_get(addr, "/metrics/backend", &[]).await;
+  assert_eq!(status, 200);
+  let out = text(body);
+  // llama.cpp declares and samples the same name, so those lines come out under
+  // the name it used, with the type it declared.
+  assert!(
+    out.contains("# TYPE llamacpp:prompt_tokens_total counter"),
+    "{out}"
+  );
+  // The vLLM family prints once, under the declared name, and keeps the type it
+  // declared; the samples keep the names the engine printed.
+  assert_eq!(
+    out.matches("# TYPE vllm:prompt_tokens counter").count(),
+    1,
+    "one block for the declared family:\n{out}"
+  );
+  assert!(
+    out.contains(&format!(
+      "vllm:prompt_tokens_total{{model_name=\"fake\",launch=\"{id}\",model=\"shaped\"}} 21"
+    )),
+    "{out}"
+  );
+  assert!(
+    out.contains("# TYPE vllm:time_to_first_token_seconds histogram"),
+    "a histogram family stays a histogram:\n{out}"
+  );
+  assert!(
+    out.contains(&format!(
+      "vllm:time_to_first_token_seconds_bucket{{model_name=\"fake\",le=\"0.1\",launch=\"{id}\",model=\"shaped\"}} 1"
+    )),
+    "{out}"
+  );
+  assert!(
+    out.contains(&format!(
+      "vllm:time_to_first_token_seconds_sum{{model_name=\"fake\",launch=\"{id}\",model=\"shaped\"}} 0.05"
+    )),
+    "{out}"
+  );
+  // No sample ended up in a block of its own with nothing to say about its type.
+  for derived in [
+    "vllm:prompt_tokens_total",
+    "vllm:time_to_first_token_seconds_bucket",
+    "vllm:time_to_first_token_seconds_sum",
+    "vllm:time_to_first_token_seconds_count",
+  ] {
+    assert!(
+      !out.contains(&format!("# TYPE {derived} ")),
+      "`{derived}` is a sample of a declared family, not a metric of its own:\n{out}"
+    );
+  }
+  assert!(!out.contains("untyped"), "every line kept a type:\n{out}");
+  assert!(
+    out.contains(&format!(
+      "llamastash:backend_metrics_series{{launch=\"{id}\",model=\"shaped\"}} 7"
+    )),
+    "the llama.cpp three plus the vLLM four all merged:\n{out}"
+  );
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metrics_backend_treats_a_success_that_is_not_200_as_unavailable() {
   let dir = unique_temp("backend-202");

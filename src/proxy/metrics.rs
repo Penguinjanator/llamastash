@@ -1017,10 +1017,43 @@ pub(crate) fn now_ms() -> u64 {
 
 /// One metric name's HELP/TYPE text and its samples, in print order.
 struct Block {
+  /// The `# HELP` text in wire form, escaped exactly once — by us for our own
+  /// strings, by the engine that printed it for a scraped one.
   help: String,
   ty: String,
-  samples: Vec<(String, f64)>,
+  samples: Vec<Sample>,
 }
+
+impl Block {
+  /// A block with no HELP yet and no declared type: `untyped` is what a scraper
+  /// reads when nothing said otherwise.
+  fn new() -> Self {
+    Block {
+      help: String::new(),
+      ty: "untyped".to_string(),
+      samples: Vec::new(),
+    }
+  }
+}
+
+/// One sample line of a block.
+struct Sample {
+  /// What this sample appends to the block's name when it prints, normally
+  /// nothing. An engine that declares one family and prints its samples under a
+  /// derived name — `# TYPE vllm:ttft histogram` with `vllm:ttft_bucket`,
+  /// `vllm:ttft_sum` and `vllm:ttft_count` — has to keep the sample's own name
+  /// while `# TYPE` prints the family's once, or the samples land in a block of
+  /// their own and every one of them reads as `untyped`.
+  suffix: &'static str,
+  /// The label text between the braces, in wire form; empty when there are none.
+  labels: String,
+  value: f64,
+}
+
+/// What an engine appends to a declared family name on a sample line: a counter
+/// prints `_total` (plus `_created` in OpenMetrics), a histogram `_bucket`,
+/// `_sum` and `_count`, a summary `_sum` and `_count`.
+const FAMILY_SUFFIXES: [&str; 5] = ["_total", "_created", "_bucket", "_sum", "_count"];
 
 /// A Prometheus text document under construction.
 ///
@@ -1044,40 +1077,64 @@ impl Document {
     }
   }
 
-  fn block(&mut self, name: &str) -> &mut (String, Block) {
+  /// The block kept under exactly `name`, created when nothing is there yet.
+  fn entry(&mut self, name: &str) -> usize {
     if let Some(i) = self.index.get(name) {
-      return &mut self.blocks[*i];
+      return *i;
     }
     self.index.insert(name.to_string(), self.blocks.len());
-    self.blocks.push((
-      name.to_string(),
-      Block {
-        help: String::new(),
-        ty: "untyped".to_string(),
-        samples: Vec::new(),
-      },
-    ));
-    self.blocks.last_mut().expect("just pushed")
+    self.blocks.push((name.to_string(), Block::new()));
+    self.blocks.len() - 1
+  }
+
+  fn block(&mut self, name: &str) -> &mut Block {
+    let at = self.entry(name);
+    &mut self.blocks[at].1
+  }
+
+  /// The block one scraped sample belongs to, and what that sample appends to
+  /// the block's name when it prints. The sample's own name wins when that is
+  /// what was declared — llama.cpp prints names that match its `# TYPE` lines,
+  /// including `foo_total` counters, and those stay byte-identical. Otherwise a
+  /// declared family one Prometheus suffix short of the sample's name does,
+  /// which is how vLLM and SGLang declare `vllm:prompt_tokens` and print
+  /// `vllm:prompt_tokens_total`. Anything else gets a block of its own, keyed
+  /// and printed under the name the engine used.
+  fn scrape_block(&mut self, name: &str) -> (usize, &'static str) {
+    if let Some(at) = self.index.get(name) {
+      return (*at, "");
+    }
+    for suffix in FAMILY_SUFFIXES {
+      if let Some(stem) = name.strip_suffix(suffix) {
+        if let Some(at) = self.index.get(stem) {
+          return (*at, suffix);
+        }
+      }
+    }
+    (self.entry(name), "")
   }
 
   /// Record a `# HELP` / `# TYPE` line read from a scraped engine. The first
-  /// one for a name wins, so merging N targets prints one block per name.
+  /// one for a name wins, so merging N targets prints one block per name. The
+  /// HELP text is stored exactly as it arrived: it is already in wire form, and
+  /// escaping it again would double every escape the engine wrote.
   pub(crate) fn declare(&mut self, name: &str, help: Option<&str>, ty: Option<&str>) {
     let block = self.block(name);
-    if block.1.help.is_empty() {
+    if block.help.is_empty() {
       if let Some(help) = help {
-        block.1.help = help.to_string();
+        block.help = help.to_string();
       }
     }
-    if block.1.ty == "untyped" {
+    if block.ty == "untyped" {
       if let Some(ty) = ty {
-        block.1.ty = ty.to_string();
+        block.ty = ty.to_string();
       }
     }
   }
 
   /// One sample of a `llamastash:*` metric. `labels` print as `key="value"`
-  /// pairs in the order given.
+  /// pairs in the order given. `help` is Rust text with real characters, so it
+  /// is escaped here and printed as stored.
   pub(crate) fn sample(
     &mut self,
     name: &str,
@@ -1091,17 +1148,21 @@ impl Document {
     }
     let rendered = labels
       .iter()
-      .map(|(k, v)| format!("{k}=\"{}\"", escape(v)))
+      .map(|(k, v)| format!("{k}=\"{}\"", escape_label(v)))
       .collect::<Vec<_>>()
       .join(",");
     let block = self.block(name);
-    if block.1.help.is_empty() {
-      block.1.help = help.to_string();
+    if block.help.is_empty() {
+      block.help = escape_help(help);
     }
-    if block.1.ty == "untyped" {
-      block.1.ty = ty.to_string();
+    if block.ty == "untyped" {
+      block.ty = ty.to_string();
     }
-    block.1.samples.push((rendered, value));
+    block.samples.push(Sample {
+      suffix: "",
+      labels: rendered,
+      value,
+    });
   }
 
   /// One sample taken verbatim from a scraped engine: `labels` is the text
@@ -1111,7 +1172,12 @@ impl Document {
     if !value.is_finite() {
       return false;
     }
-    self.block(name).1.samples.push((labels, value));
+    let (at, suffix) = self.scrape_block(name);
+    self.blocks[at].1.samples.push(Sample {
+      suffix,
+      labels,
+      value,
+    });
     true
   }
 
@@ -1131,19 +1197,24 @@ impl Document {
       if block.samples.is_empty() {
         continue;
       }
-      let mut samples: Vec<&(String, f64)> = block.samples.iter().collect();
+      let mut samples: Vec<&Sample> = block.samples.iter().collect();
       if self.sorted {
-        samples.sort_by(|a, b| a.0.cmp(&b.0));
+        samples.sort_by_key(|s| (s.suffix, s.labels.as_str()));
       }
       if !block.help.is_empty() {
-        out.push_str(&format!("# HELP {name} {}\n", escape(&block.help)));
+        out.push_str(&format!("# HELP {name} {}\n", block.help));
       }
       out.push_str(&format!("# TYPE {name} {}\n", block.ty));
-      for (labels, value) in samples {
-        if labels.is_empty() {
-          out.push_str(&format!("{name} {}\n", fmt_value(*value)));
+      for sample in samples {
+        let printed = format!("{name}{}", sample.suffix);
+        if sample.labels.is_empty() {
+          out.push_str(&format!("{printed} {}\n", fmt_value(sample.value)));
         } else {
-          out.push_str(&format!("{name}{{{labels}}} {}\n", fmt_value(*value)));
+          out.push_str(&format!(
+            "{printed}{{{}}} {}\n",
+            sample.labels,
+            fmt_value(sample.value)
+          ));
         }
       }
     }
@@ -1151,17 +1222,30 @@ impl Document {
   }
 }
 
-/// A Prometheus label value: `\`, `"`, and the control characters that have an
-/// escape are replaced.
-pub(crate) fn escape(value: &str) -> String {
+/// A label value in wire form. A quoted label value may only use `\\`, `\"` and
+/// `\n`: a strict parser reads `\t` as an illegal escape, so a tab or a carriage
+/// return goes out as itself and nothing else is touched.
+pub(crate) fn escape_label(value: &str) -> String {
   let mut out = String::with_capacity(value.len());
   for c in value.chars() {
     match c {
       '\\' => out.push_str(r"\\"),
       '"' => out.push_str(r#"\""#),
       '\n' => out.push_str(r"\n"),
-      '\r' => out.push_str(r"\r"),
-      '\t' => out.push_str(r"\t"),
+      _ => out.push(c),
+    }
+  }
+  out
+}
+
+/// HELP text in wire form. Unlike a label value it has no escape for a quote,
+/// so `"` stays a plain quote and only `\` and the newline are escaped.
+fn escape_help(value: &str) -> String {
+  let mut out = String::with_capacity(value.len());
+  for c in value.chars() {
+    match c {
+      '\\' => out.push_str(r"\\"),
+      '\n' => out.push_str(r"\n"),
       _ => out.push(c),
     }
   }
@@ -1845,9 +1929,49 @@ mod tests {
   }
 
   #[test]
-  fn metrics_label_values_are_escaped() {
-    assert_eq!(escape("a\"b\\c\nd"), r#"a\"b\\c\nd"#);
+  fn metrics_escapes_only_the_escapes_prometheus_allows() {
+    // A quoted label value accepts `\\`, `\"` and `\n` and nothing else, so a
+    // tab and a carriage return go out as themselves: `\t` is the illegal form.
+    assert_eq!(escape_label("a\"b\\c\nd\te\rf"), "a\\\"b\\\\c\\nd\te\rf");
+    // HELP text has no `\"`, so a quote in one is a plain quote and a strict
+    // parser still reads the line.
+    assert_eq!(escape_help("say \"hi\"\\y\nz\tw"), "say \"hi\"\\\\y\\nz\tw");
     assert_eq!(fmt_value(2.0), "2");
     assert_eq!(fmt_value(0.25), "0.25");
+  }
+
+  #[test]
+  fn metrics_escapes_our_own_text_once_and_an_engines_not_at_all() {
+    let mut doc = Document::new(true);
+    // Our strings are Rust text with real characters, so escaping them once, in
+    // the type that reads them, is what makes the line legal: a backslash grows,
+    // a tab and a carriage return go out as themselves (`\t` is the illegal
+    // form), and a HELP line has no escape for a quote, so a quote stays one.
+    doc.sample(
+      "a:name",
+      "quote \" and a \\ backslash",
+      "gauge",
+      &[("k", "v\"x\t\r")],
+      1.0,
+    );
+    // An engine's HELP arrived in wire form: the `\n` in it is two bytes
+    // already, so printing it verbatim is the whole round trip. Escaping it a
+    // second time is what a parser then reads as a literal backslash-n.
+    doc.declare(
+      "b:name",
+      Some(r#"time to first \n second"#),
+      Some("counter"),
+    );
+    doc.sample_raw("b:name", String::new(), 2.0);
+    let text = doc.render();
+    assert!(
+      text.contains(r#"# HELP a:name quote " and a \\ backslash"#),
+      "{text}"
+    );
+    assert!(text.contains("a:name{k=\"v\\\"x\t\r\"} 1\n"), "{text}");
+    assert!(
+      text.contains(r#"# HELP b:name time to first \n second"#),
+      "an engine HELP survives one round trip unchanged:\n{text}"
+    );
   }
 }
