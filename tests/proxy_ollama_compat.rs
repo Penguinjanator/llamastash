@@ -321,6 +321,36 @@ async fn api_tags_lists_an_alias_with_the_row_it_names() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_tags_does_not_publish_a_name_a_model_owns() {
+  // The same rule as `/v1/models`: the alias name `qwen3` is the `Qwen3` model's
+  // own id apart from case, and a request under it reaches that model, so a row
+  // for it would be a second name that cannot route.
+  let models = vec![
+    make_model("/m/Qwen3.gguf", None, "qwen3", ModeHint::Chat),
+    make_model("/m/llama.gguf", None, "llama", ModeHint::Chat),
+  ];
+  let state = proxy_state_with_aliases(models, vec![("qwen3", "llama")]).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+
+  let (status, body) = http_get(addr, "/api/tags").await;
+  assert_eq!(status, 200);
+  let v: Value = serde_json::from_slice(&body).expect("json body");
+  let names: Vec<&str> = v["models"]
+    .as_array()
+    .expect("models array")
+    .iter()
+    .map(|r| r["name"].as_str().unwrap())
+    .collect();
+  assert_eq!(
+    names,
+    ["Qwen3", "llama"],
+    "a model's own name is never published twice: {v}"
+  );
+
+  shutdown_listener(shutdown, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_tags_empty_catalog_returns_empty_models_list() {
   let state = proxy_state_with_models(Vec::new()).await;
   let (addr, shutdown, handle) = spawn_listener(state).await;

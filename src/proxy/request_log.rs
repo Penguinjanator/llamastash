@@ -1078,26 +1078,36 @@ impl Drop for RequestRecord {
 /// invisible format character turned into a space. The model name is
 /// whatever a client sent and a cause can quote a child's output, and both
 /// are later printed to a terminal, where a newline breaks a table row and
-/// an escape sequence could do worse. `is_control()` is the Cc category
-/// only; the Cf set (soft hyphen, zero-width and bidi controls, BOM)
-/// reorders or hides what a row shows and shifts every later column by
-/// the cells it claims for nothing, so it goes too.
+/// an escape sequence could do worse.
 fn clean(s: &str, max_chars: usize) -> String {
   s.chars()
     .take(max_chars)
-    .map(|c| {
-      if c.is_control()
-        || matches!(
-          c as u32,
-          0x00ad | 0x200b..=0x200f | 0x202a..=0x202e | 0x2060 | 0x2066..=0x2069 | 0xfeff
-        )
-      {
-        ' '
-      } else {
-        c
-      }
-    })
+    .map(|c| if is_invisible(c) { ' ' } else { c })
     .collect()
+}
+
+/// What a terminal hides or reorders rather than prints. `is_control()` is
+/// the Cc category only; the rest is the Cf set — soft hyphen, zero-width and
+/// bidi controls, word joiners and invisible operators, BOM, interlinear
+/// annotations and tag characters — which hides or reorders what a row shows
+/// and shifts every later column by the cells it claims for nothing.
+fn is_invisible(c: char) -> bool {
+  c.is_control()
+    || matches!(
+      c as u32,
+      0x00ad
+        | 0x061c
+        | 0x180e
+        | 0x200b..=0x200f
+        | 0x202a..=0x202e
+        | 0x2060..=0x2064
+        | 0x2066..=0x2069
+        | 0x206a..=0x206f
+        | 0xfeff
+        | 0xfff9..=0xfffb
+        | 0xe0001
+        | 0xe0020..=0xe007f
+    )
 }
 
 #[cfg(test)]
@@ -1470,13 +1480,13 @@ mod tests {
 
     let mut hostile = log.begin(ROUTE, None);
     hostile.set_requested_model(Some(
-      "evil\x1b[2Jmodel\nname\ttab\u{202e}rlo\u{200b}zwsp\u{ad}shy\u{feff}end",
+      "evil\x1b[2Jmodel\nname\ttab\u{202e}rlo\u{200b}zwsp\u{ad}shy\u{feff}end\u{2061}func\u{fffb}annot\u{61c}ar",
     ));
     hostile.respond(503, Some("launch_failed"), Some("line one\nline two"));
     let cleaned = log.tail(LogScope::All, 1).rows.remove(0);
     assert_eq!(
       cleaned.requested_model.as_deref(),
-      Some("evil [2Jmodel name tab rlo zwsp shy end")
+      Some("evil [2Jmodel name tab rlo zwsp shy end func annot ar")
     );
     assert_eq!(cleaned.cause.as_deref(), Some("line one line two"));
   }

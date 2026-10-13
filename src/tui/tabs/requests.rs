@@ -49,9 +49,9 @@ enum ColumnId {
 
 /// Table columns in display order. Keeping them is by `rank`, not by
 /// position (see [`columns::fit`]): the figures that answer "what did this
-/// request cost" stay longest, `Client` is loopback for most setups and
-/// goes first, and `Route` follows it because the tab already implies one
-/// engine's routes.
+/// request cost" stay longest, and what is left drops from the right —
+/// `Route` first because the tab already implies one engine's routes, then
+/// loopback-only `Client`, then `Request for`.
 const COLUMNS: &[Column<ColumnId>] = &[
   Column {
     id: ColumnId::Time,
@@ -199,7 +199,11 @@ impl RequestsTabState {
 
   /// Toward the newest request.
   pub fn scroll_up(&mut self) {
-    self.scroll_offset = self.scroll_offset.saturating_sub(1);
+    // A page that grew since — a taller pane, a summary strip that wrapped into
+    // fewer lines — can leave the offset past the last page the render
+    // honours, where a press would be clamped back and read as a dead key.
+    let parked = self.scroll_offset.min(self.last_page_start());
+    self.scroll_offset = parked.saturating_sub(1);
   }
 
   /// Toward older requests.
@@ -782,6 +786,28 @@ mod tests {
     state.scroll_up();
     let after = rendered(&state, 200, 6);
     assert_ne!(before, after[3], "{after:?}");
+  }
+
+  #[test]
+  fn a_page_that_grew_does_not_park_the_scroll_past_itself() {
+    let scope = || RequestsScope::Model("/m/a.gguf".to_string());
+    let mut state = RequestsTabState::default();
+    state.set(
+      scope(),
+      RequestSummary::default(),
+      (1..=200).rev().map(row).collect(),
+    );
+    // A short pane fits three rows, and scrolling stops on the last of them.
+    rendered(&state, 200, 6);
+    for _ in 0..50 {
+      state.scroll_down();
+    }
+    // The pane grows, so the page the render honours starts higher up than the
+    // parked offset. The next Up has to move the table, not be clamped back.
+    let before = rendered(&state, 200, 26);
+    state.scroll_up();
+    let after = rendered(&state, 200, 26);
+    assert_ne!(before[3], after[3], "{after:?}");
   }
 
   #[test]

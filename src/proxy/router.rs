@@ -498,7 +498,10 @@ fn model_object(id: String, m: &DiscoveredModel) -> ModelObject {
 /// [`crate::launch::resolve::resolve_exact_reference`] refuses — a target that
 /// names no model, one two models answer to, or another alias name — so nothing
 /// here repeats resolution, and nothing here spends the once-per-name warnings
-/// [`super::alias::AliasTable`] keeps for real requests.
+/// [`super::alias::AliasTable`] keeps for real requests. The same call on the
+/// *name* drops an alias a real model owns: model references fold case, so a
+/// `qwen3` alias beside a `Qwen3` model would otherwise publish a row that
+/// dresses one model and answers another.
 fn alias_rows<'a>(
   state: &ProxyState,
   cat: &[CatalogRow],
@@ -506,6 +509,9 @@ fn alias_rows<'a>(
 ) -> Vec<(String, &'a DiscoveredModel)> {
   let mut out: Vec<(String, &DiscoveredModel)> = Vec::new();
   for (name, target) in state.aliases.pairs() {
+    if crate::launch::resolve::resolve_exact_reference(cat, name).is_ok() {
+      continue;
+    }
     let Ok(row) = crate::launch::resolve::resolve_exact_reference(cat, target) else {
       continue;
     };

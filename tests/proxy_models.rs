@@ -153,6 +153,37 @@ async fn aliases_are_listed_beside_the_models_they_name() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_a_real_model_owns_is_not_published_as_an_alias() {
+  // Alias names are stored folded down while a model id keeps its case, so the
+  // listing has to ask the resolver a request asks. `qwen3` here is the `Qwen3`
+  // model's own name: a request under it gets that model, never the alias
+  // target, so a row for it would publish a name that cannot act as an alias.
+  let models = vec![
+    make_model("/m/Qwen3.gguf", None),
+    make_model("/m/llama.gguf", None),
+  ];
+  let state = proxy_state_with_aliases(models, &[("qwen3", "llama")]).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
+
+  let (status, body) = http_get(addr, "/v1/models").await;
+  assert_eq!(status, 200);
+  let v: Value = serde_json::from_slice(&body).expect("json body");
+  let ids: Vec<&str> = v["data"]
+    .as_array()
+    .expect("data array")
+    .iter()
+    .map(|r| r["id"].as_str().unwrap())
+    .collect();
+  assert_eq!(
+    ids,
+    ["Qwen3", "llama"],
+    "a model's own name is never published twice: {v}"
+  );
+
+  shutdown_listener(shutdown, listener_handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn three_models_return_in_alphabetical_order() {
   // Seed three rows with intentionally-shuffled display labels so the
   // sort is observably non-trivial. `gemma:2b` (via display_label),

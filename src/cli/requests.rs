@@ -105,19 +105,28 @@ const NOTE_MAX_W: usize = 60;
 /// string, so it gets its own cap.
 const REQUEST_FOR_MAX_W: usize = 24;
 
+/// What marks a `cap_cells` cut, and what it costs. Three plain cells, so a
+/// wide glyph cannot push the column past its cap.
+const CAP_MARK: &str = "...";
+
 /// `s` cut to `w` display cells, with `...` marking a cut.
 fn cap_cells(s: &str, w: usize) -> String {
   if console::measure_text_width(s) <= w {
     return s.to_string();
   }
+  use unicode_width::UnicodeWidthChar as _;
+  let budget = w.saturating_sub(CAP_MARK.chars().count());
   let mut out = String::new();
+  let mut used = 0usize;
   for ch in s.chars() {
-    if console::measure_text_width(&out) + console::measure_text_width(&ch.to_string()) > w - 3 {
+    let cells = ch.width().unwrap_or(0);
+    if used + cells > budget {
       break;
     }
     out.push(ch);
+    used += cells;
   }
-  out.push_str("...");
+  out.push_str(CAP_MARK);
   out
 }
 
