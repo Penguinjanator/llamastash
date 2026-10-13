@@ -1074,14 +1074,29 @@ impl Drop for RequestRecord {
   }
 }
 
-/// `s` cut to `max_chars`, with every control character turned into a
-/// space. The model name is whatever a client sent and a cause can quote a
-/// child's output, and both are later printed to a terminal, where a
-/// newline breaks a table row and an escape sequence could do worse.
+/// `s` cut to `max_chars`, with every control character and every
+/// invisible format character turned into a space. The model name is
+/// whatever a client sent and a cause can quote a child's output, and both
+/// are later printed to a terminal, where a newline breaks a table row and
+/// an escape sequence could do worse. `is_control()` is the Cc category
+/// only; the Cf set (soft hyphen, zero-width and bidi controls, BOM)
+/// reorders or hides what a row shows and shifts every later column by
+/// the cells it claims for nothing, so it goes too.
 fn clean(s: &str, max_chars: usize) -> String {
   s.chars()
     .take(max_chars)
-    .map(|c| if c.is_control() { ' ' } else { c })
+    .map(|c| {
+      if c.is_control()
+        || matches!(
+          c as u32,
+          0x00ad | 0x200b..=0x200f | 0x202a..=0x202e | 0x2060 | 0x2066..=0x2069 | 0xfeff
+        )
+      {
+        ' '
+      } else {
+        c
+      }
+    })
     .collect()
 }
 
@@ -1454,12 +1469,14 @@ mod tests {
     assert_eq!(row.cause.unwrap().len(), MAX_CAUSE_CHARS);
 
     let mut hostile = log.begin(ROUTE, None);
-    hostile.set_requested_model(Some("evil\x1b[2Jmodel\nname\ttab"));
+    hostile.set_requested_model(Some(
+      "evil\x1b[2Jmodel\nname\ttab\u{202e}rlo\u{200b}zwsp\u{ad}shy\u{feff}end",
+    ));
     hostile.respond(503, Some("launch_failed"), Some("line one\nline two"));
     let cleaned = log.tail(LogScope::All, 1).rows.remove(0);
     assert_eq!(
       cleaned.requested_model.as_deref(),
-      Some("evil [2Jmodel name tab")
+      Some("evil [2Jmodel name tab rlo zwsp shy end")
     );
     assert_eq!(cleaned.cause.as_deref(), Some("line one line two"));
   }

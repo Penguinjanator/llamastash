@@ -3,10 +3,10 @@
 //! A summary strip on top (totals and averages the daemon computed) and
 //! below it a table of requests, newest first, one row per line. Table
 //! columns have a width and a rank; as the pane narrows the higher-rank
-//! ones drop out. The two free-text columns are the exception: `Note`
-//! grows into the spare width and cuts to its first words with an
-//! ellipsis when the text is longer, and `Route`, which is last, keeps its
-//! own width.
+//! ones drop out, `Route` first and `Time` last. The two free-text columns
+//! are the exception: `Note` grows into the spare width and cuts to its
+//! first words with an ellipsis when the text is longer, while `Route`
+//! keeps its own width.
 
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -27,7 +27,7 @@ const NONE: &str = "—";
 const COL_SEP_W: usize = 1;
 /// The least `Note` is worth showing at.
 const MIN_NOTE_W: usize = 12;
-/// `Route`'s own width. It is the last column, and `Note` takes the spare.
+/// `Route`'s own width. It is the last column shown and the first dropped.
 const ROUTE_W: usize = 16;
 /// Gap between two figures on the summary strip.
 const SUMMARY_GAP: usize = 3;
@@ -41,9 +41,9 @@ enum ColumnId {
   Ttfb,
   In,
   Out,
-  Client,
-  RequestFor,
   Note,
+  RequestFor,
+  Client,
   Route,
 }
 
@@ -96,32 +96,33 @@ const COLUMNS: &[Column<ColumnId>] = &[
     rank: 60,
   },
   Column {
-    id: ColumnId::Client,
-    label: "Client",
-    width: 21,
-    rank: 100,
-  },
-  Column {
-    id: ColumnId::RequestFor,
-    label: "Request for",
-    // Fits a model name; a longer one cuts with an ellipsis. This is what
-    // an alias or a fallback answered for, so it reads differently from the
-    // model the row belongs to.
-    width: 14,
-    rank: 90,
-  },
-  Column {
     id: ColumnId::Note,
     label: "Note",
     width: MIN_NOTE_W,
     rank: 70,
   },
   Column {
+    id: ColumnId::RequestFor,
+    label: "Request for",
+    // Fits a model name; a longer one cuts with an ellipsis. It outranks
+    // `Client` and `Route` because it is the reason a row reads apart from
+    // its neighbours: the model an alias or a fallback answered for.
+    width: 14,
+    rank: 80,
+  },
+  Column {
+    id: ColumnId::Client,
+    label: "Client",
+    width: 21,
+    rank: 90,
+  },
+  Column {
     id: ColumnId::Route,
     label: "Route",
-    // Fits `chat/completions`, the longest of the common routes.
+    // Fits `chat/completions`, the longest of the common routes. The tab
+    // already implies one engine's routes, so it goes first.
     width: ROUTE_W,
-    rank: 80,
+    rank: 100,
   },
 ];
 
@@ -135,6 +136,9 @@ pub struct RequestsTabState {
   pub rows: Vec<RequestRow>,
   /// Rows scrolled down from the newest. `0` keeps the newest on top.
   pub scroll_offset: usize,
+  /// Rows the last render fit on the page, so a scroll never parks where
+  /// the render would clamp it back and swallow the keypress.
+  page_rows: std::cell::Cell<usize>,
 }
 
 /// What the tab asks the daemon for. Normally one launch, because a running
@@ -176,9 +180,15 @@ impl RequestsTabState {
         .rows
         .iter()
         .position(|row| row.seq == seq)
-        .unwrap_or_else(|| self.rows.len().saturating_sub(1)),
+        .unwrap_or_else(|| self.last_page_start()),
       None => 0,
     };
+  }
+
+  /// The largest `scroll_offset` the render honours: past it the page
+  /// starts here instead, so a scroll parked there reads as a dead key.
+  fn last_page_start(&self) -> usize {
+    self.rows.len().saturating_sub(self.page_rows.get().max(1))
   }
 
   /// Drop what is shown, scroll included, when focus moves to a row the
@@ -197,7 +207,7 @@ impl RequestsTabState {
     self.scroll_offset = self
       .scroll_offset
       .saturating_add(1)
-      .min(self.rows.len().saturating_sub(1));
+      .min(self.last_page_start());
   }
 }
 
@@ -224,6 +234,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &RequestsTabState, palet
     let layout = layout_columns(width);
     lines.push(header_line(&layout, palette));
     let room = (area.height as usize).saturating_sub(lines.len());
+    state.page_rows.set(room.max(1));
     // Keep a full page on screen when the offset runs past the end.
     let offset = state
       .scroll_offset
@@ -413,7 +424,7 @@ mod tests {
   fn columns_drop_by_rank_as_the_pane_narrows() {
     // Each column costs its width plus one separator. Running totals in
     // rank order: Time 9, Code 14, Tok/s 21, Total 29, TTFB 37, In 44,
-    // Out 51, Note 64, Route 81, Request for 96, Client 118.
+    // Out 51, Note 64, Request for 79, Client 101, Route 118.
     let full = [
       "Time",
       "Code",
@@ -422,14 +433,14 @@ mod tests {
       "TTFB",
       "In",
       "Out",
-      "Client",
-      "Request for",
       "Note",
+      "Request for",
+      "Client",
       "Route",
     ];
     assert_eq!(labels(118), full);
-    // Client ranks lowest of all, so it is the first to go.
-    let no_client = [
+    // Route ranks highest of all, so it is the first to go.
+    let no_route = [
       "Time",
       "Code",
       "Tok/s",
@@ -437,22 +448,42 @@ mod tests {
       "TTFB",
       "In",
       "Out",
-      "Request for",
       "Note",
-      "Route",
+      "Request for",
+      "Client",
     ];
-    assert_eq!(labels(117), no_client);
-    assert_eq!(labels(96), no_client);
+    assert_eq!(labels(117), no_route);
+    assert_eq!(labels(101), no_route);
     assert_eq!(
-      labels(95),
-      vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Note", "Route"]
+      labels(100),
+      vec![
+        "Time",
+        "Code",
+        "Tok/s",
+        "Total",
+        "TTFB",
+        "In",
+        "Out",
+        "Note",
+        "Request for"
+      ]
     );
     assert_eq!(
-      labels(81),
-      vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Note", "Route"]
+      labels(79),
+      vec![
+        "Time",
+        "Code",
+        "Tok/s",
+        "Total",
+        "TTFB",
+        "In",
+        "Out",
+        "Note",
+        "Request for"
+      ]
     );
     assert_eq!(
-      labels(80),
+      labels(78),
       vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Note"]
     );
     assert_eq!(
@@ -504,9 +535,9 @@ mod tests {
       .find(|c| c.id == ColumnId::Route)
       .expect("route column");
     assert_eq!(wide.width_of(route), ROUTE_W);
-    // At the width `Route` just fits the only spare cell is the separator
-    // after the last column, and `Note` grows first.
-    assert_eq!(layout_columns(81).note_w, MIN_NOTE_W + 1);
+    // At the width `Request for` just fits, the only spare cell is the
+    // separator after the last column, and `Note` grows first.
+    assert_eq!(layout_columns(79).note_w, MIN_NOTE_W + 1);
     // Too narrow for `Note`: it gets nothing and the row ends earlier.
     assert_eq!(layout_columns(63).note_w, 0);
   }
@@ -722,6 +753,35 @@ mod tests {
     state.clear();
     assert_eq!(state.scroll_offset, 0);
     assert_eq!(state.scope, None);
+  }
+
+  #[test]
+  fn an_evicted_anchor_parks_on_the_last_page_not_past_it() {
+    let scope = || RequestsScope::Model("/m/a.gguf".to_string());
+    let mut state = RequestsTabState::default();
+    state.set(
+      scope(),
+      RequestSummary::default(),
+      (1..=200).rev().map(row).collect(),
+    );
+    // The render fits three rows here, and that is what a scroll stops at.
+    rendered(&state, 200, 6);
+    for _ in 0..500 {
+      state.scroll_down();
+    }
+    assert_eq!(state.scroll_offset, 197);
+    // A window that no longer holds the row on top parks on the last page,
+    // and the next Up moves it.
+    state.set(
+      scope(),
+      RequestSummary::default(),
+      (1..=200).rev().map(|seq| row(seq + 1000)).collect(),
+    );
+    assert_eq!(state.scroll_offset, 197);
+    let before = rendered(&state, 200, 6)[3].clone();
+    state.scroll_up();
+    let after = rendered(&state, 200, 6);
+    assert_ne!(before, after[3], "{after:?}");
   }
 
   #[test]

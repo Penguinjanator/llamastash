@@ -90,7 +90,7 @@ fn requests_human(body: &Value, one_model: bool) -> String {
   }
   header.extend(["LAUNCH", "CLIENT", "REQUEST FOR", "NOTE", "ROUTE"]);
   let table: Vec<Vec<String>> = rows.iter().map(|r| cells_for(r, one_model)).collect();
-  let table = wrap_notes(&header, table);
+  let table = fit_padded_table(&header, table);
   out.push_str(&format::table(&header, &table));
   out
 }
@@ -100,12 +100,43 @@ fn requests_human(body: &Value, one_model: bool) -> String {
 /// buries the figures of every row under it.
 const NOTE_MAX_W: usize = 60;
 
-/// Split long notes over continuation lines under the NOTE column, on a
-/// terminal only. Piped output keeps one line per request with the whole
-/// note in its field, so `awk -F\t` pipelines are untouched.
-fn wrap_notes(header: &[&str], rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
+/// The widest `REQUEST FOR` gets on a terminal. `format::table` sizes a
+/// column to its widest cell with no bound, and the value is a client
+/// string, so it gets its own cap.
+const REQUEST_FOR_MAX_W: usize = 24;
+
+/// `s` cut to `w` display cells, with `...` marking a cut.
+fn cap_cells(s: &str, w: usize) -> String {
+  if console::measure_text_width(s) <= w {
+    return s.to_string();
+  }
+  let mut out = String::new();
+  for ch in s.chars() {
+    if console::measure_text_width(&out) + console::measure_text_width(&ch.to_string()) > w - 3 {
+      break;
+    }
+    out.push(ch);
+  }
+  out.push_str("...");
+  out
+}
+
+/// The padded table only: split long notes over continuation lines under
+/// the NOTE column, and cap `REQUEST FOR`, which repeats the model name on
+/// most rows and would otherwise widen the table to its longest cell.
+/// Piped output keeps one line per request with the whole values in their
+/// fields, so `awk -F\t` pipelines are untouched.
+fn fit_padded_table(header: &[&str], rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
   if !console::colors_enabled() {
     return rows;
+  }
+  let mut rows = rows;
+  if let Some(asked) = header.iter().position(|h| *h == "REQUEST FOR") {
+    for row in rows.iter_mut() {
+      if let Some(cell) = row.get_mut(asked) {
+        *cell = cap_cells(cell, REQUEST_FOR_MAX_W);
+      }
+    }
   }
   let Some(note) = header.iter().position(|h| *h == "NOTE") else {
     return rows;
@@ -322,6 +353,30 @@ mod tests {
       ),
       ..row()
     }
+  }
+
+  #[test]
+  fn a_padded_table_places_and_caps_the_asked_model() {
+    let asked = "q".repeat(REQUEST_FOR_MAX_W + 20);
+    let mut wide = row();
+    wide.requested_model = Some(asked.clone());
+    let lines: Vec<String> = on_terminal(&[wide], false)
+      .lines()
+      .map(|l| console::strip_ansi_codes(l).to_string())
+      .skip_while(|l| !l.starts_with("TIME"))
+      .collect();
+    let header = lines.first().expect("header").clone();
+    let at = |name: &str| header.find(name).expect(name);
+    assert!(at("CLIENT") < at("REQUEST FOR"), "{header}");
+    assert!(at("REQUEST FOR") < at("NOTE"), "{header}");
+    // The long name is cut in the padded table, and the cut marks itself.
+    let body = lines.last().expect("row").clone();
+    assert!(
+      !body.contains(&asked),
+      "the whole name should not reach the screen"
+    );
+    assert!(body.contains(&"q".repeat(REQUEST_FOR_MAX_W - 3)), "{body}");
+    assert!(body.contains("..."), "{body}");
   }
 
   #[test]

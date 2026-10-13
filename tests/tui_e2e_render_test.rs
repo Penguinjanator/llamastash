@@ -282,7 +282,7 @@ fn requests_view_wide_golden_render_matches_fixture() {
   // and `Route`, and the only one where a long note is cut to its first
   // words with an ellipsis instead of being dropped with the column.
   let mut app = seeded_requests_view_app();
-  let rendered = mask_clock_times(&render_to_lines_at(&mut app, 330, 30).join("\n"));
+  let rendered = mask_clock_times(&render_to_lines_at(&mut app, 350, 30).join("\n"));
   assert_golden_text(rendered + "\n", "tests/golden/requests-view-wide.txt");
 }
 

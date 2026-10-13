@@ -57,21 +57,40 @@ pub(crate) fn cell(s: &str, w: usize) -> String {
   if w == 0 {
     return String::new();
   }
-  let count = s.chars().count();
-  if count <= w {
-    let mut out = String::with_capacity(w);
-    out.push_str(s);
-    for _ in count..w {
-      out.push(' ');
-    }
-    out
-  } else {
-    let ellipsis = crate::tui::glyphs::active().ellipsis();
-    let keep = w.saturating_sub(ellipsis.chars().count());
-    let mut out: String = s.chars().take(keep).collect();
-    out.push_str(ellipsis);
-    out
+  let used = s.width();
+  if used <= w {
+    return pad(s, w, used);
   }
+  let ellipsis = crate::tui::glyphs::active().ellipsis();
+  let budget = w.saturating_sub(ellipsis.width());
+  let mut cut = String::with_capacity(w * 3);
+  let mut cut_w = 0usize;
+  for ch in s.chars() {
+    let cells = ch.width().unwrap_or(0);
+    if cut_w + cells > budget {
+      break;
+    }
+    cut.push(ch);
+    cut_w += cells;
+  }
+  let mut out = cut;
+  out.push_str(ellipsis);
+  let out_w = cut_w + ellipsis.width();
+  if out_w >= w {
+    return out;
+  }
+  pad(&out, w, out_w)
+}
+
+/// `s` plus the spaces that bring it to `w` display cells, given it
+/// already measures `used` of them.
+fn pad(s: &str, w: usize, used: usize) -> String {
+  let mut out = String::with_capacity(s.len() + w);
+  out.push_str(s);
+  for _ in used..w {
+    out.push(' ');
+  }
+  out
 }
 
 /// Like [`cell`], but a cut lands on a word boundary where one falls inside
@@ -144,6 +163,24 @@ mod tests {
   fn ids(budget: usize) -> (Vec<char>, usize) {
     let (cols, spent) = fit(COLS, budget, 1);
     (cols.iter().map(|c| c.id).collect(), spent)
+  }
+
+  #[test]
+  fn a_wide_glyph_costs_two_cells_not_one() {
+    // "モデル失敗" is 5 characters and 10 display cells.
+    assert_eq!(cell("モデル失敗", 12), "モデル失敗  ");
+    assert_eq!(cell("モデル失敗", 10), "モデル失敗");
+    assert_eq!(cell("モデル失敗", 9), "モデル失…");
+    assert_eq!(cell("モデル失敗", 11), "モデル失敗 ");
+    for w in [8usize, 9, 10, 11, 12, 20] {
+      assert_eq!(cell("モデル失敗", w).width(), w, "width {w}");
+      assert_eq!(cell_words("モデル失敗", w).width(), w, "width {w}");
+    }
+    assert_eq!(cell_words("モデル失敗", 12), "モデル失敗  ");
+    assert_eq!(cell_words("モデル失敗", 9), "モデル失…");
+    // A combining mark adds a character and no cell.
+    assert_eq!(cell("e\u{301} ok", 7), "e\u{301} ok   ");
+    assert_eq!(cell("e\u{301} ok", 7).width(), 7);
   }
 
   #[test]
