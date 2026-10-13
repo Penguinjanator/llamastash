@@ -88,6 +88,13 @@ impl AliasTable {
     }
   }
 
+  /// Every entry as `(name, model reference)` in the order the file lists them,
+  /// for the listings that publish the names. The stored names are already
+  /// through [`normalize`], which is the spelling a client's request folds to.
+  pub(crate) fn pairs(&self) -> &[(String, String)] {
+    &self.targets
+  }
+
   /// The model reference `requested` stands in for, or `None` when it is not an
   /// alias.
   pub(crate) fn target(&self, requested: &str) -> Option<&str> {

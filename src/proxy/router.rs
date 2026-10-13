@@ -418,19 +418,21 @@ async fn count_ready(state: &ProxyState) -> usize {
 /// sorted alphabetically by `id`. Empty catalog returns
 /// `{"object":"list","data":[]}` (not a 404, not an error).
 async fn list_models(state: Arc<ProxyState>) -> ProxyResponse {
-  let snap = state.ctx.catalog.shared_view().await;
+  let (snap, cat) = state.ctx.catalog.shared_pair().await;
   let ids = published_ids(&snap);
   let mut rows: Vec<ModelObject> = snap
     .iter()
-    .map(|m| {
-      ModelObject::new(published_id(&ids, m))
-        .with_mode(m.metadata.as_ref().and_then(|md| md.mode_hint.as_label()))
-    })
+    .map(|m| model_object(published_id(&ids, m), m))
     .collect();
   let state_snap = state.ctx.state.snapshot().await;
   for (named_id, r) in named_launch_ids(&state_snap.running, &ids) {
     if !rows.iter().any(|row| row.id == named_id) {
       rows.push(ModelObject::new(named_id).with_mode(Some(r.params.mode.label())));
+    }
+  }
+  for (name, m) in alias_rows(&state, &cat, &snap) {
+    if !rows.iter().any(|row| row.id == name) {
+      rows.push(model_object(name, m));
     }
   }
   // ASCII-lexicographic sort: stable, deterministic across runs, and
@@ -483,6 +485,37 @@ fn published_id(ids: &HashMap<String, String>, m: &DiscoveredModel) -> String {
     .unwrap_or_else(|| model_id_for(m))
 }
 
+/// One catalog row as an OpenAI `model` object — the row a model is published
+/// under, and the alias rows that name the same model differently.
+fn model_object(id: String, m: &DiscoveredModel) -> ModelObject {
+  ModelObject::new(id).with_mode(m.metadata.as_ref().and_then(|md| md.mode_hint.as_label()))
+}
+
+/// The `proxy.aliases` names a client can send, paired with the catalog row each
+/// one answers. One rule for both listings, the way [`named_launch_ids`] is.
+///
+/// An alias that cannot route is exactly the one
+/// [`crate::launch::resolve::resolve_exact_reference`] refuses — a target that
+/// names no model, one two models answer to, or another alias name — so nothing
+/// here repeats resolution, and nothing here spends the once-per-name warnings
+/// [`super::alias::AliasTable`] keeps for real requests.
+fn alias_rows<'a>(
+  state: &ProxyState,
+  cat: &[CatalogRow],
+  snap: &'a [DiscoveredModel],
+) -> Vec<(String, &'a DiscoveredModel)> {
+  let mut out: Vec<(String, &DiscoveredModel)> = Vec::new();
+  for (name, target) in state.aliases.pairs() {
+    let Ok(row) = crate::launch::resolve::resolve_exact_reference(cat, target) else {
+      continue;
+    };
+    if let Some(m) = snap.iter().find(|m| m.path.to_string_lossy() == row.path) {
+      out.push((name.clone(), m));
+    }
+  }
+  out
+}
+
 /// The addressable `<model-id>@<name>` ids of the live named launches, paired
 /// with the row each one came from. One rule for both listings — `/v1/models`
 /// and `/api/tags` dress the same pairs in their own row type.
@@ -529,7 +562,7 @@ fn named_launch_ids<'a>(
 /// sorted alphabetically by `name` (parity with `/v1/models`). Empty
 /// catalog returns `{"models":[]}` (not a 404).
 async fn ollama_tags(state: Arc<ProxyState>) -> ProxyResponse {
-  let snap = state.ctx.catalog.shared_view().await;
+  let (snap, cat) = state.ctx.catalog.shared_pair().await;
   let ids = published_ids(&snap);
   let mut models: Vec<TagModel> = snap
     .iter()
@@ -555,6 +588,12 @@ async fn ollama_tags(state: Arc<ProxyState>) -> ProxyResponse {
         quantization_level: String::new(),
       },
     });
+  }
+  for (name, m) in alias_rows(&state, &cat, &snap) {
+    if models.iter().any(|existing| existing.name == name) {
+      continue;
+    }
+    models.push(ollama_tag_from_discovered(m, name));
   }
   models.sort_by(|a, b| a.name.cmp(&b.name));
   let body = TagsResponse { models };

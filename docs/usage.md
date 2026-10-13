@@ -1214,13 +1214,15 @@ proxy:
       target: qwen3.8-27b-q8_0
 ```
 
-A value is any reference `llamastash list` shows — a plain name, a repo-qualified id, or a full path. It has to name exactly one model by itself: an alias is written once and the client sending the aliased name cannot refine it, so an alias is never answered with a guess. It uses the same rungs a client may send, so a published id ignores case while a full path or a file name is matched as it is spelled on disk. Entries keep the order they are written in, so repeating a name puts the last one in charge. Three rules, all of them so an alias can never surprise a client:
+A value is any reference `llamastash list` shows — a plain name, a repo-qualified id, or a full path. It has to name exactly one model by itself: an alias is written once and the client sending the aliased name cannot refine it, so an alias is never answered with a guess. It uses the same rungs a client may send, so a published id ignores case while a full path or a file name is matched as it is spelled on disk. Entries keep the order they are written in, so repeating a name puts the last one in charge. Four rules, all of them so an alias can never surprise a client:
 
 - **A model that owns the name wins.** An alias is consulted when the name the client sent names no model outright — a full path, a file name, a published id, or a repo-qualified id. A longer file name that merely *contains* the alias does not own it, and neither do two models that both contain it: the alias is the tie-break you wrote. When a request arrives for a shadowed alias the daemon logs one warning naming it.
 - **An alias names a model, nothing else.** Its value cannot pin a launch name or a preset, and a value naming another alias is an error the daemon logs once, because a chain names no model. A *name* spelled like a launch address (`qwen3@dev`) is refused when the table is built: the alias could not honour the launch half and would take a client's real address away. A client that wants a named launch of an aliased model sends `<alias>@<name>` and gets the model behind the alias, launch included.
-- **Aliases are not listed.** `/v1/models` and `/api/tags` keep showing one row per model, so an alias answers only a client that already sends the name — a listing tells you nothing about it.
+- **An alias that can route is listed.** `/v1/models` and `/api/tags` publish a row for every alias beside the model it names, so a client that picks from the listing can find the name it is hard-wired to. An alias whose value names no model, names two, or names another alias is left out, because it could not answer a request.
 
-An alias whose value names no model outright 404s, and the daemon logs one warning naming the alias and what it points at — which covers a value that matches nothing and one that only matches as a substring. A value two models answer to comes back as the same `ambiguous_model` answer with both candidates that a client sending that name itself would get, and the same warning says naming one of them is your call. So the daemon warns once about an alias that takes a name some longer file name already answered to on its own, since that moves clients that were working. The request body keeps the name the client sent, as it does for any reference the proxy resolves: an engine that answers only to the name it was served with needs `rewrite_model: true` on its generic entry (see [Generic backend](#generic-backend)).
+A listed alias is a second row for a model that already has its own id, and both listings sort by name, so a client that defaults to the first row may land on the alias instead of the model's own name — same model, different label. In `/api/tags` the alias row carries the model's `digest` and `details`, so a client that identifies models by digest sees one model under two names.
+
+An alias whose value names no model outright 404s, and the daemon logs one warning naming the alias and what it points at — which covers a value that matches nothing and one that only matches as a substring. A value two models answer to comes back as the same `ambiguous_model` answer with both candidates that a client sending that name itself would get, and the same warning says naming one of them is your call. So the daemon warns once about an alias that takes a name some longer file name already answered to on its own, since that moves clients that were working. The request body keeps the name the client sent, as it does for any reference the proxy resolves: an engine that answers only to the name it was served with needs `rewrite_model: true` on its generic entry (see [Generic backend](#generic-backend)). A managed multiplexer (Lemonade) chooses its model from that name and has no such hatch, so an alias of a model it serves does not reach it.
 
 Alias names match case-insensitively, like model references do. Editing the map takes a daemon restart.
 
@@ -1696,8 +1698,8 @@ proxy:
   # request_log_file: false  # true => also append each finished request to <cache dir>/logs/requests.jsonl.
   # aliases:                 # Names that stand in for a local model, for a tool
   #   gpt-4o-mini: qwen3-a-q8  # that will only ever ask for a fixed one. A real model
-  #                            # id always wins; aliases are not listed. See
-  #                            # "Model ids on the proxy".
+  #                            # id always wins, and every alias that can route is
+  #                            # listed. See "Model ids on the proxy".
 ```
 
 Unknown keys inside `[proxy]` are **rejected loudly** (`#[serde(deny_unknown_fields)]`) — a typo never silently falls back to defaults. The top-level config still tolerates unknown keys for forward-compat. No `tls_*` — TLS for a LAN-exposed proxy is still deferred per the plan's Scope Boundaries. The full key set with per-key sources is in `config.example.yaml` under `[proxy]`.

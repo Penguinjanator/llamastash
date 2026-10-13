@@ -271,6 +271,56 @@ async fn api_tags_returns_alphabetical_models_with_documented_fields() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_tags_lists_an_alias_with_the_row_it_names() {
+  // An alias is a name a client can send, so it is a row a client can find,
+  // dressed with the model it answers rather than as a stub. The three kinds
+  // that cannot route stay out: a target that names no model, a target that is
+  // another alias name, and a name a real model owns.
+  let models = vec![
+    make_model("/m/qwen3.gguf", Some("qwen3"), "qwen3", ModeHint::Chat),
+    make_model("/m/llama.gguf", None, "llama", ModeHint::Chat),
+  ];
+  let state = proxy_state_with_aliases(
+    models,
+    vec![
+      ("gpt-4o-mini", "qwen3"),
+      ("nowhere", "no-such-model"),
+      ("hardwired", "gpt-4o-mini"),
+      ("llama", "qwen3"),
+    ],
+  )
+  .await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+
+  let (status, body) = http_get(addr, "/api/tags").await;
+  assert_eq!(status, 200);
+  let v: Value = serde_json::from_slice(&body).expect("json body");
+  let arr = v["models"].as_array().expect("models array");
+  let names: Vec<&str> = arr.iter().map(|r| r["name"].as_str().unwrap()).collect();
+  assert_eq!(
+    names,
+    ["gpt-4o-mini", "llama", "qwen3"],
+    "one row per usable alias, none for the kinds that cannot route: {v}"
+  );
+
+  let alias = arr
+    .iter()
+    .find(|r| r["name"] == "gpt-4o-mini")
+    .expect("alias row");
+  let named = arr
+    .iter()
+    .find(|r| r["name"] == "qwen3")
+    .expect("model row");
+  assert_eq!(
+    alias["digest"], named["digest"],
+    "an alias row describes the model it names"
+  );
+  assert_eq!(alias["details"]["family"], "qwen3");
+
+  shutdown_listener(shutdown, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_tags_empty_catalog_returns_empty_models_list() {
   let state = proxy_state_with_models(Vec::new()).await;
   let (addr, shutdown, handle) = spawn_listener(state).await;

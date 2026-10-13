@@ -566,13 +566,13 @@ async fn proxy_alias_reaches_the_model_it_names() {
     "an alias must route to the model it names, got {status}: {response:?}"
   );
 
-  // And it stays off the listings: `/v1/models` is one row per model.
+  // And it is published, so a client that picks its model from a listing finds it.
   let (status, _h, listing) = llamastash::test_support::http_get(addr, "/v1/models", &[]).await;
   assert_eq!(status, 200);
   let text = String::from_utf8(listing).expect("utf8 listing");
   assert!(
-    text.contains("qwen3") && !text.contains("gpt-4o-mini"),
-    "the alias must not be published: {text}"
+    text.contains("qwen3") && text.contains("gpt-4o-mini"),
+    "the alias is listed beside the model it names: {text}"
   );
 
   let _ = model.stop(Duration::from_secs(3)).await;

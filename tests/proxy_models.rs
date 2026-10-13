@@ -91,7 +91,66 @@ async fn proxy_state_with_models(models: Vec<DiscoveredModel>) -> Arc<ProxyState
   ProxyState::from_context(&ctx, false, true, DEFAULT_BODY_LIMIT_BYTES)
 }
 
+/// Like [`proxy_state_with_models`] with a `proxy.aliases` table, the way the
+/// daemon hands it to `from_context_with_auth`.
+async fn proxy_state_with_aliases(
+  models: Vec<DiscoveredModel>,
+  aliases: &[(&str, &str)],
+) -> Arc<ProxyState> {
+  let catalog = ModelCatalog::new();
+  for m in models {
+    catalog.upsert(m).await;
+  }
+  let ctx = MethodContext::with_catalog(ShutdownToken::new(), catalog);
+  let aliases = llamastash::config::ProxyAliases::from_pairs(
+    aliases
+      .iter()
+      .map(|(name, target)| (name.to_string(), target.to_string())),
+  );
+  ProxyState::from_context_with_auth(&ctx, false, true, None, DEFAULT_BODY_LIMIT_BYTES, &aliases)
+}
+
 // --- direct-listener tests ----------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aliases_are_listed_beside_the_models_they_name() {
+  // A client that only ever sends `gpt-4o-mini` has to be able to discover it,
+  // so every alias that can route is a row. The three that cannot are left out:
+  // a target naming no model, a target that is another alias name, and a name a
+  // real model owns (which would publish one model twice under two ids).
+  let models = vec![
+    make_model("/m/qwen3.gguf", Some("qwen3")),
+    make_model("/m/llama.gguf", None),
+  ];
+  let state = proxy_state_with_aliases(
+    models,
+    &[
+      ("gpt-4o-mini", "qwen3"),
+      ("nowhere", "no-such-model"),
+      ("hardwired", "gpt-4o-mini"),
+      ("llama", "qwen3"),
+    ],
+  )
+  .await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
+
+  let (status, body) = http_get(addr, "/v1/models").await;
+  assert_eq!(status, 200);
+  let v: Value = serde_json::from_slice(&body).expect("json body");
+  let ids: Vec<&str> = v["data"]
+    .as_array()
+    .expect("data array")
+    .iter()
+    .map(|r| r["id"].as_str().unwrap())
+    .collect();
+  assert_eq!(
+    ids,
+    vec!["gpt-4o-mini", "llama", "qwen3"],
+    "one row per usable alias, none for the kinds that cannot route: {v}"
+  );
+
+  shutdown_listener(shutdown, listener_handle).await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn three_models_return_in_alphabetical_order() {
