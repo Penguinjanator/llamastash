@@ -4,6 +4,10 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-10-13
+
+This release is about seeing what the proxy is doing. `llamastash requests` and the TUI's Requests tab list the proxied requests with their timings, token counts, tok/s and the reason behind each one, `GET /metrics` publishes the same numbers for Prometheus, and `GET /metrics/backend` folds each engine's own counters into one scrape. `proxy.aliases` answers a model name a tool is hard-wired to with a local model, so that tool needs no config change. The memory gate no longer refuses hybrid Qwen models at context windows they fit, and setup got shell completions, `doctor --fix` and a terminal bell when a pull or a load ends.
+
 ### Added
 
 - **Proxy request log.** `llamastash requests` and the TUI Requests tab (`Shift+Q`) list the last 1000 proxy requests with timings, token counts, tok/s and the reason behind each one, for a model or for a single launch. ([#97](https://github.com/llamastash/llamastash/pull/97), [#109](https://github.com/llamastash/llamastash/pull/109))
@@ -32,6 +36,14 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 ### Security
 
 - quinn-proto 0.11.15 → 0.11.19, clearing five advisories. It arrives transitively through reqwest's optional HTTP/3 support and is never compiled here; lockfile-only.
+
+
+### Contributors
+
+Thanks to everyone who shipped code in this release:
+
+- [@howmuchcomputer](https://github.com/howmuchcomputer): pricing a hybrid Qwen model's KV cache by its attention layers ([#106](https://github.com/llamastash/llamastash/pull/106))
+- [@deepu105](https://github.com/deepu105): everything else
 
 ## [0.6.1] — 2026-10-02
 
