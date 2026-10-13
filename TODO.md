@@ -453,8 +453,9 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 - [ ] Keep a model's prompt cache across an unload
 - [ ] Warm the page cache before a load (`llamastash warm <model>`)
 
-### Standalone items
+### Standalone items to batch
 
+- [ ] show aliases as well in `/v1/models` or `/api/tags`
 - [ ] Bundle the llamacpp UI for other engines with no UI? Start on first request.
 - [ ] Duplication
   - [ ] next copy: `fast_probe` exists in 8 test files with two different timeouts (5 s and 15 s). Move it to `test_support` beside the listener helpers.
