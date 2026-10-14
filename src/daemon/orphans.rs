@@ -1124,7 +1124,7 @@ mod tests {
     // A previous row the rescan doesn't find is a process that exited. Left in
     // place, `status` would keep showing a dead server until the daemon
     // restarted.
-    let previous = vec![scan_row(1001, Some(41100))];
+    let previous = vec![scan_row(2_147_483_646, Some(41100))];
     let merged = merge_external(&previous, vec![scan_row(1002, Some(41101))]);
     let pids: Vec<u32> = merged.iter().map(|e| e.pid).collect();
     assert_eq!(pids, vec![1002]);
@@ -1169,9 +1169,15 @@ mod tests {
     // doesn't know, is alive and holds a port but never comes back from a scan.
     // Carrying only named rows dropped it 30 s after boot.
     let live = std::process::id();
-    let previous = vec![scan_row(live, Some(41106))];
+    // The recorded start time is the real one, so this goes through the identity
+    // match rather than the "nothing recorded, liveness decides" escape.
+    let previous = vec![ExternalProcess {
+      start_time_secs: process_start_time(live).unwrap_or(0),
+      ..scan_row(live, Some(41106))
+    }];
     let merged = merge_external(&previous, Vec::new());
     assert_eq!(merged.iter().map(|e| e.pid).collect::<Vec<_>>(), vec![live]);
+    assert_eq!(merged[0].port, Some(41106));
   }
 
   #[test]
@@ -1187,6 +1193,22 @@ mod tests {
     let previous = vec![ExternalProcess {
       start_time_secs: live_start + 1,
       ..named_row(live, 41107, "coder")
+    }];
+    assert!(merge_external(&previous, Vec::new()).is_empty());
+  }
+
+  #[test]
+  fn merge_drops_a_carried_unnamed_row_whose_pid_was_recycled() {
+    // Same rule without a name: nothing about the row makes a recycled pid safe
+    // to carry.
+    let live = std::process::id();
+    let live_start = process_start_time(live).unwrap_or(0);
+    if live_start == 0 {
+      return;
+    }
+    let previous = vec![ExternalProcess {
+      start_time_secs: live_start + 1,
+      ..scan_row(live, Some(41108))
     }];
     assert!(merge_external(&previous, Vec::new()).is_empty());
   }

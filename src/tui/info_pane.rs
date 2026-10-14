@@ -755,18 +755,27 @@ mod tests {
     // the empty path's display name printed the same word for every one of
     // them, so two such rows were indistinguishable.
     let mut app = App::new(AppOptions::default());
-    app.external = vec![ManagedRow {
-      launch_id: "ext-41102".into(),
-      path: PathBuf::new(),
-      port: 41102,
-      state: SurfaceState::External,
-      ..Default::default()
-    }];
+    app.external = vec![
+      ManagedRow {
+        launch_id: "ext-41102".into(),
+        path: PathBuf::new(),
+        port: 41102,
+        state: SurfaceState::External,
+        ..Default::default()
+      },
+      ManagedRow {
+        launch_id: "ext-41103".into(),
+        path: PathBuf::new(),
+        port: 41103,
+        state: SurfaceState::External,
+        ..Default::default()
+      },
+    ];
     let rows = render_lines(&app);
     let running_row = rows.iter().find(|r| r.contains("running")).unwrap();
     assert!(
-      running_row.contains("pid 41102 :41102"),
-      "expected the pid to stand in for the missing model name, got: {running_row:?}"
+      running_row.contains("pid 41102 :41102") && running_row.contains("pid 41103 :41103"),
+      "each pathless row must be named by its own pid, got: {running_row:?}"
     );
   }
 
