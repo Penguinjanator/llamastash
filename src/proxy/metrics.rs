@@ -374,6 +374,9 @@ pub(crate) struct LiveLaunch {
   /// Full identity of the model it serves, for callers that need more than the
   /// path (`/ui` keys its in-flight guard on it).
   pub(crate) model_id: ModelId,
+  /// `model_id.path` again as a plain string. Duplication on purpose: batch 2
+  /// rewrites the `l.path == …` comparisons, and until it merges every caller
+  /// keeps working off the string. Dropped once that lands.
   pub(crate) path: String,
   pub(crate) port: u16,
   pub(crate) ready: bool,

@@ -470,7 +470,14 @@ fn running_row<'a>(app: &'a App, budget: usize, palette: &'a Palette) -> Line<'a
     .iter()
     .chain(app.external.iter())
     .map(|m| {
-      let label = app.model_label(&m.path);
+      let label = if m.path.as_os_str().is_empty() {
+        // A server whose argv carried no `-m` has no model to name it, and
+        // `model_label("")` prints the same placeholder for every one of them.
+        // The pid is what tells two of them apart.
+        format!("pid {}", m.launch_id.trim_start_matches("ext-"))
+      } else {
+        app.model_label(&m.path)
+      };
       // A scan row whose argv carried no port flag has none to show; `:0` would
       // read as a real endpoint.
       if m.port == 0 {
@@ -739,6 +746,27 @@ mod tests {
     assert!(
       running_row.contains("portless") && !running_row.contains(":0"),
       "a scan row whose argv carried no port flag must not read as `:0`, got: {running_row:?}"
+    );
+  }
+
+  #[test]
+  fn running_row_names_a_pathless_external_row_by_pid() {
+    // A server whose argv carried no `-m` has no model to show. Falling back to
+    // the empty path's display name printed the same word for every one of
+    // them, so two such rows were indistinguishable.
+    let mut app = App::new(AppOptions::default());
+    app.external = vec![ManagedRow {
+      launch_id: "ext-41102".into(),
+      path: PathBuf::new(),
+      port: 41102,
+      state: SurfaceState::External,
+      ..Default::default()
+    }];
+    let rows = render_lines(&app);
+    let running_row = rows.iter().find(|r| r.contains("running")).unwrap();
+    assert!(
+      running_row.contains("pid 41102 :41102"),
+      "expected the pid to stand in for the missing model name, got: {running_row:?}"
     );
   }
 

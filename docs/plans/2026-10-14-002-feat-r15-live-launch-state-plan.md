@@ -65,7 +65,7 @@ Keep both changes small. No new config keys, no new backend hooks, no new depend
 
 Units 1 and 2 share no files and do not depend on each other. They run in parallel, each in its own worktree on its own branch, and are merged before review.
 
-- [ ] **Unit 1: `/ui` consumes `live_launches`** (lane 1)
+- [x] **Unit 1: `/ui` consumes `live_launches`** (lane 1)
 
 **Goal:** One registry walk for live launches.
 
@@ -93,7 +93,7 @@ Units 1 and 2 share no files and do not depend on each other. They run in parall
 
 **Verification:** `src/proxy/ui.rs` no longer calls `supervisors.snapshot()` or `catalog.shared_view()`.
 
-- [ ] **Unit 2: periodic external resweep and external rows in TUI / status** (lane 2)
+- [x] **Unit 2: periodic external resweep and external rows in TUI / status** (lane 2)
 
 **Goal:** External rows stay current, show their port, and count as running.
 

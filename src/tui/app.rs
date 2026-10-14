@@ -2567,9 +2567,9 @@ fn parse_external_row(row: &Value) -> Option<ManagedRow> {
       .and_then(Value::as_u64)
       .map(|p| p as u16)
       .unwrap_or(0),
-    // The launch name an orphan carried before its daemon died. It is the row's
-    // address in `status` and `stop`, so the TUI has to keep it to keep them.
-    name: row.get("name").and_then(Value::as_str).map(str::to_string),
+    // Nothing in the TUI addresses an external row by name — `stop <model>@<name>`
+    // is a CLI path — so the field is left as the sentinel the rest of the row uses.
+    name: None,
     // An external process wasn't launched through a preset.
     preset: None,
     state: SurfaceState::External,
@@ -3032,7 +3032,7 @@ mod tests {
   }
 
   #[test]
-  fn ingest_status_reads_an_external_rows_port_and_name() {
+  fn ingest_status_reads_an_external_rows_port() {
     let mut app = App::new(AppOptions::default());
     let body = json!({
       "external": [
@@ -3046,13 +3046,9 @@ mod tests {
     app.ingest_status(&body);
     assert_eq!(app.external.len(), 2);
     assert_eq!(app.external[0].port, 41102);
-    // The name is the row's address in `status` and `stop`, so dropping it here
-    // makes an orphan of a named launch unaddressable in the TUI.
-    assert_eq!(app.external[0].name.as_deref(), Some("coder"));
     // An argv with no port flag leaves `port` 0, and the renderers have to skip
     // it rather than print `:0` as if it were an endpoint.
     assert_eq!(app.external[1].port, 0);
-    assert_eq!(app.external[1].name, None);
     assert_eq!(
       app.surface_ports().get(&PathBuf::from("/m/scan.gguf")),
       None,
