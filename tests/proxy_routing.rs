@@ -1322,6 +1322,11 @@ async fn a_served_request_is_logged_and_reaches_requests_tail_and_status() {
   let stats = &status_body["models"][0]["request_stats"];
   assert_eq!(stats["requests"], 1, "{status_body}");
   assert!(stats["avg_duration_ms"].is_number());
+  // The prefill and cache figures `usage.md` lists for this object. The fake
+  // stream carried no usage and no timings, so they read as nothing reported.
+  assert!(stats["prefill_tokens_per_second"].is_null());
+  assert_eq!(stats["cached_tokens"], 0);
+  assert!(stats["cache_hit_ratio"].is_null());
 
   let _ = model.stop(Duration::from_secs(3)).await;
   shutdown_listener(shutdown, listener_handle).await;
