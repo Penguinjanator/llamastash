@@ -18,13 +18,13 @@
 │m/y                                                                         ││ Avg total 20.2s   Avg TTFB 16.0s       │
 │   phi-3                                  phi         Q4_K    8.0k    3.9G  ││ Avg tok/s 41.3                         │
 │                                                                            ││ Agg tok/s 52.4 over 6.3s               │
+│                                                                            ││ Prefill tok/s 1043                     │
 │                                                                            ││ Tok/s session 48.9   Tokens in 36.9k   │
-│                                                                            ││ Tokens out 328   Auto-starts 2         │
-│                                                                            ││ Unloaded 1                             │
+│                                                                            ││ Cached 33.5k (90.8%)   Tokens out 328  │
+│                                                                            ││ Auto-starts 2   Unloaded 1             │
 │                                                                            ││                                        │
 │                                                                            ││ Time     Code Tok/s  Total   TTFB      │
 │                                                                            ││ HH:MM:SS 200  41.3   4.3s    182ms     │
 │                                                                            ││ HH:MM:SS 200  —      —       182ms     │
 │                                                                            ││ HH:MM:SS 200  —      —       182ms     │
-│                                                                            ││ HH:MM:SS 200  —      4.3s    182ms     │
 └ ◌ launching · ◐ loading · ● ready · ▲ error · ○ stopped · ⇪ external ──────┘└────────────────────────────────────────┘

@@ -37,6 +37,7 @@ enum ColumnId {
   Time,
   Status,
   Speed,
+  Prefill,
   Total,
   Ttfb,
   In,
@@ -70,6 +71,14 @@ const COLUMNS: &[Column<ColumnId>] = &[
     label: "Tok/s",
     width: 6,
     rank: 30,
+  },
+  Column {
+    id: ColumnId::Prefill,
+    label: "PP/s",
+    // Prompt tokens per second, beside the generation speed it follows. Same
+    // width, and it drops after `Request for` and before `Note`.
+    width: 6,
+    rank: 75,
   },
   Column {
     id: ColumnId::Total,
@@ -363,6 +372,7 @@ fn column_value(id: ColumnId, cells: &RequestCells) -> &str {
     ColumnId::Time => &cells.time,
     ColumnId::Status => &cells.status,
     ColumnId::Speed => &cells.speed,
+    ColumnId::Prefill => &cells.prefill,
     ColumnId::Total => &cells.total,
     ColumnId::In => &cells.tokens_in,
     ColumnId::Out => &cells.tokens_out,
@@ -432,13 +442,14 @@ mod tests {
   fn columns_drop_by_rank_as_the_pane_narrows() {
     // Each column costs its width plus one separator. Running totals in
     // rank order: Time 9, Code 14, Tok/s 21, Total 29, TTFB 37, In 44,
-    // Out 51, Note 62, Request for 87, Client 109, Route 126. `Note` shows
-    // last but outranks the three columns before it, so it stays when they
-    // have gone.
+    // Out 51, Note 62, PP/s 69, Request for 94, Client 116, Route 133.
+    // `Note` shows last but outranks the four columns before it, so it stays
+    // when they have gone.
     let full = [
       "Time",
       "Code",
       "Tok/s",
+      "PP/s",
       "Total",
       "TTFB",
       "In",
@@ -448,12 +459,13 @@ mod tests {
       "Route",
       "Note",
     ];
-    assert_eq!(labels(126), full);
+    assert_eq!(labels(133), full);
     // Route ranks highest of all, so it is the first to go.
     let no_route = [
       "Time",
       "Code",
       "Tok/s",
+      "PP/s",
       "Total",
       "TTFB",
       "In",
@@ -462,44 +474,33 @@ mod tests {
       "Client",
       "Note",
     ];
-    assert_eq!(labels(125), no_route);
-    assert_eq!(labels(109), no_route);
-    assert_eq!(
-      labels(108),
-      vec![
-        "Time",
-        "Code",
-        "Tok/s",
-        "Total",
-        "TTFB",
-        "In",
-        "Out",
-        "Request for",
-        "Note"
-      ]
-    );
-    assert_eq!(
-      labels(87),
-      vec![
-        "Time",
-        "Code",
-        "Tok/s",
-        "Total",
-        "TTFB",
-        "In",
-        "Out",
-        "Request for",
-        "Note"
-      ]
-    );
-    assert_eq!(
-      labels(86),
-      vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Note"]
-    );
-    assert_eq!(
-      labels(62),
-      vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Note"]
-    );
+    assert_eq!(labels(132), no_route);
+    assert_eq!(labels(116), no_route);
+    let no_client = [
+      "Time",
+      "Code",
+      "Tok/s",
+      "PP/s",
+      "Total",
+      "TTFB",
+      "In",
+      "Out",
+      "Request for",
+      "Note",
+    ];
+    assert_eq!(labels(115), no_client);
+    assert_eq!(labels(94), no_client);
+    // `PP/s` is the next to go, and `Note` outlasts it.
+    let no_request_for = [
+      "Time", "Code", "Tok/s", "PP/s", "Total", "TTFB", "In", "Out", "Note",
+    ];
+    assert_eq!(labels(93), no_request_for);
+    assert_eq!(labels(69), no_request_for);
+    let no_prefill = [
+      "Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Note",
+    ];
+    assert_eq!(labels(68), no_prefill);
+    assert_eq!(labels(62), no_prefill);
     assert_eq!(
       labels(61),
       vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out"]
@@ -525,7 +526,7 @@ mod tests {
   fn note_absorbs_the_spare_width() {
     // The visible columns plus their separators fill the pane, with one
     // cell of slack for the separator after the last column.
-    for width in [88usize, 100, 110, 120, 160, 200] {
+    for width in [95usize, 100, 110, 120, 160, 200] {
       let layout = layout_columns(width);
       let spent: usize = layout
         .visible
@@ -547,7 +548,7 @@ mod tests {
     assert_eq!(wide.width_of(route), ROUTE_W);
     // At the width `Request for` just fits, the only spare cell is the
     // separator after the last column, and `Note` grows first.
-    assert_eq!(layout_columns(87).note_w, MIN_NOTE_W + 1);
+    assert_eq!(layout_columns(94).note_w, MIN_NOTE_W + 1);
     // Too narrow for `Note`: it gets nothing and the row ends earlier.
     assert_eq!(layout_columns(61).note_w, 0);
   }
@@ -562,6 +563,7 @@ mod tests {
         "Time",
         "Code",
         "Tok/s",
+        "PP/s",
         "Total",
         "TTFB",
         "In",
@@ -596,8 +598,9 @@ mod tests {
     let route_at = header.find("Route").unwrap();
     let note_at = header.find("Note").unwrap();
     assert!(route_at < note_at, "{header}");
+    // Measured in cells, because the row's placeholder is not one byte wide.
     assert_eq!(
-      body.find("chat/completions").unwrap(),
+      console::measure_text_width(&body[..body.find("chat/completions").unwrap()]),
       route_at,
       "header: {header}\nrow: {body}"
     );
@@ -696,18 +699,22 @@ mod tests {
         row(1),
       ],
     );
-    let lines = rendered(&state, 130, 8);
+    let lines = rendered(&state, 150, 8);
     assert!(lines[0].starts_with("Requests 2"), "{lines:?}");
     // The summary wraps to as many lines as it needs; the table starts
     // one blank line under it.
     let header = lines
       .iter()
-      .position(|l| l.starts_with("Time     Code Tok/s  Total"))
+      .position(|l| l.starts_with("Time     Code Tok/s  PP/s"))
       .expect("header row");
     assert_eq!(lines[header - 1], "");
     assert!(lines[header].ends_with("Note"), "{lines:?}");
     assert!(lines[header].contains("Request for"), "{lines:?}");
-    assert!(lines[header + 1].contains("200  39.6   1.2s"), "{lines:?}");
+    // The row has no prefill figure, so its cell is the placeholder.
+    assert!(
+      lines[header + 1].contains("200  39.6   —      1.2s"),
+      "{lines:?}"
+    );
     assert!(lines[header + 1].contains("asked-7b"), "{lines:?}");
     assert!(lines[header + 1].contains("chat/completions"), "{lines:?}");
     // Two rows, newest (`seq` 2, one second later) first.
@@ -738,7 +745,7 @@ mod tests {
     let lines = rendered(&state, 120, 10);
     let header = lines
       .iter()
-      .position(|l| l.starts_with("Time     Code Tok/s  Total"))
+      .position(|l| l.starts_with("Time     Code Tok/s  PP/s"))
       .expect("header row");
     let ellipsis = crate::tui::glyphs::active().ellipsis();
     let row_line = lines[header + 1].trim_end();
@@ -824,7 +831,7 @@ mod tests {
     let lines = rendered(&state, 120, 7);
     let header = lines
       .iter()
-      .position(|l| l.starts_with("Time     Code Tok/s  Total"))
+      .position(|l| l.starts_with("Time     Code Tok/s  PP/s"))
       .expect("header row");
     let rows_shown = &lines[header + 1..];
     assert!(rows_shown.len() >= 2, "{lines:?}");

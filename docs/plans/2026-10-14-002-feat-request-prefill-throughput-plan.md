@@ -86,7 +86,7 @@ Run sequentially; every unit touches `src/proxy/request_log.rs`.
     - Integration: a request through `fake_llama_server` with `__TEST_EMIT_TIMINGS__` logs a row with `prefill_tokens` 1, the speed from `prompt_ms` 25.704, and `cached_tokens` 40.
   - Commit: `feat(proxy): log prefill speed and cached prompt tokens per request`.
 
-- [ ] **Unit 2: summary, CLI and TUI**
+- [x] **Unit 2: summary, CLI and TUI**
   - Files: `src/proxy/request_log.rs` (`Totals`, `RequestSummary`, `RequestSummary::cells`), `src/cli/requests.rs`, `src/tui/tabs/requests.rs`, `tests/golden/requests-view*.txt`, `docs/usage.md` (`requests` section: header, columns, summary lines, reprint the padded example from the renderer, which also fixes the missing 5-space indent on its `Requests` line; TUI Requests tab section; `status --json` `request_stats` key list), `CHANGELOG.md` (one bullet under `[Unreleased]`, bundled with the existing request-log bullet if one fits).
   - Tests:
     - Token-weighted figure: rows of 100 tokens at 100 tok/s (1 s) and 10,000 tokens at 5,000 tok/s (2 s) give 3,366.7, not the mean 2,550.

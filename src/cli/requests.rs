@@ -84,7 +84,9 @@ fn requests_human(body: &Value, one_model: bool) -> String {
     out.push('\n');
     return out;
   }
-  let mut header = vec!["TIME", "CODE", "TOK/S", "TOTAL", "TTFB", "IN", "OUT"];
+  let mut header = vec![
+    "TIME", "CODE", "TOK/S", "PP/S", "TOTAL", "TTFB", "IN", "OUT",
+  ];
   if !one_model {
     header.push("MODEL");
   }
@@ -187,6 +189,7 @@ fn cells_for(row: &RequestRow, one_model: bool) -> Vec<String> {
     c.time,
     status,
     c.speed,
+    c.prefill,
     c.total,
     c.ttfb,
     c.tokens_in,
@@ -282,7 +285,7 @@ mod tests {
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(
       lines[0],
-      "TIME\tCODE\tTOK/S\tTOTAL\tTTFB\tIN\tOUT\tMODEL\tLAUNCH\tCLIENT\tREQUEST FOR\tROUTE\tNOTE"
+      "TIME\tCODE\tTOK/S\tPP/S\tTOTAL\tTTFB\tIN\tOUT\tMODEL\tLAUNCH\tCLIENT\tREQUEST FOR\tROUTE\tNOTE"
     );
     assert_eq!(lines.len(), 2);
     let cells: Vec<&str> = lines[1].split('\t').collect();
@@ -291,6 +294,7 @@ mod tests {
       [
         "200",
         "39.6",
+        "-",
         "1.2s",
         "180ms",
         "41",
@@ -309,7 +313,7 @@ mod tests {
   fn a_model_filter_drops_the_model_column() {
     let out = piped(&[row()], true);
     assert!(!out.lines().next().unwrap().contains("MODEL"));
-    assert_eq!(out.lines().nth(1).unwrap().split('\t').count(), 12);
+    assert_eq!(out.lines().nth(1).unwrap().split('\t').count(), 13);
   }
 
   #[test]
@@ -330,12 +334,13 @@ mod tests {
     let cells: Vec<&str> = out.lines().nth(1).unwrap().split('\t').collect();
     assert_eq!(cells[1], "404");
     assert_eq!(cells[2], "-");
-    assert_eq!(cells[4], "-");
-    assert_eq!(cells[7], "qwen");
-    assert_eq!(cells[8], "-");
-    assert_eq!(cells[10], "qwen");
-    assert_eq!(cells[11], "chat/completions");
-    assert_eq!(cells[12], "model_not_found");
+    assert_eq!(cells[3], "-");
+    assert_eq!(cells[5], "-");
+    assert_eq!(cells[8], "qwen");
+    assert_eq!(cells[9], "-");
+    assert_eq!(cells[11], "qwen");
+    assert_eq!(cells[12], "chat/completions");
+    assert_eq!(cells[13], "model_not_found");
   }
 
   /// Terminal rendering, with the process-wide color flag restored. It
@@ -380,6 +385,9 @@ mod tests {
       .collect();
     let header = lines.first().expect("header").clone();
     let at = |name: &str| header.find(name).expect(name);
+    // The prompt figures sit beside the generation ones they complete.
+    assert!(at("TOK/S") < at("PP/S"), "{header}");
+    assert!(at("PP/S") < at("TOTAL"), "{header}");
     assert!(at("CLIENT") < at("REQUEST FOR"), "{header}");
     assert!(at("REQUEST FOR") < at("ROUTE"), "{header}");
     assert!(at("ROUTE") < at("NOTE"), "{header}");
@@ -435,8 +443,8 @@ mod tests {
       .expect("row")
       .to_string();
     let cells: Vec<&str> = line.split('\t').collect();
-    assert_eq!(cells[7], long, "MODEL keeps the whole name");
-    assert_eq!(cells[10], long, "REQUEST FOR keeps the whole name");
+    assert_eq!(cells[8], long, "MODEL keeps the whole name");
+    assert_eq!(cells[11], long, "REQUEST FOR keeps the whole name");
   }
 
   #[test]
@@ -476,8 +484,8 @@ mod tests {
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(lines.len(), 2, "{lines:?}");
     let cells: Vec<&str> = lines[1].split('\t').collect();
-    assert_eq!(cells.len(), 13);
-    assert!(cells[12].ends_with("lower --ctx-size"), "{}", cells[12]);
+    assert_eq!(cells.len(), 14);
+    assert!(cells[13].ends_with("lower --ctx-size"), "{}", cells[13]);
   }
 
   #[test]
@@ -562,5 +570,31 @@ mod tests {
       .find(|line| line.contains("Agg tok/s"))
       .unwrap_or_default();
     assert!(line.ends_with('-'), "{line}");
+  }
+
+  #[test]
+  fn the_summary_block_prints_prefill_speed_and_cache_hits() {
+    let filled = summary_on_terminal(RequestSummary {
+      prompt_tokens: 41_000,
+      prefill_tokens_per_second: Some(3_366.7),
+      cached_tokens: 40_000,
+      cache_hit_ratio: Some(0.9756),
+      ..RequestSummary::default()
+    });
+    assert!(filled.contains("Prefill tok/s  3367"), "{filled}");
+    assert!(filled.contains("Cached  40.0k (97.6%)"), "{filled}");
+    // Nothing reported a cached count: the placeholder every other cell uses,
+    // not a zero that reads as a total miss.
+    let empty = summary_on_terminal(RequestSummary::default());
+    let prefill = empty
+      .lines()
+      .find(|line| line.contains("Prefill tok/s"))
+      .unwrap_or_default();
+    assert!(prefill.ends_with('-'), "{prefill}");
+    let cached = empty
+      .lines()
+      .find(|line| line.contains("Cached"))
+      .unwrap_or_default();
+    assert!(cached.ends_with('-'), "{cached}");
   }
 }

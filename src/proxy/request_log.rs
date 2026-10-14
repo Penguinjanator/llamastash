@@ -347,6 +347,13 @@ pub struct RequestSummary {
   /// the average. Set for a model scope only; `None` for the whole log and
   /// for a scope no request has reported a speed for yet.
   pub tokens_per_second_session: Option<f64>,
+  /// Prompt tokens per second across the scope: every prefill token the rows
+  /// carry over the seconds they took. Weighted by tokens rather than the mean
+  /// of the per-row speeds, because an agent turn prefills a few hundred
+  /// uncached tokens at a low per-token rate while a cold long prompt runs
+  /// much faster, and a plain mean would mostly report the small turns. Engine
+  /// figures and estimates both count, and so do rows however they ended.
+  pub prefill_tokens_per_second: Option<f64>,
   /// The most recent speed a request reported. Kept in the JSON and in the
   /// row table, but no longer on the summary strips: the session figure says
   /// the same thing about what is running now.
@@ -363,6 +370,12 @@ pub struct RequestSummary {
   /// [`Self::connections`] over the requests in flight right now.
   pub live_connections: Option<u64>,
   pub prompt_tokens: u64,
+  /// Prompt tokens served from the KV cache.
+  pub cached_tokens: u64,
+  /// [`Self::cached_tokens`] over the prompt tokens of the rows that carried a
+  /// cached count. `None` when none did, which is what a server that reports
+  /// neither a cached count nor `timings` reads as.
+  pub cache_hit_ratio: Option<f64>,
   pub completion_tokens: u64,
   /// Requests that started the model.
   pub auto_starts: u64,
@@ -399,6 +412,13 @@ impl RequestSummary {
           _ => none.to_string(),
         },
       ),
+      (
+        "Prefill tok/s",
+        self
+          .prefill_tokens_per_second
+          .map(fmt_tps)
+          .unwrap_or_else(|| none.to_string()),
+      ),
     ])
     .chain(
       self
@@ -407,6 +427,13 @@ impl RequestSummary {
     )
     .chain([
       ("Tokens in", fmt_count(self.prompt_tokens)),
+      (
+        "Cached",
+        match self.cache_hit_ratio {
+          Some(ratio) => format!("{} ({:.1}%)", fmt_count(self.cached_tokens), ratio * 100.0),
+          None => none.to_string(),
+        },
+      ),
       ("Tokens out", fmt_count(self.completion_tokens)),
       ("Auto-starts", self.auto_starts.to_string()),
       ("Unloaded", self.evictions.to_string()),
@@ -600,6 +627,14 @@ struct Totals {
   tps_sum: f64,
   tps_n: u64,
   tps_last: Option<f64>,
+  /// The two halves of the token-weighted prefill speed: the tokens counted
+  /// and the seconds they took.
+  prefill_tokens: u64,
+  prefill_seconds: f64,
+  /// Cached tokens, and the prompt tokens of just the rows that carried a
+  /// cached count, which are the two halves of the hit ratio.
+  cached_tokens: u64,
+  cached_prompt_tokens: u64,
   prompt_tokens: u64,
   completion_tokens: u64,
   auto_starts: u64,
@@ -628,6 +663,20 @@ impl Totals {
       self.tps_n += 1;
       self.tps_last = Some(tps);
     }
+    // A row needs both halves to contribute: a token count with no speed would
+    // add seconds out of nothing.
+    if let (Some(tokens), Some(tps)) = (row.prefill_tokens, row.prefill_tokens_per_second) {
+      if tokens > 0 && tps > 0.0 {
+        self.prefill_tokens = self.prefill_tokens.saturating_add(tokens);
+        self.prefill_seconds += tokens as f64 / tps;
+      }
+    }
+    if let Some(cached) = row.cached_tokens {
+      self.cached_tokens = self.cached_tokens.saturating_add(cached);
+      self.cached_prompt_tokens = self
+        .cached_prompt_tokens
+        .saturating_add(row.prompt_tokens.unwrap_or(0));
+    }
     self.prompt_tokens = self
       .prompt_tokens
       .saturating_add(row.prompt_tokens.unwrap_or(0));
@@ -645,6 +694,11 @@ impl Totals {
       avg_duration_ms: self.duration_ms_sum.checked_div(self.timed),
       avg_ttfb_ms: self.ttfb_ms_sum.checked_div(self.timed),
       tokens_per_second_avg: (self.tps_n > 0).then(|| self.tps_sum / self.tps_n as f64),
+      prefill_tokens_per_second: (self.prefill_seconds > 0.0)
+        .then(|| self.prefill_tokens as f64 / self.prefill_seconds),
+      cached_tokens: self.cached_tokens,
+      cache_hit_ratio: (self.cached_prompt_tokens > 0)
+        .then(|| self.cached_tokens as f64 / self.cached_prompt_tokens as f64),
       // `RequestLog::tail` fills this for a model scope; a single set of
       // totals has no notion of "the newest launch".
       tokens_per_second_session: None,
@@ -1871,7 +1925,10 @@ mod tests {
     .cells("—");
     let at = cells.iter().position(|c| c.0 == "Avg tok/s").unwrap();
     assert_eq!(cells[at + 1], ("Agg tok/s", "50.3 over 3m34s".to_string()));
-    assert_eq!(cells[at + 2].0, "Tokens in");
+    // The prompt speed follows the two generation figures, and the token
+    // counts follow it.
+    assert_eq!(cells[at + 2], ("Prefill tok/s", "—".to_string()));
+    assert_eq!(cells[at + 3].0, "Tokens in");
   }
 
   #[test]
@@ -2182,6 +2239,104 @@ mod tests {
       (None, None, None)
     );
     assert!(!row.prefill_estimated);
+    let summary: RequestSummary = serde_json::from_str("{}").expect("a summary");
+    assert_eq!(
+      (summary.prefill_tokens_per_second, summary.cache_hit_ratio),
+      (None, None)
+    );
+    assert_eq!(summary.cached_tokens, 0);
+  }
+
+  /// A finished request that computed `tokens` prompt tokens at `tps`.
+  fn prefill_usage(tokens: u64, tps: f64) -> Usage {
+    Usage {
+      prefill_tokens: Some(tokens),
+      prefill_tokens_per_second: Some(tps),
+      ..Usage::default()
+    }
+  }
+
+  #[test]
+  fn the_prefill_figure_weighs_rows_by_tokens_not_by_a_plain_mean() {
+    let log = RequestLog::new();
+    // An agent turn that prefills 100 uncached tokens at 100 tok/s, then a cold
+    // prompt that prefills 10,000 at 5,000: 10,100 tokens over three seconds.
+    // The mean of the two speeds would say 2,550 and mostly report the turn.
+    served(&log, "/m/a.gguf", "L1", prefill_usage(100, 100.0));
+    served(&log, "/m/a.gguf", "L1", prefill_usage(10_000, 5_000.0));
+    assert_eq!(
+      log.tail(LogScope::All, 0).summary.prefill_tokens_per_second,
+      Some(10_100.0 / 3.0)
+    );
+  }
+
+  #[test]
+  fn an_estimated_prefill_counts_and_a_row_needs_both_halves() {
+    let log = RequestLog::new();
+    let estimated = Usage {
+      prefill_estimated: true,
+      ..prefill_usage(500, 500.0)
+    };
+    // 5,000 computed tokens with no speed to place them in: the figure is 600
+    // tokens over two seconds, not 5,600 over two.
+    let no_speed = Usage {
+      prompt_tokens: Some(5_000),
+      prefill_tokens: Some(5_000),
+      ..Usage::default()
+    };
+    served(&log, "/m/a.gguf", "L1", estimated);
+    served(&log, "/m/a.gguf", "L1", prefill_usage(100, 100.0));
+    served(&log, "/m/a.gguf", "L1", no_speed);
+    assert_eq!(
+      log.tail(LogScope::All, 0).summary.prefill_tokens_per_second,
+      Some(300.0)
+    );
+  }
+
+  #[test]
+  fn the_cache_ratio_covers_only_the_rows_that_report_a_cached_count() {
+    let cached = |prompt, hit| Usage {
+      prompt_tokens: Some(prompt),
+      cached_tokens: Some(hit),
+      ..Usage::default()
+    };
+    let log = RequestLog::new();
+    served(&log, "/m/a.gguf", "L1", cached(1_000, 800));
+    served(&log, "/m/a.gguf", "L1", cached(1_000, 200));
+    let s = log.tail(LogScope::All, 0).summary;
+    assert_eq!(s.cached_tokens, 1_000);
+    assert_eq!(s.cache_hit_ratio, Some(0.5));
+
+    // A row that reports no cached count is in neither half of the ratio, even
+    // though its prompt tokens still count toward `Tokens in`.
+    let quiet = RequestLog::new();
+    served(
+      &quiet,
+      "/m/a.gguf",
+      "L1",
+      Usage {
+        prompt_tokens: Some(9_000),
+        ..Usage::default()
+      },
+    );
+    served(&quiet, "/m/a.gguf", "L1", cached(1_000, 500));
+    let q = quiet.tail(LogScope::All, 0).summary;
+    assert_eq!((q.prompt_tokens, q.cached_tokens), (10_000, 500));
+    assert_eq!(q.cache_hit_ratio, Some(0.5));
+
+    // Nothing reported one: no ratio rather than a zero that reads as a miss.
+    let none = RequestLog::new();
+    served(
+      &none,
+      "/m/a.gguf",
+      "L1",
+      Usage {
+        prompt_tokens: Some(10),
+        ..Usage::default()
+      },
+    );
+    let n = none.tail(LogScope::All, 0).summary;
+    assert_eq!((n.cached_tokens, n.cache_hit_ratio), (0, None));
   }
 
   #[test]
@@ -2208,17 +2363,25 @@ mod tests {
     assert_eq!(cells[2], ("Hosts", "—".to_string()));
     assert_eq!(cells[4], ("Avg total", "—".to_string()));
     assert_eq!(cells[6], ("Avg tok/s", "—".to_string()));
+    assert_eq!(cells[7], ("Agg tok/s", "—".to_string()));
+    assert_eq!(cells[8], ("Prefill tok/s", "—".to_string()));
     let filled = RequestSummary {
       avg_duration_ms: Some(1_240),
       tokens_per_second_avg: Some(39.64),
       prompt_tokens: 12_345,
+      prefill_tokens_per_second: Some(3_366.7),
+      cached_tokens: 1_200,
+      cache_hit_ratio: Some(0.9756),
       ..RequestSummary::default()
     };
     let filled_cells = filled.cells("—");
     assert_eq!(filled_cells[4].1, "1.2s");
     assert_eq!(filled_cells[6].1, "39.6");
     assert_eq!(filled_cells[7], ("Agg tok/s", "—".to_string()));
-    assert_eq!(filled_cells[8].1, "12.3k");
+    // A speed from 1000 up loses the decimal here too.
+    assert_eq!(filled_cells[8], ("Prefill tok/s", "3367".to_string()));
+    assert_eq!(filled_cells[9].1, "12.3k");
+    assert_eq!(filled_cells[10], ("Cached", "1200 (97.6%)".to_string()));
     // The session speed is the newest one a stream reported, and the only
     // speed on the strip besides the average.
     assert!(!filled_cells.iter().any(|c| c.0 == "Tok/s last"));

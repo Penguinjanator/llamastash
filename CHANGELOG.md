@@ -7,12 +7,14 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 ### Added
 
 - Request summaries carry an aggregate throughput beside the average: `Agg tok/s` and `/metrics` report the scope's generated tokens over the wall time they were produced, so concurrent streams read as what the box put out instead of one slot each.
+- The request log shows prompt processing: `PP/S` per row and `Prefill tok/s` and `Cached` in the summary, backed by `/metrics` counters, so the wait before the first token reads without starting the engine with `--metrics`. Where an engine reports no prefill timing the proxy estimates one and marks it `~`.
 - A request that a `proxy.aliases` name routed is marked `alias`, in the row note and on the wire, so an alias answer no longer reads as the model it names.
 
 ### Changed
 
 - The TUI Requests tab gives `Request for` the same 24 cells the `requests` table gives a name, and `requests` caps `MODEL` at 24 too, so one long repo id stops widening every shorter row.
 - `Note` moved to the end of the requests table, in the TUI tab and in `llamastash requests`, so the free text no longer sits between the figures and the names.
+- `llamastash requests` puts `PP/S` right after `TOK/S`, which shifts the tab-separated fields that follow it.
 
 ## [0.7.0] — 2026-10-13
 

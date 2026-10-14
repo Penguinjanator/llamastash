@@ -471,10 +471,17 @@ fn seeded_requests_view_app() -> App {
     prompt_tokens: Some(18_432),
     completion_tokens: Some(164),
     tokens_per_second: Some(41.27),
+    prefill_tokens: Some(4_096),
+    prefill_tokens_per_second: Some(612.4),
+    cached_tokens: Some(14_336),
     ..RequestRow::default()
   };
   let rows = vec![
     RequestRow {
+      // The engine sent no prefill timing here, so the row carries the proxy's
+      // own estimate.
+      prefill_estimated: true,
+      prefill_tokens_per_second: Some(96.5),
       fallback: Some("launch_failed".into()),
       requested_model: Some("qwen-70b".into()),
       client: Some("127.0.0.1:53477".into()),
@@ -486,6 +493,9 @@ fn seeded_requests_view_app() -> App {
       prompt_tokens: None,
       completion_tokens: None,
       tokens_per_second: None,
+      prefill_tokens: None,
+      prefill_tokens_per_second: None,
+      cached_tokens: None,
       ..row(5)
     },
     RequestRow {
@@ -495,6 +505,9 @@ fn seeded_requests_view_app() -> App {
       prompt_tokens: None,
       completion_tokens: None,
       tokens_per_second: None,
+      prefill_tokens: None,
+      prefill_tokens_per_second: None,
+      cached_tokens: None,
       ..row(6)
     },
     RequestRow {
@@ -502,6 +515,9 @@ fn seeded_requests_view_app() -> App {
       prompt_tokens: None,
       completion_tokens: None,
       tokens_per_second: None,
+      prefill_tokens: None,
+      prefill_tokens_per_second: None,
+      cached_tokens: None,
       route: "/v1/messages".into(),
       ..row(4)
     },
@@ -521,6 +537,9 @@ fn seeded_requests_view_app() -> App {
       prompt_tokens: None,
       completion_tokens: None,
       tokens_per_second: None,
+      prefill_tokens: None,
+      prefill_tokens_per_second: None,
+      cached_tokens: None,
       ..row(3)
     },
     RequestRow {
@@ -553,6 +572,9 @@ fn seeded_requests_view_app() -> App {
       tokens_per_second_session: Some(48.9),
       tokens_per_second_last: Some(41.27),
       prompt_tokens: 36_864,
+      prefill_tokens_per_second: Some(1042.6),
+      cached_tokens: 33_472,
+      cache_hit_ratio: Some(0.908),
       completion_tokens: 328,
       auto_starts: 2,
       evictions: 1,
