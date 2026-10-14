@@ -34,3 +34,43 @@ pub use auth::{ProxyApiKey, ProxyAuth};
 pub use route::DEFAULT_BODY_LIMIT_BYTES;
 pub use server::{serve, ProxyStatus, StatusCell};
 pub use state::ProxyState;
+
+/// Shared fixtures for the proxy modules' inline `#[cfg(test)]` modules. Not
+/// behind the `test-fixtures` feature: these build no child process.
+#[cfg(test)]
+pub(crate) mod test_support {
+  use std::sync::Arc;
+
+  use super::{state::ProxyState, DEFAULT_BODY_LIMIT_BYTES};
+  use crate::daemon::{
+    context::MethodContext,
+    registry::{LaunchId, SupervisorRegistry},
+    shutdown::ShutdownToken,
+    supervisor::{test_support::parked, ManagedState},
+  };
+
+  /// The managed multiplexer's umbrella launch id, resolved the way
+  /// [`crate::backend::umbrella_owner`] does, so a test names no backend.
+  pub(crate) fn umbrella_id() -> LaunchId {
+    crate::backend::Backends::all()
+      .into_iter()
+      .find_map(|b| crate::backend::Backend::umbrella_launch_id(&b))
+      .expect("a managed-multiplexer backend exposing an umbrella launch id")
+  }
+
+  /// A `ProxyState` whose registry holds `(launch id, state, path, port)`.
+  /// The catalog stays empty, so served names fall back to the file stem.
+  pub(crate) async fn state_with(rows: &[(&str, ManagedState, &str, u16)]) -> Arc<ProxyState> {
+    let supervisors = SupervisorRegistry::new();
+    for (id, state, path, port) in rows {
+      supervisors
+        .insert(
+          LaunchId((*id).to_string()),
+          parked((*state).clone(), path, *port),
+        )
+        .await;
+    }
+    let ctx = MethodContext::new(ShutdownToken::new()).with_supervisors(supervisors);
+    ProxyState::from_context(&ctx, false, true, DEFAULT_BODY_LIMIT_BYTES)
+  }
+}
