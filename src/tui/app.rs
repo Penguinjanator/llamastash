@@ -2554,7 +2554,7 @@ fn parse_quant(label: &str) -> crate::gguf::metadata::Quant {
 }
 
 fn parse_external_row(row: &Value) -> Option<ManagedRow> {
-  let pid = row.get("pid").and_then(Value::as_u64)? as u32;
+  let pid = u32::try_from(row.get("pid").and_then(Value::as_u64)?).ok()?;
   let path = row
     .get("model_path")
     .and_then(Value::as_str)
@@ -3039,17 +3039,25 @@ mod tests {
   }
 
   #[test]
-  fn ingest_status_drops_an_out_of_range_external_port() {
-    // A daemon-side parse could hand back anything; a wrapped `as u16` would
-    // render a real-looking wrong port.
+  fn ingest_status_drops_out_of_range_external_port_and_pid() {
+    // A daemon-side parse could hand back anything. A wrapped port would render
+    // a real-looking wrong endpoint, and a wrapped pid would render a `pid <n>`
+    // label that names someone else's process, so both drop instead.
     let mut app = App::new(AppOptions::default());
     app.ingest_status(&json!({
       "models": [],
       "external": [
         {"pid": 9913, "cmdline": "llama-server --port 70000 -m /m/ext.gguf",
          "model_path": "/m/ext.gguf", "port": 70000, "launched_by_llamastash": false},
+        {"pid": 4294967296u64, "cmdline": "llama-server --port 41200 -m /m/wide.gguf",
+         "model_path": "/m/wide.gguf", "port": 41200, "launched_by_llamastash": false},
       ]
     }));
+    assert_eq!(
+      app.external.len(),
+      1,
+      "the out-of-range pid is not ingested"
+    );
     assert_eq!(app.external[0].port, 0);
     assert_eq!(app.external[0].pid, Some(9913));
   }
