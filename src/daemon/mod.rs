@@ -479,6 +479,11 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
     });
   }
 
+  // 8a-i. Periodic external resweep. Step 6 ran the sweep once, so without this
+  // the list is frozen at boot: a server started afterwards never appears and a
+  // row whose process exited never leaves. Same slot `status` reads.
+  orphans::spawn_resweep(token.clone(), ctx.external.clone());
+
   // 8a. Per-backend boot infrastructure supervision (opt-in). A managed
   // multiplexer brings up its one shared umbrella here so discovery (which
   // probes its port) and proxy routing (which forwards to the registered

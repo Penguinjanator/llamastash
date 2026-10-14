@@ -32,6 +32,7 @@ use super::router::{self, ProxyResponse};
 use super::state::ProxyState;
 use crate::daemon::registry::LaunchId;
 use crate::daemon::supervisor::ManagedState;
+use crate::gguf::identity::ModelId;
 use crate::util::datetime;
 
 /// The media type a Prometheus scrape expects for text format 0.0.4.
@@ -370,14 +371,22 @@ pub(crate) struct LiveLaunch {
   pub(crate) id: String,
   /// Display name of the model it serves.
   pub(crate) model: String,
+  /// Full identity of the model it serves, for callers that need more than the
+  /// path (`/ui` keys its in-flight guard on it).
+  pub(crate) model_id: ModelId,
+  /// `model_id.path` again as a plain string. Duplication on purpose: batch 2
+  /// rewrites the `l.path == …` comparisons, and until it merges every caller
+  /// keeps working off the string. Dropped once that lands.
   pub(crate) path: String,
   pub(crate) port: u16,
   pub(crate) ready: bool,
 }
 
-/// Every live launch that is a model, with its display name and port. The same
-/// registry walk `/ui`'s chooser makes; infrastructure launches (a managed
-/// multiplexer's umbrella) serve no model of their own and are left out.
+/// Every live launch that is a model, with its display name, identity and port,
+/// sorted by launch order. The one registry walk, shared by `/metrics` and
+/// `/ui`'s chooser; infrastructure launches (a managed multiplexer's umbrella)
+/// serve no model of their own and are left out. A launch that is not Ready is
+/// still listed, with `ready: false`.
 pub(crate) async fn live_launches(state: &ProxyState) -> Vec<LiveLaunch> {
   let sup_snap = state.ctx.supervisors.snapshot().await;
   let cat_snap = state.ctx.catalog.shared_view().await;
@@ -387,12 +396,14 @@ pub(crate) async fn live_launches(state: &ProxyState) -> Vec<LiveLaunch> {
     if crate::backend::is_infra_launch(&launch_id) {
       continue;
     }
-    let path = model.id().path.to_string_lossy().into_owned();
-    let name = route::served_name_for_model(by_path.get(&path).copied(), &model.id().path);
+    let id = model.id().clone();
+    let path = id.path.to_string_lossy().into_owned();
+    let name = route::served_name_for_model(by_path.get(&path).copied(), &id.path);
     let ready = matches!(model.state().await, ManagedState::Ready);
     out.push(LiveLaunch {
       id: launch_id.as_str().to_string(),
       model: name,
+      model_id: id,
       path,
       port: model.port(),
       ready,
@@ -1546,6 +1557,52 @@ mod tests {
   use crate::proxy::request_log::{RequestState, DEFAULT_TAIL};
   use crate::proxy::usage_tap::Usage;
   use std::collections::BTreeSet;
+  use std::path::PathBuf;
+
+  use crate::proxy::test_support::{state_with, umbrella_id};
+
+  /// A Ready live-launch row for the scrape tests, keyed on the model's path.
+  fn live_row(id: &str, model: &str, path: &str, port: u16) -> LiveLaunch {
+    LiveLaunch {
+      id: id.into(),
+      model: model.into(),
+      model_id: ModelId {
+        path: path.into(),
+        header_blake3: [0u8; 32],
+      },
+      path: path.into(),
+      port,
+      ready: true,
+    }
+  }
+
+  /// The one registry walk: every model launch in launch order with the
+  /// identity and port its callers need, a not-Ready launch still listed with
+  /// `ready: false`, and the infra umbrella left out.
+  #[tokio::test]
+  async fn live_launches_lists_model_launches_in_launch_order() {
+    let umbrella = umbrella_id();
+    let state = state_with(&[
+      ("L10", ManagedState::Ready, "/models/zulu.gguf", 41110),
+      ("L2", ManagedState::Loading, "/models/alpha.gguf", 41102),
+      (
+        umbrella.as_str(),
+        ManagedState::Ready,
+        "/models/umbrella.gguf",
+        41120,
+      ),
+    ])
+    .await;
+    let live = live_launches(&state).await;
+    assert_eq!(
+      live
+        .iter()
+        .map(|l| (l.id.as_str(), l.model.as_str(), l.port, l.ready))
+        .collect::<Vec<_>>(),
+      vec![("L2", "alpha", 41102, false), ("L10", "zulu", 41110, true)]
+    );
+    assert_eq!(live[0].model_id.path, PathBuf::from("/models/alpha.gguf"));
+  }
 
   fn format_of(accept: Option<&str>) -> Result<Format, Reject> {
     let mut headers = HeaderMap::new();
@@ -1950,20 +2007,8 @@ mod tests {
     request(&log, "/models/a.gguf", "L1", 10, 3);
     request(&log, "/models/b.gguf", "L2", 1, 1);
     let live = [
-      LiveLaunch {
-        id: "L1".into(),
-        model: "m1".into(),
-        path: "/models/a.gguf".into(),
-        port: 1111,
-        ready: true,
-      },
-      LiveLaunch {
-        id: "L2".into(),
-        model: "m2".into(),
-        path: "/models/b.gguf".into(),
-        port: 1112,
-        ready: true,
-      },
+      live_row("L1", "m1", "/models/a.gguf", 1111),
+      live_row("L2", "m2", "/models/b.gguf", 1112),
     ];
     let snap = log.snapshot();
     let scope = Scope {
@@ -2053,13 +2098,7 @@ mod tests {
   #[test]
   fn metrics_a_live_launch_with_no_rows_answers_its_zeros() {
     let log = RequestLog::new();
-    let live = [LiveLaunch {
-      id: "L1".into(),
-      model: "m1".into(),
-      path: "/models/a.gguf".into(),
-      port: 1111,
-      ready: true,
-    }];
+    let live = [live_row("L1", "m1", "/models/a.gguf", 1111)];
     let snap = log.snapshot();
     let scope = Scope {
       log: LogScope::Launch { id: "L1".into() },
@@ -2091,13 +2130,7 @@ mod tests {
   #[test]
   fn metrics_a_live_model_with_no_rows_answers_its_zeros() {
     let log = RequestLog::new();
-    let live = [LiveLaunch {
-      id: "L1".into(),
-      model: "m1".into(),
-      path: "/models/a.gguf".into(),
-      port: 1111,
-      ready: true,
-    }];
+    let live = [live_row("L1", "m1", "/models/a.gguf", 1111)];
     let snap = log.snapshot();
     let scope = Scope {
       log: LogScope::Model {
@@ -2128,13 +2161,7 @@ mod tests {
     let log = RequestLog::new();
     request_named(&log, "m", "/models/a.gguf", "L1", 10, 5);
     log.forget_launch("L1");
-    let live = [LiveLaunch {
-      id: "L2".into(),
-      model: "m".into(),
-      path: "/models/b.gguf".into(),
-      port: 2222,
-      ready: true,
-    }];
+    let live = [live_row("L2", "m", "/models/b.gguf", 2222)];
     let snap = log.snapshot();
     let scope = Scope {
       log: LogScope::Model {
@@ -2163,13 +2190,7 @@ mod tests {
   #[test]
   fn metrics_an_idle_model_named_none_answers_under_its_path() {
     let log = RequestLog::new();
-    let live = [LiveLaunch {
-      id: "L1".into(),
-      model: NO_MODEL.into(),
-      path: "/models/none.gguf".into(),
-      port: 1111,
-      ready: true,
-    }];
+    let live = [live_row("L1", NO_MODEL, "/models/none.gguf", 1111)];
     let snap = log.snapshot();
     let scope = Scope {
       log: LogScope::Model {
@@ -2196,13 +2217,7 @@ mod tests {
     let log = RequestLog::new();
     request_named(&log, "m", "/models/a.gguf", "L1", 10, 5);
     log.forget_launch("L1");
-    let live = [LiveLaunch {
-      id: "L2".into(),
-      model: "m".into(),
-      path: "/models/b.gguf".into(),
-      port: 2222,
-      ready: true,
-    }];
+    let live = [live_row("L2", "m", "/models/b.gguf", 2222)];
     let snap = log.snapshot();
     let parsed = Parsed {
       format: Format::Json,
@@ -2229,13 +2244,7 @@ mod tests {
   #[test]
   fn metrics_an_unscoped_scrape_does_not_invent_per_launch_zeros() {
     let log = RequestLog::new();
-    let live = [LiveLaunch {
-      id: "L1".into(),
-      model: "m1".into(),
-      path: "/models/a.gguf".into(),
-      port: 1111,
-      ready: true,
-    }];
+    let live = [live_row("L1", "m1", "/models/a.gguf", 1111)];
     let snap = log.snapshot();
     let mut doc = Document::new(true);
     render(&mut doc, &snap, &live, &Scope::default(), 1, 1);

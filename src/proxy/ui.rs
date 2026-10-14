@@ -33,8 +33,7 @@ use hyper::{HeaderMap, Request, Response, StatusCode};
 
 use super::router::{BodyError, ProxyResponse};
 use super::state::ProxyState;
-use super::{forward, route};
-use crate::daemon::supervisor::ManagedState;
+use super::{forward, metrics, route};
 use crate::gguf::identity::ModelId;
 
 /// Cookie that pins a browser session to one running backend so asset
@@ -156,28 +155,18 @@ fn resolve_target(headers: &HeaderMap, mut running: Vec<RunningEntry>) -> UiTarg
   UiTarget::Chooser(running)
 }
 
-/// Snapshot every Ready, servable supervisor as a [`RunningEntry`].
-/// Names mirror `/v1/models` (display label wins, else file stem) so
-/// the chooser shows the same identifier the API surfaces. The Lemonade
-/// umbrella is skipped — it's a multiplexer process, not a web UI.
+/// Every Ready, servable launch as a [`RunningEntry`], in launch order. The
+/// rows come from [`metrics::live_launches`], the registry walk shared with
+/// `/metrics`, so the walk happens in one place. Names mirror `/v1/models`
+/// (display label wins, else file stem) so the chooser shows the same
+/// identifier the API surfaces. The managed-multiplexer umbrella is skipped
+/// there — it's a multiplexer process, not a web UI.
 async fn collect_running(state: &Arc<ProxyState>) -> Vec<RunningEntry> {
-  let sup_snap = state.ctx.supervisors.snapshot().await;
-  let cat_snap = state.ctx.catalog.shared_view().await;
-  let by_path = route::index_catalog_by_path(&cat_snap);
-
   let mut out = Vec::new();
-  for (launch_id, model) in sup_snap.into_iter() {
-    // An infrastructure launch (a managed-multiplexer umbrella) is not a
-    // servable model — skip it in the /ui walk.
-    if crate::backend::is_infra_launch(&launch_id) {
+  for launch in metrics::live_launches(state).await {
+    if !launch.ready {
       continue;
     }
-    if !matches!(model.state().await, ManagedState::Ready) {
-      continue;
-    }
-    let id = model.id().clone();
-    let path_key = id.path.to_string_lossy().into_owned();
-    let name = route::served_name_for_model(by_path.get(&path_key).copied(), &id.path);
     // Whether this model's backend serves a web UI. Uses the running model's
     // *actual* resolved backend (last_params tag, falling back to the routing
     // verdict) via `Backend::serves_web_ui`, so a compatible file force-run on a
@@ -185,16 +174,16 @@ async fn collect_running(state: &Arc<ProxyState>) -> Vec<RunningEntry> {
     // falls back to the default backend's own verdict. Names no backend.
     let serves_ui = {
       use crate::backend::Backend;
-      route::running_model_backend(state, &id)
+      route::running_model_backend(state, &launch.model_id)
         .await
         .map(|b| b.serves_web_ui())
         .unwrap_or_else(|| crate::backend::default_backend().serves_web_ui())
     };
     out.push(RunningEntry {
-      launch_id: launch_id.as_str().to_string(),
-      model_id: id,
-      port: model.port(),
-      name,
+      launch_id: launch.id,
+      model_id: launch.model_id,
+      port: launch.port,
+      name: launch.model,
       serves_ui,
     });
   }
@@ -451,6 +440,54 @@ fn html_response(status: StatusCode, body: String) -> Response<BoxBody<Bytes, Bo
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::daemon::supervisor::ManagedState;
+  use crate::proxy::test_support::{state_with, umbrella_id};
+
+  /// The running list is Ready rows only, in launch order (`L2` before `L10`),
+  /// each carrying its port and served name, and the full model id the forward
+  /// path keys its in-flight guard on.
+  #[tokio::test]
+  async fn collect_running_lists_ready_launches_in_launch_order() {
+    let state = state_with(&[
+      ("L10", ManagedState::Ready, "/models/zulu.gguf", 41110),
+      ("L2", ManagedState::Ready, "/models/alpha.gguf", 41102),
+      ("L3", ManagedState::Loading, "/models/booting.gguf", 41103),
+    ])
+    .await;
+    let running = collect_running(&state).await;
+    assert_eq!(
+      running
+        .iter()
+        .map(|e| (e.launch_id.as_str(), e.name.as_str(), e.port))
+        .collect::<Vec<_>>(),
+      vec![("L2", "alpha", 41102), ("L10", "zulu", 41110)],
+      "Ready rows only, in launch order, each with its port and name"
+    );
+    assert_eq!(
+      running[0].model_id.path,
+      std::path::PathBuf::from("/models/alpha.gguf"),
+      "the row carries the launched model's identity, not just a path string"
+    );
+    assert!(
+      running.iter().all(|e| e.serves_ui),
+      "a llama.cpp row still serves a web UI, so it stays selectable"
+    );
+  }
+
+  /// The managed multiplexer's umbrella is daemon infra, not a servable model,
+  /// so it is never a `/ui` target.
+  #[tokio::test]
+  async fn collect_running_skips_the_infrastructure_launch() {
+    let umbrella = umbrella_id();
+    let state = state_with(&[(
+      umbrella.as_str(),
+      ManagedState::Ready,
+      "/models/umbrella.gguf",
+      41120,
+    )])
+    .await;
+    assert!(collect_running(&state).await.is_empty());
+  }
 
   fn headers_with_cookie(value: &str) -> HeaderMap {
     let mut h = HeaderMap::new();

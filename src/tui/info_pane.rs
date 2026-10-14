@@ -16,6 +16,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Palette;
 use crate::tui::app::App;
+use crate::tui::status_icons::SurfaceState;
 
 const LABEL_WIDTH: usize = 8;
 const LABEL_SERVER: &str = "server  ";
@@ -447,7 +448,9 @@ fn counts_row<'a>(app: &'a App, palette: &'a Palette) -> Line<'a> {
 }
 
 fn running_row<'a>(app: &'a App, budget: usize, palette: &'a Palette) -> Line<'a> {
-  let n = app.managed.len();
+  // External processes hold a port and a model just like a managed launch, so
+  // they belong in the count the operator reads as "what is live right now".
+  let n = app.managed.len() + app.external.len();
   if n == 0 {
     return Line::from(vec![
       Span::styled(LABEL_RUNNING, palette.label_style()),
@@ -466,7 +469,23 @@ fn running_row<'a>(app: &'a App, budget: usize, palette: &'a Palette) -> Line<'a
   let parts: Vec<String> = app
     .managed
     .iter()
-    .map(|m| format!("{} :{}", app.model_label(&m.path), m.port))
+    .chain(app.external.iter())
+    .map(|m| {
+      let label = match (m.state, m.pid, m.path.as_os_str().is_empty()) {
+        // A server whose argv carried no `-m` has no model to name it, and
+        // `model_label("")` prints the same placeholder for every one of them.
+        // The pid is what tells two of them apart.
+        (SurfaceState::External, Some(pid), true) => format!("pid {pid}"),
+        _ => app.model_label(&m.path),
+      };
+      // A scan row whose argv carried no port flag has none to show; `:0` would
+      // read as a real endpoint.
+      if m.port == 0 {
+        label
+      } else {
+        format!("{label} :{}", m.port)
+      }
+    })
     .collect();
   let joined = parts.join(crate::tui::glyphs::active().middot_sep());
   let trimmed = right_ellipsise(&joined, list_budget);
@@ -495,7 +514,6 @@ mod tests {
   use crate::discovery::{DiscoveredModel, ModelSource};
   use crate::gguf::metadata::{ModeHint, ModelMetadata, Quant};
   use crate::tui::app::{App, AppOptions, DaemonInfo, ManagedRow};
-  use crate::tui::status_icons::SurfaceState;
   use ratatui::backend::TestBackend;
   use ratatui::Terminal;
   use std::path::PathBuf;
@@ -694,6 +712,88 @@ mod tests {
     assert!(
       running_row.contains("qwen :41100"),
       "expected `qwen :41100` entry, got: {running_row:?}"
+    );
+  }
+
+  #[test]
+  fn running_row_counts_external_rows_beside_managed_ones() {
+    let mut app = App::new(AppOptions::default());
+    app.managed = vec![fake_managed("/m/qwen.gguf", 41100, SurfaceState::Ready)];
+    app.external = vec![fake_managed("/m/ext.gguf", 41102, SurfaceState::External)];
+    let rows = render_lines(&app);
+    let running_row = rows.iter().find(|r| r.contains("running")).unwrap();
+    assert!(
+      running_row.contains("2 ("),
+      "an external process is running too, so it belongs in the count, got: {running_row:?}"
+    );
+    assert!(
+      running_row.contains("qwen :41100") && running_row.contains("ext :41102"),
+      "expected both the managed and the external entry listed, got: {running_row:?}"
+    );
+  }
+
+  #[test]
+  fn running_row_lists_an_external_row_without_a_port_by_name_alone() {
+    let mut app = App::new(AppOptions::default());
+    app.external = vec![fake_managed("/m/portless.gguf", 0, SurfaceState::External)];
+    let rows = render_lines(&app);
+    let running_row = rows.iter().find(|r| r.contains("running")).unwrap();
+    assert!(
+      running_row.contains("1 ("),
+      "an external process alone still counts as running, got: {running_row:?}"
+    );
+    assert!(
+      running_row.contains("portless") && !running_row.contains(":0"),
+      "a scan row whose argv carried no port flag must not read as `:0`, got: {running_row:?}"
+    );
+  }
+
+  #[test]
+  fn running_row_names_a_pathless_external_row_by_pid() {
+    // A server whose argv carried no `-m` has no model to show. Falling back to
+    // the empty path's display name printed the same word for every one of
+    // them, so two such rows were indistinguishable.
+    let mut app = App::new(AppOptions::default());
+    app.external = vec![
+      ManagedRow {
+        launch_id: "ext-41102".into(),
+        pid: Some(41102),
+        path: PathBuf::new(),
+        port: 41102,
+        state: SurfaceState::External,
+        ..Default::default()
+      },
+      ManagedRow {
+        launch_id: "ext-41103".into(),
+        pid: Some(41103),
+        path: PathBuf::new(),
+        port: 41103,
+        state: SurfaceState::External,
+        ..Default::default()
+      },
+    ];
+    let rows = render_lines(&app);
+    let running_row = rows.iter().find(|r| r.contains("running")).unwrap();
+    assert!(
+      running_row.contains("pid 41102 :41102") && running_row.contains("pid 41103 :41103"),
+      "each pathless row must be named by its own pid, got: {running_row:?}"
+    );
+
+    // The pid comes from the row's own field, not from the launch id the
+    // renderer no longer parses: with none recorded there is nothing to print.
+    app.external = vec![ManagedRow {
+      launch_id: "ext-41104".into(),
+      pid: None,
+      path: PathBuf::new(),
+      port: 0,
+      state: SurfaceState::External,
+      ..Default::default()
+    }];
+    let unlabelled = render_lines(&app);
+    let unlabelled_row = unlabelled.iter().find(|r| r.contains("running")).unwrap();
+    assert!(
+      !unlabelled_row.contains("pid 41104"),
+      "no pid recorded, so no pid label: {unlabelled_row:?}"
     );
   }
 

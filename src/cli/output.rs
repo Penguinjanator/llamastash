@@ -632,7 +632,9 @@ pub fn status_human(snap: &StatusSnapshot) -> String {
         dim_or_plain("external"),
         dim_or_plain("external"),
         dim_or_plain("-"),
-        dim_or_plain("-"),
+        // The daemon parses `--port` off the process argv; a scan row without
+        // one has no port to show, so it stays `-` rather than a fake 0.
+        dim_or_plain(&r.port.map(|p| p.to_string()).unwrap_or_else(|| "-".into())),
         dim_or_plain(&r.pid.to_string()),
         dim_or_plain("-"),
         if tty { colors::dim(&name) } else { name },
@@ -1792,6 +1794,33 @@ mod tests {
     // resolved_ctx unset → "-" in the CTX column.
     assert!(s.contains("L1\tready\tchat\t41100\t123\t-\tqwen.gguf\n"));
     assert!(s.contains("external\texternal\t-\t-\t9999\t-\text.gguf\n"));
+  }
+
+  #[test]
+  fn status_human_shows_an_external_rows_port_when_the_argv_carried_one() {
+    let _g = ColorGuard::set(false);
+    let snap = StatusSnapshot {
+      models: vec![],
+      external: vec![ExternalRow {
+        pid: 9999,
+        cmdline: "llama-server --port 8080".into(),
+        model_path: Some("/m/ext.gguf".into()),
+        port: Some(8080),
+        launched_by_llamastash: false,
+        name: None,
+      }],
+      gpu: Value::Null,
+      host: Value::Null,
+      daemon: None,
+      proxy: Value::Null,
+      backends: Value::Null,
+      servers: Value::Null,
+    };
+    let s = status_human(&snap);
+    assert!(
+      s.contains("external\texternal\t-\t8080\t9999\t-\text.gguf\n"),
+      "the PORT column must carry the parsed port, got: {s:?}"
+    );
   }
 
   #[test]

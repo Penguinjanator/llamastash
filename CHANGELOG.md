@@ -4,6 +4,10 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ## [Unreleased]
 
+### Fixed
+
+- External `llama-server` rows refresh every 30 s instead of only at daemon start, so a server started after boot appears, one that exits disappears, and the port its argv carries shows in `status` and the TUI (#111).
+
 ## [0.7.0] — 2026-10-13
 
 This release is about seeing what the proxy is doing. `llamastash requests` and the TUI's Requests tab list the proxied requests with their timings, token counts, tok/s and the reason behind each one, `GET /metrics` publishes the same numbers for Prometheus, and `GET /metrics/backend` folds each engine's own counters into one scrape. `proxy.aliases` answers a model name a tool is hard-wired to with a local model, so that tool needs no config change. The memory gate no longer refuses hybrid Qwen models at context windows they fit, and setup got shell completions, `doctor --fix` and a terminal bell when a pull or a load ends.
