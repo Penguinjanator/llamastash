@@ -100,10 +100,11 @@ fn requests_human(body: &Value, one_model: bool) -> String {
 /// buries the figures of every row under it.
 const NOTE_MAX_W: usize = 60;
 
-/// The widest `REQUEST FOR` gets on a terminal. `format::table` sizes a
-/// column to its widest cell with no bound, and the value is a client
-/// string, so it gets its own cap.
-const REQUEST_FOR_MAX_W: usize = 24;
+/// The widest `MODEL` and `REQUEST FOR` get on a terminal. `format::table`
+/// sizes a column to its widest cell with no bound, and both values are
+/// client or catalog strings, so they get their own cap. One request for a
+/// long repo id should not widen the table for every shorter row.
+const NAME_MAX_W: usize = 24;
 
 /// What marks a `cap_cells` cut, and what it costs. Three plain cells, so a
 /// wide glyph cannot push the column past its cap.
@@ -131,19 +132,22 @@ fn cap_cells(s: &str, w: usize) -> String {
 }
 
 /// The padded table only: split long notes over continuation lines under
-/// the NOTE column, and cap `REQUEST FOR`, which repeats the model name on
-/// most rows and would otherwise widen the table to its longest cell.
-/// Piped output keeps one line per request with the whole values in their
-/// fields, so `awk -F\t` pipelines are untouched.
+/// the NOTE column, and cap the two name columns, which repeat a long model
+/// name on most rows and would otherwise widen the table to its longest
+/// cell. Piped output keeps one line per request with the whole values in
+/// their fields, so `awk -F\t` pipelines are untouched.
 fn fit_padded_table(header: &[&str], rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
   if !console::colors_enabled() {
     return rows;
   }
   let mut rows = rows;
-  if let Some(asked) = header.iter().position(|h| *h == "REQUEST FOR") {
+  for name in ["MODEL", "REQUEST FOR"] {
+    let Some(col) = header.iter().position(|h| *h == name) else {
+      continue;
+    };
     for row in rows.iter_mut() {
-      if let Some(cell) = row.get_mut(asked) {
-        *cell = cap_cells(cell, REQUEST_FOR_MAX_W);
+      if let Some(cell) = row.get_mut(col) {
+        *cell = cap_cells(cell, NAME_MAX_W);
       }
     }
   }
@@ -366,7 +370,7 @@ mod tests {
 
   #[test]
   fn a_padded_table_places_and_caps_the_asked_model() {
-    let asked = "q".repeat(REQUEST_FOR_MAX_W + 20);
+    let asked = "q".repeat(NAME_MAX_W + 20);
     let mut wide = row();
     wide.requested_model = Some(asked.clone());
     let lines: Vec<String> = on_terminal(&[wide], false)
@@ -384,8 +388,54 @@ mod tests {
       !body.contains(&asked),
       "the whole name should not reach the screen"
     );
-    assert!(body.contains(&"q".repeat(REQUEST_FOR_MAX_W - 3)), "{body}");
+    assert!(body.contains(&"q".repeat(NAME_MAX_W - 3)), "{body}");
     assert!(body.contains("..."), "{body}");
+  }
+
+  #[test]
+  fn a_padded_table_caps_a_long_model_name_the_same_way() {
+    let long = "m".repeat(NAME_MAX_W + 20);
+    let cut = format!("{}{}", "m".repeat(NAME_MAX_W - 3), CAP_MARK);
+    let mut wide = row();
+    wide.model = Some(long.clone());
+    wide.requested_model = Some(long.clone());
+    let lines: Vec<String> = on_terminal(&[wide.clone()], false)
+      .lines()
+      .map(|line| console::strip_ansi_codes(line).to_string())
+      .skip_while(|line| !line.starts_with("TIME"))
+      .collect();
+    let header = lines.first().expect("header").clone();
+    let body = lines.last().expect("row").clone();
+    assert!(!body.contains(&long), "the whole name stays off screen");
+    assert_eq!(body.matches(CAP_MARK).count(), 2, "{body}");
+    // Each capped column is exactly the cap wide, so the figures after it
+    // line up with every other row.
+    let width_of = |name: &str, next: &str| {
+      let at = header.find(name).expect(name);
+      let end = at + name.len() + header[at + name.len()..].find(next).expect(next);
+      console::measure_text_width(body[at..end].trim_end())
+    };
+    assert_eq!(width_of("MODEL", "LAUNCH"), NAME_MAX_W, "{body}");
+    assert_eq!(width_of("REQUEST FOR", "NOTE"), NAME_MAX_W, "{body}");
+
+    // The one-model view has no MODEL column, and still caps the ask.
+    let one_model: Vec<String> = on_terminal(&[wide.clone()], true)
+      .lines()
+      .map(|line| console::strip_ansi_codes(line).to_string())
+      .skip_while(|line| !line.starts_with("TIME"))
+      .collect();
+    assert!(!one_model[0].contains("MODEL"), "{}", one_model[0]);
+    assert!(one_model.last().expect("row").contains(&cut));
+
+    // Piped output keeps both whole, so `awk -F\t` still reads them.
+    let line = piped(&[wide], false)
+      .lines()
+      .nth(1)
+      .expect("row")
+      .to_string();
+    let cells: Vec<&str> = line.split('\t').collect();
+    assert_eq!(cells[7], long, "MODEL keeps the whole name");
+    assert_eq!(cells[10], long, "REQUEST FOR keeps the whole name");
   }
 
   #[test]

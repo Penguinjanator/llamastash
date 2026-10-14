@@ -26,7 +26,7 @@ pub const POLL_ROWS: usize = 200;
 const NONE: &str = "—";
 const COL_SEP_W: usize = 1;
 /// The least `Note` is worth showing at.
-const MIN_NOTE_W: usize = 12;
+const MIN_NOTE_W: usize = 10;
 /// `Route`'s own width. It is the last column shown and the first dropped.
 const ROUTE_W: usize = 16;
 /// Gap between two figures on the summary strip.
@@ -104,10 +104,11 @@ const COLUMNS: &[Column<ColumnId>] = &[
   Column {
     id: ColumnId::RequestFor,
     label: "Request for",
-    // Fits a model name; a longer one cuts with an ellipsis. It outranks
+    // The same 24 cells the CLI table gives a name, enough for a repo id
+    // with its quant tag; a longer one cuts with an ellipsis. It outranks
     // `Client` and `Route` because it is the reason a row reads apart from
     // its neighbours: the model an alias or a fallback answered for.
-    width: 14,
+    width: 24,
     rank: 80,
   },
   Column {
@@ -428,7 +429,7 @@ mod tests {
   fn columns_drop_by_rank_as_the_pane_narrows() {
     // Each column costs its width plus one separator. Running totals in
     // rank order: Time 9, Code 14, Tok/s 21, Total 29, TTFB 37, In 44,
-    // Out 51, Note 64, Request for 79, Client 101, Route 118.
+    // Out 51, Note 62, Request for 87, Client 109, Route 126.
     let full = [
       "Time",
       "Code",
@@ -442,7 +443,7 @@ mod tests {
       "Client",
       "Route",
     ];
-    assert_eq!(labels(118), full);
+    assert_eq!(labels(126), full);
     // Route ranks highest of all, so it is the first to go.
     let no_route = [
       "Time",
@@ -456,10 +457,10 @@ mod tests {
       "Request for",
       "Client",
     ];
-    assert_eq!(labels(117), no_route);
-    assert_eq!(labels(101), no_route);
+    assert_eq!(labels(125), no_route);
+    assert_eq!(labels(109), no_route);
     assert_eq!(
-      labels(100),
+      labels(108),
       vec![
         "Time",
         "Code",
@@ -473,7 +474,7 @@ mod tests {
       ]
     );
     assert_eq!(
-      labels(79),
+      labels(87),
       vec![
         "Time",
         "Code",
@@ -487,15 +488,15 @@ mod tests {
       ]
     );
     assert_eq!(
-      labels(78),
+      labels(86),
       vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Note"]
     );
     assert_eq!(
-      labels(64),
+      labels(62),
       vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Note"]
     );
     assert_eq!(
-      labels(63),
+      labels(61),
       vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out"]
     );
     assert_eq!(
@@ -541,9 +542,45 @@ mod tests {
     assert_eq!(wide.width_of(route), ROUTE_W);
     // At the width `Request for` just fits, the only spare cell is the
     // separator after the last column, and `Note` grows first.
-    assert_eq!(layout_columns(79).note_w, MIN_NOTE_W + 1);
+    assert_eq!(layout_columns(87).note_w, MIN_NOTE_W + 1);
     // Too narrow for `Note`: it gets nothing and the row ends earlier.
-    assert_eq!(layout_columns(63).note_w, 0);
+    assert_eq!(layout_columns(61).note_w, 0);
+  }
+
+  #[test]
+  fn request_for_gets_the_width_the_cli_gives_a_name() {
+    let wide = layout_columns(200);
+    let asked = wide
+      .visible
+      .iter()
+      .find(|c| c.id == ColumnId::RequestFor)
+      .expect("request for column");
+    assert_eq!(wide.width_of(asked), 24);
+
+    // A name that fits the column reaches the screen whole; a longer one
+    // cuts, and the row still renders.
+    let whole = "n".repeat(24);
+    let mut state = RequestsTabState::default();
+    state.set(
+      RequestsScope::Model("/m/a.gguf".to_string()),
+      RequestSummary::default(),
+      vec![
+        RequestRow {
+          requested_model: Some(whole.clone()),
+          ..row(2)
+        },
+        RequestRow {
+          requested_model: Some("x".repeat(60)),
+          ..row(1)
+        },
+      ],
+    );
+    let lines = rendered(&state, 150, 8);
+    assert!(lines.iter().any(|l| l.contains(&whole)), "{lines:?}");
+    assert!(
+      !lines.iter().any(|l| l.contains(&"x".repeat(30))),
+      "{lines:?}"
+    );
   }
 
   #[test]
@@ -589,7 +626,7 @@ mod tests {
         row(1),
       ],
     );
-    let lines = rendered(&state, 120, 8);
+    let lines = rendered(&state, 130, 8);
     assert!(lines[0].starts_with("Requests 2"), "{lines:?}");
     // The summary wraps to as many lines as it needs; the table starts
     // one blank line under it.
