@@ -16,6 +16,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Palette;
 use crate::tui::app::App;
+use crate::tui::status_icons::SurfaceState;
 
 const LABEL_WIDTH: usize = 8;
 const LABEL_SERVER: &str = "server  ";
@@ -470,13 +471,12 @@ fn running_row<'a>(app: &'a App, budget: usize, palette: &'a Palette) -> Line<'a
     .iter()
     .chain(app.external.iter())
     .map(|m| {
-      let label = if m.path.as_os_str().is_empty() {
+      let label = match (m.state, m.pid, m.path.as_os_str().is_empty()) {
         // A server whose argv carried no `-m` has no model to name it, and
         // `model_label("")` prints the same placeholder for every one of them.
         // The pid is what tells two of them apart.
-        format!("pid {}", m.launch_id.trim_start_matches("ext-"))
-      } else {
-        app.model_label(&m.path)
+        (SurfaceState::External, Some(pid), true) => format!("pid {pid}"),
+        _ => app.model_label(&m.path),
       };
       // A scan row whose argv carried no port flag has none to show; `:0` would
       // read as a real endpoint.
@@ -514,7 +514,6 @@ mod tests {
   use crate::discovery::{DiscoveredModel, ModelSource};
   use crate::gguf::metadata::{ModeHint, ModelMetadata, Quant};
   use crate::tui::app::{App, AppOptions, DaemonInfo, ManagedRow};
-  use crate::tui::status_icons::SurfaceState;
   use ratatui::backend::TestBackend;
   use ratatui::Terminal;
   use std::path::PathBuf;
@@ -758,6 +757,7 @@ mod tests {
     app.external = vec![
       ManagedRow {
         launch_id: "ext-41102".into(),
+        pid: Some(41102),
         path: PathBuf::new(),
         port: 41102,
         state: SurfaceState::External,
@@ -765,6 +765,7 @@ mod tests {
       },
       ManagedRow {
         launch_id: "ext-41103".into(),
+        pid: Some(41103),
         path: PathBuf::new(),
         port: 41103,
         state: SurfaceState::External,
@@ -776,6 +777,23 @@ mod tests {
     assert!(
       running_row.contains("pid 41102 :41102") && running_row.contains("pid 41103 :41103"),
       "each pathless row must be named by its own pid, got: {running_row:?}"
+    );
+
+    // The pid comes from the row's own field, not from the launch id the
+    // renderer no longer parses: with none recorded there is nothing to print.
+    app.external = vec![ManagedRow {
+      launch_id: "ext-41104".into(),
+      pid: None,
+      path: PathBuf::new(),
+      port: 0,
+      state: SurfaceState::External,
+      ..Default::default()
+    }];
+    let unlabelled = render_lines(&app);
+    let unlabelled_row = unlabelled.iter().find(|r| r.contains("running")).unwrap();
+    assert!(
+      !unlabelled_row.contains("pid 41104"),
+      "no pid recorded, so no pid label: {unlabelled_row:?}"
     );
   }
 

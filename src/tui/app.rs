@@ -125,6 +125,9 @@ pub struct ManagedRow {
   pub launch_id: String,
   pub path: PathBuf,
   pub port: u16,
+  /// The process id, set only for external rows: such a row has no launch of
+  /// ours behind it, so the pid is the only thing that identifies it.
+  pub pid: Option<u32>,
   /// User-chosen launch name (from `--name`). When set, the launch is
   /// addressable as `<model-id>@<name>`; the TUI surfaces it in the
   /// running-launch view so a named launch is distinguishable from an
@@ -2559,13 +2562,15 @@ fn parse_external_row(row: &Value) -> Option<ManagedRow> {
     .unwrap_or_default();
   Some(ManagedRow {
     launch_id: format!("ext-{pid}"),
+    pid: Some(pid),
     path,
     // Parsed off the process argv by the daemon. `0` means its argv carried no
-    // port flag, which renderers must show as no port rather than `:0`.
+    // port flag (or one out of range), which renderers must show as no port
+    // rather than `:0`.
     port: row
       .get("port")
       .and_then(Value::as_u64)
-      .map(|p| p as u16)
+      .and_then(|p| u16::try_from(p).ok())
       .unwrap_or(0),
     // Nothing in the TUI addresses an external row by name — `stop <model>@<name>`
     // is a CLI path — so the field is left as the sentinel the rest of the row uses.
@@ -2687,6 +2692,8 @@ fn parse_status_row(row: &Value) -> Option<ManagedRow> {
     .map(String::from);
   Some(ManagedRow {
     launch_id,
+    // A launch of ours is addressed by its id, so it has no use for the pid.
+    pid: None,
     path,
     port,
     name,
@@ -3032,6 +3039,22 @@ mod tests {
   }
 
   #[test]
+  fn ingest_status_drops_an_out_of_range_external_port() {
+    // A daemon-side parse could hand back anything; a wrapped `as u16` would
+    // render a real-looking wrong port.
+    let mut app = App::new(AppOptions::default());
+    app.ingest_status(&json!({
+      "models": [],
+      "external": [
+        {"pid": 9913, "cmdline": "llama-server --port 70000 -m /m/ext.gguf",
+         "model_path": "/m/ext.gguf", "port": 70000, "launched_by_llamastash": false},
+      ]
+    }));
+    assert_eq!(app.external[0].port, 0);
+    assert_eq!(app.external[0].pid, Some(9913));
+  }
+
+  #[test]
   fn ingest_status_reads_an_external_rows_port() {
     let mut app = App::new(AppOptions::default());
     let body = json!({
@@ -3047,7 +3070,8 @@ mod tests {
     assert_eq!(app.external.len(), 2);
     assert_eq!(app.external[0].port, 41102);
     // An argv with no port flag leaves `port` 0, and the renderers have to skip
-    // it rather than print `:0` as if it were an endpoint.
+    // it rather than print `:0` as if it were an endpoint. A port out of the
+    // `u16` range is the same "nothing to show", not a wrapped number.
     assert_eq!(app.external[1].port, 0);
     assert_eq!(
       app.surface_ports().get(&PathBuf::from("/m/scan.gguf")),

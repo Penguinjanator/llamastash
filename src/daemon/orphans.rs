@@ -166,9 +166,10 @@ impl<'a> SweepInputs<'a> {
   }
 }
 
-/// Run a sweep. Pure-ish modulo a `sysinfo` scan of process tables
-/// and one short HTTP probe per adoption candidate.
-pub async fn sweep(inputs: SweepInputs<'_>) -> SweepReport {
+/// The synchronous half of a scan: one `sysinfo` refresh of the whole process
+/// table. Separate from [`sweep`] so a resweep tick can run it on a blocking
+/// thread instead of an async worker.
+fn scan_processes() -> System {
   // `with_environ` makes `proc.environ()` populate the process
   // environment block, which the marker check below reads to spot
   // orphan llamastash children carrying `LLAMASTASH_LAUNCHED=1`.
@@ -204,8 +205,13 @@ pub async fn sweep(inputs: SweepInputs<'_>) -> SweepReport {
   // before this refresh does.
   let mut sys = System::new();
   sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::All, true, process_refresh);
-  let daemon_pid = std::process::id();
+  sys
+}
 
+/// Run a sweep. Pure-ish modulo a `sysinfo` scan of process tables
+/// and one short HTTP probe per adoption candidate.
+pub async fn sweep(inputs: SweepInputs<'_>) -> SweepReport {
+  let sys = scan_processes();
   let mut adopted: Vec<RunningSnapshot> = Vec::new();
   let mut stale: Vec<RunningSnapshot> = Vec::new();
   for snap in inputs.recorded_running.iter().cloned() {
@@ -258,7 +264,25 @@ pub async fn sweep(inputs: SweepInputs<'_>) -> SweepReport {
   }
   let adopted_pids: BTreeSet<u32> = adopted.iter().map(|s| s.pid as u32).collect();
 
-  let external: Vec<ExternalProcess> = sys
+  let external = external_rows(&sys, &inputs.external_markers, &adopted_pids);
+
+  SweepReport {
+    adopted,
+    stale,
+    external,
+  }
+}
+
+/// The external rows in a scanned process table: every process whose
+/// basename matches a backend marker, minus `adopted_pids` (those are
+/// re-adopted launches, not strangers) and this process's own children.
+fn external_rows(
+  sys: &System,
+  external_markers: &[&'static str],
+  adopted_pids: &BTreeSet<u32>,
+) -> Vec<ExternalProcess> {
+  let daemon_pid = std::process::id();
+  sys
     .processes()
     .iter()
     .filter_map(|(pid, proc)| {
@@ -293,8 +317,7 @@ pub async fn sweep(inputs: SweepInputs<'_>) -> SweepReport {
       // basename — for `/usr/bin/llama-server` it is `llama-server`,
       // for `target/debug/llamastash` it is `llamastash`.
       let basename = proc.name().to_string_lossy();
-      let matched = inputs
-        .external_markers
+      let matched = external_markers
         .iter()
         .find(|m| crate::backend::basename_matches_marker(&basename, m))?;
       // A basename is not always the whole answer: a backend whose server is
@@ -329,13 +352,7 @@ pub async fn sweep(inputs: SweepInputs<'_>) -> SweepReport {
         name: None,
       })
     })
-    .collect();
-
-  SweepReport {
-    adopted,
-    stale,
-    external,
-  }
+    .collect()
 }
 
 /// Cadence of the periodic external resweep.
@@ -356,9 +373,10 @@ pub const RESWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// recycled onto something else and the row would describe a stranger.
 ///
 /// A previous row carrying a `name` also wins over a fresh row for the same
-/// pid. The name is the boot re-adoption's only record of that launch's address
-/// and a scan can never produce it; taking the scan row would erase the
-/// `<model>@<name>` form `stop` takes.
+/// pid, but only when the two rows describe the same process. The name is the
+/// boot re-adoption's only record of that launch's address and a scan can never
+/// produce it, so taking the scan row would erase the `<model>@<name>` form
+/// `stop` takes; taking a named row for a recycled pid would name a stranger.
 pub fn merge_external(
   previous: &[ExternalProcess],
   fresh: Vec<ExternalProcess>,
@@ -370,8 +388,10 @@ pub fn merge_external(
         .iter()
         .find(|p| p.pid == row.pid && p.name.is_some())
       {
-        Some(named) => named.clone(),
-        None => row,
+        Some(named) if start_times_agree(named.start_time_secs, row.start_time_secs) => {
+          named.clone()
+        }
+        Some(_) | None => row,
       }
     })
     .collect();
@@ -399,14 +419,14 @@ fn row_still_current(row: &ExternalProcess) -> bool {
     Some(start) => start,
     None => return false,
   };
-  // A zero on either side means "no start time was recorded", which leaves
-  // liveness as the only evidence. A matching non-zero one is positive proof
-  // the pid was not recycled.
-  if live_start == 0 || row.start_time_secs == 0 || live_start == row.start_time_secs {
-    pid_alive(row.pid as i32)
-  } else {
-    false
-  }
+  start_times_agree(row.start_time_secs, live_start) && pid_alive(row.pid as i32)
+}
+
+/// Whether two start times describe one process. A zero means "no start time was
+/// recorded", which leaves nothing to compare; a matching non-zero one is
+/// positive proof the pid was not recycled.
+fn start_times_agree(recorded: u64, other: u64) -> bool {
+  recorded == 0 || other == 0 || recorded == other
 }
 
 /// The process's start time in seconds, or `None` when no process has that pid.
@@ -419,6 +439,43 @@ fn process_start_time(pid: u32) -> Option<u64> {
     ProcessRefreshKind::everything(),
   );
   sys.process(Pid::from_u32(pid)).map(|p| p.start_time())
+}
+
+/// One resweep tick: scan, merge, write.
+///
+/// The scan is synchronous `/proc` work and merging probes each carried row, so
+/// both run on a blocking thread and nothing holds the write lock across a
+/// syscall every `status` read waits behind.
+async fn resweep_tick(external: &Arc<RwLock<Vec<ExternalProcess>>>) {
+  let previous = external.read().await.clone();
+  let scanned = previous.clone();
+  let merged = tokio::task::spawn_blocking(move || {
+    let markers = crate::backend::external_process_markers();
+    let fresh = external_rows(&scan_processes(), &markers, &BTreeSet::new());
+    merge_external(&scanned, fresh)
+  })
+  .await;
+  let Ok(merged) = merged else { return };
+  let mut slot = external.write().await;
+  *slot = keep_removals(&previous, &slot, merged);
+}
+
+/// Drop merged rows the slot lost while the scan was running.
+///
+/// `stop_external` removes a row and kills its process. If that lands between
+/// the read and the write, the scan still saw the process alive, and writing the
+/// row back would resurrect a launch the operator just stopped.
+fn keep_removals(
+  previous: &[ExternalProcess],
+  slot: &[ExternalProcess],
+  merged: Vec<ExternalProcess>,
+) -> Vec<ExternalProcess> {
+  merged
+    .into_iter()
+    .filter(|row| {
+      !previous.iter().any(|p| p.pid == row.pid) || slot.iter().any(|s| s.pid == row.pid)
+    })
+    .collect()
 }
 
 /// Refresh the shared external list every [`RESWEEP_INTERVAL`] until shutdown.
@@ -434,17 +491,7 @@ pub fn spawn_resweep(shutdown: ShutdownToken, external: Arc<RwLock<Vec<ExternalP
         _ = shutdown.wait_until_triggered() => return,
         _ = tokio::time::sleep(RESWEEP_INTERVAL) => {}
       }
-      let report = sweep(SweepInputs::new(&[])).await;
-      let mut slot = external.write().await;
-      // The scan ran before the lock was taken. `stop_external` can have killed
-      // one of these processes and dropped its row in between, so re-check
-      // liveness here rather than writing a dead row back.
-      let fresh: Vec<ExternalProcess> = report
-        .external
-        .into_iter()
-        .filter(|row| pid_alive(row.pid as i32))
-        .collect();
-      *slot = merge_external(&slot, fresh);
+      resweep_tick(&external).await;
     }
   });
 }
@@ -1171,8 +1218,12 @@ mod tests {
     let live = std::process::id();
     // The recorded start time is the real one, so this goes through the identity
     // match rather than the "nothing recorded, liveness decides" escape.
+    let live_start = process_start_time(live).unwrap_or(0);
+    if live_start == 0 {
+      return;
+    }
     let previous = vec![ExternalProcess {
-      start_time_secs: process_start_time(live).unwrap_or(0),
+      start_time_secs: live_start,
       ..scan_row(live, Some(41106))
     }];
     let merged = merge_external(&previous, Vec::new());
@@ -1211,6 +1262,98 @@ mod tests {
       ..scan_row(live, Some(41108))
     }];
     assert!(merge_external(&previous, Vec::new()).is_empty());
+  }
+
+  #[test]
+  fn merge_keeps_a_named_row_that_records_the_live_start_time() {
+    // The carried row proves its own identity: recorded start time equals the
+    // live one, so a recycled pid cannot imitate it.
+    let live = std::process::id();
+    let live_start = process_start_time(live).unwrap_or(0);
+    if live_start == 0 {
+      return;
+    }
+    let previous = vec![ExternalProcess {
+      start_time_secs: live_start,
+      ..named_row(live, 41109, "coder")
+    }];
+    let merged = merge_external(&previous, Vec::new());
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].name.as_deref(), Some("coder"));
+  }
+
+  #[test]
+  fn merge_takes_the_fresh_row_when_a_named_pid_was_recycled() {
+    // Same pid, different process: the name belongs to whatever used the pid
+    // first, so the scan row is the honest one.
+    let previous = vec![ExternalProcess {
+      start_time_secs: 111,
+      ..named_row(2_147_483_640, 41110, "coder")
+    }];
+    let fresh = vec![ExternalProcess {
+      start_time_secs: 222,
+      ..scan_row(2_147_483_640, Some(41111))
+    }];
+    let merged = merge_external(&previous, fresh);
+    assert_eq!(merged.len(), 1, "one process, one row");
+    assert_eq!(merged[0].name, None, "the recycled pid sheds the name");
+    assert_eq!(merged[0].port, Some(41111));
+  }
+
+  #[test]
+  fn merge_keeps_the_name_when_both_rows_record_one_start_time() {
+    // The re-adoption and the scan agree on which process this is, so the name
+    // stays and the address survives.
+    let previous = vec![ExternalProcess {
+      start_time_secs: 333,
+      ..named_row(2_147_483_641, 41112, "coder")
+    }];
+    let fresh = vec![ExternalProcess {
+      start_time_secs: 333,
+      ..scan_row(2_147_483_641, Some(9999))
+    }];
+    let merged = merge_external(&previous, fresh);
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].name.as_deref(), Some("coder"));
+    assert_eq!(
+      merged[0].port,
+      Some(41112),
+      "the named row still wins outright"
+    );
+  }
+
+  #[test]
+  fn keep_removals_does_not_resurrect_a_row_stopped_mid_tick() {
+    // `stop_external` took the first row out of the slot while the scan ran. A
+    // pid the scan found for the first time is new, so it stays.
+    let previous = vec![
+      scan_row(2_147_483_642, Some(41100)),
+      scan_row(2_147_483_643, Some(41101)),
+    ];
+    let slot = vec![scan_row(2_147_483_643, Some(41101))];
+    let merged = vec![
+      scan_row(2_147_483_642, Some(41100)),
+      scan_row(2_147_483_643, Some(41101)),
+      scan_row(2_147_483_644, None),
+    ];
+    let kept: Vec<u32> = keep_removals(&previous, &slot, merged)
+      .iter()
+      .map(|e| e.pid)
+      .collect();
+    assert_eq!(kept, vec![2_147_483_643, 2_147_483_644]);
+  }
+
+  #[tokio::test]
+  async fn resweep_tick_drops_a_row_whose_process_is_gone() {
+    // End to end through the tick: the scan finds nothing for the dead pid, and
+    // the merged list is what lands back in the slot.
+    let external = Arc::new(RwLock::new(vec![scan_row(2_147_483_646, Some(41105))]));
+    resweep_tick(&external).await;
+    let slot = external.read().await;
+    assert!(
+      slot.iter().all(|e| e.pid != 2_147_483_646),
+      "a dead row must not survive a tick: {slot:?}"
+    );
   }
 
   #[test]
