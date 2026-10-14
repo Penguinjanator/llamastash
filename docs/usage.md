@@ -538,11 +538,25 @@ llamastash requests [model-ref] [-n N] [--json]
 Without `model-ref` it lists every request. A `model-ref` that names a running launch — its id (`L3`), its port or its name — scopes to that launch: its own rows, and totals for what that launch served, so an earlier launch of the same model is not counted in. Any other `model-ref` names a model and keeps the wider scope, covering every launch of it. `-n` sets how many rows to print (default 100, at least 1).
 
 ```
-TIME      CODE  TOK/S  TOTAL  TTFB  IN  OUT  MODEL                         LAUNCH  CLIENT           REQUEST FOR               NOTE                             ROUTE
-16:05:11  200   -      1.0s   22ms  -   -    Llama-3.2-1B-Instruct-Q4_K_M  L1      127.0.0.1:49178  Llama-3.2-1B-Instruct...  client closed                    chat/completions
-16:05:11  200   122.6  29ms   12ms  41  3    Llama-3.2-1B-Instruct-Q4_K_M  L1      127.0.0.1:49120  Llama-3.2-1B-Instruct...  -                                chat/completions
-16:05:07  200   110.4  3.4s   3.4s  41  7    Llama-3.2-1B-Instruct-Q4_K_M  L1      127.0.0.1:49106  Llama-3.2-1B-Instruct...  auto-start                       chat/completions
-16:05:07  404   -      0ms    -     -   -    nope                          -       127.0.0.1:49062  nope                      model_not_found: nope not found  chat/completions
+Requests  4
+       Errors  1
+        Hosts  1
+  Connections  4
+    Avg total  1.7s
+     Avg TTFB  1.7s
+    Avg tok/s  116.5
+    Agg tok/s  114.9 over 87ms
+    Tokens in  82
+   Tokens out  10
+  Auto-starts  1
+     Unloaded  0
+
+TIME      CODE  TOK/S  TOTAL  TTFB  IN  OUT  MODEL                     LAUNCH  CLIENT           REQUEST FOR               NOTE                             ROUTE
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+16:05:11  200   -      1.0s   22ms  -   -    Llama-3.2-1B-Instruct...  L1      127.0.0.1:49178  Llama-3.2-1B-Instruct...  client closed                    chat/completions
+16:05:11  200   122.6  29ms   12ms  41  3    Llama-3.2-1B-Instruct...  L1      127.0.0.1:49120  Llama-3.2-1B-Instruct...  -                                chat/completions
+16:05:07  200   110.4  3.4s   3.4s  41  7    Llama-3.2-1B-Instruct...  L1      127.0.0.1:49106  Llama-3.2-1B-Instruct...  auto-start                       chat/completions
+16:05:07  404   -      0ms    -     -   -    nope                      -       127.0.0.1:49062  nope                      model_not_found: nope not found  chat/completions
 ```
 
 - `TOTAL` is the time from the proxy receiving the request to the end of the response. `TTFB` is the time to the first response body byte, which includes any model load.
