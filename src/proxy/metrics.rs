@@ -905,6 +905,29 @@ fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, live: &Cl
     s.prompt_tokens as f64,
   );
   doc.sample(
+    "llamastash:prompt_tokens_cached_total",
+    "Prompt tokens the finished requests served from the KV cache",
+    "counter",
+    &labels,
+    s.cached_tokens as f64,
+  );
+  doc.sample(
+    "llamastash:prefill_tokens_total",
+    "Prompt tokens the finished requests had to compute",
+    "counter",
+    &labels,
+    totals.prefill_tokens as f64,
+  );
+  // The seconds those tokens took, so `rate(prefill_tokens_total) /
+  // rate(prefill_seconds_total)` is the prefill speed without the log.
+  doc.sample(
+    "llamastash:prefill_seconds_total",
+    "Time the engines spent computing prompt tokens",
+    "counter",
+    &labels,
+    totals.prefill_seconds,
+  );
+  doc.sample(
     "llamastash:completion_tokens_total",
     "Completion tokens the finished requests reported",
     "counter",
@@ -988,6 +1011,17 @@ fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, live: &Cl
       tps,
     );
   }
+  // Weighted by prompt tokens rather than a mean of the per-row speeds, so it
+  // answers how fast this model prefills rather than how fast one turn did.
+  if let Some(tps) = s.prefill_tokens_per_second {
+    doc.sample(
+      "llamastash:request_prefill_tokens_per_second",
+      "Prompt tokens per second over the requests the log holds",
+      "gauge",
+      &labels,
+      tps,
+    );
+  }
   // The same traffic read as the box's throughput: every token over the time
   // they were being generated, so concurrent requests raise this and not the
   // mean above. It covers the requests the log holds, not all of them.
@@ -1040,6 +1074,8 @@ fn zero_totals() -> ScopeTotals {
     duration_ms_sum: 0,
     ttfb_ms_sum: 0,
     timed: 0,
+    prefill_tokens: 0,
+    prefill_seconds: 0.0,
   }
 }
 
@@ -1802,6 +1838,8 @@ mod tests {
         duration_ms_sum: 0,
         ttfb_ms_sum: 0,
         timed: 0,
+        prefill_tokens: 0,
+        prefill_seconds: 0.0,
       },
       models: vec![ScopeTotals {
         key: "/models/a.gguf".to_string(),
@@ -1810,6 +1848,8 @@ mod tests {
         duration_ms_sum: 0,
         ttfb_ms_sum: 0,
         timed: 0,
+        prefill_tokens: 0,
+        prefill_seconds: 0.0,
       }],
       launches: Vec::new(),
       routes: Vec::new(),
@@ -2637,6 +2677,120 @@ mod tests {
       "docs/usage.md and the code disagree; undocumented {undocumented:?}, \
        listed but never emitted {never_emitted:?}"
     );
+  }
+
+  /// One finished request that knows its prefill and cache figures.
+  fn prefill_request(log: &RequestLog) {
+    let mut rec = log.begin("/v1/chat/completions", None);
+    rec.set_model("m1", "/models/a.gguf");
+    rec.set_launch("L1");
+    rec.set_status(200);
+    rec.mark_first_byte();
+    rec.finish(
+      RequestState::Done,
+      Usage {
+        prompt_tokens: Some(500),
+        completion_tokens: Some(4),
+        tokens_per_second: Some(40.0),
+        prefill_tokens: Some(100),
+        prefill_tokens_per_second: Some(650.0),
+        cached_tokens: Some(400),
+        ..Usage::default()
+      },
+    );
+  }
+
+  fn text_of(snap: &LogSnapshot) -> String {
+    let mut doc = Document::new(true);
+    render(&mut doc, snap, &[], &Scope::default(), 0, 0);
+    doc.render()
+  }
+
+  #[test]
+  fn metrics_publish_prefill_and_cache_counters() {
+    let log = RequestLog::new();
+    prefill_request(&log);
+    let text = text_of(&log.snapshot());
+    assert!(
+      text.contains("llamastash:prompt_tokens_cached_total{model=\"m1\"} 400\n"),
+      "{text}"
+    );
+    assert!(
+      text.contains("llamastash:prefill_tokens_total{model=\"m1\"} 100\n"),
+      "{text}"
+    );
+    // 100 tokens at 650.0/s.
+    assert!(
+      text.contains("llamastash:prefill_seconds_total{model=\"m1\"} 0.15384615384615385\n"),
+      "{text}"
+    );
+    assert!(
+      text.contains("llamastash:request_prefill_tokens_per_second{model=\"m1\"} 650\n"),
+      "{text}"
+    );
+  }
+
+  #[test]
+  fn metrics_count_an_estimated_prefill_like_any_other() {
+    // A /v1/messages stream carries no prefill timing, so the figure behind these
+    // samples is the proxy's estimate. It counts, and nothing flags it.
+    let log = RequestLog::new();
+    let mut rec = log.begin("/v1/messages", None);
+    rec.set_model("m1", "/models/a.gguf");
+    rec.set_launch("L1");
+    rec.set_status(200);
+    rec.mark_first_byte();
+    rec.finish(
+      RequestState::Done,
+      Usage {
+        prompt_tokens: Some(4_000),
+        completion_tokens: Some(20),
+        tokens_per_second: Some(50.0),
+        prefill_tokens: Some(4_000),
+        prefill_tokens_per_second: Some(96.5),
+        prefill_estimated: true,
+        ..Usage::default()
+      },
+    );
+    let text = text_of(&log.snapshot());
+    assert!(
+      text.contains("llamastash:prefill_tokens_total{model=\"m1\"} 4000\n"),
+      "{text}"
+    );
+    assert!(
+      text.contains("llamastash:request_prefill_tokens_per_second{model=\"m1\"} 96.5\n"),
+      "{text}"
+    );
+  }
+
+  #[test]
+  fn metrics_omit_the_prefill_gauge_without_a_speed() {
+    // The counters are always there and read 0; a gauge of a mean with nothing to
+    // average would read as an instant prefill rather than an unknown one.
+    let log = RequestLog::new();
+    request(&log, "/models/a.gguf", "L1", 10, 3);
+    let text = text_of(&log.snapshot());
+    assert!(text.contains("llamastash:prompt_tokens_cached_total{model=\"m1\"} 0\n"));
+    assert!(text.contains("llamastash:prefill_tokens_total{model=\"m1\"} 0\n"));
+    assert!(!text.contains("llamastash:request_prefill_tokens_per_second"));
+  }
+
+  #[test]
+  fn metrics_json_carries_the_prefill_and_cache_summary_fields() {
+    let log = RequestLog::new();
+    prefill_request(&log);
+    let snap = log.snapshot();
+    let parsed = Parsed {
+      format: Format::Json,
+      scope: Scope::default(),
+      limit: 10,
+    };
+    let body = json_body(&snap, &[], &parsed, 1, 2);
+    assert_eq!(body["summary"]["cached_tokens"], 400);
+    assert_eq!(body["summary"]["prefill_tokens_per_second"], 650.0);
+    assert_eq!(body["summary"]["cache_hit_ratio"], 0.8);
+    assert_eq!(body["models"][0]["cached_tokens"], 400);
+    assert_eq!(body["requests"][0]["prefill_tokens"], 100);
   }
 
   #[test]

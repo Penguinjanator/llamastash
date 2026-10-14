@@ -984,6 +984,8 @@ impl RequestLog {
       duration_ms_sum: totals.duration_ms_sum,
       ttfb_ms_sum: totals.ttfb_ms_sum,
       timed: totals.timed,
+      prefill_tokens: totals.prefill_tokens,
+      prefill_seconds: totals.prefill_seconds,
     };
     let mut models: Vec<ScopeTotals> = inner
       .by_model
@@ -1053,6 +1055,11 @@ pub struct ScopeTotals {
   /// only holds a request the proxy could time, so a mean has to divide by this,
   /// and an error or a cancellation moves the request count but neither sum.
   pub timed: u64,
+  /// Prompt tokens the counted rows had to compute, and the seconds they took.
+  /// A counter needs both: `rate(prefill_tokens_total) /
+  /// rate(prefill_seconds_total)` is the prefill speed Prometheus reads.
+  pub prefill_tokens: u64,
+  pub prefill_seconds: f64,
 }
 
 /// A launch's totals, and whether the launch is still running.

@@ -97,7 +97,7 @@ Run sequentially; every unit touches `src/proxy/request_log.rs`.
     - TUI: column order and that `PP/s` drops after `Request for` and before `Note` as the pane narrows; goldens updated and eyeballed.
   - Commit: `feat(requests): show prefill speed and cache hits in the table and summary`.
 
-- [ ] **Unit 3: metrics**
+- [x] **Unit 3: metrics**
   - Files: `src/proxy/metrics.rs`, `docs/usage.md` (Metrics series list, so `metrics_series_names_match_the_docs` passes).
   - Tests: the three counters and the gauge appear for a model with prefill rows; the gauge is absent when no row has a prefill speed; JSON form carries the summary fields.
   - Commit: `feat(proxy): export prefill and cache counters on /metrics`.
