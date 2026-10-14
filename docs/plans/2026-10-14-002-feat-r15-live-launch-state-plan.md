@@ -60,7 +60,7 @@ Keep both changes small. No new config keys, no new backend hooks, no new depend
 - **Own-children filter: skip a process whose parent pid is the daemon's pid** (`std::process::id()`). Covers every supervised child, including one mid-spawn that no supervisor has registered yet. One check, no supervisor locking.
 - **Merge rule, as a pure function:** new list = fresh scan rows, plus each previous row whose pid is still alive with the same start time and not already in the fresh scan. When the fresh scan has the same pid as a named previous row, keep the previous (named) row only if it is the same process (start times match, or one side is unknown); otherwise the fresh row wins. Everything else from the previous list is dropped.
 - **The tick does its process I/O off the async runtime.** Scan and merge run in `spawn_blocking`; the write lock is taken only to assign the result, minus any row `stop_external` removed while the tick ran.
-- **Keep `port` on `ManagedRow` as `u16`**, with 0 meaning unknown for external rows; renderers that print an external row's port skip it when 0. Smallest change.
+- **Keep `port` on `ManagedRow` as `u16`**, with 0 meaning unknown for external rows; renderers that print an external row's port skip it when 0. Smallest change. External rows also carry `pid: Option<u32>`, so a row with no model path is labelled `pid <n>` without parsing the launch id.
 
 ## Implementation Units
 
@@ -122,7 +122,7 @@ Units 1 and 2 share no files and do not depend on each other. They run in parall
 - Merge, happy path: previous `[A(scan)]`, fresh `[B]` → `[B]` (A exited, B is new).
 - Merge: previous named row N (pid alive) not in fresh → N kept with name and port.
 - Merge: previous named row N whose pid is dead → dropped.
-- Merge: fresh has the same pid as named N → one row, N's version (name kept).
+- Merge: fresh has the same pid as named N → one row, N's version when the two start times agree, otherwise the scan row.
 - Filter: a process whose parent pid is the daemon pid is not reported as external (test through the pure filter or a helper; do not spawn real engines).
 - TUI parse: `status` external row with `port: 41102, name: "coder"` → `ManagedRow` with port 41102 and name `coder`; `port: null` → port 0.
 - Info pane: one managed + one external → `running 2 (...)` listing both; external with unknown port lists no `:0`; only external → `running 1`, not `running 0`.
@@ -145,5 +145,5 @@ Each lane in its own worktree. A new worktree has no `target/`, so the first bui
 | Risk | Mitigation |
 |---|---|
 | A supervised child is listed as external during spawn | Parent-pid filter, not supervisor registry lookup |
-| Resweep drops a re-adopted row and its in-use port | Merge keeps named rows while their pid is alive |
+| Resweep drops a re-adopted row and its in-use port | Merge keeps named rows while their pid is alive and still the same process |
 | Merge conflict with the R15 batch 2 branch in `metrics.rs` | Unit 1 stays out of the functions batch 2 rewrites |
