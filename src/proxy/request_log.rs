@@ -305,7 +305,8 @@ pub struct RequestSummary {
   /// [`Self::tokens_per_second_avg`] answers how fast one stream runs, this
   /// answers how fast the box does, so four tools streaming at once move it
   /// and not the mean. Computed over the rows the ring retains, so it ages
-  /// with the table rather than with the daemon.
+  /// with the table rather than with the daemon. Every finished row that
+  /// generated tokens counts, whatever it ended as.
   pub tokens_per_second_aggregate: Option<f64>,
   /// The busy wall [`Self::tokens_per_second_aggregate`] divides by, in ms:
   /// the union of its rows' generation windows, so time two tools spent
@@ -455,7 +456,10 @@ impl Throughput {
   /// Take one row's contribution. A row counts when it has a speed, a duration
   /// and generated tokens — the three the figure is made of — so in-flight rows
   /// and rows that never saw a usage block are in neither sum, and a newer idle
-  /// request cannot pull the figure down.
+  /// request cannot pull the figure down. The status is no filter: a generation
+  /// the client cut short or the upstream broke off still put those tokens out,
+  /// and llama.cpp folds an aborted slot's tokens into its own counters, so
+  /// counting them is what makes this agree with the engine.
   fn add(&mut self, row: &RequestRow) {
     let (Some(tps), Some(duration_ms), Some(tokens)) = (
       row.tokens_per_second,
@@ -1704,6 +1708,55 @@ mod tests {
       throughput_of(vec![RequestRow::default()]),
       (None, None),
       "a scope of rows nothing was generated for has no throughput"
+    );
+  }
+
+  #[test]
+  fn aggregate_throughput_counts_rows_cut_short_by_client_or_upstream() {
+    // A cancelled generation still happened: the engine put those tokens out,
+    // so the box did produce them and the figure has to say so.
+    let cut_short = |state, status| RequestRow {
+      state,
+      status: Some(status),
+      ..generated_row(0, 10_000, 100, 10.0)
+    };
+    assert_eq!(
+      throughput_of([
+        cut_short(RequestState::ClientClosed, 200),
+        cut_short(RequestState::UpstreamError, 502),
+      ]),
+      (Some(20.0), Some(10_000)),
+      "two cut-short rows over one shared 10 s wall"
+    );
+  }
+
+  #[test]
+  fn the_average_covers_the_rows_the_aggregate_counts() {
+    let log = RequestLog::new();
+    let usage = |tokens, tps| Usage {
+      prompt_tokens: None,
+      completion_tokens: Some(tokens),
+      tokens_per_second: Some(tps),
+      tokens_per_second_estimated: false,
+    };
+    for (state, status, tps) in [
+      (RequestState::Done, 200u16, 10.0),
+      (RequestState::ClientClosed, 200, 30.0),
+      (RequestState::UpstreamError, 502, 50.0),
+    ] {
+      let mut rec = log.begin(ROUTE, None);
+      rec.set_status(status);
+      rec.finish(state, usage(100, tps));
+    }
+    let summary = log.tail(LogScope::All, 0).summary;
+    assert_eq!(
+      summary.tokens_per_second_avg,
+      Some(30.0),
+      "the mean of 10, 30 and 50: a row that ended badly is no exception"
+    );
+    assert_eq!(
+      summary.errors, 1,
+      "only the upstream cut counts as an error"
     );
   }
 
