@@ -24,8 +24,7 @@ use hyper::{Request, Response, StatusCode};
 use serde_json::{Map, Value};
 
 use super::request_log::{
-  clamp_limit, Clients, LaunchTotals, LogScope, LogSnapshot, RequestLog, RequestSummary,
-  ScopeTotals, CAPACITY,
+  clamp_limit, Clients, LaunchTotals, LogScope, LogSnapshot, RequestSummary, ScopeTotals, CAPACITY,
 };
 use super::route;
 use super::router::{self, ProxyResponse};
@@ -418,6 +417,7 @@ pub(crate) async fn resolve_scope(
   state: &ProxyState,
   q: &Query,
   live: &[LiveLaunch],
+  snapshot: &LogSnapshot,
 ) -> Result<Scope, Reject> {
   let mut scope = Scope {
     log: LogScope::All,
@@ -426,8 +426,7 @@ pub(crate) async fn resolve_scope(
   };
 
   if let Some(value) = q.launch_ref() {
-    let snapshot = state.ctx.requests.snapshot();
-    let (id, path) = resolve_launch(state, &snapshot, live, value).await?;
+    let (id, path) = resolve_launch(state, snapshot, live, value).await?;
     scope.launch = Some(id);
     scope.path = path;
     // Naming one launch is also asking for its series.
@@ -568,10 +567,11 @@ pub(crate) async fn parse_request(
   state: &ProxyState,
   req: &Request<Incoming>,
   live: &[LiveLaunch],
+  snapshot: &LogSnapshot,
 ) -> Result<Parsed, Reject> {
   let q = Query::parse(req.uri().query());
   let format = choose_format(&q, req.headers())?;
-  let scope = resolve_scope(state, &q, live).await?;
+  let scope = resolve_scope(state, &q, live, snapshot).await?;
   Ok(Parsed {
     format,
     scope,
@@ -582,22 +582,18 @@ pub(crate) async fn parse_request(
 /// `GET /metrics`.
 pub(crate) async fn serve(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyResponse {
   let live = live_launches(&state).await;
-  let parsed = match parse_request(&state, &req, &live).await {
+  // One read of the log for the whole request: the scope resolution and the body
+  // answer from the same rows, so a scrape cannot show a request that arrived
+  // between two reads, or miss one.
+  let snapshot = state.ctx.requests.snapshot();
+  let parsed = match parse_request(&state, &req, &live, &snapshot).await {
     Ok(parsed) => parsed,
     Err(reject) => return reject.into_response(),
   };
-  let snapshot = state.ctx.requests.snapshot();
   let loaded = live.iter().filter(|l| l.ready).count();
   let discovered = state.ctx.catalog.len().await;
   if parsed.format == Format::Json {
-    return json_response(json_body(
-      &state.ctx.requests,
-      &snapshot,
-      &live,
-      &parsed,
-      loaded,
-      discovered,
-    ));
+    return json_response(json_body(&snapshot, &live, &parsed, loaded, discovered));
   }
   let mut doc = Document::new(true);
   render(
@@ -1105,7 +1101,6 @@ fn model_labels(models: &[ScopeTotals]) -> HashMap<String, String> {
 /// `llamastash requests --json` returns, plus the per-model and per-launch
 /// totals the text format carries as samples.
 fn json_body(
-  log: &RequestLog,
   snapshot: &LogSnapshot,
   live: &[LiveLaunch],
   parsed: &Parsed,
@@ -1113,7 +1108,7 @@ fn json_body(
   discovered: usize,
 ) -> Value {
   let scope = &parsed.scope;
-  let tail = log.tail(scope.log.clone(), parsed.limit);
+  let tail = snapshot.tail(&scope.log, parsed.limit);
   let mut scope_block = Map::new();
   scope_block.insert("model".into(), value_opt(scope.name.clone()));
   scope_block.insert("launch".into(), value_opt(scope.launch.clone()));
@@ -1558,7 +1553,7 @@ pub(crate) fn json_response(body: Value) -> ProxyResponse {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::proxy::request_log::{RequestState, DEFAULT_TAIL};
+  use crate::proxy::request_log::{RequestLog, RequestState, DEFAULT_TAIL};
   use crate::proxy::usage_tap::Usage;
   use std::collections::BTreeSet;
 
@@ -1840,6 +1835,32 @@ mod tests {
       printed.contains("llamastash:request_tokens_per_second_aggregate{model=\"m1\"} 20\n"),
       "{printed}"
     );
+  }
+
+  #[test]
+  fn the_json_summary_is_the_snapshot_it_came_from() {
+    let log = RequestLog::new();
+    request(&log, "/models/a.gguf", "L1", 10, 3);
+    let mut snap = log.snapshot();
+    let parsed = Parsed {
+      format: Format::Json,
+      scope: Scope::default(),
+      limit: 10,
+    };
+    // A sub-millisecond test row leaves the throughput nothing to divide by, so
+    // the scrape says so rather than inventing a speed.
+    let body = json_body(&snap, &[], &parsed, 1, 2);
+    assert_eq!(body["summary"]["tokens_per_second_aggregate"], Value::Null);
+    // The body reports the snapshot the scope was resolved from, not a second
+    // read of the log, so a request that arrives mid-scrape cannot be half in.
+    snap.all.summary.tokens_per_second_aggregate = Some(20.0);
+    snap.all.summary.busy_ms = Some(10_000);
+    let stamped = json_body(&snap, &[], &parsed, 1, 2);
+    assert_eq!(
+      stamped["summary"]["tokens_per_second_aggregate"],
+      Value::from(20.0)
+    );
+    assert_eq!(stamped["summary"]["busy_ms"], Value::from(10_000_u64));
   }
 
   #[test]
@@ -2285,7 +2306,7 @@ mod tests {
       },
       limit: 10,
     };
-    let body = json_body(&log, &snap, &live, &parsed, 1, 2);
+    let body = json_body(&snap, &live, &parsed, 1, 2);
     let rows = body["models"].as_array().expect("models");
     assert_eq!(rows.len(), 1, "{body}");
     assert_eq!(rows[0]["model"], "m", "{body}");
@@ -2628,7 +2649,7 @@ mod tests {
       scope: Scope::default(),
       limit: 10,
     };
-    let body = json_body(&log, &snap, &[], &parsed, 1, 2);
+    let body = json_body(&snap, &[], &parsed, 1, 2);
     assert_eq!(body["models_loaded"], 1);
     assert_eq!(body["summary"]["requests"], 1);
     assert_eq!(body["requests"].as_array().unwrap().len(), 1);

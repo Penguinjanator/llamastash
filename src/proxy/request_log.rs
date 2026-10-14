@@ -973,6 +973,56 @@ pub struct LaunchTotals {
   pub live: bool,
 }
 
+impl LogSnapshot {
+  /// The [`Tail`] [`RequestLog::tail`] answers for the log this snapshot came
+  /// from, taken from the snapshot instead of the log, so one `/metrics` JSON
+  /// scrape reads the log once. The summaries carry the figures stamped when
+  /// the snapshot was taken, so a scope whose rows have all left the ring
+  /// answers the same zeros here, and a scope nothing reached the same zeros.
+  pub fn tail(&self, scope: &LogScope, limit: usize) -> Tail {
+    let scoped: Option<&ScopeTotals> = match scope {
+      LogScope::All => Some(&self.all),
+      LogScope::Model { path } => self.models.iter().find(|m| &m.key == path),
+      LogScope::Launch { id } => self
+        .launches
+        .iter()
+        .find(|l| &l.totals.key == id)
+        .map(|l| &l.totals),
+    };
+    let mut summary = match scoped {
+      Some(totals) => totals.summary.clone(),
+      None => {
+        let mut empty = RequestSummary::default();
+        RowFigures::default().stamp(&mut empty);
+        empty
+      }
+    };
+    // The speed of the newest launch that served this model, which a stored
+    // summary has no notion of on its own.
+    if let LogScope::Model { .. } = scope {
+      summary.tokens_per_second_session = self
+        .rows
+        .iter()
+        .rev()
+        .find(|r| scope.matches(r))
+        .and_then(|r| r.launch_id.as_deref())
+        .and_then(|id| self.launches.iter().find(|l| l.totals.key == id))
+        .and_then(|l| l.totals.summary.tokens_per_second_avg);
+    }
+    Tail {
+      summary,
+      rows: self
+        .rows
+        .iter()
+        .rev()
+        .filter(|r| scope.matches(r))
+        .take(limit)
+        .cloned()
+        .collect(),
+    }
+  }
+}
+
 /// Owned view of the log for one scrape.
 pub struct LogSnapshot {
   /// The ring's rows, oldest first.
@@ -1735,6 +1785,53 @@ mod tests {
     let at = cells.iter().position(|c| c.0 == "Avg tok/s").unwrap();
     assert_eq!(cells[at + 1], ("Agg tok/s", "50.3 over 3m34s".to_string()));
     assert_eq!(cells[at + 2].0, "Tokens in");
+  }
+
+  #[test]
+  fn a_snapshot_answers_the_tails_the_log_answers() {
+    let log = RequestLog::new();
+    // Two models, one launch each, one speed each, and a launch that has since
+    // stopped.
+    let usage = Usage {
+      completion_tokens: Some(10),
+      tokens_per_second: Some(40.0),
+      ..Usage::default()
+    };
+    served(&log, "/m/a.gguf", "L1", usage);
+    served(&log, "/m/a.gguf", "L1", usage);
+    served(&log, "/m/b.gguf", "L2", usage);
+    log.forget_launch("L2");
+    let snap = log.snapshot();
+    for scope in [
+      LogScope::All,
+      LogScope::Model {
+        path: "/m/a.gguf".to_string(),
+      },
+      LogScope::Model {
+        path: "/m/b.gguf".to_string(),
+      },
+      // A scope nothing has ever reached.
+      LogScope::Model {
+        path: "/m/never.gguf".to_string(),
+      },
+      LogScope::Launch {
+        id: "L1".to_string(),
+      },
+      LogScope::Launch {
+        id: "L2".to_string(),
+      },
+      LogScope::Launch {
+        id: "L9".to_string(),
+      },
+    ] {
+      for limit in [0usize, 2, 10_000] {
+        assert_eq!(
+          snap.tail(&scope, limit),
+          log.tail(scope.clone(), limit),
+          "{scope:?} at limit {limit}"
+        );
+      }
+    }
   }
 
   #[test]
