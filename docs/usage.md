@@ -546,19 +546,19 @@ Without `model-ref` it lists every request. A `model-ref` that names a running l
        Avg TTFB  1.7s
       Avg tok/s  116.5
       Agg tok/s  114.9 over 87ms
-  Prefill tok/s  240.0
+  Prefill tok/s  239.9
       Tokens in  82
-         Cached  40 (97.6%)
+         Cached  40 (48.8%)
      Tokens out  10
     Auto-starts  1
        Unloaded  0
 
 TIME      CODE  TOK/S  PP/S   TOTAL  TTFB  IN  OUT  MODEL                     LAUNCH  CLIENT           REQUEST FOR               ROUTE             NOTE
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-16:05:11  200   -      -      1.0s   22ms  -   -    Llama-3.2-1B-Instruct...  L1      127.0.0.1:49178  Llama-3.2-1B-Instruct...  chat/completions  client closed
-16:05:11  200   122.6  38.9   29ms   12ms  41  3    Llama-3.2-1B-Instruct...  L1      127.0.0.1:49120  Llama-3.2-1B-Instruct...  chat/completions  -
-16:05:07  200   110.4  274.5  3.4s   3.4s  41  7    Llama-3.2-1B-Instruct...  L1      127.0.0.1:49106  Llama-3.2-1B-Instruct...  chat/completions  auto-start
-16:05:07  404   -      -      0ms    -     -   -    nope                      -       127.0.0.1:49062  nope                      chat/completions  model_not_found: nope not found
+23:13:31  200   -      -      1.0s   22ms  -   -    Llama-3.2-1B-Instruct...  L1      127.0.0.1:49178  Llama-3.2-1B-Instruct...  chat/completions  client closed
+23:13:31  200   122.6  38.9   29ms   12ms  41  3    Llama-3.2-1B-Instruct...  L1      127.0.0.1:49120  Llama-3.2-1B-Instruct...  chat/completions  -
+23:13:27  200   110.4  274.5  3.4s   3.4s  41  7    Llama-3.2-1B-Instruct...  L1      127.0.0.1:49106  Llama-3.2-1B-Instruct...  chat/completions  auto-start
+23:13:27  404   -      -      0ms    -     -   -    nope                      -       127.0.0.1:49062  nope                      chat/completions  model_not_found: nope not found
 ```
 
 - `TOTAL` is the time from the proxy receiving the request to the end of the response. `TTFB` is the time to the first response body byte, which includes any model load.
@@ -566,7 +566,7 @@ TIME      CODE  TOK/S  PP/S   TOTAL  TTFB  IN  OUT  MODEL                     LA
 - `PP/S` is the prompt-processing speed: how fast the engine computed the prompt tokens it could not reuse from its KV cache. A leading `~` marks the proxy's estimate, used wherever the server sends no prefill timing. It is `-` for a request that never reached a model.
 - `NOTE` is the last column in both the padded table and the tab-separated fields. It says what happened beyond the status code: `auto-start` (this request started the model), `unloaded L3` (launches unloaded to make room), `fallback (<reason>)`, `alias` (the `model` string the client sent was a `proxy.aliases` name, not a model name), `client closed`, `upstream error`, `loading model`, `in flight`, or the proxy's own error and its message (`launch_failed: auto-start of ...`).
 - `REQUEST FOR` is the `model` string the client sent. It reads the same as `MODEL` for a plain request, and names the asked-for model when an alias or a fallback answered instead.
-- On a terminal the table is padded: a summary block prints above it, and a `NOTE` longer than 60 cells wraps onto continuation lines under its column rather than running off the screen. The block leads with `Requests`, `Errors`, `Hosts` and `Connections`, and puts a single `Live` line between the errors and the hosts only while something is in flight — one number when every host in flight is on one connection, `hosts/connections` when they differ (one agent runner with two tools open reads `1/2`). The rest is the averages — `Avg total`, `Avg TTFB`, `Avg tok/s` (the mean of the per-request speeds), `Agg tok/s` with the wall it averages over (`Agg tok/s 52.4 over 6.3s`) and `Prefill tok/s` — then the token counts, where `Cached` carries the tokens served from the KV cache and the share of the prompts that reported one (`Cached 40 (97.6%)`), then auto-starts and unloads. The wrap belongs to that padded layout, so `--no-colors`, `NO_COLOR`, or piped stdout prints the header plus one tab-separated line per request with the whole note in its field. The padded table caps `MODEL` and `REQUEST FOR` at 24 cells with `...`, so one long repo id does not widen every shorter row; piped output carries both whole. The `MODEL` column is dropped when `model-ref` names one model or one launch.
+- On a terminal the table is padded: a summary block prints above it, and a `NOTE` longer than 60 cells wraps onto continuation lines under its column rather than running off the screen. The block leads with `Requests`, `Errors`, `Hosts` and `Connections`, and puts a single `Live` line between the errors and the hosts only while something is in flight — one number when every host in flight is on one connection, `hosts/connections` when they differ (one agent runner with two tools open reads `1/2`). The rest is the averages — `Avg total`, `Avg TTFB`, `Avg tok/s` (the mean of the per-request speeds), `Agg tok/s` with the wall it averages over (`Agg tok/s 52.4 over 6.3s`) and `Prefill tok/s` — then the token counts, where `Cached` carries the tokens served from the KV cache and the share of the prompts that reported one (`Cached 40 (48.8%)`), then auto-starts and unloads. The wrap belongs to that padded layout, so `--no-colors`, `NO_COLOR`, or piped stdout prints the header plus one tab-separated line per request with the whole note in its field. The padded table caps `MODEL` and `REQUEST FOR` at 24 cells with `...`, so one long repo id does not widen every shorter row; piped output carries both whole. The `MODEL` column is dropped when `model-ref` names one model or one launch.
 
 `--json` emits `{ "summary": {...}, "requests": [...] }`. Every key of a request is always present; a value the proxy does not have is `null`:
 
