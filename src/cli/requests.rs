@@ -88,7 +88,7 @@ fn requests_human(body: &Value, one_model: bool) -> String {
   if !one_model {
     header.push("MODEL");
   }
-  header.extend(["LAUNCH", "CLIENT", "REQUEST FOR", "NOTE", "ROUTE"]);
+  header.extend(["LAUNCH", "CLIENT", "REQUEST FOR", "ROUTE", "NOTE"]);
   let table: Vec<Vec<String>> = rows.iter().map(|r| cells_for(r, one_model)).collect();
   let table = fit_padded_table(&header, table);
   out.push_str(&format::table(&header, &table));
@@ -199,12 +199,12 @@ fn cells_for(row: &RequestRow, one_model: bool) -> Vec<String> {
     c.launch,
     c.client,
     c.request_for,
+    c.route,
     if c.note.is_empty() {
       NONE.to_string()
     } else {
       c.note
     },
-    c.route,
   ]);
   cells
 }
@@ -282,7 +282,7 @@ mod tests {
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(
       lines[0],
-      "TIME\tCODE\tTOK/S\tTOTAL\tTTFB\tIN\tOUT\tMODEL\tLAUNCH\tCLIENT\tREQUEST FOR\tNOTE\tROUTE"
+      "TIME\tCODE\tTOK/S\tTOTAL\tTTFB\tIN\tOUT\tMODEL\tLAUNCH\tCLIENT\tREQUEST FOR\tROUTE\tNOTE"
     );
     assert_eq!(lines.len(), 2);
     let cells: Vec<&str> = lines[1].split('\t').collect();
@@ -299,8 +299,8 @@ mod tests {
         "L1",
         "127.0.0.1:5000",
         "qwen",
-        "-",
         "chat/completions",
+        "-",
       ]
     );
   }
@@ -334,8 +334,8 @@ mod tests {
     assert_eq!(cells[7], "qwen");
     assert_eq!(cells[8], "-");
     assert_eq!(cells[10], "qwen");
-    assert_eq!(cells[11], "model_not_found");
-    assert_eq!(cells[12], "chat/completions");
+    assert_eq!(cells[11], "chat/completions");
+    assert_eq!(cells[12], "model_not_found");
   }
 
   /// Terminal rendering, with the process-wide color flag restored. It
@@ -381,7 +381,8 @@ mod tests {
     let header = lines.first().expect("header").clone();
     let at = |name: &str| header.find(name).expect(name);
     assert!(at("CLIENT") < at("REQUEST FOR"), "{header}");
-    assert!(at("REQUEST FOR") < at("NOTE"), "{header}");
+    assert!(at("REQUEST FOR") < at("ROUTE"), "{header}");
+    assert!(at("ROUTE") < at("NOTE"), "{header}");
     // The long name is cut in the padded table, and the cut marks itself.
     let body = lines.last().expect("row").clone();
     assert!(
@@ -416,7 +417,7 @@ mod tests {
       console::measure_text_width(body[at..end].trim_end())
     };
     assert_eq!(width_of("MODEL", "LAUNCH"), NAME_MAX_W, "{body}");
-    assert_eq!(width_of("REQUEST FOR", "NOTE"), NAME_MAX_W, "{body}");
+    assert_eq!(width_of("REQUEST FOR", "ROUTE"), NAME_MAX_W, "{body}");
 
     // The one-model view has no MODEL column, and still caps the ask.
     let one_model: Vec<String> = on_terminal(&[wide.clone()], true)
@@ -457,6 +458,16 @@ mod tests {
     // The continuation line carries the note and nothing else.
     assert!(!cont.contains("chat/completions"), "{cont}");
     assert!(!cont.contains("1.2s"), "{cont}");
+
+    // Both fragments sit under the NOTE header, now the last column: the
+    // row's note starts at it, and the continuation is indented to it.
+    let note_at = lines[0].find("NOTE").expect("NOTE column");
+    assert_eq!(row_line.find("launch_failed:").expect("note"), note_at);
+    assert_eq!(
+      cont.len() - cont.trim_start().len(),
+      note_at,
+      "continuation indented to NOTE: {cont:?}"
+    );
   }
 
   #[test]
@@ -466,7 +477,7 @@ mod tests {
     assert_eq!(lines.len(), 2, "{lines:?}");
     let cells: Vec<&str> = lines[1].split('\t').collect();
     assert_eq!(cells.len(), 13);
-    assert!(cells[11].ends_with("lower --ctx-size"), "{}", cells[11]);
+    assert!(cells[12].ends_with("lower --ctx-size"), "{}", cells[12]);
   }
 
   #[test]

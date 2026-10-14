@@ -12,6 +12,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 ### Changed
 
 - The TUI Requests tab gives `Request for` the same 24 cells the `requests` table gives a name, and `requests` caps `MODEL` at 24 too, so one long repo id stops widening every shorter row.
+- `Note` moved to the end of the requests table, in the TUI tab and in `llamastash requests`, so the free text no longer sits between the figures and the names.
 
 ## [0.7.0] — 2026-10-13
 
