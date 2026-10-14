@@ -547,7 +547,10 @@ pub(crate) async fn resolve_model(
   match route::resolve_client_reference(state, rows.as_ref(), value) {
     // The launch half of a `name@launch` reference is the caller's business,
     // not the scope's: the scope is the model it names.
-    Ok((_, row)) => Ok((row.path.clone(), route::served_name_for_row(&row))),
+    Ok((_, found)) => Ok((
+      found.row.path.clone(),
+      route::served_name_for_row(&found.row),
+    )),
     Err(route::ClientRefMiss::NotFound) => Err(Reject::UnknownRef(value.to_string())),
     Err(route::ClientRefMiss::Ambiguous(_)) => Err(Reject::Ambiguous(value.to_string())),
   }

@@ -547,7 +547,7 @@ TIME      CODE  TOK/S  TOTAL  TTFB  IN  OUT  MODEL                         LAUNC
 
 - `TOTAL` is the time from the proxy receiving the request to the end of the response. `TTFB` is the time to the first response body byte, which includes any model load.
 - `IN` / `OUT` are prompt and generated tokens. `TOK/S` is the generation speed. A leading `~` marks a speed the proxy estimated because the model's server reported none.
-- `NOTE` says what happened beyond the status code: `auto-start` (this request started the model), `unloaded L3` (launches unloaded to make room), `fallback (<reason>)`, `client closed`, `upstream error`, `loading model`, `in flight`, or the proxy's own error and its message (`launch_failed: auto-start of ...`).
+- `NOTE` says what happened beyond the status code: `auto-start` (this request started the model), `unloaded L3` (launches unloaded to make room), `fallback (<reason>)`, `alias` (the `model` string the client sent was a `proxy.aliases` name, not a model name), `client closed`, `upstream error`, `loading model`, `in flight`, or the proxy's own error and its message (`launch_failed: auto-start of ...`).
 - `REQUEST FOR` is the `model` string the client sent. It reads the same as `MODEL` for a plain request, and names the asked-for model when an alias or a fallback answered instead. The padded terminal table caps it at 24 cells with `...`; piped output carries it whole.
 - On a terminal the table is padded: a summary block prints above it, and a `NOTE` longer than 60 cells wraps onto continuation lines under its column rather than running off the screen. The block leads with `Requests`, `Errors`, `Hosts` and `Connections`, and puts a single `Live` line between the errors and the hosts only while something is in flight — one number when every host in flight is on one connection, `hosts/connections` when they differ (one agent runner with two tools open reads `1/2`). The rest is the averages, the token counts, auto-starts and unloads. The wrap belongs to that padded layout, so `--no-colors`, `NO_COLOR`, or piped stdout prints the header plus one tab-separated line per request with the whole note in its field. The `MODEL` column is dropped when `model-ref` names one model or one launch.
 
@@ -568,6 +568,7 @@ TIME      CODE  TOK/S  TOTAL  TTFB  IN  OUT  MODEL                         LAUNC
   "error": null,
   "cause": null,
   "auto_start": false,
+  "alias": false,
   "evicted": [],
   "fallback": null,
   "ttfb_ms": 22,
@@ -579,7 +580,7 @@ TIME      CODE  TOK/S  TOTAL  TTFB  IN  OUT  MODEL                         LAUNC
 }
 ```
 
-`state` is `in_flight`, `done`, `client_closed` (the client went away before the response was complete) or `upstream_error` (the model's server dropped the connection mid-response). When the proxy answered the request itself, `error` is its error `code`, or its `type` when the error has no code (`model_not_found`, `model_required`, `launch_failed`, ...), and `cause` is the error message. When another model answered because the launch failed, the row is filed under the model that answered and `fallback` holds the reason.
+`state` is `in_flight`, `done`, `client_closed` (the client went away before the response was complete) or `upstream_error` (the model's server dropped the connection mid-response). `alias` is `true` when a `proxy.aliases` entry is what routed the request, so `requested_model` holds the alias and `model` the model it names; a fallback row keeps the `true`. When the proxy answered the request itself, `error` is its error `code`, or its `type` when the error has no code (`model_not_found`, `model_required`, `launch_failed`, ...), and `cause` is the error message. When another model answered because the launch failed, the row is filed under the model that answered and `fallback` holds the reason.
 
 `summary` covers the same scope as the rows (one launch, one model, or everything) and counts finished requests since the daemon started, so it keeps counting requests whose rows have left the log. `errors` counts 4xx / 5xx answers and `upstream_error` rows; a client that hung up is not an error. The two averages cover completed 2xx / 3xx requests only. `tokens_per_second_avg` is the mean of the per-request speeds, estimated ones included. `tokens_per_second_session` is that mean for the model's newest launch alone, so a model you reloaded shows what it runs at now instead of a mean over every launch since the daemon started; it is present for a model scope only, and absent when no request has reported a speed. `tokens_per_second_last` is the most recent speed a request reported; it is in the JSON and the row table, not in the summary block a terminal prints, where the session figure says what is running now. `auto_starts` counts the requests that started the model; a request that waited on a load someone else started is not one, and neither is one whose launch was refused before it spawned. `evictions` counts the launches unloaded to make room.
 

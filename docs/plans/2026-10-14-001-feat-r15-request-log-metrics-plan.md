@@ -114,7 +114,7 @@ Worked check: two rows overlapping fully, 100 tokens each over the same 10 s →
 
 ## Implementation Units
 
-- [ ] **Unit 1: Alias flag and note**
+- [x] **Unit 1: Alias flag and note**
 
 **Goal:** A request routed through `proxy.aliases` is marked on its row and shows `alias` in the note.
 

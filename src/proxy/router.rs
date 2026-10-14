@@ -204,13 +204,32 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
     RouteDecision::ReadyAt {
       served_model_id,
       model_path,
+      alias,
       ..
-    } => record.set_model(served_model_id, model_path),
-    RouteDecision::NotRunning { resolved_row, .. }
-    | RouteDecision::BackendUnavailable { resolved_row, .. } => record.set_model(
-      &route::served_name_for_row(resolved_row),
-      &resolved_row.path,
-    ),
+    } => {
+      record.set_model(served_model_id, model_path);
+      if *alias {
+        record.set_alias();
+      }
+    }
+    RouteDecision::NotRunning {
+      resolved_row,
+      alias,
+      ..
+    }
+    | RouteDecision::BackendUnavailable {
+      resolved_row,
+      alias,
+      ..
+    } => {
+      record.set_model(
+        &route::served_name_for_row(resolved_row),
+        &resolved_row.path,
+      );
+      if *alias {
+        record.set_alias();
+      }
+    }
     _ => {}
   }
   record.publish();
@@ -285,6 +304,7 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
       served_model_key,
       model_path: _,
       upstream_path_prefix,
+      alias: _,
       fallback,
       fallback_reason,
     } => {
@@ -313,6 +333,7 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
       requested_model,
       resolved_row,
       name,
+      alias: _,
     } => {
       return route::handle_not_running(
         &state,
@@ -357,6 +378,7 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
       backend,
       requested_model,
       resolved_row: _,
+      alias: _,
     } => error_response(
       StatusCode::SERVICE_UNAVAILABLE,
       "backend_unavailable",
@@ -723,7 +745,8 @@ async fn ollama_show(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyRes
   // before a rescan answers with a model that has no metadata.
   let (snap, rows) = state.ctx.catalog.shared_pair().await;
   match route::resolve_client_reference(&state, &rows, &reference) {
-    Ok((_, resolved)) => {
+    Ok((_, found)) => {
+      let resolved = found.row;
       // Re-find the DiscoveredModel for the resolved path so we have
       // the live metadata. The resolver returns a CatalogRow clone;
       // metadata projection wants the source DiscoveredModel for the

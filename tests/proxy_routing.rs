@@ -203,6 +203,16 @@ async fn proxy_state_with_aliases(
     .0
 }
 
+/// Like [`proxy_state_with_aliases`] but keeps the context, so a test can read
+/// the request log the proxy filled while answering.
+async fn proxy_state_with_aliases_and_ctx(
+  models: Vec<DiscoveredModel>,
+  supervisors: SupervisorRegistry,
+  aliases: &[(&str, &str)],
+) -> (Arc<ProxyState>, MethodContext) {
+  build_state(models, supervisors, DEFAULT_BODY_LIMIT_BYTES, aliases).await
+}
+
 // --- happy paths --------------------------------------------------------
 
 /// A bare `GET` against the test proxy, `(status, headers, body)`.
@@ -542,6 +552,53 @@ async fn model_file_with_at_in_name_resolves_as_plain_reference() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_aliased_request_is_logged_as_an_alias() {
+  let dir = unique_temp("alias-log");
+  let catalog_path = "/fixture/qwen3.gguf";
+  let registry = SupervisorRegistry::new();
+  let (model, _port, _id) = spawn_fake_supervisor(catalog_path, &dir, LaunchMode::Chat).await;
+  registry.insert(registry.next_id(), model.clone()).await;
+
+  let (state, ctx) = proxy_state_with_aliases_and_ctx(
+    vec![discovered(catalog_path, Some("qwen3"), "qwen3")],
+    registry,
+    &[("gpt-4o-mini", "qwen3")],
+  )
+  .await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
+
+  // The alias on its own, and the same alias with a launch half: in both cases
+  // the alias table is what found the model.
+  for body in [
+    r#"{"model":"gpt-4o-mini","messages":[]}"#,
+    r#"{"model":"gpt-4o-mini@fast","messages":[]}"#,
+  ] {
+    let (status, _headers, response) = http_post(addr, "/v1/chat/completions", body, &[]).await;
+    assert_eq!(
+      status, 200,
+      "{body} should reach the model the alias names: {response:?}"
+    );
+  }
+
+  let rows = ctx.requests.tail(LogScope::All, 10).rows;
+  assert_eq!(rows.len(), 2);
+  // Newest first, so the `@fast` request is rows[0].
+  for (row, asked) in rows.iter().zip(["gpt-4o-mini@fast", "gpt-4o-mini"]) {
+    assert!(row.alias, "the alias table routed this row: {row:?}");
+    assert_eq!(row.requested_model.as_deref(), Some(asked));
+    assert_eq!(
+      row.model.as_deref(),
+      Some("qwen3"),
+      "the row is filed under the model the alias names: {row:?}"
+    );
+  }
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, listener_handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_alias_reaches_the_model_it_names() {
   let dir = unique_temp("alias");
   let catalog_path = "/fixture/qwen3.gguf";
@@ -644,7 +701,7 @@ async fn a_real_model_id_beats_an_alias_of_the_same_name() {
   // somewhere else entirely (`other-model`, which is not running). If the alias
   // won, the request would go looking for a dormant model instead of the live
   // one answering this name.
-  let state = proxy_state_with_aliases(
+  let (state, ctx) = proxy_state_with_aliases_and_ctx(
     vec![
       discovered(catalog_path, Some("gpt-4o-mini"), "qwen3"),
       discovered("/fixture/other.gguf", Some("other-model"), "qwen3"),
@@ -660,6 +717,14 @@ async fn a_real_model_id_beats_an_alias_of_the_same_name() {
   assert_eq!(
     status, 200,
     "the real model must serve its own name, got {status}: {response:?}"
+  );
+  // The alias lost, so the row must not read as an aliased request.
+  let rows = ctx.requests.tail(LogScope::All, 1).rows;
+  assert_eq!(rows.len(), 1);
+  assert!(
+    !rows[0].alias,
+    "the model answered its own name, so no alias was used: {:?}",
+    rows[0]
   );
 
   let _ = model.stop(Duration::from_secs(3)).await;

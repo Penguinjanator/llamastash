@@ -135,6 +135,11 @@ pub struct RequestRow {
   /// This request spawned the model's launch. Not set when the spawn was
   /// refused, or when the request waited on a launch something else started.
   pub auto_start: bool,
+  /// A `proxy.aliases` entry is what routed the request: `requested_model`
+  /// holds the alias the client sent, `model` the model it names. Kept as a
+  /// flag rather than read off `requested_model != model` so a fallback row
+  /// still says the client used an alias.
+  pub alias: bool,
   /// Launches unloaded to make room for this request's auto-start.
   pub evicted: Vec<String>,
   /// Why another model answered (`launch_failed` / `family_mismatch`).
@@ -233,6 +238,9 @@ impl RequestRow {
       RequestState::ClientClosed => parts.push("client closed".to_string()),
       RequestState::UpstreamError => parts.push("upstream error".to_string()),
       RequestState::Done => {}
+    }
+    if self.alias {
+      parts.push("alias".to_string());
     }
     if self.auto_start && self.state != RequestState::InFlight {
       parts.push("auto-start".to_string());
@@ -963,6 +971,11 @@ impl RequestRecord {
 
   pub fn set_auto_start(&mut self) {
     self.row.auto_start = true;
+  }
+
+  /// Stamp that a `proxy.aliases` entry is what routed this request.
+  pub fn set_alias(&mut self) {
+    self.row.alias = true;
   }
 
   pub fn set_evicted(&mut self, launches: Vec<String>) {
@@ -2004,6 +2017,7 @@ mod tests {
     let row: RequestRow = serde_json::from_str(r#"{"seq": 4, "status": 200}"#).unwrap();
     assert_eq!((row.seq, row.status), (4, Some(200)));
     assert_eq!(row.state, RequestState::InFlight);
+    assert!(!row.alias, "a row that predates `alias` is not one");
     let summary: RequestSummary = serde_json::from_str(r#"{"requests": 2}"#).unwrap();
     assert_eq!(summary.requests, 2);
     assert_eq!(summary.avg_duration_ms, None);
@@ -2028,6 +2042,7 @@ mod tests {
       "error",
       "cause",
       "auto_start",
+      "alias",
       "evicted",
       "fallback",
       "ttfb_ms",
@@ -2040,5 +2055,40 @@ mod tests {
       assert!(v.get(key).is_some(), "missing key {key}");
     }
     assert_eq!(v["state"], "client_closed");
+  }
+
+  #[test]
+  fn an_alias_reads_in_the_note_without_replacing_anything() {
+    // A bare alias row: `alias` is the only thing beyond the status.
+    let alias = RequestRow {
+      state: RequestState::Done,
+      status: Some(200),
+      alias: true,
+      ..RequestRow::default()
+    };
+    assert_eq!(alias.note(), "alias");
+
+    // The flag composes with the rest and leads the note.
+    let all = RequestRow {
+      auto_start: true,
+      evicted: vec!["L3".to_string()],
+      fallback: Some("launch_failed".to_string()),
+      ..alias.clone()
+    };
+    assert_eq!(
+      all.note(),
+      "alias, auto-start, unloaded L3, fallback (launch_failed)"
+    );
+
+    // In flight: the alias is settled at routing time, so it shows while the
+    // auto-start mark is still held back.
+    let inflight = RequestRow {
+      state: RequestState::InFlight,
+      launch_id: Some("L1".to_string()),
+      auto_start: true,
+      alias: true,
+      ..RequestRow::default()
+    };
+    assert_eq!(inflight.note(), "in flight, alias");
   }
 }
