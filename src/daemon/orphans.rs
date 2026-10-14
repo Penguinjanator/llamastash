@@ -15,10 +15,14 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
 use sysinfo::{ProcessRefreshKind, System};
+use tokio::sync::RwLock;
+
+use super::shutdown::ShutdownToken;
 
 use crate::backend::Backend;
 use crate::daemon::state_store::RunningSnapshot;
@@ -200,6 +204,7 @@ pub async fn sweep(inputs: SweepInputs<'_>) -> SweepReport {
   // before this refresh does.
   let mut sys = System::new();
   sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::All, true, process_refresh);
+  let daemon_pid = std::process::id();
 
   let mut adopted: Vec<RunningSnapshot> = Vec::new();
   let mut stale: Vec<RunningSnapshot> = Vec::new();
@@ -259,6 +264,13 @@ pub async fn sweep(inputs: SweepInputs<'_>) -> SweepReport {
     .filter_map(|(pid, proc)| {
       let pid_u32 = pid.as_u32();
       if adopted_pids.contains(&pid_u32) {
+        return None;
+      }
+      // Our own children are managed, never external. Supervised children run
+      // under `setsid` so they outlive a crash, but while this daemon is up
+      // their parent is still this process — including one mid-spawn that no
+      // supervisor has registered yet, which a registry lookup would miss.
+      if proc.parent().is_some_and(|p| p.as_u32() == daemon_pid) {
         return None;
       }
       // Skip threads. The refresh above leaves `with_tasks` off, so sysinfo
@@ -324,6 +336,62 @@ pub async fn sweep(inputs: SweepInputs<'_>) -> SweepReport {
     stale,
     external,
   }
+}
+
+/// Cadence of the periodic external resweep.
+///
+/// Fixed rather than configured: one process-table scan per tick is cheap, and
+/// an interval knob would be one more thing to get wrong.
+pub const RESWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Fold a fresh scan into the previous external list.
+///
+/// The scan is the truth about everything it can see: a scan row the previous
+/// list lacks is new, and a previous row the scan no longer finds is a process
+/// that exited, so it drops. The exception is a previous row carrying a `name`,
+/// the boot re-adoption's only record of that launch's address and something a
+/// scan can never produce. Such a row survives while its process lives, and it
+/// wins over a scan row for the same pid: the scan sees the same live server
+/// with `name: None`, so keeping the scan row would erase the `<model>@<name>`
+/// address `stop` takes.
+pub fn merge_external(
+  previous: &[ExternalProcess],
+  fresh: Vec<ExternalProcess>,
+) -> Vec<ExternalProcess> {
+  let named: Vec<&ExternalProcess> = previous.iter().filter(|e| e.name.is_some()).collect();
+  let mut merged: Vec<ExternalProcess> = fresh
+    .into_iter()
+    .map(|row| match named.iter().find(|n| n.pid == row.pid) {
+      Some(hit) => (*hit).clone(),
+      None => row,
+    })
+    .collect();
+  for carried in named {
+    if !merged.iter().any(|e| e.pid == carried.pid) && pid_alive(carried.pid as i32) {
+      merged.push(carried.clone());
+    }
+  }
+  merged
+}
+
+/// Refresh the shared external list every [`RESWEEP_INTERVAL`] until shutdown.
+///
+/// Without this the list is frozen at whatever the boot sweep found: a server
+/// started after the daemon came up never appears, and a row whose process
+/// exited never leaves. Nothing is re-adopted here, so a tick is one
+/// process-table scan with no probing.
+pub fn spawn_resweep(shutdown: ShutdownToken, external: Arc<RwLock<Vec<ExternalProcess>>>) {
+  super::supervisor::spawn_supervised("external_resweep", async move {
+    loop {
+      tokio::select! {
+        _ = shutdown.wait_until_triggered() => return,
+        _ = tokio::time::sleep(RESWEEP_INTERVAL) => {}
+      }
+      let report = sweep(SweepInputs::new(&[])).await;
+      let mut slot = external.write().await;
+      *slot = merge_external(&slot, report.external);
+    }
+  });
 }
 
 fn pid_alive(pid: i32) -> bool {
@@ -807,7 +875,62 @@ mod tests {
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn sweep_finds_unmanaged_processes_via_cmdline_marker() {
     // Spawn a long-lived dummy process whose program name matches
-    // the marker, sweep, then kill it.
+    // the marker, sweep, then kill it. It has to be detached: the sweep
+    // skips the daemon's own children, and a child of the test process is
+    // exactly that.
+    use std::time::Duration as StdDuration;
+
+    let pid = spawn_detached("sleep 30");
+    std::thread::sleep(StdDuration::from_millis(100));
+    let recorded: Vec<RunningSnapshot> = Vec::new();
+    let report = sweep(SweepInputs {
+      recorded_running: &recorded,
+      external_markers: vec!["sleep"],
+      probe_timeout: Duration::from_millis(100),
+    })
+    .await;
+    let found = report.external.iter().any(|p| p.pid == pid);
+    kill_detached(pid);
+    assert!(
+      found,
+      "sweep should have found the spawned `sleep` process by cmdline marker"
+    );
+  }
+
+  /// Spawn `cmd` so it outlives its shell parent, and return its pid.
+  ///
+  /// The shell backgrounds the command and exits, so the kernel re-parents it
+  /// away from the test process. That is what makes the row a real external
+  /// candidate: a direct child of the test process is a child of the daemon for
+  /// the sweep, and gets skipped. The redirect matters: backgrounded, the child
+  /// would hold the pipe `output()` reads and block the helper until it exits.
+  #[cfg(unix)]
+  fn spawn_detached(cmd: &str) -> u32 {
+    let out = std::process::Command::new("sh")
+      .arg("-c")
+      .arg(format!("{cmd} >/dev/null 2>&1 & echo $!"))
+      .output()
+      .expect("spawn detached helper");
+    String::from_utf8_lossy(&out.stdout)
+      .trim()
+      .parse()
+      .expect("pid printed by helper shell")
+  }
+
+  #[cfg(unix)]
+  fn kill_detached(pid: u32) {
+    let _ = std::process::Command::new("kill")
+      .arg(pid.to_string())
+      .status();
+  }
+
+  #[cfg(unix)]
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn sweep_skips_the_daemons_own_children() {
+    // The row a supervised launch would produce must never reach the external
+    // list: it is a managed launch, stoppable by name, and `status` already
+    // shows it. A direct child here stands in for a supervised child — same
+    // parent pid, and no supervisor entry yet mid-spawn.
     use std::process::{Command, Stdio};
     use std::time::Duration as StdDuration;
 
@@ -817,7 +940,6 @@ mod tests {
       .stderr(Stdio::null())
       .spawn()
       .expect("spawn sleep");
-
     std::thread::sleep(StdDuration::from_millis(100));
     let recorded: Vec<RunningSnapshot> = Vec::new();
     let report = sweep(SweepInputs {
@@ -826,12 +948,12 @@ mod tests {
       probe_timeout: Duration::from_millis(100),
     })
     .await;
-    let found = report.external.iter().any(|p| p.pid == child.id());
+    let listed = report.external.iter().any(|p| p.pid == child.id());
     let _ = child.kill();
     let _ = child.wait();
     assert!(
-      found,
-      "sweep should have found the spawned `sleep` process by cmdline marker"
+      !listed,
+      "a process the daemon spawned must not be listed as external"
     );
   }
 
@@ -844,17 +966,9 @@ mod tests {
     // be classified as external because its basename is `sleep`,
     // not `llama-server`. (Equivalent to llamastash carrying
     // `--llama-server <path>` in its own argv.)
-    use std::process::{Command, Stdio};
     use std::time::Duration as StdDuration;
 
-    let mut child = Command::new("sleep")
-      .arg("30")
-      .arg("--decoy=llama-server-path")
-      .stdout(Stdio::null())
-      .stderr(Stdio::null())
-      .spawn()
-      .expect("spawn sleep");
-
+    let pid = spawn_detached("sleep 30 --decoy=llama-server-path");
     std::thread::sleep(StdDuration::from_millis(100));
     let recorded: Vec<RunningSnapshot> = Vec::new();
     let report = sweep(SweepInputs {
@@ -863,9 +977,8 @@ mod tests {
       probe_timeout: Duration::from_millis(100),
     })
     .await;
-    let matched_by_argv = report.external.iter().any(|p| p.pid == child.id());
-    let _ = child.kill();
-    let _ = child.wait();
+    let matched_by_argv = report.external.iter().any(|p| p.pid == pid);
+    kill_detached(pid);
     assert!(
       !matched_by_argv,
       "process whose basename does not match the marker must not be \
@@ -930,5 +1043,68 @@ mod tests {
       report.external.iter().all(|e| e.name.is_none()),
       "a scan-found orphan has no launch record to take a name from"
     );
+  }
+
+  fn scan_row(pid: u32, port: Option<u16>) -> ExternalProcess {
+    ExternalProcess {
+      pid,
+      cmdline: format!("llama-server --port {}", port.unwrap_or(8080)),
+      model_path: Some(PathBuf::from("/m/a.gguf")),
+      start_time_secs: 0,
+      port,
+      launched_by_llamastash: false,
+      name: None,
+    }
+  }
+
+  fn named_row(pid: u32, port: u16, name: &str) -> ExternalProcess {
+    ExternalProcess {
+      name: Some(name.to_string()),
+      ..scan_row(pid, Some(port))
+    }
+  }
+
+  #[test]
+  fn merge_lets_the_fresh_scan_replace_the_previous_scan_rows() {
+    // A previous row the rescan doesn't find is a process that exited. Left in
+    // place, `status` would keep showing a dead server until the daemon
+    // restarted.
+    let previous = vec![scan_row(1001, Some(41100))];
+    let merged = merge_external(&previous, vec![scan_row(1002, Some(41101))]);
+    let pids: Vec<u32> = merged.iter().map(|e| e.pid).collect();
+    assert_eq!(pids, vec![1002]);
+  }
+
+  #[test]
+  fn merge_keeps_a_live_named_row_the_scan_does_not_find() {
+    // The re-adopted row is the only record of this launch's address, and the
+    // scan can't reproduce it: it has no `state.json` to read a name from.
+    let live = std::process::id();
+    let previous = vec![named_row(live, 41102, "coder")];
+    let merged = merge_external(&previous, Vec::new());
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].name.as_deref(), Some("coder"));
+    assert_eq!(merged[0].port, Some(41102));
+  }
+
+  #[test]
+  fn merge_drops_a_named_row_whose_process_has_exited() {
+    // Liveness is the only thing that distinguishes "the scan missed it" from
+    // "it died": a stopped server must drop off within one resweep.
+    let previous = vec![named_row(2_147_483_646, 41103, "coder")];
+    assert!(merge_external(&previous, Vec::new()).is_empty());
+  }
+
+  #[test]
+  fn merge_keeps_the_name_when_the_scan_finds_the_same_pid_again() {
+    // A daemon crash plus restart re-adopts the row, and the very next scan
+    // finds the same live process without a name. Keeping the scan row here is
+    // what made `<model>@<name>` stop working while the server was still up.
+    let live = std::process::id();
+    let previous = vec![named_row(live, 41104, "coder")];
+    let merged = merge_external(&previous, vec![scan_row(live, Some(9999))]);
+    assert_eq!(merged.len(), 1, "one process, one row");
+    assert_eq!(merged[0].name.as_deref(), Some("coder"));
+    assert_eq!(merged[0].port, Some(41104), "the named row wins outright");
   }
 }

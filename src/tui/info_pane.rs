@@ -447,7 +447,9 @@ fn counts_row<'a>(app: &'a App, palette: &'a Palette) -> Line<'a> {
 }
 
 fn running_row<'a>(app: &'a App, budget: usize, palette: &'a Palette) -> Line<'a> {
-  let n = app.managed.len();
+  // External processes hold a port and a model just like a managed launch, so
+  // they belong in the count the operator reads as "what is live right now".
+  let n = app.managed.len() + app.external.len();
   if n == 0 {
     return Line::from(vec![
       Span::styled(LABEL_RUNNING, palette.label_style()),
@@ -466,7 +468,17 @@ fn running_row<'a>(app: &'a App, budget: usize, palette: &'a Palette) -> Line<'a
   let parts: Vec<String> = app
     .managed
     .iter()
-    .map(|m| format!("{} :{}", app.model_label(&m.path), m.port))
+    .chain(app.external.iter())
+    .map(|m| {
+      let label = app.model_label(&m.path);
+      // A scan row whose argv carried no port flag has none to show; `:0` would
+      // read as a real endpoint.
+      if m.port == 0 {
+        label
+      } else {
+        format!("{label} :{}", m.port)
+      }
+    })
     .collect();
   let joined = parts.join(crate::tui::glyphs::active().middot_sep());
   let trimmed = right_ellipsise(&joined, list_budget);
@@ -694,6 +706,39 @@ mod tests {
     assert!(
       running_row.contains("qwen :41100"),
       "expected `qwen :41100` entry, got: {running_row:?}"
+    );
+  }
+
+  #[test]
+  fn running_row_counts_external_rows_beside_managed_ones() {
+    let mut app = App::new(AppOptions::default());
+    app.managed = vec![fake_managed("/m/qwen.gguf", 41100, SurfaceState::Ready)];
+    app.external = vec![fake_managed("/m/ext.gguf", 41102, SurfaceState::External)];
+    let rows = render_lines(&app);
+    let running_row = rows.iter().find(|r| r.contains("running")).unwrap();
+    assert!(
+      running_row.contains("2 ("),
+      "an external process is running too, so it belongs in the count, got: {running_row:?}"
+    );
+    assert!(
+      running_row.contains("qwen :41100") && running_row.contains("ext :41102"),
+      "expected both the managed and the external entry listed, got: {running_row:?}"
+    );
+  }
+
+  #[test]
+  fn running_row_lists_an_external_row_without_a_port_by_name_alone() {
+    let mut app = App::new(AppOptions::default());
+    app.external = vec![fake_managed("/m/portless.gguf", 0, SurfaceState::External)];
+    let rows = render_lines(&app);
+    let running_row = rows.iter().find(|r| r.contains("running")).unwrap();
+    assert!(
+      running_row.contains("1 ("),
+      "an external process alone still counts as running, got: {running_row:?}"
+    );
+    assert!(
+      running_row.contains("portless") && !running_row.contains(":0"),
+      "a scan row whose argv carried no port flag must not read as `:0`, got: {running_row:?}"
     );
   }
 
