@@ -218,11 +218,13 @@ impl Fields {
     });
     // The engine's own two inputs, not the `prompt_per_second` it also sends:
     // one formula covers the reported and the estimated case, and on the
-    // bodies captured from llama-server it lands on exactly that field.
+    // bodies captured from llama-server it lands on exactly that field. A `ms`
+    // small enough to overflow the quotient is no speed.
     let prefill_tps = match (self.prompt_n, self.prompt_ms) {
       (Some(tokens), Some(ms)) if tokens > 0 => Some(tokens as f64 * 1000.0 / ms),
       _ => None,
-    };
+    }
+    .filter(|tps| tps.is_finite());
     let cached = self
       .cache_n
       .or(self.cached_in_prompt_details)
@@ -335,6 +337,17 @@ mod tests {
         ..Usage::default()
       }
     );
+  }
+
+  #[test]
+  fn a_prompt_timing_too_small_to_divide_by_is_no_speed() {
+    // A `prompt_ms` this small overflows the quotient to infinity. A speed of
+    // infinity prints, counts towards the scope's figure, and takes the
+    // seconds counter with it when it is rendered.
+    let body = r#"{"usage":{"prompt_tokens":41,"completion_tokens":3},"timings":{"cache_n":0,"prompt_n":41,"prompt_ms":1e-320,"predicted_n":3,"predicted_per_second":39.6}}"#;
+    let usage = usage_of(body);
+    assert_eq!(usage.prefill_tokens, Some(41));
+    assert_eq!(usage.prefill_tokens_per_second, None);
   }
 
   #[test]
