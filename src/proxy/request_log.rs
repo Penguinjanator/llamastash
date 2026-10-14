@@ -374,7 +374,8 @@ pub struct RequestSummary {
   pub cached_tokens: u64,
   /// [`Self::cached_tokens`] over the prompt tokens of the rows that carried a
   /// cached count. `None` when none did, which is what a server that reports
-  /// neither a cached count nor `timings` reads as.
+  /// neither a cached count nor `timings` reads as. A row with a cached count
+  /// and no prompt count is left out of both halves, so this never reads above 1.
   pub cache_hit_ratio: Option<f64>,
   pub completion_tokens: u64,
   /// Requests that started the model.
@@ -634,6 +635,10 @@ struct Totals {
   /// Cached tokens, and the prompt tokens of just the rows that carried a
   /// cached count, which are the two halves of the hit ratio.
   cached_tokens: u64,
+  /// The numerator of the hit ratio: the cached counts that had a prompt count
+  /// to sit against. `cached_tokens` alone can outrun the denominator when a
+  /// row reports a cached count and no prompt count.
+  ratio_cached_tokens: u64,
   cached_prompt_tokens: u64,
   prompt_tokens: u64,
   completion_tokens: u64,
@@ -673,9 +678,12 @@ impl Totals {
     }
     if let Some(cached) = row.cached_tokens {
       self.cached_tokens = self.cached_tokens.saturating_add(cached);
-      self.cached_prompt_tokens = self
-        .cached_prompt_tokens
-        .saturating_add(row.prompt_tokens.unwrap_or(0));
+      // Both halves of the ratio come from one row or from neither, and a row
+      // cannot have reused more of its prompt than the prompt it reports.
+      if let Some(prompt) = row.prompt_tokens {
+        self.ratio_cached_tokens = self.ratio_cached_tokens.saturating_add(cached.min(prompt));
+        self.cached_prompt_tokens = self.cached_prompt_tokens.saturating_add(prompt);
+      }
     }
     self.prompt_tokens = self
       .prompt_tokens
@@ -698,7 +706,7 @@ impl Totals {
         .then(|| self.prefill_tokens as f64 / self.prefill_seconds),
       cached_tokens: self.cached_tokens,
       cache_hit_ratio: (self.cached_prompt_tokens > 0)
-        .then(|| self.cached_tokens as f64 / self.cached_prompt_tokens as f64),
+        .then(|| self.ratio_cached_tokens as f64 / self.cached_prompt_tokens as f64),
       // `RequestLog::tail` fills this for a model scope; a single set of
       // totals has no notion of "the newest launch".
       tokens_per_second_session: None,
@@ -2344,6 +2352,53 @@ mod tests {
     );
     let n = none.tail(LogScope::All, 0).summary;
     assert_eq!((n.cached_tokens, n.cache_hit_ratio), (0, None));
+  }
+
+  #[test]
+  fn a_cached_count_with_no_prompt_count_cannot_tip_the_ratio() {
+    // The two halves come from different objects, so a body can send one without
+    // the other. Such a row belongs to neither half, and one row cannot claim it
+    // reused more than its whole prompt either.
+    let log = RequestLog::new();
+    served(
+      &log,
+      "/m/a.gguf",
+      "L1",
+      Usage {
+        prompt_tokens: Some(1_000),
+        cached_tokens: Some(500),
+        ..Usage::default()
+      },
+    );
+    served(
+      &log,
+      "/m/a.gguf",
+      "L1",
+      Usage {
+        cached_tokens: Some(9_000),
+        ..Usage::default()
+      },
+    );
+    let s = log.tail(LogScope::All, 0).summary;
+    assert_eq!(s.cached_tokens, 9_500);
+    assert_eq!(s.cache_hit_ratio, Some(0.5));
+
+    let boast = RequestLog::new();
+    served(
+      &boast,
+      "/m/a.gguf",
+      "L1",
+      Usage {
+        prompt_tokens: Some(10),
+        cached_tokens: Some(500),
+        ..Usage::default()
+      },
+    );
+    assert_eq!(
+      boast.tail(LogScope::All, 0).summary.cache_hit_ratio,
+      Some(1.0),
+      "a ratio above 1 is not a hit rate"
+    );
   }
 
   #[test]
