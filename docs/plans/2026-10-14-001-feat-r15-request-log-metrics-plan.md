@@ -146,7 +146,7 @@ Worked check: two rows overlapping fully, 100 tokens each over the same 10 s →
 
 **Verification:** alias rows show `alias` in `requests` and the TUI Note column; the new key appears in `requests --json` rows.
 
-- [ ] **Unit 2: Aggregate throughput**
+- [x] **Unit 2: Aggregate throughput**
 
 **Goal:** Every summary carries `tokens_per_second_aggregate` and `busy_ms`, computed over the scope's ring rows, shown as `Agg tok/s … over …`.
 
@@ -180,7 +180,7 @@ Worked check: two rows overlapping fully, 100 tokens each over the same 10 s →
 
 **Verification:** `requests`, `requests --json`, `status --json` `request_stats`, `/metrics` and `/metrics?format=json` all carry the figure for the same scope with the same value.
 
-- [ ] **Unit 3: One log snapshot per `/metrics` JSON scrape**
+- [x] **Unit 3: One log snapshot per `/metrics` JSON scrape**
 
 **Goal:** `serve` reads the log once; launch resolution and the JSON body use that snapshot.
 
@@ -205,7 +205,7 @@ Worked check: two rows overlapping fully, 100 tokens each over the same 10 s →
 
 **Verification:** outside test code, `src/proxy/metrics.rs` and `src/proxy/metrics_backend.rs` each call `requests.snapshot()` once per request path, and `metrics.rs` has no `RequestLog::tail` call.
 
-- [ ] **Unit 4: Column widths — TUI and CLI**
+- [x] **Unit 4: Column widths — TUI and CLI**
 
 **Goal:** TUI `Request for` 24 cells and `Note` min 10; CLI padded table caps `MODEL` at 24 like `REQUEST FOR`.
 
@@ -231,7 +231,7 @@ Worked check: two rows overlapping fully, 100 tokens each over the same 10 s →
 
 **Verification:** `--render` of the Requests tab shows the wider `Request for`; `requests` on a TTY caps `MODEL`.
 
-- [ ] **Unit 5: Docs, CHANGELOG, TODO**
+- [x] **Unit 5: Docs, CHANGELOG, TODO**
 
 **Goal:** Everything user-visible is documented and the TODO items are struck.
 

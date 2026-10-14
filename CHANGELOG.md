@@ -4,6 +4,15 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ## [Unreleased]
 
+### Added
+
+- Request summaries carry an aggregate throughput beside the average: `Agg tok/s` and `/metrics` report the scope's generated tokens over the wall time they were produced, so concurrent streams read as what the box put out instead of one slot each.
+- A request that a `proxy.aliases` name routed is marked `alias`, in the row note and on the wire, so an alias answer no longer reads as the model it names.
+
+### Changed
+
+- The TUI Requests tab gives `Request for` the same 24 cells the `requests` table gives a name, and `requests` caps `MODEL` at 24 too, so one long repo id stops widening every shorter row.
+
 ## [0.7.0] — 2026-10-13
 
 This release is about seeing what the proxy is doing. `llamastash requests` and the TUI's Requests tab list the proxied requests with their timings, token counts, tok/s and the reason behind each one, `GET /metrics` publishes the same numbers for Prometheus, and `GET /metrics/backend` folds each engine's own counters into one scrape. `proxy.aliases` answers a model name a tool is hard-wired to with a local model, so that tool needs no config change. The memory gate no longer refuses hybrid Qwen models at context windows they fit, and setup got shell completions, `doctor --fix` and a terminal bell when a pull or a load ends.
