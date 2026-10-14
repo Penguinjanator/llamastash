@@ -245,9 +245,9 @@ struct StopExternalParams {
 /// Stop an unmanaged `llama-server` process the daemon previously
 /// surfaced via the `external` snapshot. Sends SIGTERM, waits up
 /// to `grace_secs`, then SIGKILL if the process is still alive.
-/// The external snapshot is rebuilt next time `status` is fetched
-/// (the supervisor doesn't drive sysinfo on a tick), so the row
-/// will keep appearing until the next sweep refreshes it.
+/// The external snapshot refreshes on the periodic resweep
+/// (`orphans::RESWEEP_INTERVAL`), so the row drops off within one interval of
+/// the process exiting.
 async fn stop_external_handler(
   ctx: &MethodContext,
   params: Option<Value>,

@@ -125,6 +125,9 @@ pub struct ManagedRow {
   pub launch_id: String,
   pub path: PathBuf,
   pub port: u16,
+  /// The process id, set only for external rows: such a row has no launch of
+  /// ours behind it, so the pid is the only thing that identifies it.
+  pub pid: Option<u32>,
   /// User-chosen launch name (from `--name`). When set, the launch is
   /// addressable as `<model-id>@<name>`; the TUI surfaces it in the
   /// running-launch view so a named launch is distinguishable from an
@@ -1414,6 +1417,11 @@ impl App {
   fn surface_ports(&self) -> BTreeMap<PathBuf, u16> {
     let mut out: BTreeMap<PathBuf, u16> = BTreeMap::new();
     for m in &self.external {
+      // A scan row whose argv carried no port flag has no port to show;
+      // inserting it would render as `:0` in the list's Port column.
+      if m.port == 0 {
+        continue;
+      }
       out.insert(m.path.clone(), m.port);
     }
     for m in &self.managed {
@@ -2546,7 +2554,7 @@ fn parse_quant(label: &str) -> crate::gguf::metadata::Quant {
 }
 
 fn parse_external_row(row: &Value) -> Option<ManagedRow> {
-  let pid = row.get("pid").and_then(Value::as_u64)? as u32;
+  let pid = u32::try_from(row.get("pid").and_then(Value::as_u64)?).ok()?;
   let path = row
     .get("model_path")
     .and_then(Value::as_str)
@@ -2554,11 +2562,18 @@ fn parse_external_row(row: &Value) -> Option<ManagedRow> {
     .unwrap_or_default();
   Some(ManagedRow {
     launch_id: format!("ext-{pid}"),
+    pid: Some(pid),
     path,
-    // External processes don't have an observable port from
-    // sysinfo cmdline alone — surface 0 and let the right pane
-    // know to hide the endpoint slot for these rows.
-    port: 0,
+    // Parsed off the process argv by the daemon. `0` means its argv carried no
+    // port flag (or one out of range), which renderers must show as no port
+    // rather than `:0`.
+    port: row
+      .get("port")
+      .and_then(Value::as_u64)
+      .and_then(|p| u16::try_from(p).ok())
+      .unwrap_or(0),
+    // Nothing in the TUI addresses an external row by name — `stop <model>@<name>`
+    // is a CLI path — so the field is left as the sentinel the rest of the row uses.
     name: None,
     // An external process wasn't launched through a preset.
     preset: None,
@@ -2677,6 +2692,8 @@ fn parse_status_row(row: &Value) -> Option<ManagedRow> {
     .map(String::from);
   Some(ManagedRow {
     launch_id,
+    // A launch of ours is addressed by its id, so it has no use for the pid.
+    pid: None,
     path,
     port,
     name,
@@ -3019,6 +3036,60 @@ mod tests {
     app.ingest_list_models(&body);
     assert_eq!(app.models.len(), 1);
     assert_eq!(app.models[0].path, PathBuf::from("/m/a.gguf"));
+  }
+
+  #[test]
+  fn ingest_status_drops_out_of_range_external_port_and_pid() {
+    // A daemon-side parse could hand back anything. A wrapped port would render
+    // a real-looking wrong endpoint, and a wrapped pid would render a `pid <n>`
+    // label that names someone else's process, so both drop instead.
+    let mut app = App::new(AppOptions::default());
+    app.ingest_status(&json!({
+      "models": [],
+      "external": [
+        {"pid": 9913, "cmdline": "llama-server --port 70000 -m /m/ext.gguf",
+         "model_path": "/m/ext.gguf", "port": 70000, "launched_by_llamastash": false},
+        {"pid": 4294967296u64, "cmdline": "llama-server --port 41200 -m /m/wide.gguf",
+         "model_path": "/m/wide.gguf", "port": 41200, "launched_by_llamastash": false},
+      ]
+    }));
+    assert_eq!(
+      app.external.len(),
+      1,
+      "the out-of-range pid is not ingested"
+    );
+    assert_eq!(app.external[0].port, 0);
+    assert_eq!(app.external[0].pid, Some(9913));
+  }
+
+  #[test]
+  fn ingest_status_reads_an_external_rows_port() {
+    let mut app = App::new(AppOptions::default());
+    let body = json!({
+      "external": [
+        {"pid": 9911, "cmdline": "llama-server --port 41102 -m /m/ext.gguf",
+         "model_path": "/m/ext.gguf", "port": 41102, "launched_by_llamastash": false,
+         "name": "coder"},
+        {"pid": 9912, "cmdline": "llama-server -m /m/scan.gguf",
+         "model_path": "/m/scan.gguf", "port": null, "launched_by_llamastash": false},
+      ]
+    });
+    app.ingest_status(&body);
+    assert_eq!(app.external.len(), 2);
+    assert_eq!(app.external[0].port, 41102);
+    // An argv with no port flag leaves `port` 0, and the renderers have to skip
+    // it rather than print `:0` as if it were an endpoint. A port out of the
+    // `u16` range is the same "nothing to show", not a wrapped number.
+    assert_eq!(app.external[1].port, 0);
+    assert_eq!(
+      app.surface_ports().get(&PathBuf::from("/m/scan.gguf")),
+      None,
+      "a portless external row must not surface a port"
+    );
+    assert_eq!(
+      app.surface_ports().get(&PathBuf::from("/m/ext.gguf")),
+      Some(&41102)
+    );
   }
 
   #[test]

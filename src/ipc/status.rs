@@ -298,7 +298,8 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
     }
   }
   // External — read-only rows for `llama-server` processes the
-  // daemon doesn't own. Populated by the startup orphan sweep.
+  // daemon doesn't own. Populated by the boot sweep, then refreshed every
+  // `orphans::RESWEEP_INTERVAL` by `orphans::spawn_resweep`.
   // Stable shape: `{pid, cmdline, model_path, port, launched_by_llamastash}`,
   // plus `name` on a row demoted from a named launch.
   let external_snapshot = ctx.external.read().await.clone();

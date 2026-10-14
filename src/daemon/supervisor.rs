@@ -1066,15 +1066,21 @@ pub(crate) mod test_support {
 
   /// A model parked in `state`, on a fixed path and port.
   pub(crate) fn in_state(state: ManagedState) -> ManagedModel {
+    parked(state, "/test/m.gguf", 41100)
+  }
+
+  /// A model parked in `state` at `path` on `port`, for callers that need
+  /// several distinguishable registry rows.
+  pub(crate) fn parked(state: ManagedState, path: &str, port: u16) -> ManagedModel {
     let id = ModelId {
-      path: PathBuf::from("/test/m.gguf"),
+      path: PathBuf::from(path),
       header_blake3: [0u8; 32],
     };
     let params = LaunchParams::new(id.path.clone(), LaunchMode::Chat);
     ManagedModel {
       inner: Arc::new(ManagedInner {
         id,
-        port: 41100,
+        port,
         mode: LaunchMode::Chat,
         params,
         log_path: PathBuf::from("/tmp/llamastash-test.log"),
