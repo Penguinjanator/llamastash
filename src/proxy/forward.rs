@@ -564,10 +564,11 @@ impl LoggedResponse {
     // says how much of it was generation. An estimated speed already spans the
     // whole wait, which leaves nothing here.
     let generated = usage.completion_tokens? as f64 / usage.tokens_per_second?;
-    self
-      .sent
-      .elapsed()
-      .checked_sub(Duration::from_secs_f64(generated))
+    // The count and the speed are the engine's, so their quotient can be any
+    // magnitude, and this runs in a `Drop`. A window too large for a `Duration`
+    // is no window.
+    let generated = Duration::try_from_secs_f64(generated).ok()?;
+    self.sent.elapsed().checked_sub(generated)
   }
 }
 
@@ -906,6 +907,21 @@ mod tests {
     assert!(row.prefill_estimated);
     let est = row.prefill_tokens_per_second.expect("an estimate");
     assert!((49.0..=50.0).contains(&est), "{est}");
+  }
+
+  #[test]
+  fn an_absurd_engine_generation_speed_leaves_no_estimate() {
+    // The whole-response window is the wait minus the generation the engine says
+    // it did. Both bodies put that beyond a `Duration`, and this runs in a
+    // `Drop`, where a panic would strand the row in flight forever.
+    let too_many_tokens = r#"{"usage":{"prompt_tokens":1000,"completion_tokens":1e19,"completion_tokens_per_second":0.5,"prompt_tokens_details":{"cached_tokens":600}}}"#;
+    let too_slow = r#"{"usage":{"prompt_tokens":1000,"completion_tokens":100,"completion_tokens_per_second":5e-324,"prompt_tokens_details":{"cached_tokens":600}}}"#;
+    for body in [too_many_tokens, too_slow] {
+      let row = prefill_row(false, body, true);
+      assert_eq!(row.state, RequestState::Done, "{body}");
+      assert!(!row.prefill_estimated, "{body}");
+      assert_eq!(row.prefill_tokens_per_second, None, "{body}");
+    }
   }
 
   #[test]
