@@ -58,7 +58,8 @@ Keep both changes small. No new config keys, no new backend hooks, no new depend
 - **`/ui` chooser order becomes launch order (`L2` before `L10`)** because it inherits `live_launches`' sort. Acceptable and deterministic.
 - **Resweep = `orphans::sweep` with an empty `recorded_running`**, every 30 s, as a token-cancelled task spawned next to the other daemon tasks after the context is built.
 - **Own-children filter: skip a process whose parent pid is the daemon's pid** (`std::process::id()`). Covers every supervised child, including one mid-spawn that no supervisor has registered yet. One check, no supervisor locking.
-- **Merge rule, as a pure function:** new list = fresh scan rows, plus each previous row with a `name` (the re-adopted rows) whose pid is still alive and not already in the fresh scan. When the fresh scan has the same pid as a named previous row, keep the previous (named) row. Everything else from the previous list is dropped.
+- **Merge rule, as a pure function:** new list = fresh scan rows, plus each previous row whose pid is still alive with the same start time and not already in the fresh scan. When the fresh scan has the same pid as a named previous row, keep the previous (named) row only if it is the same process (start times match, or one side is unknown); otherwise the fresh row wins. Everything else from the previous list is dropped.
+- **The tick does its process I/O off the async runtime.** Scan and merge run in `spawn_blocking`; the write lock is taken only to assign the result, minus any row `stop_external` removed while the tick ran.
 - **Keep `port` on `ManagedRow` as `u16`**, with 0 meaning unknown for external rows; renderers that print an external row's port skip it when 0. Smallest change.
 
 ## Implementation Units
@@ -105,7 +106,7 @@ Units 1 and 2 share no files and do not depend on each other. They run in parall
 - Modify: `src/daemon/orphans.rs` (own-children filter; pure merge function; resweep loop + interval constant)
 - Modify: `src/daemon/mod.rs` (spawn the resweep task with the daemon's cancel token)
 - Modify: `src/ipc/methods.rs` (fix the `stop_external` doc comment that says the snapshot is rebuilt on `status`)
-- Modify: `src/tui/app.rs` (`parse_external_row` reads `port` and `name`)
+- Modify: `src/tui/app.rs` (`parse_external_row` reads `port`; `name` stays `None` because the TUI never addresses an external row by name)
 - Modify: `src/tui/info_pane.rs` (`running_row` counts and lists external rows)
 - Modify: wherever the TUI prints an external row's port (find it; skip the port when 0)
 - Modify: `src/cli/output.rs` (status table `PORT` for external rows)
