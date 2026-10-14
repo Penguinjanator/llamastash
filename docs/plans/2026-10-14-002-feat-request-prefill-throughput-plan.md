@@ -102,7 +102,7 @@ Run sequentially; every unit touches `src/proxy/request_log.rs`.
   - Tests: the three counters and the gauge appear for a model with prefill rows; the gauge is absent when no row has a prefill speed; JSON form carries the summary fields.
   - Commit: `feat(proxy): export prefill and cache counters on /metrics`.
 
-- [ ] **Unit 4: E2E and doc sweep**
+- [x] **Unit 4: E2E and doc sweep**
   - Run the E2E below, then check `README.md`, `docs/architecture.md`, `docs/usage.md`, `CHANGELOG.md` for any statement the new fields make wrong. Tick this plan's checkboxes.
   - Commit only if the sweep changed something: `docs: ...`.
 
