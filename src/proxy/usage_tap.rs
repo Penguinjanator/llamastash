@@ -8,8 +8,8 @@
 //! - `usage`: token counts (OpenAI `prompt_tokens` / `completion_tokens`,
 //!   Anthropic and Responses `input_tokens` / `output_tokens`), and
 //!   `completion_tokens_per_second` on servers that report speed there.
-//! - `timings`: the server's own counters (`prompt_n`, `cache_n`,
-//!   `predicted_n`) and `predicted_per_second`.
+//! - `timings`: the server's own counters (`prompt_n`, `prompt_ms`,
+//!   `cache_n`, `predicted_n`) and `predicted_per_second`.
 //! - `metrics`: `tokens_per_second`, on servers that attach per-request
 //!   metrics.
 //!
@@ -35,6 +35,16 @@ pub struct Usage {
   pub tokens_per_second: Option<f64>,
   /// The speed was worked out by [`Self::estimate_speed`].
   pub tokens_per_second_estimated: bool,
+  /// Prompt tokens the engine computed, the ones it reused from the KV cache
+  /// left out.
+  pub prefill_tokens: Option<u64>,
+  /// How fast those were computed: what the server reported, or the proxy's
+  /// estimate when [`Self::prefill_estimated`] is set.
+  pub prefill_tokens_per_second: Option<f64>,
+  /// The prefill speed was worked out by [`Self::estimate_prefill`].
+  pub prefill_estimated: bool,
+  /// Prompt tokens served from the KV cache.
+  pub cached_tokens: Option<u64>,
 }
 
 impl Usage {
@@ -51,6 +61,29 @@ impl Usage {
       }
       _ => {}
     }
+  }
+
+  /// When the server reported no prefill timing, estimate the speed the
+  /// uncached part of the prompt was computed at, over `window`, the time the
+  /// proxy saw the engine working on the prompt.
+  ///
+  /// This needs the cached count: without it the proxy cannot tell computed
+  /// tokens from cache hits, and an agent prompt is mostly cache hits, so
+  /// assuming none were would overstate the speed many times over.
+  pub fn estimate_prefill(&mut self, window: std::time::Duration) {
+    let secs = window.as_secs_f64();
+    let (Some(prompt), Some(cached)) = (self.prompt_tokens, self.cached_tokens) else {
+      return;
+    };
+    let Some(uncached) = prompt.checked_sub(cached).filter(|n| *n > 0) else {
+      return;
+    };
+    if self.prefill_tokens_per_second.is_some() || secs <= 0.0 {
+      return;
+    }
+    self.prefill_tokens = Some(uncached);
+    self.prefill_tokens_per_second = Some(uncached as f64 / secs);
+    self.prefill_estimated = true;
   }
 }
 
@@ -113,7 +146,10 @@ struct Fields {
   completion_tokens: Option<u64>,
   usage_tps: Option<f64>,
   prompt_n: Option<u64>,
+  prompt_ms: Option<f64>,
   cache_n: Option<u64>,
+  cached_in_prompt_details: Option<u64>,
+  cached_in_input_details: Option<u64>,
   predicted_n: Option<u64>,
   timings_tps: Option<f64>,
   metrics_tps: Option<f64>,
@@ -140,9 +176,19 @@ impl Fields {
         &mut self.usage_tps,
         rate(&obj, "completion_tokens_per_second"),
       );
+      // The cached count lives in a nested object on the OpenAI routes.
+      set(
+        &mut self.cached_in_prompt_details,
+        nested_count(&obj, "prompt_tokens_details", "cached_tokens"),
+      );
+      set(
+        &mut self.cached_in_input_details,
+        nested_count(&obj, "input_tokens_details", "cached_tokens"),
+      );
     }
     for obj in objects_keyed(buf, b"\"timings\"") {
       set(&mut self.prompt_n, count(&obj, "prompt_n"));
+      set(&mut self.prompt_ms, rate(&obj, "prompt_ms"));
       set(&mut self.cache_n, count(&obj, "cache_n"));
       set(&mut self.predicted_n, count(&obj, "predicted_n"));
       set(&mut self.timings_tps, rate(&obj, "predicted_per_second"));
@@ -170,12 +216,28 @@ impl Fields {
       n.saturating_add(self.cache_read_input_tokens.unwrap_or(0))
         .saturating_add(self.cache_creation_input_tokens.unwrap_or(0))
     });
+    // The engine's own two inputs, not the `prompt_per_second` it also sends:
+    // one formula covers the reported and the estimated case, and on the
+    // bodies captured from llama-server it lands on exactly that field.
+    let prefill_tps = match (self.prompt_n, self.prompt_ms) {
+      (Some(tokens), Some(ms)) if tokens > 0 => Some(tokens as f64 * 1000.0 / ms),
+      _ => None,
+    };
+    let cached = self
+      .cache_n
+      .or(self.cached_in_prompt_details)
+      .or(self.cached_in_input_details)
+      .or(self.cache_read_input_tokens);
     Usage {
       // OpenAI's `prompt_tokens` is the whole prompt by definition.
       prompt_tokens: self.prompt_tokens.or(from_timings).or(from_input),
       completion_tokens: self.completion_tokens.or(self.predicted_n),
       tokens_per_second: self.timings_tps.or(self.usage_tps).or(self.metrics_tps),
       tokens_per_second_estimated: false,
+      prefill_tokens: self.prompt_n,
+      prefill_tokens_per_second: prefill_tps,
+      prefill_estimated: false,
+      cached_tokens: cached,
     }
   }
 }
@@ -193,6 +255,12 @@ fn count(obj: &Map<String, Value>, key: &str) -> Option<u64> {
       .filter(|f| f.is_finite() && *f >= 0.0)
       .map(|f| f as u64)
   })
+}
+
+/// A count inside the object under `key`, e.g. the `cached_tokens` of
+/// `usage.prompt_tokens_details`.
+fn nested_count(obj: &Map<String, Value>, key: &str, field: &str) -> Option<u64> {
+  count(obj.get(key)?.as_object()?, field)
 }
 
 fn rate(obj: &Map<String, Value>, key: &str) -> Option<f64> {
@@ -259,6 +327,11 @@ mod tests {
         prompt_tokens: Some(41),
         completion_tokens: Some(7),
         tokens_per_second: Some(39.639020651929755),
+        // All 41 prompt tokens were computed, and `prompt_n` over `prompt_ms`
+        // is exactly the `prompt_per_second` the body reports.
+        prefill_tokens: Some(41),
+        prefill_tokens_per_second: Some(274.5174184649789),
+        cached_tokens: Some(0),
         ..Usage::default()
       }
     );
@@ -280,6 +353,9 @@ mod tests {
         prompt_tokens: Some(41),
         completion_tokens: Some(3),
         tokens_per_second: Some(38.64062288684094),
+        prefill_tokens: Some(1),
+        prefill_tokens_per_second: Some(38.90445066915655),
+        cached_tokens: Some(40),
         ..Usage::default()
       }
     );
@@ -297,6 +373,9 @@ mod tests {
         prompt_tokens: Some(41),
         completion_tokens: Some(7),
         tokens_per_second: Some(39.12465113852735),
+        prefill_tokens: Some(1),
+        prefill_tokens_per_second: Some(37.87878787878788),
+        cached_tokens: Some(40),
         ..Usage::default()
       }
     );
@@ -323,6 +402,7 @@ mod tests {
         prompt_tokens: Some(41),
         completion_tokens: Some(4),
         tokens_per_second: None,
+        cached_tokens: Some(40),
         ..Usage::default()
       }
     );
@@ -333,10 +413,13 @@ mod tests {
     let body = r#"{"id":"chatcmpl-11kF","type":"message","role":"assistant","content":[{"type":"text","text":"Hi, How are you?"}],"model":"m.gguf","stop_reason":"end_turn","stop_sequence":null,"usage":{"cache_read_input_tokens":40,"input_tokens":1,"output_tokens":7}}"#;
     assert_eq!(
       usage_of(body),
+      // No `timings` on this surface, so no prefill speed: the proxy has to
+      // estimate one from its own clock.
       Usage {
         prompt_tokens: Some(41),
         completion_tokens: Some(7),
         tokens_per_second: None,
+        cached_tokens: Some(40),
         ..Usage::default()
       }
     );
@@ -356,6 +439,9 @@ mod tests {
         prompt_tokens: Some(41),
         completion_tokens: Some(4),
         tokens_per_second: Some(39.544447959506485),
+        prefill_tokens: Some(1),
+        prefill_tokens_per_second: Some(44.63289444320464),
+        cached_tokens: Some(40),
         ..Usage::default()
       }
     );
@@ -397,6 +483,74 @@ mod tests {
     }
   }
 
+  #[test]
+  fn cached_tokens_falls_back_through_the_usage_fields() {
+    // `timings.cache_n` first. Where a body carries no `timings`, the cached
+    // count is in the field the route happens to use.
+    let in_prompt_details = r#"{"usage":{"prompt_tokens":41,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":40}}}"#;
+    assert_eq!(usage_of(in_prompt_details).cached_tokens, Some(40));
+    let in_input_details = r#"{"usage":{"input_tokens":41,"output_tokens":4,"input_tokens_details":{"cached_tokens":32}}}"#;
+    assert_eq!(usage_of(in_input_details).cached_tokens, Some(32));
+    let in_anthropic_field = r#"{"usage":{"input_tokens":1,"cache_read_input_tokens":40}}"#;
+    assert_eq!(usage_of(in_anthropic_field).cached_tokens, Some(40));
+    // A body that carries both detail objects reads the OpenAI one, and
+    // either beats the bare Anthropic field.
+    let both_details = r#"{"usage":{"prompt_tokens_details":{"cached_tokens":40},"input_tokens_details":{"cached_tokens":32},"cache_read_input_tokens":7}}"#;
+    assert_eq!(usage_of(both_details).cached_tokens, Some(40));
+    // And `timings` wins over all of them.
+    let with_timings = r#"{"usage":{"prompt_tokens_details":{"cached_tokens":7}},"timings":{"prompt_n":34,"cache_n":40}}"#;
+    assert_eq!(usage_of(with_timings).cached_tokens, Some(40));
+  }
+
+  #[test]
+  fn prefill_is_estimated_only_from_a_cached_count_and_a_real_window() {
+    use std::time::Duration;
+    let mut usage = Usage {
+      prompt_tokens: Some(1000),
+      cached_tokens: Some(600),
+      ..Usage::default()
+    };
+    usage.estimate_prefill(Duration::from_millis(500));
+    assert_eq!(usage.prefill_tokens, Some(400), "only the uncached part");
+    assert_eq!(usage.prefill_tokens_per_second, Some(800.0));
+    assert!(usage.prefill_estimated);
+
+    // An engine figure is never replaced.
+    let mut reported = Usage {
+      prompt_tokens: Some(1000),
+      cached_tokens: Some(600),
+      prefill_tokens: Some(300),
+      prefill_tokens_per_second: Some(1234.5),
+      ..Usage::default()
+    };
+    reported.estimate_prefill(Duration::from_millis(500));
+    assert_eq!(reported.prefill_tokens_per_second, Some(1234.5));
+    assert_eq!(reported.prefill_tokens, Some(300));
+    assert!(!reported.prefill_estimated);
+
+    // Without a cached count the proxy cannot tell what was computed, a whole
+    // prompt of cache hits has nothing to time, and a zero window divides by
+    // nothing.
+    for (prompt, cached, window) in [
+      (Some(1000), None, Duration::from_millis(500)),
+      (None, Some(600), Duration::from_millis(500)),
+      (Some(600), Some(600), Duration::from_millis(500)),
+      (Some(1000), Some(600), Duration::ZERO),
+    ] {
+      let mut guess = Usage {
+        prompt_tokens: prompt,
+        cached_tokens: cached,
+        ..Usage::default()
+      };
+      guess.estimate_prefill(window);
+      assert_eq!(
+        guess.prefill_tokens_per_second, None,
+        "{prompt:?} {cached:?} {window:?}"
+      );
+      assert!(!guess.prefill_estimated);
+    }
+  }
+
   // The next two bodies are from a second engine (its own `timings`
   // object, llama-server's field names), captured 2026-10-06 and cut down.
 
@@ -411,6 +565,9 @@ mod tests {
         prompt_tokens: Some(58),
         completion_tokens: Some(8),
         tokens_per_second: Some(51.97378099459679),
+        // Nothing had to be computed, so there is no prefill speed to read.
+        prefill_tokens: Some(0),
+        cached_tokens: Some(58),
         ..Usage::default()
       }
     );
@@ -436,6 +593,8 @@ data: [DONE]
         prompt_tokens: Some(58),
         completion_tokens: Some(8),
         tokens_per_second: Some(56.15098094745978),
+        prefill_tokens: Some(0),
+        cached_tokens: Some(58),
         ..Usage::default()
       }
     );

@@ -155,6 +155,17 @@ pub struct RequestRow {
   /// The server reported no speed, so the proxy worked it out from the
   /// token count and its own clock.
   pub tokens_per_second_estimated: bool,
+  /// Prompt tokens the engine computed, with the ones it reused from the KV
+  /// cache left out.
+  pub prefill_tokens: Option<u64>,
+  /// How fast those tokens were computed, reported by the engine or estimated
+  /// by the proxy.
+  pub prefill_tokens_per_second: Option<f64>,
+  /// No prefill timing reached the proxy, so [`Self::prefill_tokens_per_second`]
+  /// is its own estimate.
+  pub prefill_estimated: bool,
+  /// Prompt tokens served from the KV cache.
+  pub cached_tokens: Option<u64>,
 }
 
 /// A row as table-cell text. The CLI table and the TUI tab both render
@@ -167,6 +178,8 @@ pub struct RequestCells {
   pub ttfb: String,
   /// Prefixed with `~` when the speed is the proxy's estimate.
   pub speed: String,
+  /// Prompt-processing speed, `~` when it is the proxy's estimate.
+  pub prefill: String,
   pub tokens_in: String,
   pub tokens_out: String,
   /// The route without its `/v1/` prefix, which every logged route has.
@@ -208,6 +221,10 @@ impl RequestRow {
           ""
         };
         format!("{mark}{t:.1}")
+      })),
+      prefill: or_none(self.prefill_tokens_per_second.map(|t| {
+        let mark = if self.prefill_estimated { "~" } else { "" };
+        format!("{mark}{}", fmt_tps(t))
       })),
       tokens_in: or_none(self.prompt_tokens.map(fmt_count)),
       tokens_out: or_none(self.completion_tokens.map(fmt_count)),
@@ -271,6 +288,19 @@ fn fmt_count(n: u64) -> String {
     format!("{:.1}k", n as f64 / 1_000.0)
   } else {
     format!("{:.1}M", n as f64 / 1_000_000.0)
+  }
+}
+
+/// A prefill speed for a table cell: one decimal below 1000, a whole number
+/// from there up, so `~12345` still fits the six cells the column gives it.
+fn fmt_tps(v: f64) -> String {
+  // One decimal of thousands rounds up to `1000.0` from here, which costs a
+  // cell more than the column has.
+  const WHOLE_FROM: f64 = 999.95;
+  if v < WHOLE_FROM {
+    format!("{v:.1}")
+  } else {
+    format!("{v:.0}")
   }
 }
 
@@ -1196,6 +1226,10 @@ impl RequestRecord {
     self.row.completion_tokens = usage.completion_tokens;
     self.row.tokens_per_second = usage.tokens_per_second;
     self.row.tokens_per_second_estimated = usage.tokens_per_second_estimated;
+    self.row.prefill_tokens = usage.prefill_tokens;
+    self.row.prefill_tokens_per_second = usage.prefill_tokens_per_second;
+    self.row.prefill_estimated = usage.prefill_estimated;
+    self.row.cached_tokens = usage.cached_tokens;
     {
       let mut inner = self.log.lock();
       let inner = &mut *inner;
@@ -1737,7 +1771,7 @@ mod tests {
       prompt_tokens: None,
       completion_tokens: Some(tokens),
       tokens_per_second: Some(tps),
-      tokens_per_second_estimated: false,
+      ..Usage::default()
     };
     for (state, status, tps) in [
       (RequestState::Done, 200u16, 10.0),
@@ -2053,6 +2087,7 @@ mod tests {
         c.total,
         c.ttfb,
         c.speed,
+        c.prefill,
         c.tokens_in,
         c.tokens_out,
         c.route,
@@ -2066,6 +2101,7 @@ mod tests {
         "1.2s",
         "180ms",
         "39.6",
+        "-",
         "41",
         "12.3k",
         "chat/completions",
@@ -2080,6 +2116,36 @@ mod tests {
       ..row.clone()
     };
     assert_eq!(estimated.cells("-").speed, "~39.6");
+    // A prefill speed keeps one decimal below 1000 and drops it from there up,
+    // so an estimate of twelve thousand still fits the column's six cells.
+    assert_eq!(
+      RequestRow {
+        prefill_tokens_per_second: Some(38.904),
+        prefill_estimated: true,
+        ..row.clone()
+      }
+      .cells("-")
+      .prefill,
+      "~38.9"
+    );
+    assert_eq!(
+      RequestRow {
+        prefill_tokens_per_second: Some(999.96),
+        ..row.clone()
+      }
+      .cells("-")
+      .prefill,
+      "1000"
+    );
+    assert_eq!(
+      RequestRow {
+        prefill_tokens_per_second: Some(12_345.0),
+        ..row.clone()
+      }
+      .cells("-")
+      .prefill,
+      "12345"
+    );
     // Nothing served it: the model asked for stands in, the rest is blank.
     let pending = RequestRow {
       requested_model: Some("qwen".to_string()),
@@ -2093,13 +2159,29 @@ mod tests {
         p.total,
         p.ttfb,
         p.speed,
+        p.prefill,
         p.tokens_in,
         p.tokens_out,
         p.launch,
         p.client
       ],
-      ["-"; 8]
+      ["-"; 9]
     );
+  }
+
+  #[test]
+  fn a_row_from_an_older_daemon_loads_the_new_figures_as_missing() {
+    let row: RequestRow =
+      serde_json::from_str(r#"{"seq":3,"route":"/v1/chat/completions"}"#).expect("a row");
+    assert_eq!(
+      (
+        row.prefill_tokens,
+        row.prefill_tokens_per_second,
+        row.cached_tokens
+      ),
+      (None, None, None)
+    );
+    assert!(!row.prefill_estimated);
   }
 
   #[test]

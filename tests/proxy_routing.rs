@@ -1357,6 +1357,14 @@ async fn tokens_and_speed_come_from_the_end_of_the_response() {
   assert_eq!(row.completion_tokens, Some(3));
   assert_eq!(row.tokens_per_second, Some(38.64));
   assert!(!row.tokens_per_second_estimated, "the server reported it");
+  assert_eq!(row.cached_tokens, Some(40));
+  assert_eq!(row.prefill_tokens, Some(1));
+  assert_eq!(
+    row.prefill_tokens_per_second,
+    Some(1000.0 / 25.704),
+    "prompt_n over prompt_ms, not the body's rounded prompt_per_second"
+  );
+  assert!(!row.prefill_estimated);
 
   // An Anthropic-shape body: `usage.input_tokens` / `output_tokens`, and
   // no speed from the server, so the proxy estimates it from its clock.
@@ -1374,6 +1382,11 @@ async fn tokens_and_speed_come_from_the_end_of_the_response() {
   assert!(row.tokens_per_second_estimated);
   let estimate = row.tokens_per_second.expect("estimated speed");
   assert!(estimate > 0.0 && estimate.is_finite(), "{estimate}");
+  // No `timings` and no cached count: the proxy cannot tell what the engine
+  // computed, so it estimates no prefill either.
+  assert_eq!(row.cached_tokens, None);
+  assert_eq!(row.prefill_tokens_per_second, None);
+  assert!(!row.prefill_estimated);
 
   let summary = ctx
     .requests

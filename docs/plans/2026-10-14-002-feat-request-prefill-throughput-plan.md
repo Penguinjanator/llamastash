@@ -74,7 +74,7 @@ Relevant code:
 
 Run sequentially; every unit touches `src/proxy/request_log.rs`.
 
-- [ ] **Unit 1: capture prefill and cache figures per row**
+- [x] **Unit 1: capture prefill and cache figures per row**
   - Files: `src/proxy/usage_tap.rs`, `src/proxy/forward.rs`, `src/proxy/request_log.rs` (row fields, `finish`, `cells`), `tests/proxy_*.rs` (one integration test through the fake), `docs/usage.md` (row field list for `requests --json`), `docs/architecture.md` (only if it describes what the tap reads).
   - Tests (`usage_tap.rs` unit tests, real llama.cpp body shapes):
     - Whole chat body with `timings` (`prompt_n`, `prompt_ms`, `cache_n`) and `usage.prompt_tokens_details.cached_tokens`: prefill tokens, speed (equals `prompt_per_second`), cached from `cache_n`, not estimated.

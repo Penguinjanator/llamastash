@@ -23,7 +23,7 @@
 //!   family-MRU fallback path.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures::TryStreamExt;
 use http_body_util::{combinators::BoxBody, BodyExt, StreamBody};
@@ -34,7 +34,7 @@ use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use super::request_log::{RequestRecord, RequestState};
 use super::router::{BodyError, ProxyResponse};
 use super::state::ProxyState;
-use super::usage_tap::ResponseTap;
+use super::usage_tap::{ResponseTap, Usage};
 
 /// Hop-by-hop header set — RFC 7230 §6.1. Stripped on both the
 /// outbound request (so we don't leak the inbound peer's keep-alive
@@ -374,6 +374,7 @@ fn build_streaming_response(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.starts_with("text/event-stream")),
+      sent,
       generating_since: sent,
     }
   });
@@ -478,6 +479,10 @@ struct LoggedResponse {
   errored: bool,
   /// The response is an event stream.
   streamed: bool,
+  /// When the request went upstream, before the response began. The prefill
+  /// estimate is measured from here, so routing and an auto-start's model load
+  /// stay out of it.
+  sent: Instant,
   /// Where the proxy's clock starts timing generation, for the tok/s
   /// estimate: the first byte of a stream, or the moment the request went
   /// upstream for a response that arrives whole. The second includes
@@ -532,9 +537,37 @@ impl Drop for LoggedResponse {
       .map(ResponseTap::usage)
       .unwrap_or_default();
     if state == RequestState::Done {
+      // The window has to be read before the estimate lands on the usage, and
+      // it only exists where the engine's own generation speed says how much
+      // of the wait was not prompt processing.
+      if let Some(window) = self.prefill_window(&usage) {
+        usage.estimate_prefill(window);
+      }
       usage.estimate_speed(self.generating_since.elapsed());
     }
     self.record.finish(state, usage);
+  }
+}
+
+impl LoggedResponse {
+  /// How long the engine spent computing the prompt, by the proxy's clock, or
+  /// `None` when this response leaves no window to measure.
+  ///
+  /// A queue wait inside the engine stays in the window, so a request that had
+  /// to wait for a slot estimates low.
+  fn prefill_window(&self, usage: &Usage) -> Option<Duration> {
+    if self.streamed {
+      // A stream's first byte arrives once the prompt has been processed.
+      return self.generating_since.checked_duration_since(self.sent);
+    }
+    // A response that arrives whole is one wait, and the engine's own speed
+    // says how much of it was generation. An estimated speed already spans the
+    // whole wait, which leaves nothing here.
+    let generated = usage.completion_tokens? as f64 / usage.tokens_per_second?;
+    self
+      .sent
+      .elapsed()
+      .checked_sub(Duration::from_secs_f64(generated))
   }
 }
 
@@ -618,6 +651,7 @@ pub(crate) fn deconstruct(
 
 #[cfg(test)]
 mod tests {
+  use super::super::request_log::RequestRow;
   use super::*;
   use http_body_util::BodyExt;
 
@@ -777,6 +811,9 @@ mod tests {
   /// before its body's first byte.
   fn estimated_speed(streamed: bool) -> f64 {
     let log = crate::proxy::request_log::RequestLog::new();
+    let ten_seconds_ago = Instant::now()
+      .checked_sub(std::time::Duration::from_secs(10))
+      .expect("the clock has run for ten seconds");
     let mut logged = LoggedResponse {
       record: log.begin("/v1/chat/completions", None),
       tap: Some(ResponseTap::default()),
@@ -785,9 +822,8 @@ mod tests {
       ended: false,
       errored: false,
       streamed,
-      generating_since: Instant::now()
-        .checked_sub(std::time::Duration::from_secs(10))
-        .expect("the clock has run for ten seconds"),
+      sent: ten_seconds_ago,
+      generating_since: ten_seconds_ago,
     };
     let body = Bytes::from_static(br#"{"usage":{"prompt_tokens":5,"completion_tokens":100}}"#);
     logged.observe(&Some(Ok(Frame::data(body))));
@@ -812,5 +848,80 @@ mod tests {
     // A response that arrives whole is timed from the send.
     let whole = estimated_speed(false);
     assert!((9.0..=10.0).contains(&whole), "{whole}");
+  }
+
+  /// A response whose request went upstream ten seconds ago, whose first byte
+  /// arrived just now, and whose body is `body`. `ended` is whether the body
+  /// reached its end; a body that did not is a client that hung up.
+  fn prefill_row(streamed: bool, body: &'static str, ended: bool) -> RequestRow {
+    let log = crate::proxy::request_log::RequestLog::new();
+    let sent = Instant::now()
+      .checked_sub(std::time::Duration::from_secs(10))
+      .expect("the clock has run for ten seconds");
+    let mut logged = LoggedResponse {
+      record: log.begin("/v1/chat/completions", None),
+      tap: Some(ResponseTap::default()),
+      content_length: None,
+      seen: 0,
+      ended: false,
+      errored: false,
+      streamed,
+      sent,
+      generating_since: sent,
+    };
+    logged.observe(&Some(Ok(Frame::data(Bytes::from_static(body.as_bytes())))));
+    if ended {
+      logged.observe(&None);
+    }
+    drop(logged);
+    log
+      .tail(crate::proxy::request_log::LogScope::All, 1)
+      .rows
+      .into_iter()
+      .next()
+      .expect("a row")
+  }
+
+  /// A 1000-token prompt with 600 of it cached, 100 generated tokens, and no
+  /// speed from the engine.
+  const NO_ENGINE_SPEED: &str = r#"{"usage":{"prompt_tokens":1000,"completion_tokens":100,"prompt_tokens_details":{"cached_tokens":600}}}"#;
+
+  #[test]
+  fn a_stream_measures_prefill_from_the_send_to_its_first_byte() {
+    // The 400 uncached tokens over the ten seconds before the first byte.
+    let row = prefill_row(true, NO_ENGINE_SPEED, true);
+    assert_eq!(row.prefill_tokens, Some(400));
+    assert!(row.prefill_estimated);
+    let est = row.prefill_tokens_per_second.expect("an estimate");
+    assert!((39.0..=40.0).contains(&est), "{est}");
+  }
+
+  #[test]
+  fn a_whole_response_subtracts_the_generation_it_reports() {
+    // The whole wait was ten seconds and the engine says it generated its 100
+    // tokens at 50 tok/s, so two of those seconds were generation: 400
+    // uncached tokens over the other eight is 50 tok/s.
+    let body = r#"{"usage":{"prompt_tokens":1000,"completion_tokens":100,"completion_tokens_per_second":50,"prompt_tokens_details":{"cached_tokens":600}}}"#;
+    let row = prefill_row(false, body, true);
+    assert!(row.prefill_estimated);
+    let est = row.prefill_tokens_per_second.expect("an estimate");
+    assert!((49.0..=50.0).contains(&est), "{est}");
+  }
+
+  #[test]
+  fn a_whole_response_with_no_engine_speed_gets_no_prefill_estimate() {
+    // Its estimated generation speed already spans the whole wait, so there is
+    // no prefill window left to measure.
+    let row = prefill_row(false, NO_ENGINE_SPEED, true);
+    assert!(!row.prefill_estimated);
+    assert_eq!(row.prefill_tokens_per_second, None);
+  }
+
+  #[test]
+  fn a_row_that_never_finished_gets_no_prefill_estimate() {
+    let row = prefill_row(true, NO_ENGINE_SPEED, false);
+    assert_eq!(row.state, RequestState::ClientClosed);
+    assert!(!row.prefill_estimated);
+    assert_eq!(row.prefill_tokens_per_second, None);
   }
 }

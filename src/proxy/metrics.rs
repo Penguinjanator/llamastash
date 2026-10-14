@@ -1778,7 +1778,7 @@ mod tests {
         prompt_tokens: Some(prompt),
         completion_tokens: Some(completion),
         tokens_per_second: Some(40.0),
-        tokens_per_second_estimated: false,
+        ..Usage::default()
       },
     );
   }
