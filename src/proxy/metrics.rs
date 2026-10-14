@@ -919,10 +919,12 @@ fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, live: &Cl
     totals.prefill_tokens as f64,
   );
   // The seconds those tokens took, so `rate(prefill_tokens_total) /
-  // rate(prefill_seconds_total)` is the prefill speed without the log.
+  // rate(prefill_seconds_total)` is the prefill speed without the log. An
+  // estimated row's window is the proxy's own clock, queue wait inside the
+  // engine included, which is why the speed can read low under concurrency.
   doc.sample(
     "llamastash:prefill_seconds_total",
-    "Time the engines spent computing prompt tokens",
+    "Time spent computing prompt tokens, estimated windows included",
     "counter",
     &labels,
     totals.prefill_seconds,
@@ -1013,10 +1015,12 @@ fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, live: &Cl
   }
   // Weighted by prompt tokens rather than a mean of the per-row speeds, so it
   // answers how fast this model prefills rather than how fast one turn did.
+  // Like every other total here it counts since daemon start, not just the
+  // rows the log still keeps.
   if let Some(tps) = s.prefill_tokens_per_second {
     doc.sample(
       "llamastash:request_prefill_tokens_per_second",
-      "Prompt tokens per second over the requests the log holds",
+      "Prompt tokens per second since daemon start",
       "gauge",
       &labels,
       tps,

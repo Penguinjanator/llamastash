@@ -1535,7 +1535,7 @@ Counters, monotonic since daemon start:
 | `llamastash:prompt_tokens_cached_total` | `model` | of those, the tokens served from the KV cache |
 | `llamastash:completion_tokens_total` | `model` | |
 | `llamastash:prefill_tokens_total` | `model` | prompt tokens the engine had to compute (the prompt minus its cache hits) |
-| `llamastash:prefill_seconds_total` | `model` | the time that took; prefill speed = `rate(prefill_tokens_total) / rate(prefill_seconds_total)` |
+| `llamastash:prefill_seconds_total` | `model` | the time that took, estimated windows included (an estimate is the proxy's own clock, so it carries any queue wait inside the engine); prefill speed = `rate(prefill_tokens_total) / rate(prefill_seconds_total)` |
 | `llamastash:request_duration_seconds_total` | `model` | sum of finished durations |
 | `llamastash:request_timed_total` | `model` | how many requests that sum and the one below cover; mean = `rate(request_duration_seconds_total) / rate(request_timed_total)` |
 | `llamastash:request_ttft_seconds_total` | `model` | sum of time-to-first-byte |
@@ -1556,8 +1556,8 @@ Gauges: `llamastash:requests_in_flight{model}`, `llamastash:hosts_in_flight{mode
 `llamastash:request_tokens_per_second_aggregate{model}` (the scope's tokens over the time
 they were being generated, so it rises with concurrency where the average does not; it covers
 the requests the log holds, and a scope with no finished request that produced tokens omits the line),
-`llamastash:request_prefill_tokens_per_second{model}` (prompt tokens per second over the same
-requests, weighted by tokens instead of a mean of the per-row speeds, and omitted the same way
+`llamastash:request_prefill_tokens_per_second{model}` (prompt tokens per second since daemon
+start, weighted by tokens instead of a mean of the per-row speeds, and omitted the same way
 when no request reported one),
 `llamastash:models_loaded`,
 `llamastash:models_discovered`, `llamastash:request_log_rows`, `llamastash:request_log_capacity`,
