@@ -1,6 +1,6 @@
 # Plan: physical-device identity for alternate compute selectors
 
-Tracking TODO.md (General Roadmap → High priority).
+Tracking TODO.md (General Roadmap → Low priority).
 
 ## Problem
 
