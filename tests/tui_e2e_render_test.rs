@@ -546,6 +546,10 @@ fn seeded_requests_view_app() -> App {
       avg_duration_ms: Some(20_165),
       avg_ttfb_ms: Some(16_026),
       tokens_per_second_avg: Some(41.27),
+      // 328 tokens over 6.3s of generation: the two streams overlapped, so
+      // the box ran faster than any one request.
+      tokens_per_second_aggregate: Some(52.4),
+      busy_ms: Some(6_259),
       tokens_per_second_session: Some(48.9),
       tokens_per_second_last: Some(41.27),
       prompt_tokens: 36_864,

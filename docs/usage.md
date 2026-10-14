@@ -1526,7 +1526,11 @@ that traffic.
 Gauges: `llamastash:requests_in_flight{model}`, `llamastash:hosts_in_flight{model}`
 (distinct client hosts with a request in flight right now), `llamastash:request_duration_seconds_avg{model}`,
 `llamastash:request_ttft_seconds_avg{model}`, `llamastash:request_tokens_per_second{model}`
-(last reported), `llamastash:request_tokens_per_second_avg{model}`, `llamastash:models_loaded`,
+(last reported), `llamastash:request_tokens_per_second_avg{model}`,
+`llamastash:request_tokens_per_second_aggregate{model}` (the scope's tokens over the time
+they were being generated, so it rises with concurrency where the average does not; it covers
+the requests the log holds, and a scope with no streamed request yet omits the line),
+`llamastash:models_loaded`,
 `llamastash:models_discovered`, `llamastash:request_log_rows`, `llamastash:request_log_capacity`,
 `llamastash:request_log_file_dropped_total`.
 `llamastash:route_requests_total` and the daemon gauges above that carry no `model` label

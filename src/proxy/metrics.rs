@@ -992,6 +992,18 @@ fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, live: &Cl
       tps,
     );
   }
+  // The same traffic read as the box's throughput: every token over the time
+  // they were being generated, so concurrent requests raise this and not the
+  // mean above. It covers the requests the log holds, not all of them.
+  if let Some(tps) = s.tokens_per_second_aggregate {
+    doc.sample(
+      "llamastash:request_tokens_per_second_aggregate",
+      "Tokens per second over the generation time of the requests the log holds",
+      "gauge",
+      &labels,
+      tps,
+    );
+  }
 }
 
 /// The `model` label a live scope answers with before any row exists: the
@@ -1773,6 +1785,60 @@ mod tests {
         tokens_per_second: Some(40.0),
         tokens_per_second_estimated: false,
       },
+    );
+  }
+
+  /// A snapshot of one model whose summary carries the throughput figures, for
+  /// the series that a sub-millisecond test row cannot produce on its own.
+  fn snapshot_with_throughput(tps: Option<f64>, busy_ms: Option<u64>) -> LogSnapshot {
+    let mut summary = RequestSummary {
+      requests: 1,
+      tokens_per_second_aggregate: tps,
+      busy_ms,
+      ..RequestSummary::default()
+    };
+    summary.hosts = Some(0);
+    LogSnapshot {
+      rows: Vec::new(),
+      all: ScopeTotals {
+        key: String::new(),
+        label: None,
+        summary: summary.clone(),
+        duration_ms_sum: 0,
+        ttfb_ms_sum: 0,
+        timed: 0,
+      },
+      models: vec![ScopeTotals {
+        key: "/models/a.gguf".to_string(),
+        label: Some("m1".to_string()),
+        summary,
+        duration_ms_sum: 0,
+        ttfb_ms_sum: 0,
+        timed: 0,
+      }],
+      launches: Vec::new(),
+      routes: Vec::new(),
+    }
+  }
+
+  #[test]
+  fn the_throughput_gauge_prints_only_when_the_scope_has_one() {
+    let text_of = |snap: &LogSnapshot| {
+      let mut doc = Document::new(true);
+      render(&mut doc, snap, &[], &Scope::default(), 1, 1);
+      doc.render()
+    };
+    // A scope no request has reported a speed for has no sample to print, rather
+    // than a made-up zero.
+    let text = text_of(&snapshot_with_throughput(None, None));
+    assert!(
+      !text.contains("request_tokens_per_second_aggregate"),
+      "{text}"
+    );
+    let printed = text_of(&snapshot_with_throughput(Some(20.0), Some(10_000)));
+    assert!(
+      printed.contains("llamastash:request_tokens_per_second_aggregate{model=\"m1\"} 20\n"),
+      "{printed}"
     );
   }
 

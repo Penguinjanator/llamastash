@@ -483,4 +483,23 @@ mod tests {
     assert!(predates.contains("Hosts  -"), "{predates}");
     assert!(predates.contains("Connections  -"), "{predates}");
   }
+
+  #[test]
+  fn the_summary_block_prints_the_aggregate_throughput_with_its_wall() {
+    let strip = summary_on_terminal(RequestSummary {
+      tokens_per_second_avg: Some(41.3),
+      tokens_per_second_aggregate: Some(52.4),
+      busy_ms: Some(6_259),
+      ..RequestSummary::default()
+    });
+    assert!(strip.contains("Agg tok/s"), "{strip}");
+    assert!(strip.contains("52.4 over 6.3s"), "{strip}");
+    // No throughput: the placeholder every other cell uses, not a zero.
+    let empty = summary_on_terminal(RequestSummary::default());
+    let line = empty
+      .lines()
+      .find(|line| line.contains("Agg tok/s"))
+      .unwrap_or_default();
+    assert!(line.ends_with('-'), "{line}");
+  }
 }
