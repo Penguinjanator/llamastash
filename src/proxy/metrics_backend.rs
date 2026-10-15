@@ -87,7 +87,10 @@ impl Scrape {
 /// `GET /metrics/backend`.
 pub(crate) async fn serve(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyResponse {
   let live = live_launches(&state).await;
-  let parsed = match metrics::parse_request(&state, &req, &live).await {
+  // The scope of a scrape is resolved from the same rows the `/metrics` body of
+  // the same request would read, so one read answers the whole request.
+  let snapshot = state.ctx.requests.snapshot();
+  let parsed = match metrics::parse_request(&state, &req, &live, &snapshot).await {
     Ok(parsed) => parsed,
     Err(reject) => return reject.into_response(),
   };

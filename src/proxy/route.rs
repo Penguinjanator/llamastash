@@ -73,6 +73,8 @@ pub(crate) enum RouteDecision {
     /// Upstream OpenAI path prefix (`None` → the direct backend's `/v1/...`,
     /// `Some("/api")` → a managed-multiplexer umbrella's `/api/v1/...`).
     upstream_path_prefix: Option<String>,
+    /// A `proxy.aliases` entry named this model.
+    alias: bool,
     fallback: bool,
     fallback_reason: Option<String>,
   },
@@ -95,6 +97,8 @@ pub(crate) enum RouteDecision {
     // dead_code: consumed via destructuring in router::forward_request.
     #[allow(dead_code)]
     name: Option<String>,
+    /// A `proxy.aliases` entry named this model.
+    alias: bool,
   },
   /// `resolve_model` returned zero matches. Emits 404
   /// `model_not_found` with `matches: []`.
@@ -118,6 +122,8 @@ pub(crate) enum RouteDecision {
     /// The catalog entry asked for, so the request log files the 503
     /// under the model.
     resolved_row: Box<CatalogRow>,
+    /// A `proxy.aliases` entry named this model.
+    alias: bool,
   },
 }
 
@@ -262,7 +268,7 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
 
   // Reference → catalog row, in the one order that applies everywhere a client
   // names a model (see [`resolve_client_reference`]).
-  let (mut name, resolved) = match resolve_client_reference(state, &rows, &requested) {
+  let (mut name, found) = match resolve_client_reference(state, &rows, &requested) {
     Ok(v) => v,
     Err(ClientRefMiss::NotFound) => {
       return RouteDecision::NotFound {
@@ -279,6 +285,8 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
       }
     }
   };
+  let resolved = found.row;
+  let alias = found.alias;
 
   // Managed-multiplexer models are served by a shared umbrella process, not a
   // per-model supervisor: route them to the umbrella's port. Handled before
@@ -291,7 +299,7 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
   if crate::discovery::ModelSource::from_label(&resolved.source)
     .is_some_and(|s| crate::backend::is_managed_multiplexer(s.backend_id()))
   {
-    return decide_umbrella_route(state, requested, &resolved).await;
+    return decide_umbrella_route(state, requested, &resolved, alias).await;
   }
 
   // Walk the supervisor snapshot for Ready entries serving the resolved row's
@@ -369,6 +377,7 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
       served_model_key: model.id().clone(),
       model_path: resolved.path.clone(),
       upstream_path_prefix: None,
+      alias,
       fallback: false,
       fallback_reason: None,
     };
@@ -381,6 +390,7 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
     requested_model: requested,
     resolved_row: Box::new(resolved),
     name,
+    alias,
   }
 }
 
@@ -394,6 +404,26 @@ pub(crate) enum ClientRefMiss {
   Ambiguous(Vec<String>),
 }
 
+/// Where a client's reference landed: the catalog row, and whether an alias is
+/// what put the request on it.
+pub(crate) struct ResolvedRef {
+  pub row: CatalogRow,
+  /// A `proxy.aliases` entry named the row, so `requested_model` and `model`
+  /// differ by the table rather than by a fallback. Carried as a flag because
+  /// the requested string is user input a note must not repeat.
+  pub alias: bool,
+}
+
+impl ResolvedRef {
+  fn plain(row: CatalogRow) -> Self {
+    Self { row, alias: false }
+  }
+
+  fn aliased(row: CatalogRow) -> Self {
+    Self { row, alias: true }
+  }
+}
+
 /// Turn a client's `model` string into `(launch name, catalog row)`.
 ///
 /// The whole string is resolved first, as one reference. Only when it names no
@@ -405,7 +435,7 @@ pub(crate) fn resolve_client_reference(
   state: &ProxyState,
   rows: &[CatalogRow],
   requested: &str,
-) -> Result<(Option<String>, CatalogRow), ClientRefMiss> {
+) -> Result<(Option<String>, ResolvedRef), ClientRefMiss> {
   match resolve_reference(state, rows, requested) {
     Ok(row) => return Ok((None, row)),
     Err(ClientRefMiss::Ambiguous(candidates)) => return Err(ClientRefMiss::Ambiguous(candidates)),
@@ -431,11 +461,11 @@ fn resolve_reference(
   state: &ProxyState,
   rows: &[CatalogRow],
   reference: &str,
-) -> Result<CatalogRow, ClientRefMiss> {
+) -> Result<ResolvedRef, ClientRefMiss> {
   match crate::launch::resolve::resolve_exact_reference(rows, reference) {
     Ok(row) => {
       state.aliases.warn_shadowed(reference);
-      return Ok(row);
+      return Ok(ResolvedRef::plain(row));
     }
     // No outright model under this name, so an alias of it is next. A name two
     // models share counts as no outright model: that is what the alias settles.
@@ -447,7 +477,9 @@ fn resolve_reference(
     return resolve_aliased_reference(state, rows, reference, target);
   }
 
-  resolve_model_with_candidates(rows, reference).map_err(|err| client_miss(rows, err))
+  resolve_model_with_candidates(rows, reference)
+    .map(ResolvedRef::plain)
+    .map_err(|err| client_miss(rows, err))
 }
 
 /// The alias half of [`resolve_reference`]. The target has to name one model
@@ -460,11 +492,11 @@ fn resolve_aliased_reference(
   rows: &[CatalogRow],
   reference: &str,
   target: &str,
-) -> Result<CatalogRow, ClientRefMiss> {
+) -> Result<ResolvedRef, ClientRefMiss> {
   match crate::launch::resolve::resolve_exact_reference(rows, target) {
     Ok(row) => {
       note_moved_partial(state, rows, reference, target, &row);
-      Ok(row)
+      Ok(ResolvedRef::aliased(row))
     }
     Err(err @ ResolveError::Many(_)) => Err(aliased_ambiguous(state, rows, reference, target, err)),
     // The target named no model outright. Two readings are left and each gets
@@ -579,6 +611,7 @@ async fn decide_umbrella_route(
   state: &Arc<ProxyState>,
   requested: String,
   resolved: &CatalogRow,
+  alias: bool,
 ) -> RouteDecision {
   use crate::backend::{Backend, Backends};
   let backend_id =
@@ -604,6 +637,7 @@ async fn decide_umbrella_route(
           .as_ref()
           .and_then(|b| b.umbrella_openai_prefix())
           .map(str::to_string),
+        alias,
         fallback: false,
         fallback_reason: None,
       }
@@ -614,6 +648,7 @@ async fn decide_umbrella_route(
         .to_string(),
       requested_model: requested,
       resolved_row: Box::new(resolved.clone()),
+      alias,
     },
   }
 }

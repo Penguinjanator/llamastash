@@ -203,6 +203,16 @@ async fn proxy_state_with_aliases(
     .0
 }
 
+/// Like [`proxy_state_with_aliases`] but keeps the context, so a test can read
+/// the request log the proxy filled while answering.
+async fn proxy_state_with_aliases_and_ctx(
+  models: Vec<DiscoveredModel>,
+  supervisors: SupervisorRegistry,
+  aliases: &[(&str, &str)],
+) -> (Arc<ProxyState>, MethodContext) {
+  build_state(models, supervisors, DEFAULT_BODY_LIMIT_BYTES, aliases).await
+}
+
 // --- happy paths --------------------------------------------------------
 
 /// A bare `GET` against the test proxy, `(status, headers, body)`.
@@ -542,6 +552,53 @@ async fn model_file_with_at_in_name_resolves_as_plain_reference() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_aliased_request_is_logged_as_an_alias() {
+  let dir = unique_temp("alias-log");
+  let catalog_path = "/fixture/qwen3.gguf";
+  let registry = SupervisorRegistry::new();
+  let (model, _port, _id) = spawn_fake_supervisor(catalog_path, &dir, LaunchMode::Chat).await;
+  registry.insert(registry.next_id(), model.clone()).await;
+
+  let (state, ctx) = proxy_state_with_aliases_and_ctx(
+    vec![discovered(catalog_path, Some("qwen3"), "qwen3")],
+    registry,
+    &[("gpt-4o-mini", "qwen3")],
+  )
+  .await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
+
+  // The alias on its own, and the same alias with a launch half: in both cases
+  // the alias table is what found the model.
+  for body in [
+    r#"{"model":"gpt-4o-mini","messages":[]}"#,
+    r#"{"model":"gpt-4o-mini@fast","messages":[]}"#,
+  ] {
+    let (status, _headers, response) = http_post(addr, "/v1/chat/completions", body, &[]).await;
+    assert_eq!(
+      status, 200,
+      "{body} should reach the model the alias names: {response:?}"
+    );
+  }
+
+  let rows = ctx.requests.tail(LogScope::All, 10).rows;
+  assert_eq!(rows.len(), 2);
+  // Newest first, so the `@fast` request is rows[0].
+  for (row, asked) in rows.iter().zip(["gpt-4o-mini@fast", "gpt-4o-mini"]) {
+    assert!(row.alias, "the alias table routed this row: {row:?}");
+    assert_eq!(row.requested_model.as_deref(), Some(asked));
+    assert_eq!(
+      row.model.as_deref(),
+      Some("qwen3"),
+      "the row is filed under the model the alias names: {row:?}"
+    );
+  }
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, listener_handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_alias_reaches_the_model_it_names() {
   let dir = unique_temp("alias");
   let catalog_path = "/fixture/qwen3.gguf";
@@ -644,7 +701,7 @@ async fn a_real_model_id_beats_an_alias_of_the_same_name() {
   // somewhere else entirely (`other-model`, which is not running). If the alias
   // won, the request would go looking for a dormant model instead of the live
   // one answering this name.
-  let state = proxy_state_with_aliases(
+  let (state, ctx) = proxy_state_with_aliases_and_ctx(
     vec![
       discovered(catalog_path, Some("gpt-4o-mini"), "qwen3"),
       discovered("/fixture/other.gguf", Some("other-model"), "qwen3"),
@@ -660,6 +717,14 @@ async fn a_real_model_id_beats_an_alias_of_the_same_name() {
   assert_eq!(
     status, 200,
     "the real model must serve its own name, got {status}: {response:?}"
+  );
+  // The alias lost, so the row must not read as an aliased request.
+  let rows = ctx.requests.tail(LogScope::All, 1).rows;
+  assert_eq!(rows.len(), 1);
+  assert!(
+    !rows[0].alias,
+    "the model answered its own name, so no alias was used: {:?}",
+    rows[0]
   );
 
   let _ = model.stop(Duration::from_secs(3)).await;
@@ -1257,6 +1322,11 @@ async fn a_served_request_is_logged_and_reaches_requests_tail_and_status() {
   let stats = &status_body["models"][0]["request_stats"];
   assert_eq!(stats["requests"], 1, "{status_body}");
   assert!(stats["avg_duration_ms"].is_number());
+  // The prefill and cache figures `usage.md` lists for this object. The fake
+  // stream carried no usage and no timings, so they read as nothing reported.
+  assert!(stats["prefill_tokens_per_second"].is_null());
+  assert_eq!(stats["cached_tokens"], 0);
+  assert!(stats["cache_hit_ratio"].is_null());
 
   let _ = model.stop(Duration::from_secs(3)).await;
   shutdown_listener(shutdown, listener_handle).await;
@@ -1292,6 +1362,14 @@ async fn tokens_and_speed_come_from_the_end_of_the_response() {
   assert_eq!(row.completion_tokens, Some(3));
   assert_eq!(row.tokens_per_second, Some(38.64));
   assert!(!row.tokens_per_second_estimated, "the server reported it");
+  assert_eq!(row.cached_tokens, Some(40));
+  assert_eq!(row.prefill_tokens, Some(1));
+  assert_eq!(
+    row.prefill_tokens_per_second,
+    Some(1000.0 / 25.704),
+    "prompt_n over prompt_ms, not the body's rounded prompt_per_second"
+  );
+  assert!(!row.prefill_estimated);
 
   // An Anthropic-shape body: `usage.input_tokens` / `output_tokens`, and
   // no speed from the server, so the proxy estimates it from its clock.
@@ -1309,6 +1387,11 @@ async fn tokens_and_speed_come_from_the_end_of_the_response() {
   assert!(row.tokens_per_second_estimated);
   let estimate = row.tokens_per_second.expect("estimated speed");
   assert!(estimate > 0.0 && estimate.is_finite(), "{estimate}");
+  // No `timings` and no cached count: the proxy cannot tell what the engine
+  // computed, so it estimates no prefill either.
+  assert_eq!(row.cached_tokens, None);
+  assert_eq!(row.prefill_tokens_per_second, None);
+  assert!(!row.prefill_estimated);
 
   let summary = ctx
     .requests
