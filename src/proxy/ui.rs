@@ -1,7 +1,10 @@
-//! `/ui` browser surface: serve the running model's stock llama.cpp
-//! web UI through the proxy on one stable, port-stable origin
-//! (`http://127.0.0.1:11435/ui/`) so users stop hunting the ephemeral
-//! backend port in `status`.
+//! `/ui` browser surface: serve a chat UI for the running model through the
+//! proxy on one port-stable origin (`http://127.0.0.1:11435/ui/`) so users
+//! stop hunting the ephemeral backend port in `status`.
+//!
+//! A launch gets its UI from one of three sources, decided by [`ui_source`]:
+//! the backend's own UI, the llama.cpp UI bundled in the binary
+//! ([`super::ui_bundle`]) for engines that ship none, or nothing at all.
 //!
 //! The stock UI is base-path aware — its index uses relative assets
 //! (`./bundle.js`) and SvelteKit computes `base` from the URL — so
@@ -33,8 +36,11 @@ use hyper::{HeaderMap, Request, Response, StatusCode};
 
 use super::router::{BodyError, ProxyResponse};
 use super::state::ProxyState;
-use super::{forward, metrics, route};
+use super::{forward, metrics, route, ui_bundle};
+use crate::daemon::registry::LaunchId;
 use crate::gguf::identity::ModelId;
+use crate::launch::mode::LaunchMode;
+use serde_json::Value;
 
 /// Cookie that pins a browser session to one running backend so asset
 /// and base-relative API requests under `/ui/` all reach the model
@@ -47,10 +53,44 @@ struct RunningEntry {
   model_id: ModelId,
   port: u16,
   name: String,
-  /// Whether this backend serves a browser web UI `/ui` can reverse-proxy
-  /// (D-ui). A backend that serves none has rows that are never auto-pinned and render
-  /// non-selectable in the chooser.
-  serves_ui: bool,
+  /// Where this launch's browser UI comes from. A launch with no UI at all
+  /// is never auto-pinned and renders non-selectable in the chooser.
+  ui: UiSource,
+}
+
+/// Where a launch's browser UI comes from. Decided from the owning
+/// backend's `serves_web_ui` verdict and the launch mode, so no backend is
+/// named here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiSource {
+  /// The backend serves its own UI; `/ui` reverse-proxies all of it.
+  Engine,
+  /// The backend serves none, so `/ui` serves the bundled llama.cpp UI and
+  /// forwards only the engine's `/v1/...` surface.
+  Bundled,
+  /// Nothing to open: an embedding or rerank launch on a backend that
+  /// serves no UI.
+  None,
+}
+
+impl UiSource {
+  /// Whether a chooser row for this launch opens a UI.
+  fn is_selectable(self) -> bool {
+    matches!(self, Self::Engine | Self::Bundled)
+  }
+}
+
+/// The one rule behind the three sources: a backend with a UI always uses
+/// its own, a UI-less backend gets the bundled chat UI, and a UI-less
+/// embedding or rerank launch has nothing worth opening.
+fn ui_source(serves_web_ui: bool, mode: LaunchMode) -> UiSource {
+  if serves_web_ui {
+    UiSource::Engine
+  } else if mode == LaunchMode::Chat {
+    UiSource::Bundled
+  } else {
+    UiSource::None
+  }
 }
 
 /// Where a `/ui/...` request should be served from.
@@ -105,7 +145,13 @@ pub(crate) async fn serve(state: Arc<ProxyState>, req: Request<Incoming>) -> Pro
   }
 
   match resolve_target(req.headers(), running) {
-    UiTarget::Forward(entry) => forward_ui(&state, req, entry).await,
+    UiTarget::Forward(entry) => match entry.ui {
+      UiSource::Engine => forward_to_launch(&state, req, &entry).await,
+      UiSource::Bundled => serve_bundled(&state, req, &entry).await,
+      // Unreachable through `resolve_target`, which only forwards
+      // selectable entries; the chooser is what a UI-less launch gets.
+      UiSource::None => Ok(html_response(StatusCode::OK, chooser_html(&[entry], None))),
+    },
     // No valid pin here by construction, so nothing is marked active.
     UiTarget::Chooser(entries) => Ok(html_response(StatusCode::OK, chooser_html(&entries, None))),
     UiTarget::None => Ok(html_response(StatusCode::OK, no_model_html())),
@@ -137,19 +183,19 @@ fn resolve_target(headers: &HeaderMap, mut running: Vec<RunningEntry>) -> UiTarg
   if running.is_empty() {
     return UiTarget::None;
   }
-  // 1. Cookie pin → that backend, but only if it serves a web UI.
+  // 1. Cookie pin → that backend, but only if it has a UI to serve.
   if let Some(pin) = read_target_cookie(headers) {
     if let Some(idx) = running
       .iter()
-      .position(|e| e.launch_id == pin && e.serves_ui)
+      .position(|e| e.launch_id == pin && e.ui.is_selectable())
     {
       return UiTarget::Forward(running.swap_remove(idx));
     }
   }
-  // 2. Auto-forward only to a *lone* UI-serving model; anything else (a lone
+  // 2. Auto-forward only to a *lone* model with a UI; anything else (a lone
   //    UI-less model, or several models) shows the chooser — which renders
   //    UI-less rows non-selectable.
-  if running.len() == 1 && running[0].serves_ui {
+  if running.len() == 1 && running[0].ui.is_selectable() {
     return UiTarget::Forward(running.pop().expect("len == 1"));
   }
   UiTarget::Chooser(running)
@@ -167,24 +213,24 @@ async fn collect_running(state: &Arc<ProxyState>) -> Vec<RunningEntry> {
     if !launch.ready {
       continue;
     }
-    // Whether this model's backend serves a web UI. Uses the running model's
-    // *actual* resolved backend (last_params tag, falling back to the routing
-    // verdict) via `Backend::serves_web_ui`, so a compatible file force-run on a
-    // different backend still reflects that backend's UI. An unresolved backend
-    // falls back to the default backend's own verdict. Names no backend.
-    let serves_ui = {
+    // Whether this launch's backend serves a web UI, from the backend that
+    // owns *this launch* (keyed on launch id, the same resolver the stop path
+    // uses) rather than the one the model would route to: one GGUF can run on
+    // two servers at once, and only the launch on a UI-less engine needs the
+    // bundle. An unresolved backend falls back to the default backend's own
+    // verdict. Names no backend.
+    let serves_web_ui = {
       use crate::backend::Backend;
-      route::running_model_backend(state, &launch.model_id)
+      crate::daemon::launch_service::backend_for_launch(&state.ctx, &LaunchId(launch.id.clone()))
         .await
-        .map(|b| b.serves_web_ui())
-        .unwrap_or_else(|| crate::backend::default_backend().serves_web_ui())
+        .serves_web_ui()
     };
     out.push(RunningEntry {
       launch_id: launch.id,
       model_id: launch.model_id,
       port: launch.port,
       name: launch.model,
-      serves_ui,
+      ui: ui_source(serves_web_ui, launch.mode),
     });
   }
   out
@@ -193,13 +239,15 @@ async fn collect_running(state: &Arc<ProxyState>) -> Vec<RunningEntry> {
 /// Strip the `/ui` prefix and forward the request to `entry`'s backend.
 /// The UI's relative assets (`/ui/bundle.js`) and base-relative API
 /// calls (`/ui/v1/chat/completions`, `/ui/props`) all land here and
-/// route to the same target.
-async fn forward_ui(
+/// route to the same target. Shared by the engine-UI path (every request)
+/// and the bundled path (its `/v1/...` arm).
+async fn forward_to_launch(
   state: &Arc<ProxyState>,
   req: Request<Incoming>,
-  entry: RunningEntry,
+  entry: &RunningEntry,
 ) -> ProxyResponse {
-  let (method, uri, headers, body) = forward::deconstruct(req);
+  let stripped = strip_ui_prefix(req.uri());
+  let (method, _uri, headers, body) = forward::deconstruct(req);
   // Buffer the body under the daemon's cap via the same helper the
   // data plane uses. UI asset GETs are bodyless; the base-relative API
   // POSTs carry a JSON payload we pass through untouched.
@@ -209,7 +257,6 @@ async fn forward_ui(
     Err(e) => return route::body_error_response(e, cap),
   };
 
-  let stripped = strip_ui_prefix(&uri);
   let upstream_uri: hyper::Uri = stripped
     .parse()
     .unwrap_or_else(|_| hyper::Uri::from_static("/"));
@@ -233,6 +280,88 @@ async fn forward_ui(
     None,
   )
   .await
+}
+
+/// What a bundled-UI request maps to once `/ui` is stripped.
+enum BundledRoute<'a> {
+  /// The proxy's own answer for the `/props` route, which no engine other
+  /// than the bundle's origin serves.
+  Props,
+  /// The engine's OpenAI surface, forwarded unchanged so the model name it
+  /// accepts is the one the UI sends back.
+  Forward,
+  /// An embedded bundle file, or a path the bundle does not carry.
+  File(&'a str),
+}
+
+fn classify_bundled(stripped: &str) -> BundledRoute<'_> {
+  let path = stripped.split('?').next().unwrap_or("/");
+  if path == "/props" {
+    BundledRoute::Props
+  } else if path.starts_with("/v1/") {
+    BundledRoute::Forward
+  } else {
+    BundledRoute::File(path)
+  }
+}
+
+/// Serve a bundled-UI request: `/props` is ours, `/v1/...` goes to the
+/// engine, and everything else is a file from the embedded bundle.
+async fn serve_bundled(
+  state: &Arc<ProxyState>,
+  req: Request<Incoming>,
+  entry: &RunningEntry,
+) -> ProxyResponse {
+  match classify_bundled(&strip_ui_prefix(req.uri())) {
+    BundledRoute::Props => {
+      let ctx = launch_ctx(state, &entry.launch_id).await;
+      let vision = launch_vision(state, &entry.model_id.path).await;
+      Ok(json_response(
+        StatusCode::OK,
+        ui_bundle::props(&entry.name, ctx, vision),
+      ))
+    }
+    BundledRoute::Forward => forward_to_launch(state, req, entry).await,
+    BundledRoute::File(path) => match ui_bundle::get(path) {
+      Some(bytes) => Ok(static_response(
+        StatusCode::OK,
+        ui_bundle::content_type(path),
+        Bytes::from_static(bytes),
+      )),
+      None => Ok(not_found()),
+    },
+  }
+}
+
+/// The context window to report for a bundled launch: what the backend
+/// resolved when it reports actuals, else what the launch asked for, else
+/// zero. A gauge at zero beats a guessed number.
+async fn launch_ctx(state: &Arc<ProxyState>, launch_id: &str) -> u32 {
+  let Some(model) = state
+    .ctx
+    .supervisors
+    .get(&LaunchId(launch_id.to_string()))
+    .await
+  else {
+    return 0;
+  };
+  model
+    .actuals()
+    .await
+    .resolved_ctx
+    .or(model.params().ctx)
+    .unwrap_or(0)
+}
+
+/// Whether the launch's model takes images, from its catalog row's
+/// projector flags. No row and no projector both read as text-only.
+async fn launch_vision(state: &Arc<ProxyState>, path: &std::path::Path) -> bool {
+  let catalog = state.ctx.catalog.shared_view().await;
+  catalog
+    .iter()
+    .find(|row| row.path == path)
+    .and_then(|row| row.multimodal)
+    .is_some_and(|m| m.vision)
 }
 
 /// Strip the leading `/ui` from a `/ui/...` request URI, preserving the
@@ -315,7 +444,7 @@ fn chooser_html(running: &[RunningEntry], active: Option<&str>) -> String {
     } else {
       ""
     };
-    if e.serves_ui {
+    if e.ui.is_selectable() {
       items.push_str(&format!(
         "<li><a class=\"has-ui\" href=\"/ui/?target={id}\"><span class=\"name\">{name}</span><span class=\"port\">:{port}{current}</span></a></li>",
         id = escape_html(&e.launch_id),
@@ -426,15 +555,35 @@ fn empty_body() -> BoxBody<Bytes, BodyError> {
 }
 
 fn html_response(status: StatusCode, body: String) -> Response<BoxBody<Bytes, BodyError>> {
+  static_response(status, "text/html; charset=utf-8", Bytes::from(body))
+}
+
+/// A response whose body we built here — a static page, an embedded file,
+/// a stand-in JSON body — as opposed to one forwarded from an engine.
+fn static_response(
+  status: StatusCode,
+  content_type: &str,
+  body: Bytes,
+) -> Response<BoxBody<Bytes, BodyError>> {
   Response::builder()
     .status(status)
-    .header(CONTENT_TYPE, "text/html; charset=utf-8")
-    .body(
-      Full::new(Bytes::from(body))
-        .map_err(|never| match never {})
-        .boxed(),
-    )
-    .expect("static html response must build")
+    .header(CONTENT_TYPE, content_type)
+    .body(Full::new(body).map_err(|never| match never {}).boxed())
+    .expect("static response must build")
+}
+
+fn json_response(status: StatusCode, body: Value) -> Response<BoxBody<Bytes, BodyError>> {
+  static_response(status, "application/json", Bytes::from(body.to_string()))
+}
+
+/// The answer for a `/ui/` path that is neither forwarded nor in the
+/// bundle. A body a browser can show, not a blank page.
+fn not_found() -> Response<BoxBody<Bytes, BodyError>> {
+  static_response(
+    StatusCode::NOT_FOUND,
+    "text/plain; charset=utf-8",
+    Bytes::from_static(b"no such UI file"),
+  )
 }
 
 #[cfg(test)]
@@ -469,8 +618,8 @@ mod tests {
       "the row carries the launched model's identity, not just a path string"
     );
     assert!(
-      running.iter().all(|e| e.serves_ui),
-      "a llama.cpp row still serves a web UI, so it stays selectable"
+      running.iter().all(|e| e.ui == UiSource::Engine),
+      "the default backend's row still serves its own web UI, so it stays selectable"
     );
   }
 
@@ -496,10 +645,25 @@ mod tests {
   }
 
   fn entry(launch_id: &str, port: u16, name: &str) -> RunningEntry {
-    entry_ui(launch_id, port, name, true)
+    entry_src(launch_id, port, name, UiSource::Engine)
   }
 
-  fn entry_ui(launch_id: &str, port: u16, name: &str, serves_ui: bool) -> RunningEntry {
+  /// A row that either has a UI of its own or has none at all (an embedding
+  /// or rerank launch), for the rules that only care about that split.
+  fn entry_ui(launch_id: &str, port: u16, name: &str, has_ui: bool) -> RunningEntry {
+    entry_src(
+      launch_id,
+      port,
+      name,
+      if has_ui {
+        UiSource::Engine
+      } else {
+        UiSource::None
+      },
+    )
+  }
+
+  fn entry_src(launch_id: &str, port: u16, name: &str, ui: UiSource) -> RunningEntry {
     RunningEntry {
       launch_id: launch_id.to_string(),
       model_id: ModelId {
@@ -508,7 +672,91 @@ mod tests {
       },
       port,
       name: name.to_string(),
-      serves_ui,
+      ui,
+    }
+  }
+
+  /// The three sources: a backend with a UI always uses its own, whatever it
+  /// was launched for; a UI-less backend gets the bundle only for chat.
+  #[test]
+  fn ui_source_prefers_the_engine_then_the_bundle_then_nothing() {
+    for mode in [LaunchMode::Chat, LaunchMode::Embedding, LaunchMode::Rerank] {
+      assert_eq!(ui_source(true, mode), UiSource::Engine, "{mode:?}");
+    }
+    assert_eq!(ui_source(false, LaunchMode::Chat), UiSource::Bundled);
+    assert_eq!(ui_source(false, LaunchMode::Embedding), UiSource::None);
+    assert_eq!(ui_source(false, LaunchMode::Rerank), UiSource::None);
+    // Only a launch with no UI at all is excluded from opening one.
+    assert!(UiSource::Engine.is_selectable());
+    assert!(UiSource::Bundled.is_selectable());
+    assert!(!UiSource::None.is_selectable());
+  }
+
+  /// A bundled launch is a real target: a lone one opens directly and a
+  /// cookie pin forwards to it, exactly like the backend's own UI.
+  #[test]
+  fn resolve_target_forwards_a_bundled_launch() {
+    let lone = || vec![entry_src("L1", 41100, "noui", UiSource::Bundled)];
+    match resolve_target(&HeaderMap::new(), lone()) {
+      UiTarget::Forward(e) => assert_eq!(e.launch_id, "L1"),
+      _ => panic!("a lone bundled launch opens directly"),
+    }
+    match resolve_target(&headers_with_cookie("ls_ui_target=L1"), lone()) {
+      UiTarget::Forward(e) => assert_eq!(e.launch_id, "L1"),
+      _ => panic!("a cookie pinned to a bundled launch forwards to it"),
+    }
+  }
+
+  /// A bundled row is a green link; only a row with no UI at all stays red.
+  #[test]
+  fn chooser_links_a_bundled_row_and_keeps_a_ui_less_row_red() {
+    let html = chooser_html(
+      &[
+        entry_src("L1", 41100, "bundled", UiSource::Bundled),
+        entry_src("L2", 41101, "embed", UiSource::None),
+      ],
+      None,
+    );
+    assert!(
+      html.contains(
+        "<a class=\"has-ui\" href=\"/ui/?target=L1\"><span class=\"name\">bundled</span>"
+      ),
+      "a bundled row is a link: {html}"
+    );
+    let row = html
+      .split("<li class=\"no-ui\">")
+      .nth(1)
+      .unwrap_or_default();
+    let row = row.split("</li>").next().unwrap_or(row);
+    assert!(
+      !row.contains("<a "),
+      "a UI-less row must not be a link: {row}"
+    );
+  }
+
+  /// How a bundled launch's requests split after `/ui` is stripped: the
+  /// proxy answers `/props`, the engine answers its `/v1/...` surface, and
+  /// everything else is looked up in the embedded bundle.
+  #[test]
+  fn bundled_paths_split_props_forward_and_files() {
+    assert!(matches!(classify_bundled("/props"), BundledRoute::Props));
+    assert!(matches!(
+      classify_bundled("/props?x=1"),
+      BundledRoute::Props
+    ));
+    assert!(matches!(
+      classify_bundled("/v1/models"),
+      BundledRoute::Forward
+    ));
+    assert!(matches!(
+      classify_bundled("/v1/chat/completions"),
+      BundledRoute::Forward
+    ));
+    for path in ["/", "/slots", "/tools", "/nope.js"] {
+      assert!(
+        matches!(classify_bundled(path), BundledRoute::File(p) if p == path),
+        "{path} is a bundle lookup"
+      );
     }
   }
 
