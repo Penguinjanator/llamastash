@@ -214,7 +214,7 @@ All four run in one lane, in order. None can run in parallel (U2 needs U1's arch
 **Verification:**
 - Every doc statement about `/ui` matches U2's behavior; no doc still says only llama.cpp launches open.
 
-- [ ] **Unit 4: Weekly refresh workflow**
+- [x] **Unit 4: Weekly refresh workflow**
 
 **Goal:** A PR shows up when upstream publishes a newer UI.
 

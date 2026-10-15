@@ -75,7 +75,7 @@ done
 
 ## Step 2 — Add secrets
 
-Two secrets live on `llamastash/llamastash`. Both come from mint flows GitHub and crates.io expose only via the web — set them once, then push via `gh secret set`.
+Three secrets live on `llamastash/llamastash`. All of them come from mint flows GitHub and crates.io expose only via the web — set each once, then push via `gh secret set`.
 
 ### `CRATES_IO_TOKEN`
 
@@ -105,8 +105,22 @@ Fine-grained PAT used by `release.yml`'s `publish-homebrew` and `publish-site` j
 
 ```sh
 gh secret set GH_BUMP_TOKEN --repo llamastash/llamastash --body '<paste-here>'
+```
 
-# Confirm both secrets are set (values are not shown):
+### `LLAMA_UI_BUMP_TOKEN`
+
+Fine-grained PAT used by `update-llama-ui.yml` to push a `chore/llama-ui-<build>` branch and open the UI bump PR on this repo. Until it is set the workflow is a no-op: it prints a run-log notice and exits 0. It cannot be `GITHUB_TOKEN`, because events made with `GITHUB_TOKEN` start no other workflow and `can_approve_pull_request_reviews` is off here, so a bot PR opened by the built-in token would sit with required checks that never run.
+
+1. **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.**
+2. **Resource owner:** `llamastash`.
+3. **Repository access:** Only select repositories → `llamastash`.
+4. **Permissions:** `Contents: Read and write` and `Pull requests: Read and write`. Nothing else.
+5. **Expiration:** 1 year, on the same reminder as above.
+
+```sh
+gh secret set LLAMA_UI_BUMP_TOKEN --repo llamastash/llamastash --body '<paste-here>'
+
+# Confirm all three secrets are set (values are not shown):
 gh secret list --repo llamastash/llamastash
 ```
 
@@ -288,6 +302,7 @@ gh run rerun --repo llamastash/llamastash --failed <run-id>
 | ----------------- | --------------------------------------- | --------------- | ------------------------------------------------------------------------------------------ |
 | `CRATES_IO_TOKEN` | First publish, suspected leak, annually | annual          | crates.io UI → `gh secret set CRATES_IO_TOKEN --repo llamastash/llamastash --body '<new>'` |
 | `GH_BUMP_TOKEN`   | PAT expiry, leak, annually              | annual          | GitHub PAT UI → `gh secret set GH_BUMP_TOKEN --repo llamastash/llamastash --body '<new>'`  |
+| `LLAMA_UI_BUMP_TOKEN` | PAT expiry, leak, annually          | annual          | GitHub PAT UI → `gh secret set LLAMA_UI_BUMP_TOKEN --repo llamastash/llamastash --body '<new>'` |
 
 The long-term answer (tracked in `TODO.md`) is migrating to a scoped GitHub App with OIDC instead of PATs — eliminates rotation entirely. Out of scope for 0.0.1.
 

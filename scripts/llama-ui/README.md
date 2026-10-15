@@ -23,9 +23,12 @@ it unless the published `.sha256` matches, reads the real build number out of
 Running it again for a build whose sha is already in `VERSION` changes nothing.
 Only the script writes `VERSION`; do not edit it by hand.
 
-A weekly workflow (`.github/workflows/update-llama-ui.yml`) runs
-`update.sh latest` on a schedule and opens a PR when upstream moves. It is a
-no-op until the `LLAMA_UI_BUMP_TOKEN` repo secret exists.
+A weekly workflow (`.github/workflows/update-llama-ui.yml`) runs `update.sh
+latest` on Monday 04:00 UTC and opens a PR from `chore/llama-ui-<build>` when
+upstream moves. It never merges, so the check below is what stops a bad bump.
+The workflow writes through the `LLAMA_UI_BUMP_TOKEN` repo secret and does
+nothing while it is unset; minting it is Step 2 of
+`docs/runbooks/release-0.0.1-bootstrap.md`.
 
 ### Before merging a bump
 
