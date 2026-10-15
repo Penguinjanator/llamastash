@@ -2820,6 +2820,10 @@ mod tests {
       "completion_tokens",
       "tokens_per_second",
       "tokens_per_second_estimated",
+      "prefill_tokens",
+      "prefill_tokens_per_second",
+      "prefill_estimated",
+      "cached_tokens",
     ] {
       assert!(v.get(key).is_some(), "missing key {key}");
     }
