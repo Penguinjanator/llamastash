@@ -449,6 +449,9 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 
 ## R15 (v0.8.0 checklist)
 
+- [ ] Nvidia + intel multi gpu detection issues
+- [ ] launch settings key col width should accomodate longer keys, make dynamic
+
 ### Batch 1: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
 
 - [ ] Keep a model's prompt cache across an unload
@@ -471,11 +474,7 @@ _Shared context: `src/metrics/`, `llamastash requests`, `/metrics?format=json`, 
 
 _Shared context: `metrics::live_launches`, `proxy/ui.rs::collect_running`, the daemon orphan sweep and `ctx.external`._
 
-- [ ] `orphans::row_still_current` keeps an external row when the platform reports no start time, while `stop_external` refuses to signal that same pid, and the two answer "is this the same process" with separate code. Share one helper returning same / recycled / unknown and let each caller pick its policy for `unknown`. ([plan](docs/plans/2026-10-14-002-feat-r15-live-launch-state-plan.md))
-- [ ] The resweep's own-children filter skips only direct children of the daemon, so a configured launcher that forks the real server instead of exec'ing it leaves a grandchild: it is listed as external and counted twice in `running`. ([plan](docs/plans/2026-10-14-002-feat-r15-live-launch-state-plan.md))
 - [x] ~~`merge_keeps_a_live_row_the_scan_cannot_match_even_without_a_name` in `src/daemon/orphans.rs` records `process_start_time(live).unwrap_or(0)`, so on a platform where sysinfo reports no start time it passes through the "unknown start time" branch instead of the start-time match it is meant to cover.~~ — done: the test returns early on 0 like its siblings.
-- [ ] `metrics::LiveLaunch` carries both `path: String` and `model_id.path` for one fact, so every construction site has to keep them in sync. Dropped once batch 2 (which rewrites the `l.path == …` comparisons) merges ([plan](docs/plans/2026-10-14-002-feat-r15-live-launch-state-plan.md)).
-
 - [x] ~~`metrics::live_launches` walks supervisors and the catalog the way `proxy/ui.rs::collect_running` does, and the plan asked for one enumeration. Have `collect_running` consume `live_launches` (filtering on `ready`) instead of its own copy.~~ — done in R15 batch 3 ([plan](docs/plans/2026-10-14-002-feat-r15-live-launch-state-plan.md)).
 - [x] ~~**External rows are a boot-time snapshot, and the TUI counters ignore them.** The orphan sweep that fills `ctx.external` runs once during daemon startup ([`src/daemon/mod.rs`](src/daemon/mod.rs) ~350-410); nothing re-sweeps afterwards. Three consequences, all reproduced 2026-09-02: (1) a `llama-server` started after the daemon is invisible to `status` however long it runs; (2) a row whose process has exited stays listed indefinitely, so `status` reported `external … pid 3940842` for a process `kill -0` confirmed dead, while a live external server on another port went unlisted, and a `daemon stop && daemon start` corrected both; (3) the Models pane _does_ render the row with the `⇪ external` glyph, but the Daemon pane's `running N` / `N ready` counters exclude external rows, so the header reads `running 0` with an external row visible right below it. A genuinely external process (one llamastash never launched) also lands with no port: TUI shows `:0`, `status` shows `-`, because only the adopted branch sets `port: Some(adopted.port)`. Do a simple periodic resweep using existing plumbing, use an interval that wont cause cpu/memory pressure.~~ — done: a 30 s resweep (`orphans::spawn_resweep`) refreshes `ctx.external` — a server started after boot appears, a dead row drops, the daemon's own children are never listed, and a re-adopted row keeps its name and port while it lives. External rows now count in the TUI's `running` row and carry their argv port in `status` and the TUI.
 
@@ -513,12 +512,15 @@ _Shared context: `test_support` listener helpers, `util::test_temp`, the per-bin
 
 - [ ] `fast_probe` exists in 8 test files with two different timeouts (5 s and 15 s). Move it to `test_support` beside the listener helpers.
 - [ ] the temp-dir helper is in twice (`test_support::unique_temp_dir(prefix, label)` for the integration tests, `util::test_temp::unique_temp_dir(label)` for `src/` unit tests), and 24 `tests/*.rs` binaries wrap the first in the same one-line `fn unique_temp`. One helper with the prefix folded into the label retires all 24.
+- [ ] **Unit tests write to the real system clipboard.** `u_c_p_yanks_work_from_settings_tab` ([`events.rs`](src/tui/events.rs) ~5032) presses `p`/`u`/`c`, which call the real [`clipboard::write`](src/util/clipboard.rs) (arboard Wayland backend). Every `cargo test` on a desktop replaces the user's clipboard and pushes `/m/qwen.gguf` and `http://127.0.0.1:41100/v1` into clipboard history (seen in DMS 2026-10-14). Fix: return early from `clipboard::write` under `cfg(test)` (e.g. `Ok("test")`); the test already accepts the `copied …` toast, and the shell-out tests call `write_via` directly.
 
 ## General Roadmap
 
 Items are grouped into batches by what a work session loads to do them - the same modules, docs and test surface. A batch is one unit of work.
 
 ### High priority
+
+#### To be batched
 
 #### Batch H1 - New CLI verbs on the agent contract
 
@@ -590,6 +592,12 @@ _Shared context: The generic `ModelIdentity` seam and plan 002's substrate; need
 - [ ] MLX as a native peer backend (the generic `ModelIdentity` seam already supports it; would drop in alongside llama.cpp/Lemonade). The MLX backend (needs a Mac) — [`docs/plans/2026-06-24-002-feat-mlx-backend-plan.md`](docs/plans/2026-06-24-002-feat-mlx-backend-plan.md).
 
 ### Low priority
+
+#### To be batched
+
+- [ ] `metrics::LiveLaunch` carries both `path: String` and `model_id.path` for one fact, so every construction site has to keep them in sync. Dropped once batch 2 (which rewrites the `l.path == …` comparisons) merges ([plan](docs/plans/2026-10-14-002-feat-r15-live-launch-state-plan.md)).
+- [ ] `orphans::row_still_current` keeps an external row when the platform reports no start time, while `stop_external` refuses to signal that same pid, and the two answer "is this the same process" with separate code. Share one helper returning same / recycled / unknown and let each caller pick its policy for `unknown`. ([plan](docs/plans/2026-10-14-002-feat-r15-live-launch-state-plan.md))
+- [ ] The resweep's own-children filter skips only direct children of the daemon, so a configured launcher that forks the real server instead of exec'ing it leaves a grandchild: it is listed as external and counted twice in `running`. ([plan](docs/plans/2026-10-14-002-feat-r15-live-launch-state-plan.md))
 
 #### Batch L1 - Proxy routing, auto-start and load adoption
 
