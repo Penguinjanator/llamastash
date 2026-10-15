@@ -241,6 +241,68 @@ async fn dormant_model_auto_starts_and_forwards_without_fallback_headers() {
   std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The auto-start arm carries the alias flag too. It is the route most alias
+/// requests take, since the model they name is usually asleep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_auto_started_request_is_logged_as_an_alias() {
+  let dir = unique_temp("alias-autostart");
+  let log_dir = dir.join("logs");
+  std::fs::create_dir_all(&log_dir).unwrap();
+  let model_path = write_gguf(&dir, "qwen3.gguf", "qwen3");
+  let other_path = write_gguf(&dir, "llama.gguf", "llama");
+  let (state, ctx) = build_state_with_aliases(
+    vec![
+      discovered(&model_path, Some("qwen3"), "qwen3"),
+      discovered(&other_path, Some("llama"), "llama"),
+    ],
+    &log_dir,
+    allocate_port_range(),
+    &[("gpt-4o-mini", "qwen3")],
+  )
+  .await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
+
+  // Both models are dormant, so both requests take the same arm and only the
+  // first one finds its model through the alias table.
+  for (asked, model, aliased) in [("gpt-4o-mini", "qwen3", true), ("llama", "llama", false)] {
+    let body = serde_json::json!({
+      "model": asked,
+      "messages": [{"role":"user","content":"hi"}],
+      "stream": true,
+    })
+    .to_string();
+    let (status, _headers, response) = http_post(addr, "/v1/chat/completions", &body).await;
+    assert_eq!(
+      status, 200,
+      "{asked} should auto-start {model}: {response:?}"
+    );
+
+    let row = newest_request_when(&ctx.requests, |row| {
+      row.state != RequestState::InFlight && row.requested_model.as_deref() == Some(asked)
+    })
+    .await;
+    assert!(row.auto_start, "{asked} started its model: {row:?}");
+    assert_eq!(row.model.as_deref(), Some(model));
+    assert_eq!(
+      row.alias, aliased,
+      "only the alias lookup marks the row: {row:?}"
+    );
+    assert_eq!(
+      row.note(),
+      if aliased {
+        "alias, auto-start"
+      } else {
+        "auto-start"
+      },
+      "the note carries it too: {row:?}"
+    );
+  }
+
+  stop_all(&ctx).await;
+  shutdown_listener(shutdown, listener_handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
 // ---- Scenario 2: slow start — request blocks for window then succeeds -
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

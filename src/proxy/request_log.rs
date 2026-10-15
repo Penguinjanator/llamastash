@@ -135,6 +135,11 @@ pub struct RequestRow {
   /// This request spawned the model's launch. Not set when the spawn was
   /// refused, or when the request waited on a launch something else started.
   pub auto_start: bool,
+  /// A `proxy.aliases` entry is what routed the request: `requested_model`
+  /// holds the alias the client sent, `model` the model it names. Kept as a
+  /// flag rather than read off `requested_model != model` so a fallback row
+  /// still says the client used an alias.
+  pub alias: bool,
   /// Launches unloaded to make room for this request's auto-start.
   pub evicted: Vec<String>,
   /// Why another model answered (`launch_failed` / `family_mismatch`).
@@ -150,6 +155,17 @@ pub struct RequestRow {
   /// The server reported no speed, so the proxy worked it out from the
   /// token count and its own clock.
   pub tokens_per_second_estimated: bool,
+  /// Prompt tokens the engine computed, with the ones it reused from the KV
+  /// cache left out.
+  pub prefill_tokens: Option<u64>,
+  /// How fast those tokens were computed, reported by the engine or estimated
+  /// by the proxy.
+  pub prefill_tokens_per_second: Option<f64>,
+  /// No prefill timing reached the proxy, so [`Self::prefill_tokens_per_second`]
+  /// is its own estimate.
+  pub prefill_estimated: bool,
+  /// Prompt tokens served from the KV cache.
+  pub cached_tokens: Option<u64>,
 }
 
 /// A row as table-cell text. The CLI table and the TUI tab both render
@@ -162,6 +178,8 @@ pub struct RequestCells {
   pub ttfb: String,
   /// Prefixed with `~` when the speed is the proxy's estimate.
   pub speed: String,
+  /// Prompt-processing speed, `~` when it is the proxy's estimate.
+  pub prefill: String,
   pub tokens_in: String,
   pub tokens_out: String,
   /// The route without its `/v1/` prefix, which every logged route has.
@@ -202,7 +220,11 @@ impl RequestRow {
         } else {
           ""
         };
-        format!("{mark}{t:.1}")
+        format!("{mark}{}", fmt_tps(t))
+      })),
+      prefill: or_none(self.prefill_tokens_per_second.map(|t| {
+        let mark = if self.prefill_estimated { "~" } else { "" };
+        format!("{mark}{}", fmt_tps(t))
       })),
       tokens_in: or_none(self.prompt_tokens.map(fmt_count)),
       tokens_out: or_none(self.completion_tokens.map(fmt_count)),
@@ -233,6 +255,9 @@ impl RequestRow {
       RequestState::ClientClosed => parts.push("client closed".to_string()),
       RequestState::UpstreamError => parts.push("upstream error".to_string()),
       RequestState::Done => {}
+    }
+    if self.alias {
+      parts.push("alias".to_string());
     }
     if self.auto_start && self.state != RequestState::InFlight {
       parts.push("auto-start".to_string());
@@ -266,6 +291,24 @@ fn fmt_count(n: u64) -> String {
   }
 }
 
+/// A speed for a table cell: one decimal below 1000, a whole number to
+/// 99,999.4, and whole thousands with a `k` from there up, so `~` plus the
+/// value always fits the six cells the column gives it.
+fn fmt_tps(v: f64) -> String {
+  // One decimal of thousands rounds up to `1000.0` from here, which costs a
+  // cell more than the column has.
+  const WHOLE_FROM: f64 = 999.95;
+  // A whole number runs past the column from here, so thousands take a `k`.
+  const KILO_FROM: f64 = 99_999.5;
+  if v < WHOLE_FROM {
+    format!("{v:.1}")
+  } else if v < KILO_FROM {
+    format!("{v:.0}")
+  } else {
+    format!("{:.0}k", v / 1_000.0)
+  }
+}
+
 /// A duration for a table cell: `850ms`, `1.2s`, `2m05s`, `1h02m`.
 fn fmt_ms(ms: u64) -> String {
   let secs = ms / 1000;
@@ -292,11 +335,30 @@ pub struct RequestSummary {
   pub avg_ttfb_ms: Option<u64>,
   /// Mean of the per-request speeds, estimated ones included.
   pub tokens_per_second_avg: Option<f64>,
+  /// Tokens per second across the whole scope: every completion token the
+  /// rows it retains carry over the wall time they were generating. Where
+  /// [`Self::tokens_per_second_avg`] answers how fast one stream runs, this
+  /// answers how fast the box does, so four tools streaming at once move it
+  /// and not the mean. Computed over the rows the ring retains, so it ages
+  /// with the table rather than with the daemon. Every finished row that
+  /// generated tokens counts, whatever it ended as.
+  pub tokens_per_second_aggregate: Option<f64>,
+  /// The busy wall [`Self::tokens_per_second_aggregate`] divides by, in ms:
+  /// the union of its rows' generation windows, so time two tools spent
+  /// generating at once counts once. Present exactly when it is.
+  pub busy_ms: Option<u64>,
   /// Mean speed of the newest launch of the scoped model only: what this
   /// session is running at, with a reloaded model no older launch pulling
   /// the average. Set for a model scope only; `None` for the whole log and
   /// for a scope no request has reported a speed for yet.
   pub tokens_per_second_session: Option<f64>,
+  /// Prompt tokens per second across the scope: every prefill token the rows
+  /// carry over the seconds they took. Weighted by tokens rather than the mean
+  /// of the per-row speeds, because an agent turn prefills a few hundred
+  /// uncached tokens at a low per-token rate while a cold long prompt runs
+  /// much faster, and a plain mean would mostly report the small turns. Engine
+  /// figures and estimates both count, and so do rows however they ended.
+  pub prefill_tokens_per_second: Option<f64>,
   /// The most recent speed a request reported. Kept in the JSON and in the
   /// row table, but no longer on the summary strips: the session figure says
   /// the same thing about what is running now.
@@ -313,6 +375,13 @@ pub struct RequestSummary {
   /// [`Self::connections`] over the requests in flight right now.
   pub live_connections: Option<u64>,
   pub prompt_tokens: u64,
+  /// Prompt tokens served from the KV cache, on the rows that report a prompt
+  /// count as well. A row with a cached count and no prompt count is in neither
+  /// half of the pair below.
+  pub cached_tokens: u64,
+  /// [`Self::cached_tokens`] over the prompt tokens they were served from.
+  /// `None` when no row reported both, which is not the same answer as `0`.
+  pub cache_hit_ratio: Option<f64>,
   pub completion_tokens: u64,
   /// Requests that started the model.
   pub auto_starts: u64,
@@ -325,10 +394,7 @@ impl RequestSummary {
   /// for a figure no request has supplied yet.
   pub fn cells(&self, none: &str) -> Vec<(&'static str, String)> {
     let ms = |v: Option<u64>| v.map(fmt_ms).unwrap_or_else(|| none.to_string());
-    let tps = |v: Option<f64>| {
-      v.map(|t| format!("{t:.1}"))
-        .unwrap_or_else(|| none.to_string())
-    };
+    let tps = |v: Option<f64>| v.map(fmt_tps).unwrap_or_else(|| none.to_string());
     let num = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_else(|| none.to_string());
     vec![
       ("Requests", self.requests.to_string()),
@@ -342,14 +408,35 @@ impl RequestSummary {
       ("Avg total", ms(self.avg_duration_ms)),
       ("Avg TTFB", ms(self.avg_ttfb_ms)),
       ("Avg tok/s", tps(self.tokens_per_second_avg)),
+      (
+        "Agg tok/s",
+        match (self.tokens_per_second_aggregate, self.busy_ms) {
+          (Some(t), Some(busy)) => format!("{} over {}", fmt_tps(t), fmt_ms(busy)),
+          _ => none.to_string(),
+        },
+      ),
+      (
+        "Prefill tok/s",
+        self
+          .prefill_tokens_per_second
+          .map(fmt_tps)
+          .unwrap_or_else(|| none.to_string()),
+      ),
     ])
     .chain(
       self
         .tokens_per_second_session
-        .map(|t| ("Tok/s session", format!("{t:.1}"))),
+        .map(|t| ("Tok/s session", fmt_tps(t))),
     )
     .chain([
       ("Tokens in", fmt_count(self.prompt_tokens)),
+      (
+        "Cached",
+        match self.cache_hit_ratio {
+          Some(ratio) => format!("{} ({:.1}%)", fmt_count(self.cached_tokens), ratio * 100.0),
+          None => none.to_string(),
+        },
+      ),
       ("Tokens out", fmt_count(self.completion_tokens)),
       ("Auto-starts", self.auto_starts.to_string()),
       ("Unloaded", self.evictions.to_string()),
@@ -412,29 +499,112 @@ impl Clients {
   }
 }
 
-/// [`Clients`] of a scope and the same over its in-flight rows.
+/// The throughput of a scope, read off the rows the ring retains.
+///
+/// The mean of the per-request speeds answers how fast one stream runs. This
+/// answers how fast the box does: every token the counted rows carry over the
+/// wall time they were generating, so four tools streaming at once move it
+/// where the mean cannot.
 #[derive(Default)]
-struct ClientPair {
-  all: Clients,
-  live: Clients,
+struct Throughput {
+  /// Generation windows as `(start, end)` in ms, on the rows' own clock.
+  windows: Vec<(u64, u64)>,
+  tokens: u64,
 }
 
-impl ClientPair {
+impl Throughput {
+  /// Take one row's contribution. A row counts when it has a speed, a duration
+  /// and generated tokens — the three the figure is made of — so in-flight rows
+  /// and rows that never saw a usage block are in neither sum, and a newer idle
+  /// request cannot pull the figure down. The status is no filter: a generation
+  /// the client cut short or the upstream broke off still put those tokens out,
+  /// and llama.cpp folds an aborted slot's tokens into its own counters, so
+  /// counting them is what makes this agree with the engine.
+  fn add(&mut self, row: &RequestRow) {
+    let (Some(tps), Some(duration_ms), Some(tokens)) = (
+      row.tokens_per_second,
+      row.duration_ms,
+      row.completion_tokens,
+    ) else {
+      return;
+    };
+    if row.state == RequestState::InFlight || tps <= 0.0 || tokens == 0 || duration_ms == 0 {
+      return;
+    }
+    // The row ends when its response did, and the speed on it says how much of
+    // that was generation. Anchoring the span to the end and clamping it into
+    // the request is what keeps a load that precedes generation, or a
+    // non-streamed request whose first byte is the whole wait, from stretching
+    // or collapsing the wall.
+    let end = row.started_at_ms.saturating_add(duration_ms);
+    let span = (tokens as f64 / tps * 1000.0).round() as u64;
+    let start = end.saturating_sub(span).max(row.started_at_ms);
+    if start >= end {
+      return;
+    }
+    self.windows.push((start, end));
+    self.tokens = self.tokens.saturating_add(tokens);
+  }
+
+  /// `(tokens per second, busy wall ms)`, both `None` when no row counted.
+  ///
+  /// The wall is the union of the windows: a second with four streams running
+  /// is one second of the box being busy, not four. Sorting is in place: a
+  /// snapshot takes this once per scope while it holds the log lock.
+  fn figures(&mut self) -> (Option<f64>, Option<u64>) {
+    if self.windows.is_empty() {
+      return (None, None);
+    }
+    self.windows.sort_unstable();
+    let mut busy: u64 = 0;
+    let mut run = self.windows[0];
+    for &(start, end) in &self.windows[1..] {
+      if start > run.1 {
+        busy = busy.saturating_add(run.1 - run.0);
+        run = (start, end);
+      } else {
+        run.1 = run.1.max(end);
+      }
+    }
+    busy = busy.saturating_add(run.1 - run.0);
+    if busy == 0 {
+      return (None, None);
+    }
+    (Some(self.tokens as f64 * 1000.0 / busy as f64), Some(busy))
+  }
+}
+
+/// The figures a summary can only get from the rows a scope retains: its
+/// clients and its throughput. Both [`RequestLog::tail`] and
+/// [`RequestLog::snapshot`] stamp these, so the two paths cannot differ.
+#[derive(Default)]
+struct RowFigures {
+  all: Clients,
+  live: Clients,
+  throughput: Throughput,
+}
+
+impl RowFigures {
   fn add(&mut self, row: &RequestRow) {
     self.all.add(row);
     if row.state == RequestState::InFlight {
       self.live.add(row);
     }
+    self.throughput.add(row);
   }
 
-  /// Stamp the four client figures onto `summary`. A daemon that computes
-  /// them always answers, so an empty scope reads `Some(0)`; only an older
-  /// daemon leaves them `None`.
-  fn stamp(&self, summary: &mut RequestSummary) {
+  /// Stamp the row-derived figures onto `summary`. A daemon that computes the
+  /// client figures always answers, so a scope with no rows left reads `Some(0)`
+  /// and only an older daemon leaves them `None`. The two throughput figures are
+  /// `None` until a row of the scope has both a token count and a speed.
+  fn stamp(&mut self, summary: &mut RequestSummary) {
     summary.hosts = Some(self.all.hosts());
     summary.connections = Some(self.all.connections());
     summary.live_hosts = Some(self.live.hosts());
     summary.live_connections = Some(self.live.connections());
+    let (tps, busy_ms) = self.throughput.figures();
+    summary.tokens_per_second_aggregate = tps;
+    summary.busy_ms = busy_ms;
   }
 }
 
@@ -460,6 +630,14 @@ struct Totals {
   tps_sum: f64,
   tps_n: u64,
   tps_last: Option<f64>,
+  /// The two halves of the token-weighted prefill speed: the tokens counted
+  /// and the seconds they took.
+  prefill_tokens: u64,
+  prefill_seconds: f64,
+  /// Cached tokens, and the prompt tokens they were served from. One row
+  /// supplies both halves of the hit ratio or neither.
+  cached_tokens: u64,
+  cached_prompt_tokens: u64,
   prompt_tokens: u64,
   completion_tokens: u64,
   auto_starts: u64,
@@ -488,6 +666,21 @@ impl Totals {
       self.tps_n += 1;
       self.tps_last = Some(tps);
     }
+    // A row needs both halves to contribute: a token count with no speed would
+    // add seconds out of nothing.
+    if let (Some(tokens), Some(tps)) = (row.prefill_tokens, row.prefill_tokens_per_second) {
+      if tokens > 0 && tps > 0.0 {
+        self.prefill_tokens = self.prefill_tokens.saturating_add(tokens);
+        self.prefill_seconds += tokens as f64 / tps;
+      }
+    }
+    if let (Some(cached), Some(prompt)) = (row.cached_tokens, row.prompt_tokens) {
+      // One row fills both halves or neither, so the count printed beside the
+      // ratio is the count the ratio used, and no row can claim it reused more
+      // of a prompt than the prompt it reports.
+      self.cached_tokens = self.cached_tokens.saturating_add(cached.min(prompt));
+      self.cached_prompt_tokens = self.cached_prompt_tokens.saturating_add(prompt);
+    }
     self.prompt_tokens = self
       .prompt_tokens
       .saturating_add(row.prompt_tokens.unwrap_or(0));
@@ -505,10 +698,19 @@ impl Totals {
       avg_duration_ms: self.duration_ms_sum.checked_div(self.timed),
       avg_ttfb_ms: self.ttfb_ms_sum.checked_div(self.timed),
       tokens_per_second_avg: (self.tps_n > 0).then(|| self.tps_sum / self.tps_n as f64),
+      prefill_tokens_per_second: (self.prefill_seconds > 0.0)
+        .then(|| self.prefill_tokens as f64 / self.prefill_seconds),
+      cached_tokens: self.cached_tokens,
+      cache_hit_ratio: (self.cached_prompt_tokens > 0)
+        .then(|| self.cached_tokens as f64 / self.cached_prompt_tokens as f64),
       // `RequestLog::tail` fills this for a model scope; a single set of
       // totals has no notion of "the newest launch".
       tokens_per_second_session: None,
       tokens_per_second_last: self.tps_last,
+      // Both throughput figures come from the rows behind the totals, which a
+      // set of totals no longer holds; `tail` and `snapshot` fill them in.
+      tokens_per_second_aggregate: None,
+      busy_ms: None,
       // The client figures count rows, which a set of totals no longer holds.
       // `RequestLog::tail` and `snapshot` fill them in.
       hosts: None,
@@ -684,11 +886,11 @@ impl RequestLog {
     let inner = self.lock();
     let totals = inner.totals(&scope);
     let mut summary = totals.map(Totals::summary).unwrap_or_default();
-    let mut counts = ClientPair::default();
+    let mut figures = RowFigures::default();
     for row in inner.rows.iter().filter(|row| scope.matches(row)) {
-      counts.add(row);
+      figures.add(row);
     }
-    counts.stamp(&mut summary);
+    figures.stamp(&mut summary);
     // The speed of the newest launch that served this model, so a model
     // reloaded at a different speed shows both numbers.
     if let LogScope::Model { .. } = scope {
@@ -764,19 +966,19 @@ impl RequestLog {
   /// renders from this instead of holding the lock while it builds a body.
   pub fn snapshot(&self) -> LogSnapshot {
     let inner = self.lock();
-    // The client figures of every scope, in one pass over the ring, so a
-    // `/metrics` summary prints the same four numbers as `requests --json`
-    // of the same scope: both count these rows and nothing else.
-    let mut counts = ClientPair::default();
-    let mut model_counts: HashMap<&str, ClientPair> = HashMap::new();
-    let mut launch_counts: HashMap<&str, ClientPair> = HashMap::new();
+    // The row figures of every scope, in one pass over the ring, so a
+    // `/metrics` summary prints the same numbers as `requests --json` of the
+    // same scope: both count these rows and nothing else.
+    let mut figures = RowFigures::default();
+    let mut model_figures: HashMap<&str, RowFigures> = HashMap::new();
+    let mut launch_figures: HashMap<&str, RowFigures> = HashMap::new();
     for row in inner.rows.iter() {
-      counts.add(row);
+      figures.add(row);
       if let Some(path) = row.model_path.as_deref() {
-        model_counts.entry(path).or_default().add(row);
+        model_figures.entry(path).or_default().add(row);
       }
       if let Some(launch) = row.launch_id.as_deref() {
-        launch_counts.entry(launch).or_default().add(row);
+        launch_figures.entry(launch).or_default().add(row);
       }
     }
     let view = |key: String, totals: &Totals| ScopeTotals {
@@ -786,6 +988,8 @@ impl RequestLog {
       duration_ms_sum: totals.duration_ms_sum,
       ttfb_ms_sum: totals.ttfb_ms_sum,
       timed: totals.timed,
+      prefill_tokens: totals.prefill_tokens,
+      prefill_seconds: totals.prefill_seconds,
     };
     let mut models: Vec<ScopeTotals> = inner
       .by_model
@@ -795,11 +999,10 @@ impl RequestLog {
     models.sort_by(|a, b| a.key.cmp(&b.key));
     // A scope whose rows all left the ring has no counts of its own; zero is
     // the answer, not "not computed".
-    let empty = ClientPair::default();
     for model in &mut models {
-      model_counts
-        .get(model.key.as_str())
-        .unwrap_or(&empty)
+      model_figures
+        .remove(model.key.as_str())
+        .unwrap_or_default()
         .stamp(&mut model.summary);
     }
     let mut launches: Vec<LaunchTotals> = inner
@@ -816,13 +1019,13 @@ impl RequestLog {
       live: false,
     }));
     for launch in &mut launches {
-      launch_counts
-        .get(launch.totals.key.as_str())
-        .unwrap_or(&empty)
+      launch_figures
+        .remove(launch.totals.key.as_str())
+        .unwrap_or_default()
         .stamp(&mut launch.totals.summary);
     }
     let mut all = view(String::new(), &inner.all);
-    counts.stamp(&mut all.summary);
+    figures.stamp(&mut all.summary);
     let mut routes: Vec<(String, u64)> = inner
       .by_route
       .iter()
@@ -855,12 +1058,67 @@ pub struct ScopeTotals {
   /// only holds a request the proxy could time, so a mean has to divide by this,
   /// and an error or a cancellation moves the request count but neither sum.
   pub timed: u64,
+  /// Prompt tokens the counted rows had to compute, and the seconds they took.
+  /// A counter needs both: `rate(prefill_tokens_total) /
+  /// rate(prefill_seconds_total)` is the prefill speed Prometheus reads.
+  pub prefill_tokens: u64,
+  pub prefill_seconds: f64,
 }
 
 /// A launch's totals, and whether the launch is still running.
 pub struct LaunchTotals {
   pub totals: ScopeTotals,
   pub live: bool,
+}
+
+impl LogSnapshot {
+  /// The [`Tail`] [`RequestLog::tail`] answers for the log this snapshot came
+  /// from, taken from the snapshot instead of the log, so one `/metrics` JSON
+  /// scrape reads the log once. The summaries carry the figures stamped when
+  /// the snapshot was taken, so a scope whose rows have all left the ring
+  /// answers the same zeros here, and a scope nothing reached the same zeros.
+  pub fn tail(&self, scope: &LogScope, limit: usize) -> Tail {
+    let scoped: Option<&ScopeTotals> = match scope {
+      LogScope::All => Some(&self.all),
+      LogScope::Model { path } => self.models.iter().find(|m| &m.key == path),
+      LogScope::Launch { id } => self
+        .launches
+        .iter()
+        .find(|l| &l.totals.key == id)
+        .map(|l| &l.totals),
+    };
+    let mut summary = match scoped {
+      Some(totals) => totals.summary.clone(),
+      None => {
+        let mut empty = RequestSummary::default();
+        RowFigures::default().stamp(&mut empty);
+        empty
+      }
+    };
+    // The speed of the newest launch that served this model, which a stored
+    // summary has no notion of on its own.
+    if let LogScope::Model { .. } = scope {
+      summary.tokens_per_second_session = self
+        .rows
+        .iter()
+        .rev()
+        .find(|r| scope.matches(r))
+        .and_then(|r| r.launch_id.as_deref())
+        .and_then(|id| self.launches.iter().find(|l| l.totals.key == id))
+        .and_then(|l| l.totals.summary.tokens_per_second_avg);
+    }
+    Tail {
+      summary,
+      rows: self
+        .rows
+        .iter()
+        .rev()
+        .filter(|r| scope.matches(r))
+        .take(limit)
+        .cloned()
+        .collect(),
+    }
+  }
 }
 
 /// Owned view of the log for one scrape.
@@ -965,6 +1223,11 @@ impl RequestRecord {
     self.row.auto_start = true;
   }
 
+  /// Stamp that a `proxy.aliases` entry is what routed this request.
+  pub fn set_alias(&mut self) {
+    self.row.alias = true;
+  }
+
   pub fn set_evicted(&mut self, launches: Vec<String>) {
     self.row.evicted = launches;
   }
@@ -1027,6 +1290,10 @@ impl RequestRecord {
     self.row.completion_tokens = usage.completion_tokens;
     self.row.tokens_per_second = usage.tokens_per_second;
     self.row.tokens_per_second_estimated = usage.tokens_per_second_estimated;
+    self.row.prefill_tokens = usage.prefill_tokens;
+    self.row.prefill_tokens_per_second = usage.prefill_tokens_per_second;
+    self.row.prefill_estimated = usage.prefill_estimated;
+    self.row.cached_tokens = usage.cached_tokens;
     {
       let mut inner = self.log.lock();
       let inner = &mut *inner;
@@ -1423,6 +1690,317 @@ mod tests {
     assert_eq!((s.auto_starts, s.evictions), (1, 2));
   }
 
+  /// A finished row that generated `tokens` at `tps` between `start` and
+  /// `start + wall_ms`, built without a log so a test can place windows.
+  fn generated_row(start: u64, wall_ms: u64, tokens: u64, tps: f64) -> RequestRow {
+    RequestRow {
+      started_at_ms: start,
+      duration_ms: Some(wall_ms),
+      completion_tokens: Some(tokens),
+      tokens_per_second: Some(tps),
+      state: RequestState::Done,
+      status: Some(200),
+      ..RequestRow::default()
+    }
+  }
+
+  fn throughput_of(rows: impl IntoIterator<Item = RequestRow>) -> (Option<f64>, Option<u64>) {
+    let mut throughput = Throughput::default();
+    for row in rows {
+      throughput.add(&row);
+    }
+    throughput.figures()
+  }
+
+  #[test]
+  fn aggregate_throughput_divides_tokens_by_the_wall_time_they_took() {
+    // Two rows over the same 10 s: 200 tokens out of a box busy for 10 s. The
+    // mean of the two speeds says 10 tok/s, which is one stream; the box did 20.
+    assert_eq!(
+      throughput_of([
+        generated_row(0, 10_000, 100, 10.0),
+        generated_row(0, 10_000, 100, 10.0),
+      ]),
+      (Some(20.0), Some(10_000))
+    );
+
+    // Back to back, the same two rows are 20 s of wall for 200 tokens, and the
+    // two figures agree.
+    assert_eq!(
+      throughput_of([
+        generated_row(0, 10_000, 100, 10.0),
+        generated_row(10_000, 10_000, 100, 10.0),
+      ]),
+      (Some(10.0), Some(20_000))
+    );
+
+    // Half-overlapping: 0-10 s and 5-15 s is 15 s of wall.
+    assert_eq!(
+      throughput_of([
+        generated_row(0, 10_000, 100, 10.0),
+        generated_row(5_000, 10_000, 100, 10.0),
+      ])
+      .1,
+      Some(15_000)
+    );
+
+    // A short row inside a long one adds tokens and no wall: the box was busy
+    // either way.
+    assert_eq!(
+      throughput_of([
+        generated_row(0, 10_000, 100, 10.0),
+        generated_row(1_000, 1_000, 50, 50.0),
+      ]),
+      (Some(15.0), Some(10_000))
+    );
+  }
+
+  #[test]
+  fn aggregate_throughput_counts_generation_time_not_the_whole_request() {
+    // A non-streamed request: the client waited 5 s and 5 s of it was
+    // generation, so the wall is the request and the figure is its speed.
+    assert_eq!(
+      throughput_of([generated_row(0, 5_000, 100, 20.0)]),
+      (Some(20.0), Some(5_000))
+    );
+    // A speed that cannot account for its own tokens inside the request keeps
+    // the whole duration as the wall, so the figure cannot claim a busier box
+    // than the clock saw.
+    assert_eq!(
+      throughput_of([generated_row(0, 2_000, 100, 10.0)]),
+      (Some(50.0), Some(2_000))
+    );
+  }
+
+  #[test]
+  fn aggregate_throughput_ignores_rows_that_cannot_contribute() {
+    let good = generated_row(0, 10_000, 100, 10.0);
+    let rows = vec![
+      good.clone(),
+      // In flight: its work is not over, so neither sum knows it.
+      RequestRow {
+        state: RequestState::InFlight,
+        ..generated_row(1_000, 5_000, 50, 50.0)
+      },
+      // No tokens, no speed, a zero speed, no duration.
+      RequestRow {
+        completion_tokens: None,
+        ..good.clone()
+      },
+      RequestRow {
+        tokens_per_second: None,
+        ..good.clone()
+      },
+      RequestRow {
+        tokens_per_second: Some(0.0),
+        completion_tokens: Some(0),
+        ..good.clone()
+      },
+      RequestRow {
+        duration_ms: None,
+        ..good.clone()
+      },
+    ];
+    assert_eq!(throughput_of(rows), (Some(10.0), Some(10_000)));
+    assert_eq!(
+      throughput_of(vec![RequestRow::default()]),
+      (None, None),
+      "a scope of rows nothing was generated for has no throughput"
+    );
+  }
+
+  #[test]
+  fn a_whole_response_with_an_estimated_speed_covers_its_whole_wait() {
+    // A response that arrives whole and gets its speed estimated spans the whole
+    // wait, queue time and prompt processing included. The window cannot be
+    // shorter than that wait, so such a row pulls the aggregate down and
+    // stretches `busy_ms`, which is what it really was.
+    let whole = RequestRow {
+      tokens_per_second_estimated: true,
+      ..generated_row(0, 10_000, 100, 10.0)
+    };
+    assert_eq!(throughput_of([whole]), (Some(10.0), Some(10_000)));
+  }
+
+  #[test]
+  fn aggregate_throughput_counts_rows_cut_short_by_client_or_upstream() {
+    // A cancelled generation still happened: the engine put those tokens out,
+    // so the box did produce them and the figure has to say so.
+    let cut_short = |state, status| RequestRow {
+      state,
+      status: Some(status),
+      ..generated_row(0, 10_000, 100, 10.0)
+    };
+    assert_eq!(
+      throughput_of([
+        cut_short(RequestState::ClientClosed, 200),
+        cut_short(RequestState::UpstreamError, 502),
+      ]),
+      (Some(20.0), Some(10_000)),
+      "two cut-short rows over one shared 10 s wall"
+    );
+  }
+
+  #[test]
+  fn the_average_covers_the_rows_the_aggregate_counts() {
+    let log = RequestLog::new();
+    let usage = |tokens, tps| Usage {
+      prompt_tokens: None,
+      completion_tokens: Some(tokens),
+      tokens_per_second: Some(tps),
+      ..Usage::default()
+    };
+    for (state, status, tps) in [
+      (RequestState::Done, 200u16, 10.0),
+      (RequestState::ClientClosed, 200, 30.0),
+      (RequestState::UpstreamError, 502, 50.0),
+    ] {
+      let mut rec = log.begin(ROUTE, None);
+      rec.set_status(status);
+      rec.finish(state, usage(100, tps));
+    }
+    let summary = log.tail(LogScope::All, 0).summary;
+    assert_eq!(
+      summary.tokens_per_second_avg,
+      Some(30.0),
+      "the mean of 10, 30 and 50: a row that ended badly is no exception"
+    );
+    assert_eq!(
+      summary.errors, 1,
+      "only the upstream cut counts as an error"
+    );
+  }
+
+  #[test]
+  fn a_scopes_throughput_counts_only_its_own_rows() {
+    let log = RequestLog::new();
+    // Two models, one launch each, two rows per model 10 s apart at 10 tok/s.
+    let usage = Usage {
+      completion_tokens: Some(100),
+      tokens_per_second: Some(10.0),
+      ..Usage::default()
+    };
+    for (model, launch) in [("/m/a.gguf", "L1"), ("/m/b.gguf", "L2")] {
+      for start in [0u64, 10_000] {
+        let seq = served(&log, model, launch, usage);
+        let mut inner = log.lock();
+        let row = inner.rows.iter_mut().find(|r| r.seq == seq).unwrap();
+        row.started_at_ms = start;
+        row.duration_ms = Some(10_000);
+      }
+    }
+    // The two models generated at once, so all of it is 400 tokens over 20 s.
+    let all = log.tail(LogScope::All, 0).summary;
+    assert_eq!(
+      (all.tokens_per_second_aggregate, all.busy_ms),
+      (Some(20.0), Some(20_000)),
+      "the figure covers the scope, not the `limit` of rows asked for"
+    );
+    // Each scope sees its own two rows: 200 tokens over 20 s.
+    for scope in [
+      LogScope::Model {
+        path: "/m/a.gguf".to_string(),
+      },
+      LogScope::Launch {
+        id: "L1".to_string(),
+      },
+    ] {
+      let s = log.tail(scope, 0).summary;
+      assert_eq!(
+        (s.tokens_per_second_aggregate, s.busy_ms),
+        (Some(10.0), Some(20_000))
+      );
+    }
+    // The same figures a `/metrics` scrape reads, which stamps from the same
+    // rows.
+    let snap = log.snapshot();
+    assert_eq!(
+      (
+        snap.all.summary.tokens_per_second_aggregate,
+        snap.all.summary.busy_ms
+      ),
+      (Some(20.0), Some(20_000))
+    );
+    assert_eq!(
+      (
+        snap.models[0].summary.tokens_per_second_aggregate,
+        snap.models[0].summary.busy_ms
+      ),
+      (Some(10.0), Some(20_000))
+    );
+    assert_eq!(
+      (
+        snap.launches[0].totals.summary.tokens_per_second_aggregate,
+        snap.launches[0].totals.summary.busy_ms
+      ),
+      (Some(10.0), Some(20_000))
+    );
+  }
+
+  #[test]
+  fn agg_tok_s_sits_beside_avg_tok_s_and_names_its_wall() {
+    let cells = RequestSummary {
+      tokens_per_second_avg: Some(10.0),
+      tokens_per_second_aggregate: Some(50.3),
+      busy_ms: Some(214_000),
+      ..RequestSummary::default()
+    }
+    .cells("—");
+    let at = cells.iter().position(|c| c.0 == "Avg tok/s").unwrap();
+    assert_eq!(cells[at + 1], ("Agg tok/s", "50.3 over 3m34s".to_string()));
+    // The prompt speed follows the two generation figures, and the token
+    // counts follow it.
+    assert_eq!(cells[at + 2], ("Prefill tok/s", "—".to_string()));
+    assert_eq!(cells[at + 3].0, "Tokens in");
+  }
+
+  #[test]
+  fn a_snapshot_answers_the_tails_the_log_answers() {
+    let log = RequestLog::new();
+    // Two models, one launch each, one speed each, and a launch that has since
+    // stopped.
+    let usage = Usage {
+      completion_tokens: Some(10),
+      tokens_per_second: Some(40.0),
+      ..Usage::default()
+    };
+    served(&log, "/m/a.gguf", "L1", usage);
+    served(&log, "/m/a.gguf", "L1", usage);
+    served(&log, "/m/b.gguf", "L2", usage);
+    log.forget_launch("L2");
+    let snap = log.snapshot();
+    for scope in [
+      LogScope::All,
+      LogScope::Model {
+        path: "/m/a.gguf".to_string(),
+      },
+      LogScope::Model {
+        path: "/m/b.gguf".to_string(),
+      },
+      // A scope nothing has ever reached.
+      LogScope::Model {
+        path: "/m/never.gguf".to_string(),
+      },
+      LogScope::Launch {
+        id: "L1".to_string(),
+      },
+      LogScope::Launch {
+        id: "L2".to_string(),
+      },
+      LogScope::Launch {
+        id: "L9".to_string(),
+      },
+    ] {
+      for limit in [0usize, 2, 10_000] {
+        assert_eq!(
+          snap.tail(&scope, limit),
+          log.tail(scope.clone(), limit),
+          "{scope:?} at limit {limit}"
+        );
+      }
+    }
+  }
+
   #[test]
   fn ring_is_bounded_and_totals_outlive_the_rows() {
     let log = RequestLog::new();
@@ -1589,6 +2167,7 @@ mod tests {
         c.total,
         c.ttfb,
         c.speed,
+        c.prefill,
         c.tokens_in,
         c.tokens_out,
         c.route,
@@ -1602,6 +2181,7 @@ mod tests {
         "1.2s",
         "180ms",
         "39.6",
+        "-",
         "41",
         "12.3k",
         "chat/completions",
@@ -1616,6 +2196,36 @@ mod tests {
       ..row.clone()
     };
     assert_eq!(estimated.cells("-").speed, "~39.6");
+    // A prefill speed keeps one decimal below 1000 and drops it from there up,
+    // so an estimate of twelve thousand still fits the column's six cells.
+    assert_eq!(
+      RequestRow {
+        prefill_tokens_per_second: Some(38.904),
+        prefill_estimated: true,
+        ..row.clone()
+      }
+      .cells("-")
+      .prefill,
+      "~38.9"
+    );
+    assert_eq!(
+      RequestRow {
+        prefill_tokens_per_second: Some(999.96),
+        ..row.clone()
+      }
+      .cells("-")
+      .prefill,
+      "1000"
+    );
+    assert_eq!(
+      RequestRow {
+        prefill_tokens_per_second: Some(12_345.0),
+        ..row.clone()
+      }
+      .cells("-")
+      .prefill,
+      "12345"
+    );
     // Nothing served it: the model asked for stands in, the rest is blank.
     let pending = RequestRow {
       requested_model: Some("qwen".to_string()),
@@ -1629,13 +2239,187 @@ mod tests {
         p.total,
         p.ttfb,
         p.speed,
+        p.prefill,
         p.tokens_in,
         p.tokens_out,
         p.launch,
         p.client
       ],
-      ["-"; 8]
+      ["-"; 9]
     );
+  }
+
+  #[test]
+  fn a_row_from_an_older_daemon_loads_the_new_figures_as_missing() {
+    let row: RequestRow =
+      serde_json::from_str(r#"{"seq":3,"route":"/v1/chat/completions"}"#).expect("a row");
+    assert_eq!(
+      (
+        row.prefill_tokens,
+        row.prefill_tokens_per_second,
+        row.cached_tokens
+      ),
+      (None, None, None)
+    );
+    assert!(!row.prefill_estimated);
+    let summary: RequestSummary = serde_json::from_str("{}").expect("a summary");
+    assert_eq!(
+      (summary.prefill_tokens_per_second, summary.cache_hit_ratio),
+      (None, None)
+    );
+    assert_eq!(summary.cached_tokens, 0);
+  }
+
+  /// A finished request that computed `tokens` prompt tokens at `tps`.
+  fn prefill_usage(tokens: u64, tps: f64) -> Usage {
+    Usage {
+      prefill_tokens: Some(tokens),
+      prefill_tokens_per_second: Some(tps),
+      ..Usage::default()
+    }
+  }
+
+  #[test]
+  fn the_prefill_figure_weighs_rows_by_tokens_not_by_a_plain_mean() {
+    let log = RequestLog::new();
+    // An agent turn that prefills 100 uncached tokens at 100 tok/s, then a cold
+    // prompt that prefills 10,000 at 5,000: 10,100 tokens over three seconds.
+    // The mean of the two speeds would say 2,550 and mostly report the turn.
+    served(&log, "/m/a.gguf", "L1", prefill_usage(100, 100.0));
+    served(&log, "/m/a.gguf", "L1", prefill_usage(10_000, 5_000.0));
+    assert_eq!(
+      log.tail(LogScope::All, 0).summary.prefill_tokens_per_second,
+      Some(10_100.0 / 3.0)
+    );
+  }
+
+  #[test]
+  fn an_estimated_prefill_counts_and_a_row_needs_both_halves() {
+    let log = RequestLog::new();
+    let estimated = Usage {
+      prefill_estimated: true,
+      ..prefill_usage(500, 500.0)
+    };
+    // 5,000 computed tokens with no speed to place them in: the figure is 600
+    // tokens over two seconds, not 5,600 over two.
+    let no_speed = Usage {
+      prompt_tokens: Some(5_000),
+      prefill_tokens: Some(5_000),
+      ..Usage::default()
+    };
+    served(&log, "/m/a.gguf", "L1", estimated);
+    served(&log, "/m/a.gguf", "L1", prefill_usage(100, 100.0));
+    served(&log, "/m/a.gguf", "L1", no_speed);
+    assert_eq!(
+      log.tail(LogScope::All, 0).summary.prefill_tokens_per_second,
+      Some(300.0)
+    );
+  }
+
+  #[test]
+  fn the_cache_ratio_covers_only_the_rows_that_report_a_cached_count() {
+    let cached = |prompt, hit| Usage {
+      prompt_tokens: Some(prompt),
+      cached_tokens: Some(hit),
+      ..Usage::default()
+    };
+    let log = RequestLog::new();
+    served(&log, "/m/a.gguf", "L1", cached(1_000, 800));
+    served(&log, "/m/a.gguf", "L1", cached(1_000, 200));
+    let s = log.tail(LogScope::All, 0).summary;
+    assert_eq!(s.cached_tokens, 1_000);
+    assert_eq!(s.cache_hit_ratio, Some(0.5));
+
+    // A row that reports no cached count is in neither half of the ratio, even
+    // though its prompt tokens still count toward `Tokens in`.
+    let quiet = RequestLog::new();
+    served(
+      &quiet,
+      "/m/a.gguf",
+      "L1",
+      Usage {
+        prompt_tokens: Some(9_000),
+        ..Usage::default()
+      },
+    );
+    served(&quiet, "/m/a.gguf", "L1", cached(1_000, 500));
+    let q = quiet.tail(LogScope::All, 0).summary;
+    assert_eq!((q.prompt_tokens, q.cached_tokens), (10_000, 500));
+    assert_eq!(q.cache_hit_ratio, Some(0.5));
+
+    // Nothing reported one: no ratio rather than a zero that reads as a miss.
+    let none = RequestLog::new();
+    served(
+      &none,
+      "/m/a.gguf",
+      "L1",
+      Usage {
+        prompt_tokens: Some(10),
+        ..Usage::default()
+      },
+    );
+    let n = none.tail(LogScope::All, 0).summary;
+    assert_eq!((n.cached_tokens, n.cache_hit_ratio), (0, None));
+  }
+
+  #[test]
+  fn a_cached_count_with_no_prompt_count_cannot_tip_the_ratio() {
+    // The two halves come from different objects, so a body can send one without
+    // the other. Such a row belongs to neither half, and one row cannot claim it
+    // reused more than its whole prompt either.
+    let log = RequestLog::new();
+    served(
+      &log,
+      "/m/a.gguf",
+      "L1",
+      Usage {
+        prompt_tokens: Some(1_000),
+        cached_tokens: Some(500),
+        ..Usage::default()
+      },
+    );
+    served(
+      &log,
+      "/m/a.gguf",
+      "L1",
+      Usage {
+        cached_tokens: Some(9_000),
+        ..Usage::default()
+      },
+    );
+    let s = log.tail(LogScope::All, 0).summary;
+    // The 9,000 cached tokens are real, but there is no prompt to read them
+    // against, so they are in neither half of what the cell prints.
+    assert_eq!(s.cached_tokens, 500);
+    assert_eq!(s.cache_hit_ratio, Some(0.5));
+
+    let boast = RequestLog::new();
+    served(
+      &boast,
+      "/m/a.gguf",
+      "L1",
+      Usage {
+        prompt_tokens: Some(10),
+        cached_tokens: Some(500),
+        ..Usage::default()
+      },
+    );
+    assert_eq!(
+      boast.tail(LogScope::All, 0).summary.cache_hit_ratio,
+      Some(1.0),
+      "a ratio above 1 is not a hit rate"
+    );
+  }
+
+  #[test]
+  fn speeds_pick_a_unit_by_size() {
+    assert_eq!(fmt_tps(38.9), "38.9");
+    assert_eq!(fmt_tps(999.9), "999.9");
+    assert_eq!(fmt_tps(1_000.0), "1000");
+    assert_eq!(fmt_tps(99_999.4), "99999");
+    assert_eq!(fmt_tps(99_999.5), "100k");
+    // The ceiling the tap allows, with the `~` an estimate adds: six cells.
+    assert_eq!(fmt_tps(1_000_000.0), "1000k");
   }
 
   #[test]
@@ -1662,16 +2446,25 @@ mod tests {
     assert_eq!(cells[2], ("Hosts", "—".to_string()));
     assert_eq!(cells[4], ("Avg total", "—".to_string()));
     assert_eq!(cells[6], ("Avg tok/s", "—".to_string()));
+    assert_eq!(cells[7], ("Agg tok/s", "—".to_string()));
+    assert_eq!(cells[8], ("Prefill tok/s", "—".to_string()));
     let filled = RequestSummary {
       avg_duration_ms: Some(1_240),
       tokens_per_second_avg: Some(39.64),
       prompt_tokens: 12_345,
+      prefill_tokens_per_second: Some(3_366.7),
+      cached_tokens: 1_200,
+      cache_hit_ratio: Some(0.9756),
       ..RequestSummary::default()
     };
     let filled_cells = filled.cells("—");
     assert_eq!(filled_cells[4].1, "1.2s");
     assert_eq!(filled_cells[6].1, "39.6");
-    assert_eq!(filled_cells[7].1, "12.3k");
+    assert_eq!(filled_cells[7], ("Agg tok/s", "—".to_string()));
+    // A speed from 1000 up loses the decimal here too.
+    assert_eq!(filled_cells[8], ("Prefill tok/s", "3367".to_string()));
+    assert_eq!(filled_cells[9].1, "12.3k");
+    assert_eq!(filled_cells[10], ("Cached", "1200 (97.6%)".to_string()));
     // The session speed is the newest one a stream reported, and the only
     // speed on the strip besides the average.
     assert!(!filled_cells.iter().any(|c| c.0 == "Tok/s last"));
@@ -2004,9 +2797,12 @@ mod tests {
     let row: RequestRow = serde_json::from_str(r#"{"seq": 4, "status": 200}"#).unwrap();
     assert_eq!((row.seq, row.status), (4, Some(200)));
     assert_eq!(row.state, RequestState::InFlight);
+    assert!(!row.alias, "a row that predates `alias` is not one");
     let summary: RequestSummary = serde_json::from_str(r#"{"requests": 2}"#).unwrap();
     assert_eq!(summary.requests, 2);
     assert_eq!(summary.avg_duration_ms, None);
+    assert_eq!(summary.tokens_per_second_aggregate, None);
+    assert_eq!(summary.busy_ms, None);
   }
 
   #[test]
@@ -2028,6 +2824,7 @@ mod tests {
       "error",
       "cause",
       "auto_start",
+      "alias",
       "evicted",
       "fallback",
       "ttfb_ms",
@@ -2036,9 +2833,48 @@ mod tests {
       "completion_tokens",
       "tokens_per_second",
       "tokens_per_second_estimated",
+      "prefill_tokens",
+      "prefill_tokens_per_second",
+      "prefill_estimated",
+      "cached_tokens",
     ] {
       assert!(v.get(key).is_some(), "missing key {key}");
     }
     assert_eq!(v["state"], "client_closed");
+  }
+
+  #[test]
+  fn an_alias_reads_in_the_note_without_replacing_anything() {
+    // A bare alias row: `alias` is the only thing beyond the status.
+    let alias = RequestRow {
+      state: RequestState::Done,
+      status: Some(200),
+      alias: true,
+      ..RequestRow::default()
+    };
+    assert_eq!(alias.note(), "alias");
+
+    // The flag composes with the rest and leads the note.
+    let all = RequestRow {
+      auto_start: true,
+      evicted: vec!["L3".to_string()],
+      fallback: Some("launch_failed".to_string()),
+      ..alias.clone()
+    };
+    assert_eq!(
+      all.note(),
+      "alias, auto-start, unloaded L3, fallback (launch_failed)"
+    );
+
+    // In flight: the alias is settled at routing time, so it shows while the
+    // auto-start mark is still held back.
+    let inflight = RequestRow {
+      state: RequestState::InFlight,
+      launch_id: Some("L1".to_string()),
+      auto_start: true,
+      alias: true,
+      ..RequestRow::default()
+    };
+    assert_eq!(inflight.note(), "in flight, alias");
   }
 }

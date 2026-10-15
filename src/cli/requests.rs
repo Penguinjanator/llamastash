@@ -84,11 +84,13 @@ fn requests_human(body: &Value, one_model: bool) -> String {
     out.push('\n');
     return out;
   }
-  let mut header = vec!["TIME", "CODE", "TOK/S", "TOTAL", "TTFB", "IN", "OUT"];
+  let mut header = vec![
+    "TIME", "CODE", "TOK/S", "PP/S", "TOTAL", "TTFB", "IN", "OUT",
+  ];
   if !one_model {
     header.push("MODEL");
   }
-  header.extend(["LAUNCH", "CLIENT", "REQUEST FOR", "NOTE", "ROUTE"]);
+  header.extend(["LAUNCH", "CLIENT", "REQUEST FOR", "ROUTE", "NOTE"]);
   let table: Vec<Vec<String>> = rows.iter().map(|r| cells_for(r, one_model)).collect();
   let table = fit_padded_table(&header, table);
   out.push_str(&format::table(&header, &table));
@@ -100,10 +102,11 @@ fn requests_human(body: &Value, one_model: bool) -> String {
 /// buries the figures of every row under it.
 const NOTE_MAX_W: usize = 60;
 
-/// The widest `REQUEST FOR` gets on a terminal. `format::table` sizes a
-/// column to its widest cell with no bound, and the value is a client
-/// string, so it gets its own cap.
-const REQUEST_FOR_MAX_W: usize = 24;
+/// The widest `MODEL` and `REQUEST FOR` get on a terminal. `format::table`
+/// sizes a column to its widest cell with no bound, and both values are
+/// client or catalog strings, so they get their own cap. One request for a
+/// long repo id should not widen the table for every shorter row.
+const NAME_MAX_W: usize = 24;
 
 /// What marks a `cap_cells` cut, and what it costs. Three plain cells, so a
 /// wide glyph cannot push the column past its cap.
@@ -131,19 +134,22 @@ fn cap_cells(s: &str, w: usize) -> String {
 }
 
 /// The padded table only: split long notes over continuation lines under
-/// the NOTE column, and cap `REQUEST FOR`, which repeats the model name on
-/// most rows and would otherwise widen the table to its longest cell.
-/// Piped output keeps one line per request with the whole values in their
-/// fields, so `awk -F\t` pipelines are untouched.
+/// the NOTE column, and cap the two name columns, which repeat a long model
+/// name on most rows and would otherwise widen the table to its longest
+/// cell. Piped output keeps one line per request with the whole values in
+/// their fields, so `awk -F\t` pipelines are untouched.
 fn fit_padded_table(header: &[&str], rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
   if !console::colors_enabled() {
     return rows;
   }
   let mut rows = rows;
-  if let Some(asked) = header.iter().position(|h| *h == "REQUEST FOR") {
+  for name in ["MODEL", "REQUEST FOR"] {
+    let Some(col) = header.iter().position(|h| *h == name) else {
+      continue;
+    };
     for row in rows.iter_mut() {
-      if let Some(cell) = row.get_mut(asked) {
-        *cell = cap_cells(cell, REQUEST_FOR_MAX_W);
+      if let Some(cell) = row.get_mut(col) {
+        *cell = cap_cells(cell, NAME_MAX_W);
       }
     }
   }
@@ -183,6 +189,7 @@ fn cells_for(row: &RequestRow, one_model: bool) -> Vec<String> {
     c.time,
     status,
     c.speed,
+    c.prefill,
     c.total,
     c.ttfb,
     c.tokens_in,
@@ -195,12 +202,12 @@ fn cells_for(row: &RequestRow, one_model: bool) -> Vec<String> {
     c.launch,
     c.client,
     c.request_for,
+    c.route,
     if c.note.is_empty() {
       NONE.to_string()
     } else {
       c.note
     },
-    c.route,
   ]);
   cells
 }
@@ -278,7 +285,7 @@ mod tests {
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(
       lines[0],
-      "TIME\tCODE\tTOK/S\tTOTAL\tTTFB\tIN\tOUT\tMODEL\tLAUNCH\tCLIENT\tREQUEST FOR\tNOTE\tROUTE"
+      "TIME\tCODE\tTOK/S\tPP/S\tTOTAL\tTTFB\tIN\tOUT\tMODEL\tLAUNCH\tCLIENT\tREQUEST FOR\tROUTE\tNOTE"
     );
     assert_eq!(lines.len(), 2);
     let cells: Vec<&str> = lines[1].split('\t').collect();
@@ -287,6 +294,7 @@ mod tests {
       [
         "200",
         "39.6",
+        "-",
         "1.2s",
         "180ms",
         "41",
@@ -295,8 +303,8 @@ mod tests {
         "L1",
         "127.0.0.1:5000",
         "qwen",
-        "-",
         "chat/completions",
+        "-",
       ]
     );
   }
@@ -305,7 +313,7 @@ mod tests {
   fn a_model_filter_drops_the_model_column() {
     let out = piped(&[row()], true);
     assert!(!out.lines().next().unwrap().contains("MODEL"));
-    assert_eq!(out.lines().nth(1).unwrap().split('\t').count(), 12);
+    assert_eq!(out.lines().nth(1).unwrap().split('\t').count(), 13);
   }
 
   #[test]
@@ -326,12 +334,13 @@ mod tests {
     let cells: Vec<&str> = out.lines().nth(1).unwrap().split('\t').collect();
     assert_eq!(cells[1], "404");
     assert_eq!(cells[2], "-");
-    assert_eq!(cells[4], "-");
-    assert_eq!(cells[7], "qwen");
-    assert_eq!(cells[8], "-");
-    assert_eq!(cells[10], "qwen");
-    assert_eq!(cells[11], "model_not_found");
+    assert_eq!(cells[3], "-");
+    assert_eq!(cells[5], "-");
+    assert_eq!(cells[8], "qwen");
+    assert_eq!(cells[9], "-");
+    assert_eq!(cells[11], "qwen");
     assert_eq!(cells[12], "chat/completions");
+    assert_eq!(cells[13], "model_not_found");
   }
 
   /// Terminal rendering, with the process-wide color flag restored. It
@@ -366,7 +375,7 @@ mod tests {
 
   #[test]
   fn a_padded_table_places_and_caps_the_asked_model() {
-    let asked = "q".repeat(REQUEST_FOR_MAX_W + 20);
+    let asked = "q".repeat(NAME_MAX_W + 20);
     let mut wide = row();
     wide.requested_model = Some(asked.clone());
     let lines: Vec<String> = on_terminal(&[wide], false)
@@ -376,16 +385,66 @@ mod tests {
       .collect();
     let header = lines.first().expect("header").clone();
     let at = |name: &str| header.find(name).expect(name);
+    // The prompt figures sit beside the generation ones they complete.
+    assert!(at("TOK/S") < at("PP/S"), "{header}");
+    assert!(at("PP/S") < at("TOTAL"), "{header}");
     assert!(at("CLIENT") < at("REQUEST FOR"), "{header}");
-    assert!(at("REQUEST FOR") < at("NOTE"), "{header}");
+    assert!(at("REQUEST FOR") < at("ROUTE"), "{header}");
+    assert!(at("ROUTE") < at("NOTE"), "{header}");
     // The long name is cut in the padded table, and the cut marks itself.
     let body = lines.last().expect("row").clone();
     assert!(
       !body.contains(&asked),
       "the whole name should not reach the screen"
     );
-    assert!(body.contains(&"q".repeat(REQUEST_FOR_MAX_W - 3)), "{body}");
+    assert!(body.contains(&"q".repeat(NAME_MAX_W - 3)), "{body}");
     assert!(body.contains("..."), "{body}");
+  }
+
+  #[test]
+  fn a_padded_table_caps_a_long_model_name_the_same_way() {
+    let long = "m".repeat(NAME_MAX_W + 20);
+    let cut = format!("{}{}", "m".repeat(NAME_MAX_W - 3), CAP_MARK);
+    let mut wide = row();
+    wide.model = Some(long.clone());
+    wide.requested_model = Some(long.clone());
+    let lines: Vec<String> = on_terminal(&[wide.clone()], false)
+      .lines()
+      .map(|line| console::strip_ansi_codes(line).to_string())
+      .skip_while(|line| !line.starts_with("TIME"))
+      .collect();
+    let header = lines.first().expect("header").clone();
+    let body = lines.last().expect("row").clone();
+    assert!(!body.contains(&long), "the whole name stays off screen");
+    assert_eq!(body.matches(CAP_MARK).count(), 2, "{body}");
+    // Each capped column is exactly the cap wide, so the figures after it
+    // line up with every other row.
+    let width_of = |name: &str, next: &str| {
+      let at = header.find(name).expect(name);
+      let end = at + name.len() + header[at + name.len()..].find(next).expect(next);
+      console::measure_text_width(body[at..end].trim_end())
+    };
+    assert_eq!(width_of("MODEL", "LAUNCH"), NAME_MAX_W, "{body}");
+    assert_eq!(width_of("REQUEST FOR", "ROUTE"), NAME_MAX_W, "{body}");
+
+    // The one-model view has no MODEL column, and still caps the ask.
+    let one_model: Vec<String> = on_terminal(&[wide.clone()], true)
+      .lines()
+      .map(|line| console::strip_ansi_codes(line).to_string())
+      .skip_while(|line| !line.starts_with("TIME"))
+      .collect();
+    assert!(!one_model[0].contains("MODEL"), "{}", one_model[0]);
+    assert!(one_model.last().expect("row").contains(&cut));
+
+    // Piped output keeps both whole, so `awk -F\t` still reads them.
+    let line = piped(&[wide], false)
+      .lines()
+      .nth(1)
+      .expect("row")
+      .to_string();
+    let cells: Vec<&str> = line.split('\t').collect();
+    assert_eq!(cells[8], long, "MODEL keeps the whole name");
+    assert_eq!(cells[11], long, "REQUEST FOR keeps the whole name");
   }
 
   #[test]
@@ -407,6 +466,16 @@ mod tests {
     // The continuation line carries the note and nothing else.
     assert!(!cont.contains("chat/completions"), "{cont}");
     assert!(!cont.contains("1.2s"), "{cont}");
+
+    // Both fragments sit under the NOTE header, now the last column: the
+    // row's note starts at it, and the continuation is indented to it.
+    let note_at = lines[0].find("NOTE").expect("NOTE column");
+    assert_eq!(row_line.find("launch_failed:").expect("note"), note_at);
+    assert_eq!(
+      cont.len() - cont.trim_start().len(),
+      note_at,
+      "continuation indented to NOTE: {cont:?}"
+    );
   }
 
   #[test]
@@ -415,8 +484,8 @@ mod tests {
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(lines.len(), 2, "{lines:?}");
     let cells: Vec<&str> = lines[1].split('\t').collect();
-    assert_eq!(cells.len(), 13);
-    assert!(cells[11].ends_with("lower --ctx-size"), "{}", cells[11]);
+    assert_eq!(cells.len(), 14);
+    assert!(cells[13].ends_with("lower --ctx-size"), "{}", cells[13]);
   }
 
   #[test]
@@ -482,5 +551,50 @@ mod tests {
     });
     assert!(predates.contains("Hosts  -"), "{predates}");
     assert!(predates.contains("Connections  -"), "{predates}");
+  }
+
+  #[test]
+  fn the_summary_block_prints_the_aggregate_throughput_with_its_wall() {
+    let strip = summary_on_terminal(RequestSummary {
+      tokens_per_second_avg: Some(41.3),
+      tokens_per_second_aggregate: Some(52.4),
+      busy_ms: Some(6_259),
+      ..RequestSummary::default()
+    });
+    assert!(strip.contains("Agg tok/s"), "{strip}");
+    assert!(strip.contains("52.4 over 6.3s"), "{strip}");
+    // No throughput: the placeholder every other cell uses, not a zero.
+    let empty = summary_on_terminal(RequestSummary::default());
+    let line = empty
+      .lines()
+      .find(|line| line.contains("Agg tok/s"))
+      .unwrap_or_default();
+    assert!(line.ends_with('-'), "{line}");
+  }
+
+  #[test]
+  fn the_summary_block_prints_prefill_speed_and_cache_hits() {
+    let filled = summary_on_terminal(RequestSummary {
+      prompt_tokens: 41_000,
+      prefill_tokens_per_second: Some(3_366.7),
+      cached_tokens: 40_000,
+      cache_hit_ratio: Some(0.9756),
+      ..RequestSummary::default()
+    });
+    assert!(filled.contains("Prefill tok/s  3367"), "{filled}");
+    assert!(filled.contains("Cached  40.0k (97.6%)"), "{filled}");
+    // Nothing reported a cached count: the placeholder every other cell uses,
+    // not a zero that reads as a total miss.
+    let empty = summary_on_terminal(RequestSummary::default());
+    let prefill = empty
+      .lines()
+      .find(|line| line.contains("Prefill tok/s"))
+      .unwrap_or_default();
+    assert!(prefill.ends_with('-'), "{prefill}");
+    let cached = empty
+      .lines()
+      .find(|line| line.contains("Cached"))
+      .unwrap_or_default();
+    assert!(cached.ends_with('-'), "{cached}");
   }
 }

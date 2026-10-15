@@ -4,9 +4,9 @@
 //! below it a table of requests, newest first, one row per line. Table
 //! columns have a width and a rank; as the pane narrows the higher-rank
 //! ones drop out, `Route` first and `Time` last. The two free-text columns
-//! are the exception: `Note` grows into the spare width and cuts to its
-//! first words with an ellipsis when the text is longer, while `Route`
-//! keeps its own width.
+//! are the exception: `Note` is the last column, grows into the spare width
+//! and cuts to its first words with an ellipsis when the text is longer,
+//! while `Route` keeps its own width.
 
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -26,8 +26,8 @@ pub const POLL_ROWS: usize = 200;
 const NONE: &str = "—";
 const COL_SEP_W: usize = 1;
 /// The least `Note` is worth showing at.
-const MIN_NOTE_W: usize = 12;
-/// `Route`'s own width. It is the last column shown and the first dropped.
+const MIN_NOTE_W: usize = 10;
+/// `Route`'s own width. It is the first column dropped.
 const ROUTE_W: usize = 16;
 /// Gap between two figures on the summary strip.
 const SUMMARY_GAP: usize = 3;
@@ -37,6 +37,7 @@ enum ColumnId {
   Time,
   Status,
   Speed,
+  Prefill,
   Total,
   Ttfb,
   In,
@@ -72,6 +73,14 @@ const COLUMNS: &[Column<ColumnId>] = &[
     rank: 30,
   },
   Column {
+    id: ColumnId::Prefill,
+    label: "PP/s",
+    // Prompt tokens per second, beside the generation speed it follows. Same
+    // width, and it drops after `Note`.
+    width: 6,
+    rank: 70,
+  },
+  Column {
     id: ColumnId::Total,
     label: "Total",
     width: 7,
@@ -96,18 +105,13 @@ const COLUMNS: &[Column<ColumnId>] = &[
     rank: 60,
   },
   Column {
-    id: ColumnId::Note,
-    label: "Note",
-    width: MIN_NOTE_W,
-    rank: 70,
-  },
-  Column {
     id: ColumnId::RequestFor,
     label: "Request for",
-    // Fits a model name; a longer one cuts with an ellipsis. It outranks
+    // The same 24 cells the CLI table gives a name, enough for a repo id
+    // with its quant tag; a longer one cuts with an ellipsis. It outranks
     // `Client` and `Route` because it is the reason a row reads apart from
     // its neighbours: the model an alias or a fallback answered for.
-    width: 14,
+    width: 24,
     rank: 80,
   },
   Column {
@@ -123,6 +127,15 @@ const COLUMNS: &[Column<ColumnId>] = &[
     // already implies one engine's routes, so it goes first.
     width: ROUTE_W,
     rank: 100,
+  },
+  Column {
+    id: ColumnId::Note,
+    // Last, so the free text grows to the right of the fixed figures and
+    // nothing shifts under it. Rank 75 keeps it until `Request for`,
+    // `Client` and `Route` have gone, and drops it before `PP/s`.
+    label: "Note",
+    width: MIN_NOTE_W,
+    rank: 75,
   },
 ];
 
@@ -359,6 +372,7 @@ fn column_value(id: ColumnId, cells: &RequestCells) -> &str {
     ColumnId::Time => &cells.time,
     ColumnId::Status => &cells.status,
     ColumnId::Speed => &cells.speed,
+    ColumnId::Prefill => &cells.prefill,
     ColumnId::Total => &cells.total,
     ColumnId::In => &cells.tokens_in,
     ColumnId::Out => &cells.tokens_out,
@@ -428,78 +442,71 @@ mod tests {
   fn columns_drop_by_rank_as_the_pane_narrows() {
     // Each column costs its width plus one separator. Running totals in
     // rank order: Time 9, Code 14, Tok/s 21, Total 29, TTFB 37, In 44,
-    // Out 51, Note 64, Request for 79, Client 101, Route 118.
+    // Out 51, PP/s 58, Note 69, Request for 94, Client 116, Route 133.
+    // `Note` shows last but outranks the four columns before it, so it stays
+    // when they have gone.
     let full = [
       "Time",
       "Code",
       "Tok/s",
+      "PP/s",
       "Total",
       "TTFB",
       "In",
       "Out",
-      "Note",
       "Request for",
       "Client",
       "Route",
+      "Note",
     ];
-    assert_eq!(labels(118), full);
+    assert_eq!(labels(133), full);
     // Route ranks highest of all, so it is the first to go.
     let no_route = [
       "Time",
       "Code",
       "Tok/s",
+      "PP/s",
       "Total",
       "TTFB",
       "In",
       "Out",
-      "Note",
       "Request for",
       "Client",
+      "Note",
     ];
-    assert_eq!(labels(117), no_route);
-    assert_eq!(labels(101), no_route);
+    assert_eq!(labels(132), no_route);
+    assert_eq!(labels(116), no_route);
+    let no_client = [
+      "Time",
+      "Code",
+      "Tok/s",
+      "PP/s",
+      "Total",
+      "TTFB",
+      "In",
+      "Out",
+      "Request for",
+      "Note",
+    ];
+    assert_eq!(labels(115), no_client);
+    assert_eq!(labels(94), no_client);
+    // `Note` is the next to go, and `PP/s` outlasts it.
+    let no_request_for = [
+      "Time", "Code", "Tok/s", "PP/s", "Total", "TTFB", "In", "Out", "Note",
+    ];
+    assert_eq!(labels(93), no_request_for);
+    assert_eq!(labels(69), no_request_for);
+    let no_note = [
+      "Time", "Code", "Tok/s", "PP/s", "Total", "TTFB", "In", "Out",
+    ];
+    assert_eq!(labels(68), no_note);
+    assert_eq!(labels(58), no_note);
     assert_eq!(
-      labels(100),
-      vec![
-        "Time",
-        "Code",
-        "Tok/s",
-        "Total",
-        "TTFB",
-        "In",
-        "Out",
-        "Note",
-        "Request for"
-      ]
-    );
-    assert_eq!(
-      labels(79),
-      vec![
-        "Time",
-        "Code",
-        "Tok/s",
-        "Total",
-        "TTFB",
-        "In",
-        "Out",
-        "Note",
-        "Request for"
-      ]
-    );
-    assert_eq!(
-      labels(78),
-      vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Note"]
-    );
-    assert_eq!(
-      labels(64),
-      vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Note"]
-    );
-    assert_eq!(
-      labels(63),
+      labels(57),
       vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out"]
     );
     assert_eq!(
-      labels(57),
+      labels(51),
       vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out"]
     );
     assert_eq!(
@@ -519,7 +526,7 @@ mod tests {
   fn note_absorbs_the_spare_width() {
     // The visible columns plus their separators fill the pane, with one
     // cell of slack for the separator after the last column.
-    for width in [88usize, 100, 110, 120, 160, 200] {
+    for width in [95usize, 100, 110, 120, 160, 200] {
       let layout = layout_columns(width);
       let spent: usize = layout
         .visible
@@ -541,9 +548,112 @@ mod tests {
     assert_eq!(wide.width_of(route), ROUTE_W);
     // At the width `Request for` just fits, the only spare cell is the
     // separator after the last column, and `Note` grows first.
-    assert_eq!(layout_columns(79).note_w, MIN_NOTE_W + 1);
+    assert_eq!(layout_columns(94).note_w, MIN_NOTE_W + 1);
     // Too narrow for `Note`: it gets nothing and the row ends earlier.
-    assert_eq!(layout_columns(63).note_w, 0);
+    assert_eq!(layout_columns(61).note_w, 0);
+  }
+
+  #[test]
+  fn note_shows_after_route_and_takes_the_spare_width() {
+    let wide = layout_columns(160);
+    let labels: Vec<&str> = wide.visible.iter().map(|c| c.label).collect();
+    assert_eq!(
+      labels,
+      vec![
+        "Time",
+        "Code",
+        "Tok/s",
+        "PP/s",
+        "Total",
+        "TTFB",
+        "In",
+        "Out",
+        "Request for",
+        "Client",
+        "Route",
+        "Note"
+      ]
+    );
+
+    // The header and a row line up, and a long note runs to the right edge
+    // instead of pushing the fixed columns.
+    let mut state = RequestsTabState::default();
+    state.set(
+      RequestsScope::Model("/m/a.gguf".to_string()),
+      RequestSummary::default(),
+      vec![RequestRow {
+        requested_model: Some("asked-7b".to_string()),
+        error: Some("launch_failed".to_string()),
+        cause: Some("lower --ctx-size".to_string()),
+        status: Some(502),
+        ..row(1)
+      }],
+    );
+    let lines = rendered(&state, 160, 6);
+    let header = lines.iter().find(|l| l.contains("Route")).expect("header");
+    let body = lines
+      .iter()
+      .find(|l| l.contains("chat/completions"))
+      .expect("row");
+    let route_at = header.find("Route").unwrap();
+    let note_at = header.find("Note").unwrap();
+    assert!(route_at < note_at, "{header}");
+    // Measured in cells, because the row's placeholder is not one byte wide.
+    assert_eq!(
+      console::measure_text_width(&body[..body.find("chat/completions").unwrap()]),
+      route_at,
+      "header: {header}\nrow: {body}"
+    );
+    let note = "launch_failed: lower --ctx-size";
+    assert!(body.contains(note), "{body}");
+    // `Note` gets the whole width past `Route`, not just its own 10 cells,
+    // so the free text reads without an ellipsis here.
+    assert!(body.trim_end().ends_with(note), "{body}");
+    assert!(
+      body.find(note).unwrap() + note.len() > route_at + ROUTE_W,
+      "note_w is wider than Route: {body}"
+    );
+    assert!(
+      console::measure_text_width(body) <= 160,
+      "{} cells",
+      console::measure_text_width(body)
+    );
+  }
+
+  #[test]
+  fn request_for_gets_the_width_the_cli_gives_a_name() {
+    let wide = layout_columns(200);
+    let asked = wide
+      .visible
+      .iter()
+      .find(|c| c.id == ColumnId::RequestFor)
+      .expect("request for column");
+    assert_eq!(wide.width_of(asked), 24);
+
+    // A name that fits the column reaches the screen whole; a longer one
+    // cuts, and the row still renders.
+    let whole = "n".repeat(24);
+    let mut state = RequestsTabState::default();
+    state.set(
+      RequestsScope::Model("/m/a.gguf".to_string()),
+      RequestSummary::default(),
+      vec![
+        RequestRow {
+          requested_model: Some(whole.clone()),
+          ..row(2)
+        },
+        RequestRow {
+          requested_model: Some("x".repeat(60)),
+          ..row(1)
+        },
+      ],
+    );
+    let lines = rendered(&state, 150, 8);
+    assert!(lines.iter().any(|l| l.contains(&whole)), "{lines:?}");
+    assert!(
+      !lines.iter().any(|l| l.contains(&"x".repeat(30))),
+      "{lines:?}"
+    );
   }
 
   #[test]
@@ -589,18 +699,22 @@ mod tests {
         row(1),
       ],
     );
-    let lines = rendered(&state, 120, 8);
+    let lines = rendered(&state, 150, 8);
     assert!(lines[0].starts_with("Requests 2"), "{lines:?}");
     // The summary wraps to as many lines as it needs; the table starts
     // one blank line under it.
     let header = lines
       .iter()
-      .position(|l| l.starts_with("Time     Code Tok/s  Total"))
+      .position(|l| l.starts_with("Time     Code Tok/s  PP/s"))
       .expect("header row");
     assert_eq!(lines[header - 1], "");
-    assert!(lines[header].ends_with("Route"), "{lines:?}");
+    assert!(lines[header].ends_with("Note"), "{lines:?}");
     assert!(lines[header].contains("Request for"), "{lines:?}");
-    assert!(lines[header + 1].contains("200  39.6   1.2s"), "{lines:?}");
+    // The row has no prefill figure, so its cell is the placeholder.
+    assert!(
+      lines[header + 1].contains("200  39.6   —      1.2s"),
+      "{lines:?}"
+    );
     assert!(lines[header + 1].contains("asked-7b"), "{lines:?}");
     assert!(lines[header + 1].contains("chat/completions"), "{lines:?}");
     // Two rows, newest (`seq` 2, one second later) first.
@@ -631,7 +745,7 @@ mod tests {
     let lines = rendered(&state, 120, 10);
     let header = lines
       .iter()
-      .position(|l| l.starts_with("Time     Code Tok/s  Total"))
+      .position(|l| l.starts_with("Time     Code Tok/s  PP/s"))
       .expect("header row");
     let ellipsis = crate::tui::glyphs::active().ellipsis();
     let row_line = lines[header + 1].trim_end();
@@ -717,7 +831,7 @@ mod tests {
     let lines = rendered(&state, 120, 7);
     let header = lines
       .iter()
-      .position(|l| l.starts_with("Time     Code Tok/s  Total"))
+      .position(|l| l.starts_with("Time     Code Tok/s  PP/s"))
       .expect("header row");
     let rows_shown = &lines[header + 1..];
     assert!(rows_shown.len() >= 2, "{lines:?}");
