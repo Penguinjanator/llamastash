@@ -917,7 +917,7 @@ fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, live: &Cl
   );
   doc.sample(
     "llamastash:prompt_tokens_cached_total",
-    "Prompt tokens the finished requests served from the KV cache",
+    "Prompt tokens served from the KV cache by requests that report a prompt count",
     "counter",
     &labels,
     s.cached_tokens as f64,

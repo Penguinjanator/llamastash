@@ -376,12 +376,11 @@ pub struct RequestSummary {
   pub live_connections: Option<u64>,
   pub prompt_tokens: u64,
   /// Prompt tokens served from the KV cache, on the rows that report a prompt
-  /// count too.
+  /// count as well. A row with a cached count and no prompt count is in neither
+  /// half of the pair below.
   pub cached_tokens: u64,
-  /// [`Self::cached_tokens`] over the prompt tokens they were served from. Both
-  /// halves come from rows that reported each, so a server that reports neither
-  /// reads `None`, which is not the same answer as `0`, and the ratio is at most
-  /// 1.
+  /// [`Self::cached_tokens`] over the prompt tokens they were served from.
+  /// `None` when no row reported both, which is not the same answer as `0`.
   pub cache_hit_ratio: Option<f64>,
   pub completion_tokens: u64,
   /// Requests that started the model.
@@ -635,10 +634,9 @@ struct Totals {
   /// and the seconds they took.
   prefill_tokens: u64,
   prefill_seconds: f64,
-  /// Cached tokens, and the prompt tokens of just the rows that carried a
-  /// cached count, which are the two halves of the hit ratio.
+  /// Cached tokens, and the prompt tokens they were served from. One row
+  /// supplies both halves of the hit ratio or neither.
   cached_tokens: u64,
-  ratio_cached_tokens: u64,
   cached_prompt_tokens: u64,
   prompt_tokens: u64,
   completion_tokens: u64,
@@ -676,12 +674,12 @@ impl Totals {
         self.prefill_seconds += tokens as f64 / tps;
       }
     }
-    if let Some(cached) = row.cached_tokens {
-      self.cached_tokens = self.cached_tokens.saturating_add(cached);
-      if let Some(prompt) = row.prompt_tokens {
-        self.ratio_cached_tokens = self.ratio_cached_tokens.saturating_add(cached.min(prompt));
-        self.cached_prompt_tokens = self.cached_prompt_tokens.saturating_add(prompt);
-      }
+    if let (Some(cached), Some(prompt)) = (row.cached_tokens, row.prompt_tokens) {
+      // One row fills both halves or neither, so the count printed beside the
+      // ratio is the count the ratio used, and no row can claim it reused more
+      // of a prompt than the prompt it reports.
+      self.cached_tokens = self.cached_tokens.saturating_add(cached.min(prompt));
+      self.cached_prompt_tokens = self.cached_prompt_tokens.saturating_add(prompt);
     }
     self.prompt_tokens = self
       .prompt_tokens
@@ -704,7 +702,7 @@ impl Totals {
         .then(|| self.prefill_tokens as f64 / self.prefill_seconds),
       cached_tokens: self.cached_tokens,
       cache_hit_ratio: (self.cached_prompt_tokens > 0)
-        .then(|| self.ratio_cached_tokens as f64 / self.cached_prompt_tokens as f64),
+        .then(|| self.cached_tokens as f64 / self.cached_prompt_tokens as f64),
       // `RequestLog::tail` fills this for a model scope; a single set of
       // totals has no notion of "the newest launch".
       tokens_per_second_session: None,
@@ -2378,7 +2376,9 @@ mod tests {
       },
     );
     let s = log.tail(LogScope::All, 0).summary;
-    assert_eq!(s.cached_tokens, 9_500);
+    // The 9,000 cached tokens are real, but there is no prompt to read them
+    // against, so they are in neither half of what the cell prints.
+    assert_eq!(s.cached_tokens, 500);
     assert_eq!(s.cache_hit_ratio, Some(0.5));
 
     let boast = RequestLog::new();
