@@ -122,6 +122,18 @@ pub(crate) fn content_type(path: &str) -> &'static str {
   }
 }
 
+/// Cache policy by the member's path. Everything under
+/// `_app/immutable/` carries a content hash in its file name, so it never
+/// changes under the name it is served with; the rest (the index, the service
+/// worker, the manifest) has to be revalidated so a bump reaches a browser.
+pub(crate) fn cache_control(path: &str) -> &'static str {
+  if member_key(path).starts_with("_app/immutable/") {
+    "public, max-age=31536000, immutable"
+  } else {
+    "no-cache"
+  }
+}
+
 /// The stand-in `/props` body. The UI reads `role`, `model_path`,
 /// `default_generation_settings.n_ctx` and `.params` unguarded; everything
 /// else it reads with `?.`, so omitting it leaves the feature off rather
@@ -130,7 +142,6 @@ pub(crate) fn props(served_name: &str, ctx: u32, vision: bool) -> Value {
   json!({
     "role": "model",
     "model_path": served_name,
-    "total_slots": 1,
     "build_info": build_info(),
     "default_generation_settings": {
       "n_ctx": ctx,
@@ -193,6 +204,45 @@ mod tests {
     assert!(get("/tools").is_none());
   }
 
+  /// The bytes we embed are the bytes the pin record says they are, so a bump
+  /// that rewrites one file without the other cannot ship.
+  #[test]
+  fn embedded_archive_matches_the_recorded_sha() {
+    use sha2::{Digest as _, Sha256};
+    let recorded = VERSION_FILE
+      .lines()
+      .find_map(|line| line.strip_prefix("sha256="))
+      .unwrap_or_default();
+    let computed: String = Sha256::digest(ARCHIVE)
+      .iter()
+      .map(|byte| format!("{byte:02x}"))
+      .collect();
+    assert_eq!(
+      computed, recorded,
+      "data/llama-ui/dist.tar.gz does not match the sha256 in VERSION"
+    );
+    assert_eq!(recorded.len(), 64, "VERSION records a full sha256");
+  }
+
+  /// Content-hashed members are cached forever, everything the browser has to
+  /// revalidate after a bump is not.
+  #[test]
+  fn immutable_members_are_cached_and_the_rest_revalidate() {
+    assert_eq!(
+      cache_control("/_app/immutable/bundle.abc123.js"),
+      "public, max-age=31536000, immutable"
+    );
+    assert_eq!(cache_control("/"), "no-cache");
+    for path in [
+      "/index.html",
+      "/sw.js",
+      "/manifest.webmanifest",
+      "/favicon.svg",
+    ] {
+      assert_eq!(cache_control(path), "no-cache", "{path}");
+    }
+  }
+
   /// The pinned version record is what `build_info` reports, so a UI bump
   /// cannot leave a stale build number in the page.
   #[test]
@@ -211,7 +261,6 @@ mod tests {
     let body = props("my-model", 32768, true);
     assert_eq!(body["role"], "model");
     assert_eq!(body["model_path"], "my-model");
-    assert_eq!(body["total_slots"], 1);
     assert_eq!(body["default_generation_settings"]["n_ctx"], 32768);
     assert!(
       body["default_generation_settings"]["params"].is_object(),

@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
-use hyper::header::{CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE};
+use hyper::header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE};
 use hyper::{HeaderMap, Request, Response, StatusCode};
 
 use super::router::{BodyError, ProxyResponse};
@@ -146,7 +146,7 @@ pub(crate) async fn serve(state: Arc<ProxyState>, req: Request<Incoming>) -> Pro
 
   match resolve_target(req.headers(), running) {
     UiTarget::Forward(entry) => match entry.ui {
-      UiSource::Engine => forward_to_launch(&state, req, &entry).await,
+      UiSource::Engine => forward_to_launch(&state, req, &entry, None).await,
       UiSource::Bundled => serve_bundled(&state, req, &entry).await,
       // Unreachable through `resolve_target`, which only forwards
       // selectable entries; the chooser is what a UI-less launch gets.
@@ -248,20 +248,30 @@ async fn collect_running(state: &Arc<ProxyState>) -> Vec<RunningEntry> {
 /// calls (`/ui/v1/chat/completions`, `/ui/props`) all land here and
 /// route to the same target. Shared by the engine-UI path (every request)
 /// and the bundled path (its `/v1/...` arm).
+///
+/// `model_when_absent` names the model to put in a JSON body that carries
+/// none. Only the bundled path passes it: that page sends no `model` in
+/// single-model mode and engines differ on whether they need one. The engine's
+/// own page always names its model, so that path passes `None`.
 async fn forward_to_launch(
   state: &Arc<ProxyState>,
   req: Request<Incoming>,
   entry: &RunningEntry,
+  model_when_absent: Option<&str>,
 ) -> ProxyResponse {
   let stripped = strip_ui_prefix(req.uri());
   let (method, _uri, headers, body) = forward::deconstruct(req);
   // Buffer the body under the daemon's cap via the same helper the
   // data plane uses. UI asset GETs are bodyless; the base-relative API
-  // POSTs carry a JSON payload we pass through untouched.
+  // POSTs carry a JSON payload.
   let cap = state.max_body_size;
   let body_bytes = match route::buffer_body(body, cap).await {
     Ok(b) => b,
     Err(e) => return route::body_error_response(e, cap),
+  };
+  let body_bytes = match model_when_absent {
+    Some(name) => forward::with_model_added(body_bytes, name),
+    None => body_bytes,
   };
 
   let upstream_uri: hyper::Uri = stripped
@@ -294,8 +304,8 @@ enum BundledRoute<'a> {
   /// The proxy's own answer for the `/props` route, which no engine other
   /// than the bundle's origin serves.
   Props,
-  /// The engine's OpenAI surface, forwarded unchanged so the model name it
-  /// accepts is the one the UI sends back.
+  /// The engine's OpenAI surface, forwarded as the client sent it, except
+  /// that a JSON body naming no model gets this launch's served name.
   Forward,
   /// A route only the bundle's origin engine serves, answered here with a
   /// fixed status so the page degrades the way it does against an engine that
@@ -304,13 +314,17 @@ enum BundledRoute<'a> {
     status: StatusCode,
     why: &'static str,
   },
+  /// The page's "is any stream still running?" query. Nothing resumes through
+  /// us, so it is the empty list the origin engine answers for ids it has no
+  /// stream for, which the page reads without logging a problem.
+  NoStreams,
   /// An embedded bundle file, or a path the bundle does not carry.
   File(&'a str),
 }
 
 fn classify_bundled(stripped: &str) -> BundledRoute<'_> {
   let path = stripped.split('?').next().unwrap_or("/");
-  if path.split('/').any(|seg| seg == "..") {
+  if path.split('/').any(is_dot_segment) {
     // Dot segments are answered before the prefix tests: the forward client
     // collapses them, so `/ui/v1/../../x` would hand the engine a path
     // outside `/v1`.
@@ -318,6 +332,8 @@ fn classify_bundled(stripped: &str) -> BundledRoute<'_> {
   }
   if path == "/props" {
     BundledRoute::Props
+  } else if path == "/v1/streams/lookup" {
+    BundledRoute::NoStreams
   } else if path == "/tools" {
     // 403 is what the bundle's origin answers when started without server
     // tools, and the page reads it as "tools are disabled" instead of a
@@ -338,6 +354,14 @@ fn classify_bundled(stripped: &str) -> BundledRoute<'_> {
   }
 }
 
+/// Whether one path segment is a dot segment once percent-encoding is
+/// accounted for. The URL layer decodes `%2e` and `%2E` before it collapses
+/// dot segments, so `/ui/v1/%2e%2e/%2e%2e/health` reaches the engine the same
+/// way a literal `../..` would.
+fn is_dot_segment(segment: &str) -> bool {
+  segment.replace("%2e", ".").replace("%2E", ".") == ".."
+}
+
 /// Serve a bundled-UI request: `/props` is ours, `/v1/...` goes to the engine,
 /// the origin-only routes get our own answer, and everything else is a file
 /// from the embedded bundle.
@@ -355,14 +379,22 @@ async fn serve_bundled(
         ui_bundle::props(&entry.name, ctx, vision),
       ))
     }
-    BundledRoute::Forward => forward_to_launch(state, req, entry).await,
+    BundledRoute::Forward => forward_to_launch(state, req, entry, Some(&entry.name)).await,
     BundledRoute::Refused { status, why } => Ok(plain(status, why)),
+    BundledRoute::NoStreams => Ok(json_response(StatusCode::OK, serde_json::json!([]))),
     BundledRoute::File(path) => match ui_bundle::get(path) {
-      Some(bytes) => Ok(static_response(
-        StatusCode::OK,
-        ui_bundle::content_type(path),
-        Bytes::from_static(bytes),
-      )),
+      Some(bytes) => {
+        let mut response = static_response(
+          StatusCode::OK,
+          ui_bundle::content_type(path),
+          Bytes::from_static(bytes),
+        );
+        response.headers_mut().insert(
+          CACHE_CONTROL,
+          hyper::header::HeaderValue::from_static(ui_bundle::cache_control(path)),
+        );
+        Ok(response)
+      }
       None => Ok(plain(StatusCode::NOT_FOUND, "no such UI file")),
     },
   }
@@ -813,7 +845,7 @@ mod tests {
     for path in [
       "/v1/stream",
       "/v1/stream?conv_id=c&from=4",
-      "/v1/streams/lookup",
+      "/v1/streams/other",
     ] {
       assert!(
         matches!(
@@ -826,13 +858,28 @@ mod tests {
         "{path} reports stream resume off"
       );
     }
+    // The page asks this on every load, so it gets the origin engine's "no
+    // stream for these ids" answer rather than an error to log.
+    assert!(matches!(
+      classify_bundled("/v1/streams/lookup"),
+      BundledRoute::NoStreams
+    ));
   }
 
   /// A dot segment must not smuggle a path past the `/v1` forward prefix:
   /// the forward client would collapse it into an engine route outside `/v1`.
   #[test]
   fn bundled_dot_segments_stay_inside_the_bundle() {
-    for path in ["/v1/../../secret", "/../etc/passwd", "/a/../b"] {
+    for path in [
+      "/v1/../../secret",
+      "/../etc/passwd",
+      "/a/../b",
+      // The URL layer decodes these before collapsing dot segments, so an
+      // encoded pair escapes exactly like a literal one.
+      "/v1/%2e%2e/%2e%2e/metrics",
+      "/v1/%2E%2e/%2E%2e/health",
+      "/v1/.%2e/%2e./health",
+    ] {
       assert!(
         matches!(classify_bundled(path), BundledRoute::File(_)),
         "{path} is a bundle lookup, not a forward"

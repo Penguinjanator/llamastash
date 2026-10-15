@@ -489,8 +489,10 @@ async fn bundled_launch_serves_the_embedded_ui() {
   );
   assert!(props["default_generation_settings"]["params"].is_object());
 
-  // Engine-only surface: slots and stream resume answer 404, and server tools
-  // report as disabled with a 403, which is what the page reads as "off".
+  // Engine-only surface: slots answers 404, server tools report as disabled
+  // with a 403 (what the page reads as "off"), and the resume lookup gets the
+  // engine's "nothing running" answer, an empty list, which the page reads
+  // without logging a problem.
   assert_eq!(http_get(addr, "/ui/slots", &[]).await.0, 404);
   assert_eq!(http_get(addr, "/ui/tools", &[]).await.0, 403);
   assert_eq!(
@@ -500,19 +502,56 @@ async fn bundled_launch_serves_the_embedded_ui() {
     404,
     "stream resume stays off"
   );
+  let (status, _h, body) = http_post(
+    addr,
+    "/ui/v1/streams/lookup",
+    r#"{"conversation_ids":["x::y"]}"#,
+    &[],
+  )
+  .await;
+  assert_eq!(status, 200, "the resume lookup answers the page");
   assert_eq!(
-    http_get(addr, "/ui/v1/streams/lookup", &[]).await.0,
-    404,
-    "the resume lookup stays off too"
+    String::from_utf8_lossy(&body).trim(),
+    "[]",
+    "no stream is running through the proxy"
   );
 
-  // A dot segment must not smuggle a path past the forwarded `/v1` prefix.
+  // A dot segment must not smuggle a path past the forwarded `/v1` prefix,
+  // percent-encoded or not: the engine's own `/health` answers 200 at its root.
   assert_eq!(http_get(addr, "/ui/v1/../../nope", &[]).await.0, 404);
+  assert_eq!(
+    http_get(addr, "/ui/v1/%2e%2e/%2e%2e/health", &[]).await.0,
+    404,
+    "an encoded dot pair stays inside the bundle"
+  );
 
   // The OpenAI surface still reaches the engine.
   let (status, _h, body) = http_get(addr, "/ui/v1/models", &[]).await;
   assert_eq!(status, 200);
   assert!(String::from_utf8_lossy(&body).contains("/fixture/solo.gguf"));
+
+  // The page sends no `model` in single-model mode and some engines refuse a
+  // request without one, so the forward fills in the launch's served name. The
+  // fake echoes the name it received back in the stream.
+  let (status, _h, body) = http_post(
+    addr,
+    "/ui/v1/chat/completions",
+    r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+    &[],
+  )
+  .await;
+  assert_eq!(status, 200);
+  let frame = String::from_utf8_lossy(&body);
+  let received = frame
+    .lines()
+    .find_map(|line| line.strip_prefix("data: "))
+    .and_then(|data| serde_json::from_str::<Value>(data).ok())
+    .and_then(|chunk| chunk["model"].as_str().map(str::to_string))
+    .unwrap_or_default();
+  assert_eq!(
+    received, "solo",
+    "the engine got the launch's served name, not the file path: {frame}"
+  );
 
   let _ = model.stop(Duration::from_secs(3)).await;
   shutdown_listener(shutdown, handle).await;

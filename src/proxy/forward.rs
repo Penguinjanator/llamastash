@@ -343,6 +343,29 @@ fn with_model(body: Bytes, model: &str) -> Bytes {
   )))
 }
 
+/// `body` with a top-level `model` added when it carries none, for a client
+/// that names no model (the bundled page does not in single-model mode, and
+/// some engines answer 400 without one). Same raw-entry approach as
+/// [`with_model`]: untouched entries keep their bytes and key order. A body
+/// that is not a JSON object — a bodyless GET included — is returned
+/// unchanged.
+pub(crate) fn with_model_added(body: Bytes, model: &str) -> Bytes {
+  let Some(entries) = crate::util::json_body::entries(&body) else {
+    return body;
+  };
+  if entries.iter().any(|(key, _)| key == "model") {
+    return body;
+  }
+  // Encoding a `&str` cannot fail.
+  let model_value = serde_json::to_vec(&model).expect("string encodes");
+  Bytes::from(crate::util::json_body::write_object(
+    entries
+      .iter()
+      .map(|(key, value)| (key.as_str(), value.get().as_bytes()))
+      .chain(std::iter::once(("model", model_value.as_slice()))),
+  ))
+}
+
 /// Translate `reqwest::Response` into `hyper::Response`, preserving
 /// status + headers (minus hop-by-hop) and piping the body chunks
 /// through `StreamBody` so SSE chunks reach the client as they
@@ -642,6 +665,35 @@ mod tests {
       assert_eq!(
         with_model(Bytes::from(untouched), "q"),
         untouched.as_bytes()
+      );
+    }
+  }
+
+  #[test]
+  fn with_model_added_fills_only_a_body_that_names_none() {
+    let out = with_model_added(
+      Bytes::from(r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#),
+      "solo",
+    );
+    assert_eq!(
+      out,
+      r#"{"messages":[{"role":"user","content":"hi"}],"stream":true,"model":"solo"}"#.as_bytes(),
+      "the name is appended and the client's own bytes and order survive"
+    );
+
+    // A body that names its model stays the client's bytes: this is an
+    // insertion, not the request-model rewrite `with_model` does.
+    let named = r#"{"model":"other","stream":true}"#;
+    assert_eq!(
+      with_model_added(Bytes::from(named), "solo"),
+      named.as_bytes()
+    );
+
+    for not_object in ["", " ", "not json", "[1]", "1"] {
+      assert_eq!(
+        with_model_added(Bytes::from(not_object), "solo"),
+        not_object.as_bytes(),
+        "{not_object} is not an object body"
       );
     }
   }
