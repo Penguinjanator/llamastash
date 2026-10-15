@@ -28,6 +28,7 @@ pub(crate) mod router;
 pub mod server;
 pub mod state;
 pub(crate) mod ui;
+pub(crate) mod ui_bundle;
 pub mod usage_tap;
 
 pub use auth::{ProxyApiKey, ProxyAuth};

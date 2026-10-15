@@ -6,6 +6,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ### Added
 
+- `/ui` opens a chat page for engines that ship no web UI of their own (vLLM, SGLang, generic entries): a copy of the llama.cpp UI rides in the binary, so every chat launch has one.
 - Request summaries carry an aggregate throughput beside the average: `Agg tok/s` and `/metrics` report the scope's generated tokens over the wall time they were produced, so concurrent streams read as what the box put out instead of one slot each (#112).
 - The request log shows prompt processing: `PP/S` per row and `Prefill tok/s` and `Cached` in the summary, backed by `/metrics` counters, so the wait before the first token reads without starting the engine with `--metrics`. Where an engine reports no prefill timing the proxy estimates one and marks it `~` (#112).
 - A request that a `proxy.aliases` name routed is marked `alias`, in the row note and on the wire, so an alias answer no longer reads as the model it names (#112).

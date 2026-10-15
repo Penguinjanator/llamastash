@@ -100,12 +100,25 @@ async fn spawn_fake(
   catalog_path: &str,
   log_dir: &Path,
 ) -> llamastash::daemon::supervisor::ManagedModel {
+  spawn_fake_tagged(catalog_path, log_dir, "llamacpp", None).await
+}
+
+/// Like [`spawn_fake`] but tagged as another backend's launch, with an
+/// explicit requested ctx. A backend that serves no web UI of its own is what
+/// puts the proxy's `/ui` on the embedded-bundle path.
+async fn spawn_fake_tagged(
+  catalog_path: &str,
+  log_dir: &Path,
+  resolved_backend: &str,
+  ctx: Option<u32>,
+) -> llamastash::daemon::supervisor::ManagedModel {
   let port = allocate_port();
   let id = ModelId {
     path: PathBuf::from(catalog_path),
     header_blake3: [0u8; 32],
   };
-  let params = LaunchParams::new(PathBuf::from(catalog_path), LaunchMode::Chat);
+  let mut params = LaunchParams::new(PathBuf::from(catalog_path), LaunchMode::Chat);
+  params.ctx = ctx;
   let plan = LlamaCppBackend::new().process_spec(&params, port, fake_binary(), fast_probe());
   let model = supervisor_spawn(ManagedSpawn {
     id,
@@ -116,7 +129,7 @@ async fn spawn_fake(
     plan,
     origin: llamastash::daemon::supervisor::LaunchOrigin::Manual,
     fit_gate: None,
-    resolved_backend: "llamacpp".to_string(),
+    resolved_backend: resolved_backend.to_string(),
   })
   .await
   .expect("spawn fake_llama_server");
@@ -244,6 +257,22 @@ async fn single_running_serves_ui_and_forwards_paths() {
   assert!(
     text.contains("/fixture/solo.gguf"),
     "expected the forwarded /v1/models payload, got: {text}"
+  );
+
+  // The engine's own page is forwarded as the client sent it: no model name is
+  // added here, so the fake answers with the `-m` path it fell back to, not
+  // the launch's served name.
+  let (_status, _h, body) = http_post(
+    addr,
+    "/ui/v1/chat/completions",
+    r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+    &[],
+  )
+  .await;
+  let frame = String::from_utf8_lossy(&body);
+  assert!(
+    frame.contains(r#""model":"/fixture/solo.gguf""#),
+    "the engine path forwards the body untouched: {frame}"
   );
 
   let _ = model.stop(Duration::from_secs(3)).await;
@@ -426,6 +455,129 @@ async fn auth_enforced_ui_challenges_basic_and_accepts_credentials() {
   let bearer = format!("Bearer {key}");
   let (status, _h, _b) = http_get(addr, "/ui/", &[("Authorization", &bearer)]).await;
   assert_eq!(status, 200, "Bearer with the key must still pass");
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A launch whose engine serves no web UI of its own gets the embedded bundle
+/// instead: the page and `/props` come from the proxy, the OpenAI surface
+/// still reaches the engine, and the routes only the bundle's origin serves
+/// answer the way an engine without them does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bundled_launch_serves_the_embedded_ui() {
+  let dir = unique_temp("bundled");
+  let registry = SupervisorRegistry::new();
+  let model = spawn_fake_tagged("/fixture/solo.gguf", &dir, "generic", Some(2048)).await;
+  registry.insert(registry.next_id(), model.clone()).await;
+  let state = build_state(
+    vec![discovered("/fixture/solo.gguf", Some("solo"))],
+    registry,
+    None,
+  )
+  .await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+
+  let (status, headers, body) = http_get(addr, "/ui/", &[]).await;
+  assert_eq!(status, 200);
+  assert_eq!(
+    header_value(&headers, "content-type"),
+    Some("text/html; charset=utf-8")
+  );
+  assert_eq!(
+    header_value(&headers, "cache-control"),
+    Some("no-cache"),
+    "the index revalidates so a bump reaches the browser"
+  );
+  let text = String::from_utf8_lossy(&body);
+  assert!(
+    text.contains("<!doctype html>") && !text.contains("fake-llama-webui"),
+    "expected the embedded index, got: {text}"
+  );
+
+  let (status, headers, body) = http_get(addr, "/ui/props", &[]).await;
+  assert_eq!(status, 200);
+  assert_eq!(
+    header_value(&headers, "content-type"),
+    Some("application/json")
+  );
+  let props: Value = serde_json::from_slice(&body).expect("/props is JSON");
+  assert_eq!(props["model_path"], "solo");
+  assert_eq!(
+    props["default_generation_settings"]["n_ctx"], 2048,
+    "props reports the ctx the launch asked for"
+  );
+  assert!(props["default_generation_settings"]["params"].is_object());
+
+  // Engine-only surface: slots answers 404, server tools report as disabled
+  // with a 403 (what the page reads as "off"), and the resume lookup gets the
+  // engine's "nothing running" answer, an empty list, which the page reads
+  // without logging a problem.
+  assert_eq!(http_get(addr, "/ui/slots", &[]).await.0, 404);
+  assert_eq!(http_get(addr, "/ui/tools", &[]).await.0, 403);
+  assert_eq!(
+    http_get(addr, "/ui/v1/stream?conv_id=c&from=0", &[])
+      .await
+      .0,
+    404,
+    "stream resume stays off"
+  );
+  let (status, _h, body) = http_post(
+    addr,
+    "/ui/v1/streams/lookup",
+    r#"{"conversation_ids":["x::y"]}"#,
+    &[],
+  )
+  .await;
+  assert_eq!(status, 200, "the resume lookup answers the page");
+  assert_eq!(
+    String::from_utf8_lossy(&body).trim(),
+    "[]",
+    "no stream is running through the proxy"
+  );
+
+  // A dot segment must not smuggle a path past the forwarded `/v1` prefix,
+  // percent-encoded or not: the engine's own `/health` answers 200 at its root.
+  assert_eq!(http_get(addr, "/ui/v1/../../nope", &[]).await.0, 404);
+  assert_eq!(
+    http_get(addr, "/ui/v1/%2e%2e/%2e%2e/health", &[]).await.0,
+    404,
+    "an encoded dot pair stays inside the bundle"
+  );
+  assert_eq!(
+    http_get(addr, "/ui/v1/x/\\..\\..\\health", &[]).await.0,
+    404,
+    "backslash separators stay inside the bundle too"
+  );
+
+  // The OpenAI surface still reaches the engine.
+  let (status, _h, body) = http_get(addr, "/ui/v1/models", &[]).await;
+  assert_eq!(status, 200);
+  assert!(String::from_utf8_lossy(&body).contains("/fixture/solo.gguf"));
+
+  // The page sends no `model` in single-model mode and some engines refuse a
+  // request without one, so the forward fills in the launch's served name. The
+  // fake echoes the name it received back in the stream.
+  let (status, _h, body) = http_post(
+    addr,
+    "/ui/v1/chat/completions",
+    r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+    &[],
+  )
+  .await;
+  assert_eq!(status, 200);
+  let frame = String::from_utf8_lossy(&body);
+  let received = frame
+    .lines()
+    .find_map(|line| line.strip_prefix("data: "))
+    .and_then(|data| serde_json::from_str::<Value>(data).ok())
+    .and_then(|chunk| chunk["model"].as_str().map(str::to_string))
+    .unwrap_or_default();
+  assert_eq!(
+    received, "solo",
+    "the engine got the launch's served name, not the file path: {frame}"
+  );
 
   let _ = model.stop(Duration::from_secs(3)).await;
   shutdown_listener(shutdown, handle).await;

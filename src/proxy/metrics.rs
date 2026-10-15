@@ -379,6 +379,9 @@ pub(crate) struct LiveLaunch {
   pub(crate) path: String,
   pub(crate) port: u16,
   pub(crate) ready: bool,
+  /// What the launch was started for. `/ui` needs it to tell a chat launch
+  /// (which can be given a chat UI) from an embedding or rerank one.
+  pub(crate) mode: crate::launch::mode::LaunchMode,
 }
 
 /// Every live launch that is a model, with its display name, identity and port,
@@ -406,6 +409,7 @@ pub(crate) async fn live_launches(state: &ProxyState) -> Vec<LiveLaunch> {
       path,
       port: model.port(),
       ready,
+      mode: model.mode(),
     });
   }
   out.sort_by(|a, b| launch_order(&a.id).cmp(&launch_order(&b.id)));
@@ -1623,6 +1627,7 @@ mod tests {
       path: path.into(),
       port,
       ready: true,
+      mode: crate::launch::mode::LaunchMode::Chat,
     }
   }
 

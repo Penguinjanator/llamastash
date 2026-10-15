@@ -368,7 +368,7 @@ jobs:
           else
             cp "target/${{ matrix.target }}/release/llamastash" "dist/${stage}/"
           fi
-          cp LICENSE README.md CHANGELOG.md "dist/${stage}/"
+          cp LICENSE NOTICE README.md CHANGELOG.md "dist/${stage}/"
           if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
             (cd dist && 7z a -tzip "${stage}.zip" "${stage}" \
               && sha256sum "${stage}.zip" >"${stage}.zip.sha256")

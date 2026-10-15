@@ -1,0 +1,90 @@
+name: update-llama-ui
+
+# Monthly refresh of the llama.cpp UI bundle embedded in the binary
+# (data/llama-ui/, served at /ui for engines with no UI of their own).
+# Monthly rather than weekly because upstream cuts many builds a week and every
+# build changes the archive: a weekly PR would commit a 3.1 MB blob to git
+# history almost every week.
+#
+# Opens a PR when upstream publishes a newer build. It never merges: a human
+# runs the manual /ui check from scripts/llama-ui/README.md first, because a
+# bump can start reading a /props field the proxy does not answer.
+#
+# Writes go through the LLAMA_UI_BUMP_TOKEN PAT rather than GITHUB_TOKEN:
+# `can_approve_pull_request_reviews` is off on this repo and an event made with
+# GITHUB_TOKEN starts no other workflow, so a GITHUB_TOKEN PR would sit with
+# required checks that never run. With the secret unset the run is a no-op.
+
+on:
+  schedule:
+    - cron: "0 4 1 * *" # 04:00 UTC on the 1st of each month
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    name: Bump the bundled llama.cpp UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check for the bump token
+        id: gate
+        env:
+          TOKEN: ${{ secrets.LLAMA_UI_BUMP_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::LLAMA_UI_BUMP_TOKEN is not set on this repo, so no bump PR can be opened. See docs/runbooks/release-0.0.1-bootstrap.md."
+          fi
+
+      - uses: actions/checkout@v7
+        if: steps.gate.outputs.proceed == 'true'
+        with:
+          token: ${{ secrets.LLAMA_UI_BUMP_TOKEN }}
+
+      - name: Refresh the archive to whatever upstream publishes
+        if: steps.gate.outputs.proceed == 'true'
+        run: scripts/llama-ui/update.sh latest
+
+      - name: Open the PR when it moved
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.LLAMA_UI_BUMP_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$(git status --porcelain -- data/llama-ui)" ]; then
+            echo "::notice::data/llama-ui already matches upstream, nothing to open."
+            exit 0
+          fi
+
+          build="$(awk -F= '/^build=/{print $2}' data/llama-ui/VERSION)"
+          sha="$(awk -F= '/^sha256=/{print $2}' data/llama-ui/VERSION)"
+          branch="chore/llama-ui-${build}"
+          title="chore(proxy): bump bundled llama.cpp UI to ${build}"
+
+          if [ -n "$(git ls-remote --heads origin "$branch")" ]; then
+            echo "::notice::${branch} already exists on the remote, leaving that PR alone."
+            exit 0
+          fi
+
+          git switch -c "$branch"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/llama-ui
+          git commit -m "$title"
+          git push origin "HEAD:${branch}"
+
+          body=$(cat <<EOF
+          Upstream published a newer llama.cpp UI build than the one embedded in the binary. \`data/llama-ui/VERSION\` now records:
+
+          - build: \`${build}\`
+          - sha256: \`${sha}\`
+
+          Before merging, do the manual check from \`scripts/llama-ui/README.md\`: run the daemon from this branch, start one UI-less chat launch, open \`/ui/\` and send a message. It should load without a server error and stream an answer. A new UI release can read a \`/props\` field the proxy does not answer, and the chat screen would error instead.
+          EOF
+          )
+          gh pr create --head "$branch" --title "$title" --body "$body"

@@ -1,18 +1,27 @@
-llamastash — third-party attributions
-====================================
-
 llamastash itself is MIT-licensed (see `LICENSE`). This NOTICE file lists
-third-party sources whose code or curation feeds the benchmark snapshot
-regeneration flow (Unit 7 of the v2 plan). The Rust binary does not link
-or embed any of the sources below; they run only in the CI workflow
-that produces `data/benchmark-snapshot.json`.
+the third-party sources below. Those under "Embedded in the binary" ship
+inside the compiled artefact. Those under "Vendored sources" only feed the
+benchmark snapshot regeneration flow: the Rust binary does not link or embed
+them, they run in the CI workflow that produces `data/benchmark-snapshot.json`.
+
+Embedded in the binary
+----------------------
+
+1. llama.cpp web UI (https://github.com/ggml-org/llama.cpp, tools/ui)
+   License: MIT (Copyright (c) the ggml.c / llama.cpp contributors)
+   Usage: the prebuilt UI bundle (`data/llama-ui/dist.tar.gz`, pinned
+   build and sha256 in `data/llama-ui/VERSION`) is embedded in the
+   binary and served at `/ui/` for engines that ship no web UI of their
+   own. Only the prebuilt bundle is embedded, not the UI's sources.
+   The bundle includes npm packages under their own licenses; the full
+   list is llama.cpp's `tools/ui/package.json`.
+
+Vendored sources
+----------------
 
 When a source is vendored, the upstream commit hash and license are
 recorded next to the corresponding adapter under
 `scripts/benchmark_sources/`.
-
-Vendored sources
-----------------
 
 1. whichllm (https://github.com/Andyyyy64/whichllm)
    License: MIT
@@ -37,7 +46,6 @@ Vendored sources
    the polyglot_leaderboard.yml in Aider's GitHub repo by
    scripts/benchmark_sources/aider.py.
 
-If you ship a binary build of llamastash, you do not need to redistribute
-this NOTICE — none of the above is in the compiled artefact. The file
-is part of the source release for transparency about where the snapshot
-data came from.
+If you ship a binary build of llamastash, redistribute this NOTICE beside
+the binary: the "Embedded in the binary" entries are in the compiled
+artefact. Release tarballs copy it next to `LICENSE`.
