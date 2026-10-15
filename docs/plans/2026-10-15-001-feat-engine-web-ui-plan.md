@@ -10,7 +10,7 @@ origin: docs/brainstorms/2026-10-15-engine-web-ui-requirements.md
 
 ## Overview
 
-`/ui` only works for llama.cpp launches, because only llama.cpp serves a web UI. vLLM v0.31.0 and SGLang v0.5.21 serve none (checked 2026-10-15), and neither do generic entries like gufo and Halogen. This plan embeds llama.cpp's prebuilt UI in the binary and serves it from the proxy for UI-less chat launches. The proxy answers the one llama.cpp-only route the UI needs (`/props`) and forwards `/v1/*` to the engine. A maintainer script refreshes the embedded copy, and a weekly workflow opens a PR when upstream moves.
+`/ui` only works for llama.cpp launches, because only llama.cpp serves a web UI. vLLM v0.31.0 and SGLang v0.5.21 serve none (checked 2026-10-15), and neither do generic entries like gufo and Halogen. This plan embeds llama.cpp's prebuilt UI in the binary and serves it from the proxy for UI-less chat launches. The proxy answers the routes only that page's origin engine serves (`/props` above all) and forwards `/v1/*` to the engine, filling in the launch's model name when a request carries none. A maintainer script refreshes the embedded copy, and a monthly workflow opens a PR when upstream moves.
 
 Keep it simple. No new process, no runtime download, no response rewriting.
 
@@ -34,7 +34,7 @@ From the origin doc (see origin: `docs/brainstorms/2026-10-15-engine-web-ui-requ
 - R14. Cookie pin, chooser, `/ui/switch`, `?target=`, LAN Basic auth unchanged.
 - R15. `docs/usage.md` § Web UI covers engines and limits.
 - R16. `TODO.md`: router-mode follow-up added, batch 5 item struck.
-- R17 (added in planning). A weekly workflow opens a refresh PR when upstream `latest` moves, using a PAT secret `LLAMA_UI_BUMP_TOKEN`, and does nothing when the secret is missing.
+- R17 (added in planning). A monthly workflow opens a refresh PR when upstream `latest` moves, using a PAT secret `LLAMA_UI_BUMP_TOKEN`, and does nothing when the secret is missing.
 
 ## Scope Boundaries
 
@@ -43,7 +43,7 @@ From the origin doc (see origin: `docs/brainstorms/2026-10-15-engine-web-ui-requ
 - No service worker changes.
 - No sidecar process, no runtime download.
 - No Lemonade-specific handling; its chat rows get the bundled UI through R4, untested.
-- The weekly workflow opens a PR only. It never merges.
+- The monthly workflow opens a PR only. It never merges.
 
 ## Context & Research
 
@@ -67,7 +67,7 @@ From the origin doc (see origin: `docs/brainstorms/2026-10-15-engine-web-ui-requ
 - `GET ./props`: required. Unguarded reads: `default_generation_settings.n_ctx`, `default_generation_settings.params`, `model_path` (basename used as the single-model name). The rest is read with `?.`: `modalities.{vision,audio,video}`, `role` (`"router"` means router mode, anything else is single-model), `build_info`, `model_alias`, `ui_settings`.
 - `GET ./v1/models`: model list in single-model mode, sent back as `model` in chat requests.
 - `POST ./v1/chat/completions`: SSE. Always sends `return_progress`, `sse_ping_interval`, `reasoning_format`. vLLM accepts unknown fields (`extra="allow"`), SGLang ignores them (pydantic default).
-- Optional, may 404: `./slots`, `./v1/stream`, `./v1/streams/lookup`, `./v1/chat/completions/control`, `/cors-proxy`. `./tools` is the one that wants a specific status: 403 means "server tools are disabled" to the page, anything else logs an error and is retried before every message.
+- Optional, may 404: `./slots`, `./v1/stream`, `./v1/chat/completions/control`, `/cors-proxy`. `./v1/streams/lookup` wants `200 []`, the answer the origin gives when it has no stream for those ids; a non-2xx makes the page log a warning on load. `./tools` is the one that wants a specific status: 403 means "server tools are disabled" to the page, anything else logs an error and is retried before every message.
 - Archive: `https://huggingface.co/buckets/ggml-org/llama-ui/resolve/<bNNNN|latest>/dist.tar.gz` plus `dist.tar.gz.sha256`. `latest` was `b11642` on 2026-10-15 (3.1 MB; 10 MB unpacked; `build.json` inside holds `{"version":"b11642"}`). Not every build number is published (`b11643` returned 404).
 
 ### Facts checked during planning
@@ -79,11 +79,11 @@ From the origin doc (see origin: `docs/brainstorms/2026-10-15-engine-web-ui-requ
 
 - **Three UI sources per launch:** the engine's own UI (backend `serves_web_ui`), the bundled UI (UI-less backend and chat mode), or none. A small enum on `RunningEntry` replaces the `serves_ui` bool. Keeps R4: only the trait call and the launch mode decide.
 - **Bundled routing by path:** `/props` is answered by the proxy; `/v1/...` is forwarded unchanged to the launch's port with the same `forward::forward_to_upstream` call `forward_ui` uses today (no request log, R13); everything else is an embedded file (`/` serves `index.html`) or 404. Forwarding `/v1/models` straight to the engine gives the UI the name the engine accepts (R8), including gufo's `--served-model-name`.
-- **Fake `/props` is minimal:** `role: "model"`, `model_path` = the launch's served name, `default_generation_settings: {n_ctx, params: {}}`, `modalities: {vision, audio: false, video: false}`, `total_slots: 1`, `build_info` naming llamastash and its version. `n_ctx` is the launch's `resolved_ctx` when its backend reports one (llama.cpp, vLLM and SGLang implement `fetch_actuals`), else the launch's requested ctx (`params.ctx`, what `status` shows as `ctx`; for a generic entry it comes from the `ctx: true` knob), else `0`. The generic backend reports no actuals, so generic launches always take the second value.
+- **Fake `/props` is minimal:** `role: "model"`, `model_path` = the launch's served name, `default_generation_settings: {n_ctx, params: {}}`, `modalities: {vision, audio: false, video: false}`, `build_info` naming llamastash and its version. `total_slots` is left out: the page only displays it and the launch's real slot count is not what a single bundled page needs. `n_ctx` is the launch's `resolved_ctx` when its backend reports one (llama.cpp, vLLM and SGLang implement `fetch_actuals`), else the launch's requested ctx (`params.ctx`, what `status` shows as `ctx`; for a generic entry it comes from the `ctx: true` knob), else `0`. The generic backend reports no actuals, so generic launches always take the second value.
 - **Embedded archive, unpacked once:** `include_bytes!` the `.tar.gz`; on the first bundled-UI request unpack it into an in-memory map (path to bytes) held in a `OnceLock`. About 10 MB of RAM after first use, zero before (R10). Lookups are map keys, never filesystem paths, so there is no path traversal surface.
 - **Version record:** `data/llama-ui/VERSION` holds the build (`b11642`) and the archive's sha256. Written only by the refresh script.
 - **NOTICE ships in release tarballs:** add a llama.cpp UI entry to `NOTICE` (MIT, the ggml authors, and that the bundle includes npm packages under their own licenses, listed in llama.cpp `tools/ui/package.json`), fix NOTICE's line that says the binary embeds none of its sources, and copy `NOTICE` into the release tarball beside `LICENSE` (R12).
-- **Weekly refresh PR:** Monday 04:00 UTC cron plus `workflow_dispatch`. Runs the same script with `latest`; opens a PR from `chore/llama-ui-<build>` with the PAT. Exits early when the secret is unset, nothing changed, or that branch already exists on the remote. *(Cadence changed after implementation: the cron is now monthly, `0 4 1 * *`, because every upstream build changes the archive and a weekly PR would commit a fresh 3.1 MB blob to git history almost every week.)*
+- **Monthly refresh PR:** `0 4 1 * *` cron (04:00 UTC on the 1st) plus `workflow_dispatch`. Runs the same script with `latest`; opens a PR from `chore/llama-ui-<build>` with the PAT. Exits early when the secret is unset, nothing changed, or that branch already exists on the remote. Monthly rather than weekly as planned: every upstream build changes the archive, so a weekly PR would commit a fresh 3.1 MB blob to git history almost every week.
 
 ## Open Questions
 
@@ -111,9 +111,16 @@ From the origin doc (see origin: `docs/brainstorms/2026-10-15-engine-web-ui-requ
        Bundled -> strip /ui, then:
                     /props        -> fake props JSON (ctx, vision, name)
                     /tools        -> 403 ("server tools are not enabled")
+                    /v1/streams/lookup -> 200 [] (nothing resumes through us)
                     /v1/stream, /v1/streams/* -> 404 (stream resume off)
-                    /v1/...       -> forward_to_upstream(entry.port), no log
+                    /v1/...       -> forward_to_upstream(entry.port), no log,
+                                     a JSON body naming no model gets the
+                                     launch's served name added
                     other path    -> embedded file ("/" -> index.html) | 404
+
+       A path the forward client's URL parser resolves to something else (dot
+       segments spelled literally, `%2e`-encoded, or with backslashes) is
+       answered from the bundle, so it can only be a 404.
 ```
 
 ## Implementation Units
@@ -140,7 +147,7 @@ All four run in one lane, in order. None can run in parallel (U2 needs U1's arch
 **Approach:**
 - `update.sh <bNNNN|latest>`: download the `.sha256` then the archive from the HF bucket URL above; refuse unless the `.sha256` body starts with 64 hex chars and the archive matches it; read the real build from `build.json` inside the archive (so `latest` records a concrete `bNNNN`); write `data/llama-ui/dist.tar.gz` and `VERSION` (build line, sha256 line); print the build. Same sha as the current `VERSION`: change nothing and say so. Download into a `mktemp -d` dir and extract only `build.json` from the archive (never unpack the whole tree into `/tmp`).
 - Bash with `set -euo pipefail`, `curl`, `sha256sum` (or `shasum -a 256` on macOS), `tar`. Short header comment saying what it does and how to run it.
-- `scripts/llama-ui/README.md`: what the script does, how to run it by hand, that the weekly workflow (U4) runs it, and the manual check to do before merging a bump (open `/ui` on one UI-less engine and send a message).
+- `scripts/llama-ui/README.md`: what the script does, how to run it by hand, that the monthly workflow (U4) runs it, and the manual check to do before merging a bump (open `/ui` on one UI-less engine and send a message).
 
 **Patterns to follow:** `scripts/vllm/README.md`; `scripts/regenerate-benchmark-snapshot.py` for a data refresh.
 
@@ -180,7 +187,7 @@ All four run in one lane, in order. None can run in parallel (U2 needs U1's arch
 - Happy path: `resolve_target` with one bundled entry and no cookie forwards to it; a cookie pinned to a bundled entry forwards to it.
 - Edge case: one none-source entry alone still shows the chooser (existing rule), and a cookie pinned to it falls through to the chooser.
 - Happy path: `chooser_html` renders a bundled entry as a green link to `/ui/?target=<id>` and a none entry as a red, non-link row.
-- Happy path: bundled path routing: `/props` and `/props?x=1` -> fake props; `/v1/models`, `/v1/chat/completions` -> forward; `/` -> `index.html`; `/slots`, `/nope.js` and a dot-segment path -> 404; `/tools` -> 403; `/v1/stream` and `/v1/streams/lookup` -> 404.
+- Happy path: bundled path routing: `/props` and `/props?x=1` -> fake props; `/v1/models`, `/v1/chat/completions` -> forward (a body with no `model` gets the launch's served name); `/` -> `index.html`; `/slots`, `/nope.js` and a dot-segment path (literal, `%2e`-encoded or backslash) -> 404; `/tools` -> 403; `/v1/streams/lookup` -> 200 `[]`; `/v1/stream` -> 404.
 - Happy path: embedded lookup: `/` returns `index.html` with `text/html`; the archive's `_app/immutable/bundle.*.js` (found by scanning keys, not a hardcoded hash) returns a JavaScript content type and non-empty bytes.
 - Happy path: fake props JSON: `n_ctx` equals the ctx passed in; `modalities.vision` follows the flag; `role` is `"model"`; `model_path` equals the served name; `default_generation_settings.params` is an object.
 - Integration: existing `tests/proxy_ui.rs` (llama.cpp path) stays green unchanged.
@@ -216,7 +223,7 @@ All four run in one lane, in order. None can run in parallel (U2 needs U1's arch
 **Verification:**
 - Every doc statement about `/ui` matches U2's behavior; no doc still says only llama.cpp launches open.
 
-- [x] **Unit 4: Weekly refresh workflow**
+- [x] **Unit 4: Monthly refresh workflow**
 
 **Goal:** A PR shows up when upstream publishes a newer UI.
 
@@ -230,7 +237,7 @@ All four run in one lane, in order. None can run in parallel (U2 needs U1's arch
 - Modify: `scripts/llama-ui/README.md` (mention the workflow and the secret)
 
 **Approach:**
-- Triggers: `schedule` (Monday 04:00 UTC) and `workflow_dispatch`. `permissions: contents: read`; the PAT does the writes.
+- Triggers: `schedule` (04:00 UTC on the 1st of each month) and `workflow_dispatch`. `permissions: contents: read`; the PAT does the writes.
 - Steps: exit 0 with a `::notice::` when `LLAMA_UI_BUMP_TOKEN` is empty; `actions/checkout@v7` with that token; run `scripts/llama-ui/update.sh latest`; exit 0 when `data/llama-ui` is unchanged; exit 0 when `chore/llama-ui-<build>` already exists on the remote; else commit as `github-actions[bot]` with `chore(proxy): bump bundled llama.cpp UI to <build>`, push the branch, `gh pr create` (with `GH_TOKEN` set to the PAT) and a body naming the build, sha256, and the manual `/ui` check from `scripts/llama-ui/README.md`.
 - Runbook entry: fine-grained PAT on `llamastash/llamastash` with Contents and Pull requests read/write; the workflow is a no-op until it exists.
 
