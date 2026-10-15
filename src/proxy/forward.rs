@@ -34,7 +34,7 @@ use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use super::request_log::{RequestRecord, RequestState};
 use super::router::{BodyError, ProxyResponse};
 use super::state::ProxyState;
-use super::usage_tap::{ResponseTap, Usage};
+use super::usage_tap::{carries_token, ResponseTap, Usage};
 
 /// Hop-by-hop header set — RFC 7230 §6.1. Stripped on both the
 /// outbound request (so we don't leak the inbound peer's keep-alive
@@ -376,6 +376,7 @@ fn build_streaming_response(
         .is_some_and(|v| v.starts_with("text/event-stream")),
       sent,
       generating_since: sent,
+      first_token: None,
     }
   });
 
@@ -484,10 +485,14 @@ struct LoggedResponse {
   /// stay out of it.
   sent: Instant,
   /// Where the proxy's clock starts timing generation, for the tok/s
-  /// estimate: the first byte of a stream, or the moment the request went
-  /// upstream for a response that arrives whole. The second includes
-  /// prompt processing, so that estimate reads low.
+  /// estimate: a stream's first token, or its first byte when no piece of it
+  /// showed a token, or the moment the request went upstream for a response
+  /// that arrives whole. The last two include prompt processing, so those
+  /// estimates read low.
   generating_since: Instant,
+  /// When a stream's first token arrived, which is when its prompt was done.
+  /// Its first byte can be a status event sent before the prompt is computed.
+  first_token: Option<Instant>,
 }
 
 impl LoggedResponse {
@@ -503,6 +508,11 @@ impl LoggedResponse {
           if self.streamed {
             self.generating_since = Instant::now();
           }
+        }
+        if self.streamed && self.first_token.is_none() && carries_token(data) {
+          let now = Instant::now();
+          self.first_token = Some(now);
+          self.generating_since = now;
         }
         self.seen += data.len() as u64;
         if let Some(tap) = self.tap.as_mut() {
@@ -557,8 +567,9 @@ impl LoggedResponse {
   /// to wait for a slot estimates low.
   fn prefill_window(&self, usage: &Usage) -> Option<Duration> {
     if self.streamed {
-      // A stream's first byte arrives once the prompt has been processed.
-      return self.generating_since.checked_duration_since(self.sent);
+      // A stream with no token the tap could see has no window: its first byte
+      // may have been sent before the prompt was computed.
+      return self.first_token?.checked_duration_since(self.sent);
     }
     // A response that arrives whole is one wait, and the engine's own speed
     // says how much of it was generation. An estimated speed already spans the
@@ -807,70 +818,14 @@ mod tests {
     );
   }
 
-  /// The tok/s estimated for a response that reported 100 generated
-  /// tokens and no speed, and whose request went upstream ten seconds
-  /// before its body's first byte.
-  fn estimated_speed(streamed: bool) -> f64 {
-    let log = crate::proxy::request_log::RequestLog::new();
-    let ten_seconds_ago = Instant::now()
-      .checked_sub(std::time::Duration::from_secs(10))
-      .expect("the clock has run for ten seconds");
-    // A stream's window runs to the first byte, and the first byte has to be
-    // some time ago for the estimate to be a speed at all: a byte that lands in
-    // this instant divides 100 tokens by microseconds, which is past the ceiling.
-    let one_second_ago = Instant::now()
-      .checked_sub(std::time::Duration::from_secs(1))
-      .expect("the clock has run for a second");
-    let mut logged = LoggedResponse {
-      record: log.begin("/v1/chat/completions", None),
-      tap: Some(ResponseTap::default()),
-      content_length: None,
-      seen: 0,
-      ended: false,
-      errored: false,
-      streamed,
-      sent: ten_seconds_ago,
-      generating_since: ten_seconds_ago,
-    };
-    let body = Bytes::from_static(br#"{"usage":{"prompt_tokens":5,"completion_tokens":100}}"#);
-    logged.observe(&Some(Ok(Frame::data(body.clone()))));
-    // The first byte arrived a second ago rather than in this instant.
-    if streamed {
-      logged.generating_since = one_second_ago;
-    }
-    logged.observe(&None);
-    drop(logged);
-    let row = log
-      .tail(crate::proxy::request_log::LogScope::All, 1)
-      .rows
-      .into_iter()
-      .next()
-      .expect("a row");
-    assert!(row.tokens_per_second_estimated);
-    row.tokens_per_second.expect("an estimate")
-  }
-
-  #[test]
-  fn the_speed_estimate_times_a_stream_from_its_first_byte() {
-    // Timed from the send, 100 tokens in ten seconds is 10 tok/s at most. A
-    // stream is timed from its first byte, a second ago: 100 tok/s, not the 10
-    // the whole wait would say.
-    let stream = estimated_speed(true);
-    assert!((90.0..=110.0).contains(&stream), "{stream}");
-    // A response that arrives whole is timed from the send.
-    let whole = estimated_speed(false);
-    assert!((9.0..=10.0).contains(&whole), "{whole}");
-  }
-
-  /// A response whose request went upstream ten seconds ago, whose first byte
-  /// arrived just now, and whose body is `body`. `ended` is whether the body
-  /// reached its end; a body that did not is a client that hung up.
-  fn prefill_row(streamed: bool, body: &'static str, ended: bool) -> RequestRow {
-    let log = crate::proxy::request_log::RequestLog::new();
-    let sent = Instant::now()
-      .checked_sub(std::time::Duration::from_secs(10))
-      .expect("the clock has run for ten seconds");
-    let mut logged = LoggedResponse {
+  /// A response to a request that went upstream at `sent`, with nothing of
+  /// its body seen yet.
+  fn logged_response(
+    log: &crate::proxy::request_log::RequestLog,
+    streamed: bool,
+    sent: Instant,
+  ) -> LoggedResponse {
+    LoggedResponse {
       record: log.begin("/v1/chat/completions", None),
       tap: Some(ResponseTap::default()),
       content_length: None,
@@ -880,12 +835,21 @@ mod tests {
       streamed,
       sent,
       generating_since: sent,
-    };
-    logged.observe(&Some(Ok(Frame::data(Bytes::from_static(body.as_bytes())))));
-    if ended {
-      logged.observe(&None);
+      first_token: None,
     }
-    drop(logged);
+  }
+
+  fn data(body: &'static str) -> Option<Result<Frame<Bytes>, BodyError>> {
+    Some(Ok(Frame::data(Bytes::from_static(body.as_bytes()))))
+  }
+
+  fn ten_seconds_ago() -> Instant {
+    Instant::now()
+      .checked_sub(std::time::Duration::from_secs(10))
+      .expect("the clock has run for ten seconds")
+  }
+
+  fn only_row(log: &crate::proxy::request_log::RequestLog) -> RequestRow {
     log
       .tail(crate::proxy::request_log::LogScope::All, 1)
       .rows
@@ -894,14 +858,104 @@ mod tests {
       .expect("a row")
   }
 
+  /// An Anthropic stream's first event, which engines send before they compute
+  /// the prompt.
+  const MESSAGE_START: &str = r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"m","usage":{"input_tokens":1000,"output_tokens":0}}}
+
+"#;
+  const TOKEN: &str = r#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}
+
+"#;
+
+  /// The tok/s estimated for a response that reported 100 generated tokens and
+  /// no speed, and whose request went upstream ten seconds ago.
+  fn estimated_speed(streamed: bool) -> f64 {
+    let log = crate::proxy::request_log::RequestLog::new();
+    let mut logged = logged_response(&log, streamed, ten_seconds_ago());
+    logged.observe(&data(
+      r#"{"usage":{"prompt_tokens":5,"completion_tokens":100}}"#,
+    ));
+    // This body shows no token, so a stream's clock is its first byte. Here
+    // that byte arrived a second ago rather than in this instant, which would
+    // divide 100 tokens by microseconds, past the ceiling.
+    if streamed {
+      logged.generating_since = Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .expect("the clock has run for a second");
+    }
+    logged.observe(&None);
+    drop(logged);
+    let row = only_row(&log);
+    assert!(row.tokens_per_second_estimated);
+    row.tokens_per_second.expect("an estimate")
+  }
+
+  #[test]
+  fn the_speed_estimate_times_a_stream_from_where_its_clock_started() {
+    // Timed from the send, 100 tokens in ten seconds is 10 tok/s at most. A
+    // stream is timed from its clock, a second ago: 100 tok/s, not the 10 the
+    // whole wait would say.
+    let stream = estimated_speed(true);
+    assert!((90.0..=110.0).contains(&stream), "{stream}");
+    // A response that arrives whole is timed from the send.
+    let whole = estimated_speed(false);
+    assert!((9.0..=10.0).contains(&whole), "{whole}");
+  }
+
+  #[test]
+  fn a_stream_starts_its_clock_at_its_first_token_not_its_first_byte() {
+    let log = crate::proxy::request_log::RequestLog::new();
+    let sent = ten_seconds_ago();
+    let mut logged = logged_response(&log, true, sent);
+    logged.observe(&data(MESSAGE_START));
+    assert_eq!(logged.first_token, None);
+    assert_eq!(logged.prefill_window(&Usage::default()), None);
+    let first_byte = logged.generating_since;
+    assert!(first_byte > sent);
+
+    logged.observe(&data(TOKEN));
+    let first_token = logged.first_token.expect("the token starts the clock");
+    assert!(first_token >= first_byte);
+    assert_eq!(logged.generating_since, first_token);
+    assert_eq!(
+      logged.prefill_window(&Usage::default()),
+      first_token.checked_duration_since(sent)
+    );
+    logged.observe(&data(TOKEN));
+    assert_eq!(logged.first_token, Some(first_token));
+
+    // A response that arrives whole is timed from the send, whatever it holds.
+    let mut whole = logged_response(&log, false, sent);
+    whole.observe(&data(TOKEN));
+    assert_eq!((whole.first_token, whole.generating_since), (None, sent));
+  }
+
+  /// A response whose request went upstream ten seconds ago and whose body is
+  /// `frames`, all arriving just now. `ended` is whether the body reached its
+  /// end; a body that did not is a client that hung up.
+  fn prefill_row(streamed: bool, frames: &[&'static str], ended: bool) -> RequestRow {
+    let log = crate::proxy::request_log::RequestLog::new();
+    let mut logged = logged_response(&log, streamed, ten_seconds_ago());
+    for frame in frames {
+      logged.observe(&data(frame));
+    }
+    if ended {
+      logged.observe(&None);
+    }
+    drop(logged);
+    only_row(&log)
+  }
+
   /// A 1000-token prompt with 600 of it cached, 100 generated tokens, and no
   /// speed from the engine.
   const NO_ENGINE_SPEED: &str = r#"{"usage":{"prompt_tokens":1000,"completion_tokens":100,"prompt_tokens_details":{"cached_tokens":600}}}"#;
 
   #[test]
-  fn a_stream_measures_prefill_from_the_send_to_its_first_byte() {
-    // The 400 uncached tokens over the ten seconds before the first byte.
-    let row = prefill_row(true, NO_ENGINE_SPEED, true);
+  fn a_stream_measures_prefill_from_the_send_to_its_first_token() {
+    // The 400 uncached tokens over the ten seconds before the first token.
+    let row = prefill_row(true, &[MESSAGE_START, TOKEN, NO_ENGINE_SPEED], true);
     assert_eq!(row.prefill_tokens, Some(400));
     assert!(row.prefill_estimated);
     let est = row.prefill_tokens_per_second.expect("an estimate");
@@ -914,7 +968,7 @@ mod tests {
     // tokens at 50 tok/s, so two of those seconds were generation: 400
     // uncached tokens over the other eight is 50 tok/s.
     let body = r#"{"usage":{"prompt_tokens":1000,"completion_tokens":100,"completion_tokens_per_second":50,"prompt_tokens_details":{"cached_tokens":600}}}"#;
-    let row = prefill_row(false, body, true);
+    let row = prefill_row(false, &[body], true);
     assert!(row.prefill_estimated);
     let est = row.prefill_tokens_per_second.expect("an estimate");
     assert!((49.0..=50.0).contains(&est), "{est}");
@@ -928,7 +982,7 @@ mod tests {
     let too_many_tokens = r#"{"usage":{"prompt_tokens":1000,"completion_tokens":1e19,"completion_tokens_per_second":0.5,"prompt_tokens_details":{"cached_tokens":600}}}"#;
     let too_slow = r#"{"usage":{"prompt_tokens":1000,"completion_tokens":100,"completion_tokens_per_second":5e-324,"prompt_tokens_details":{"cached_tokens":600}}}"#;
     for body in [too_many_tokens, too_slow] {
-      let row = prefill_row(false, body, true);
+      let row = prefill_row(false, &[body], true);
       assert_eq!(row.state, RequestState::Done, "{body}");
       assert!(!row.prefill_estimated, "{body}");
       assert_eq!(row.prefill_tokens_per_second, None, "{body}");
@@ -939,14 +993,24 @@ mod tests {
   fn a_whole_response_with_no_engine_speed_gets_no_prefill_estimate() {
     // Its estimated generation speed already spans the whole wait, so there is
     // no prefill window left to measure.
-    let row = prefill_row(false, NO_ENGINE_SPEED, true);
+    let row = prefill_row(false, &[NO_ENGINE_SPEED], true);
+    assert!(!row.prefill_estimated);
+    assert_eq!(row.prefill_tokens_per_second, None);
+  }
+
+  #[test]
+  fn a_stream_with_no_token_gets_no_prefill_estimate() {
+    // Its first byte is a status event, which can arrive before the engine has
+    // looked at the prompt, so it says nothing about how long the prompt took.
+    let row = prefill_row(true, &[MESSAGE_START, NO_ENGINE_SPEED], true);
+    assert_eq!(row.state, RequestState::Done);
     assert!(!row.prefill_estimated);
     assert_eq!(row.prefill_tokens_per_second, None);
   }
 
   #[test]
   fn a_row_that_never_finished_gets_no_prefill_estimate() {
-    let row = prefill_row(true, NO_ENGINE_SPEED, false);
+    let row = prefill_row(true, &[TOKEN, NO_ENGINE_SPEED], false);
     assert_eq!(row.state, RequestState::ClientClosed);
     assert!(!row.prefill_estimated);
     assert_eq!(row.prefill_tokens_per_second, None);

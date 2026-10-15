@@ -304,10 +304,7 @@ fn usable_speed(v: f64) -> Option<f64> {
 fn objects_keyed(buf: &[u8], quoted_key: &[u8]) -> Vec<Map<String, Value>> {
   let mut found = Vec::new();
   let mut from = 0;
-  while let Some(at) = buf[from..]
-    .windows(quoted_key.len())
-    .position(|w| w == quoted_key)
-  {
+  while let Some(at) = find(&buf[from..], quoted_key) {
     from += at + quoted_key.len();
     let rest = skip_ws(&buf[from..]);
     let Some(rest) = rest.strip_prefix(b":") else {
@@ -330,6 +327,55 @@ fn objects_keyed(buf: &[u8], quoted_key: &[u8]) -> Vec<Map<String, Value>> {
 fn skip_ws(buf: &[u8]) -> &[u8] {
   let n = buf.iter().take_while(|b| b.is_ascii_whitespace()).count();
   &buf[n..]
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+  haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Whether a piece of a streamed body holds a generated token.
+///
+/// A stream's first byte does not mean the prompt is done: an engine can open
+/// with a status event (`message_start`, `response.created`, a chat chunk that
+/// only sets the role) before it computes the prompt. The first token does.
+/// The needles are keys and event types, and a quote inside a JSON string is
+/// escaped, so token text cannot match one. A needle split across two pieces
+/// matches on the next token instead.
+pub(crate) fn carries_token(chunk: &[u8]) -> bool {
+  // Anthropic text, thinking and tool input all arrive in this event, and
+  // every Responses event that streams output has a type ending `.delta`.
+  // `message_delta` ends `_delta"`, and it carries no token.
+  const EVENTS: [&[u8]; 2] = [b"content_block_delta", b".delta\""];
+  // Chat and text completion deltas. A role-only chunk has `"content":""`
+  // or `null`, and a `response.created` echoes `"text":{"format":...}`.
+  const STRINGS: [&[u8]; 4] = [
+    b"\"content\":",
+    b"\"reasoning_content\":",
+    b"\"reasoning\":",
+    b"\"text\":",
+  ];
+  EVENTS.iter().any(|n| find(chunk, n).is_some())
+    || STRINGS
+      .iter()
+      .any(|key| some_value(chunk, key, |v| matches!(v, [b'"', c, ..] if *c != b'"')))
+    || some_value(
+      chunk,
+      b"\"tool_calls\":",
+      |v| matches!(v, [b'[', rest @ ..] if skip_ws(rest).starts_with(b"{")),
+    )
+}
+
+/// Whether the value after some occurrence of `key` in `buf` passes `test`,
+/// given the bytes from the value's first character on.
+fn some_value(buf: &[u8], key: &[u8], test: impl Fn(&[u8]) -> bool) -> bool {
+  let mut from = 0;
+  while let Some(at) = find(&buf[from..], key) {
+    from += at + key.len();
+    if test(skip_ws(&buf[from..])) {
+      return true;
+    }
+  }
+  false
 }
 
 #[cfg(test)]
@@ -529,6 +575,83 @@ mod tests {
         ..Usage::default()
       }
     );
+  }
+
+  #[test]
+  fn status_events_carry_no_token() {
+    // What engines send before they compute the prompt. Engines were seen
+    // sending the first of these 2 to 48 ms after the request, long before
+    // the prompt was done.
+    let status = [
+      concat!(
+        "event: message_start\n",
+        r#"data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"m","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":41,"output_tokens":0}}}"#,
+        "\n\n",
+      ),
+      "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+      concat!(
+        "event: content_block_start\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+      ),
+      concat!(
+        "event: response.created\n",
+        r#"data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_1","object":"response","status":"in_progress","model":"m","output":[],"text":{"format":{"type":"text"}},"usage":null}}"#,
+        "\n\n",
+      ),
+      concat!(
+        "event: response.in_progress\n",
+        r#"data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_1","object":"response","status":"in_progress","output":[]}}"#,
+        "\n\n",
+      ),
+      concat!(
+        "event: response.output_item.added\n",
+        r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message","status":"in_progress","role":"assistant","content":[]}}"#,
+        "\n\n",
+      ),
+      concat!(
+        "event: response.content_part.added\n",
+        r#"data: {"type":"response.content_part.added","item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}"#,
+        "\n\n",
+      ),
+      r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}],"object":"chat.completion.chunk"}"#,
+      r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":null}}],"object":"chat.completion.chunk"}"#,
+      r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[]}}],"object":"chat.completion.chunk"}"#,
+      r#"data: {"choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]}"#,
+    ];
+    for event in status {
+      assert!(!carries_token(event.as_bytes()), "{event}");
+    }
+  }
+
+  #[test]
+  fn token_events_carry_a_token() {
+    let tokens = [
+      r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#,
+      r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let"}}"#,
+      r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":""}}"#,
+      r#"data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"Hi"}"#,
+      r#"data: {"type":"response.reasoning_text.delta","item_id":"rs_1","output_index":0,"content_index":0,"delta":"Let"}"#,
+      r#"data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":1,"delta":"{\""}"#,
+      r#"data: {"choices":[{"index":0,"delta":{"content":"Hi"}}],"object":"chat.completion.chunk"}"#,
+      r#"data: {"choices":[{"index":0,"delta":{"content":"\n"}}],"object":"chat.completion.chunk"}"#,
+      r#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"Let"}}],"object":"chat.completion.chunk"}"#,
+      r#"data: {"choices":[{"index":0,"delta":{"reasoning":"Let"}}],"object":"chat.completion.chunk"}"#,
+      r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get","arguments":""}}]}}]}"#,
+      r#"data: {"choices":[{"text":"Hi","index":0,"finish_reason":null}],"object":"text_completion"}"#,
+      r#"data: {"choices": [{"index": 0, "delta": {"content": "Hi"}}]}"#,
+    ];
+    for event in tokens {
+      assert!(carries_token(event.as_bytes()), "{event}");
+    }
+    // A role-only chunk and the first token in one piece.
+    let both = concat!(
+      r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}"#,
+      "\n\n",
+      r#"data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}"#,
+      "\n\n",
+    );
+    assert!(carries_token(both.as_bytes()));
   }
 
   #[test]
