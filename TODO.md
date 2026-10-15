@@ -487,7 +487,9 @@ _Shared context: Alias resolution in the proxy, the `/v1/models` and `/api/tags`
 
 _Shared context: The `/ui` reverse proxy and which engines serve a UI of their own._
 
-- [ ] Bundle the llamacpp UI for other engines with no UI? Start on first request.
+- [x] ~~Bundle the llamacpp UI for other engines with no UI? Start on first request.~~ — done: the UI ships in the binary (`data/llama-ui/`, unpacked on the first request that needs it), and a chat launch on an engine with no UI gets it at `/ui`. The proxy answers the one llama.cpp-only route the page needs and forwards its `/v1` traffic to the engine. Plan: [`docs/plans/2026-10-15-001-feat-engine-web-ui-plan.md`](docs/plans/2026-10-15-001-feat-engine-web-ui-plan.md).
+- [ ] **Router mode for the bundled UI (approach B).** Serve one bundled UI for every engine, as a llama.cpp router: `/props` answers `role: "router"`, the page's own picker lists the catalog, and chat goes through normal proxy routing. It would drop the chooser, `/ui/switch` and the one-reload-two-UI-versions quirk, at the cost of following upstream's router API. Origin doc: [`docs/brainstorms/2026-10-15-engine-web-ui-requirements.md`](docs/brainstorms/2026-10-15-engine-web-ui-requirements.md) § Key Decisions.
+- [ ] **Exercise the bundled UI on a real vLLM, SGLang, gufo and Halogen launch.** Only a generic entry running `llama-server --no-ui` has been checked so far (engine b11658 against the bundled UI b11642, on the XPS). Needs a CUDA host for the rest, and it has to confirm whether gufo and Halogen accept the extra request fields the page sends (`return_progress`, `sse_ping_interval`, `reasoning_format`).
 
 ### Batch 6: Generic-backend engines and the multiplexer decision
 

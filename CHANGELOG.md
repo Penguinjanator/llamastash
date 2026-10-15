@@ -4,6 +4,10 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ## [Unreleased]
 
+### Added
+
+- `/ui` opens a chat page for engines that ship no web UI of their own (vLLM, SGLang, generic entries): a copy of the llama.cpp UI rides in the binary, so every chat launch has one.
+
 ### Fixed
 
 - External `llama-server` rows refresh every 30 s instead of only at daemon start, so a server started after boot appears, one that exits disappears, and the port its argv carries shows in `status` and the TUI (#111).

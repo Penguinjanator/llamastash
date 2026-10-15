@@ -1252,13 +1252,23 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:11435 \
 
 ### Web UI (`/ui`)
 
-Open `http://127.0.0.1:11435/ui/` in a browser (swap in the actual `proxy.listen` port if it roamed) to use the running model's stock llama.cpp web UI through the proxy — one stable address, so you never have to look up the ephemeral backend port. Chat history persists across model switches because it's keyed to the browser origin, which never changes.
+Open `http://127.0.0.1:11435/ui/` in a browser (swap in the actual `proxy.listen` port if it roamed) to chat with the running model through the proxy — one stable address, so you never have to look up the ephemeral backend port. Chat history persists across model switches because it's keyed to the browser origin, which never changes.
+
+A launch gets its UI from one of two places. If its engine serves a web UI (llama.cpp does), `/ui` reverse-proxies the engine's own. If the engine serves none, which is the case for vLLM, SGLang and generic entries like gufo or Halogen, a **chat** launch gets a copy of the llama.cpp UI embedded in the llamastash binary (build `b11642`, recorded with its sha256 in `data/llama-ui/VERSION`). It reads the engine through the same `/v1` surface the API uses, so it asks for the model name the engine accepts, shows the launch's context window in its gauge (what the engine resolved, or what the launch asked for), and offers image attach only when the model takes images (a vision projector, or `vision: true` on a generic entry without a GGUF). A non-chat launch has no chat page to show, so it gets no UI.
 
 - **One model running:** `/ui/` opens its UI directly.
-- **Several running:** `/ui/` shows a small chooser; pick one and the browser reloads onto it. The pick is remembered in a `ls_ui_target` cookie (scoped to `/ui`), so assets and chat requests stay pinned to that model. The chooser lists **running** models only; start a stopped one from the TUI / `llamastash start <model>` first. Rows are coloured by whether they open: a **green** name has a web UI and is a link, a **red** one is running on a backend that serves no browser interface, so it is listed for visibility and is not a link.
+- **Several running:** `/ui/` shows a small chooser; pick one and the browser reloads onto it. The pick is remembered in a `ls_ui_target` cookie (scoped to `/ui`), so assets and chat requests stay pinned to that model. The chooser lists **running** models only; start a stopped one from the TUI / `llamastash start <model>` first. Rows are coloured by whether they open: a **green** name has a UI, its engine's own or the embedded one, and is a link; a **red** one has nothing to open, so it is listed for visibility and is not a link.
 - **None running:** `/ui/` shows a "no model running" page pointing you at the TUI / CLI.
 
 **Switching models.** Once you've picked a model, `/ui/` keeps forwarding to it (that's the cookie pin). To pick a different one, open `http://127.0.0.1:11435/ui/switch` — it always re-shows the chooser and marks the model you're currently on. Bookmark it; the stock chat UI has no in-page switcher and llamastash deliberately doesn't inject one. You can also jump straight to a specific model with `http://127.0.0.1:11435/ui/?target=<launch-id>` (the `L1` / `L2` ids from `llamastash status`), which re-pins and reloads — this is exactly what the chooser links do under the hood.
+
+**Limits of the embedded UI.** It is llama.cpp's page driven against a different engine, and it sends only what every engine answers (`/v1/models` and `/v1/chat/completions`). So:
+
+- Thinking text stays hidden on vLLM: it streams `delta.reasoning`, the UI reads `delta.reasoning_content`.
+- llama.cpp-only features have nothing behind them and are off: the slots view, stream resume, and server-side tools.
+- The page is cached by a service worker. After switching between a llama.cpp model and an embedded-UI model, one reload can show the other version of the page.
+
+Checked live on 2026-10-15 with the bundled UI `b11642` against a generic entry running `llama-server` `b11658` started with `--no-ui`, so nothing else served the page: the UI loaded, `/ui/props` reported the launch's ctx, and answers streamed token by token. vLLM, SGLang, gufo and Halogen are not exercised yet (see [`TODO.md`](../TODO.md)), including whether they accept the extra request fields this UI sends.
 
 `/ui` is reachable over [LAN](#lan-access-opt-in-behind-a-key) too. A browser can't send a bearer header by navigating, so when a key is configured the proxy answers `/ui` with `WWW-Authenticate: Basic`: the browser prompts once, you paste the proxy key as the **password** (any username), and it's remembered per-origin. Same key as the API path, no login page, no key-in-URL. On the keyless loopback default there's no prompt. As with the API, LAN mode is plaintext HTTP (no TLS yet), so the key crosses the wire as base64 — keep it on a trusted network.
 

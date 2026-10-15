@@ -118,7 +118,7 @@ From the origin doc (see origin: `docs/brainstorms/2026-10-15-engine-web-ui-requ
 
 All four run in one lane, in order. None can run in parallel (U2 needs U1's archive; U3 documents U2; U4 calls U1's script).
 
-- [ ] **Unit 1: Vendored UI archive, refresh script, NOTICE**
+- [x] **Unit 1: Vendored UI archive, refresh script, NOTICE**
 
 **Goal:** The pinned UI archive is in the repo, a script refreshes it, and the license notice ships.
 
@@ -149,7 +149,7 @@ All four run in one lane, in order. None can run in parallel (U2 needs U1's arch
 - `scripts/llama-ui/update.sh b11642` writes both files; `VERSION` says `b11642`; running it again reports no change and leaves `git status` clean.
 - `cargo package --no-verify --allow-dirty` produces a `.crate` under 10 MiB, and `cargo package --list --allow-dirty` includes `data/llama-ui/dist.tar.gz`.
 
-- [ ] **Unit 2: Serve the bundled UI for UI-less chat launches**
+- [x] **Unit 2: Serve the bundled UI for UI-less chat launches**
 
 **Goal:** `/ui` opens a working chat for a UI-less chat launch, with llama.cpp launches unchanged.
 
@@ -187,7 +187,7 @@ All four run in one lane, in order. None can run in parallel (U2 needs U1's arch
 - Unit tests above pass; `tests/proxy_ui.rs` passes.
 - E2E against a real engine, isolated daemon (see Verification below): a generic entry running real `llama-server --no-ui` on a 1B GGUF opens the bundled UI at `/ui/`, `/ui/props` reports the same ctx as `status --json` `ctx` for that launch (4096), a streamed `/ui/v1/chat/completions` returns tokens, `/ui/slots` returns 404. A llama.cpp launch beside it still serves its own UI when pinned.
 
-- [ ] **Unit 3: Docs, CHANGELOG, TODO**
+- [x] **Unit 3: Docs, CHANGELOG, TODO**
 
 **Goal:** Docs match the new behavior; open work is indexed.
 
