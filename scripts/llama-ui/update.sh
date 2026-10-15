@@ -54,7 +54,9 @@ if [[ "$actual" != "$expected" ]]; then
 fi
 
 # The archive member paths are all prefixed with ./.
-build="$(tar xzf "$tmp/$ARCHIVE" ./build.json -O | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+# `|| true` keeps a failing tar from tripping `set -e` inside the substitution,
+# so the guard below is what reports the problem.
+build="$(tar xzf "$tmp/$ARCHIVE" ./build.json -O | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1 || true)"
 if [[ ! "$build" =~ ^b[0-9]+$ ]]; then
   echo "refusing: build.json inside the archive has no usable version (got: $build)" >&2
   exit 1
