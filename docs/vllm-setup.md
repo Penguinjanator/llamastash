@@ -203,7 +203,25 @@ channel where it is labelled for what it is.
   out alone and vLLM's own `0.92` check applies. Discrete-GPU hosts are
   untouched; there the fraction applies to real VRAM.
 - **The model name is the repo id.** LlamaStash passes `--served-model-name`, so
-  `/v1/models` and your requests use `owner/name`, not the cache path.
+  `/v1/models` and your requests use `owner/name`, not the cache path. vLLM
+  answers to that name only, and the proxy forwards the `model` a client sent,
+  so a `proxy.aliases` name for a vLLM model gets vLLM's own `404`
+  (`NotFoundError`).
+- **The request log gets less from vLLM than from llama.cpp.** Measured on vLLM
+  0.27.1 with Qwen2.5-0.5B-Instruct:
+  - vLLM sends no speed of its own, so every `TOK/S` is the proxy's `~`
+    estimate, and a response that arrives whole never gets a `PP/S`.
+  - By default only `/v1/responses` reports a cached count. Chat and
+    completions send `prompt_tokens_details: null` and `/v1/messages` sends no
+    cache field, so those rows have no `cached_tokens` and no `PP/S`. Start the
+    model with `-- --enable-prompt-tokens-details` (still off by default in
+    0.31.0) and they carry the count, and a streamed row gets an estimated
+    `PP/S`.
+  - A streamed `/v1/responses` sends `response.created` before vLLM computes
+    the prompt, so the estimate's window is the 9-12 ms to that event and
+    `PP/S` reads about 10x too fast: 197,521 tok/s, where a streamed chat with
+    a prompt of the same size read 20,324 and vLLM's own `/metrics` averaged
+    17.7k over the run. The fix is open in `TODO.md`.
 - **No GGUF on vLLM.** A GGUF binds llama.cpp. vLLM claims safetensors
   repos only.
 - **Single-host only.** Tensor parallel across local GPUs is exposed;
