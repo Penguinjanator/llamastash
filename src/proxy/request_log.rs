@@ -1810,6 +1810,19 @@ mod tests {
   }
 
   #[test]
+  fn a_whole_response_with_an_estimated_speed_covers_its_whole_wait() {
+    // A response that arrives whole and gets its speed estimated spans the whole
+    // wait, queue time and prompt processing included. The window cannot be
+    // shorter than that wait, so such a row pulls the aggregate down and
+    // stretches `busy_ms`, which is what it really was.
+    let whole = RequestRow {
+      tokens_per_second_estimated: true,
+      ..generated_row(0, 10_000, 100, 10.0)
+    };
+    assert_eq!(throughput_of([whole]), (Some(10.0), Some(10_000)));
+  }
+
+  #[test]
   fn aggregate_throughput_counts_rows_cut_short_by_client_or_upstream() {
     // A cancelled generation still happened: the engine put those tokens out,
     // so the box did produce them and the figure has to say so.

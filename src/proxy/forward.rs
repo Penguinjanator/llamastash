@@ -815,6 +815,12 @@ mod tests {
     let ten_seconds_ago = Instant::now()
       .checked_sub(std::time::Duration::from_secs(10))
       .expect("the clock has run for ten seconds");
+    // A stream's window runs to the first byte, and the first byte has to be
+    // some time ago for the estimate to be a speed at all: a byte that lands in
+    // this instant divides 100 tokens by microseconds, which is past the ceiling.
+    let one_second_ago = Instant::now()
+      .checked_sub(std::time::Duration::from_secs(1))
+      .expect("the clock has run for a second");
     let mut logged = LoggedResponse {
       record: log.begin("/v1/chat/completions", None),
       tap: Some(ResponseTap::default()),
@@ -827,7 +833,11 @@ mod tests {
       generating_since: ten_seconds_ago,
     };
     let body = Bytes::from_static(br#"{"usage":{"prompt_tokens":5,"completion_tokens":100}}"#);
-    logged.observe(&Some(Ok(Frame::data(body))));
+    logged.observe(&Some(Ok(Frame::data(body.clone()))));
+    // The first byte arrived a second ago rather than in this instant.
+    if streamed {
+      logged.generating_since = one_second_ago;
+    }
     logged.observe(&None);
     drop(logged);
     let row = log
@@ -842,10 +852,11 @@ mod tests {
 
   #[test]
   fn the_speed_estimate_times_a_stream_from_its_first_byte() {
-    // Timed from the send, 100 tokens in ten seconds is 10 tok/s at most.
-    // A stream is timed from its first byte, which arrived just now.
+    // Timed from the send, 100 tokens in ten seconds is 10 tok/s at most. A
+    // stream is timed from its first byte, a second ago: 100 tok/s, not the 10
+    // the whole wait would say.
     let stream = estimated_speed(true);
-    assert!(stream > 100.0, "{stream}");
+    assert!((90.0..=110.0).contains(&stream), "{stream}");
     // A response that arrives whole is timed from the send.
     let whole = estimated_speed(false);
     assert!((9.0..=10.0).contains(&whole), "{whole}");
