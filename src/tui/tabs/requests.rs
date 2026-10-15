@@ -76,9 +76,9 @@ const COLUMNS: &[Column<ColumnId>] = &[
     id: ColumnId::Prefill,
     label: "PP/s",
     // Prompt tokens per second, beside the generation speed it follows. Same
-    // width, and it drops after `Request for` and before `Note`.
+    // width, and it drops after `Note`.
     width: 6,
-    rank: 75,
+    rank: 70,
   },
   Column {
     id: ColumnId::Total,
@@ -131,11 +131,11 @@ const COLUMNS: &[Column<ColumnId>] = &[
   Column {
     id: ColumnId::Note,
     // Last, so the free text grows to the right of the fixed figures and
-    // nothing shifts under it. Rank 70 still puts it ahead of `Request for`,
-    // `Client` and `Route` in the drop order.
+    // nothing shifts under it. Rank 75 keeps it until `Request for`,
+    // `Client` and `Route` have gone, and drops it before `PP/s`.
     label: "Note",
     width: MIN_NOTE_W,
-    rank: 70,
+    rank: 75,
   },
 ];
 
@@ -442,7 +442,7 @@ mod tests {
   fn columns_drop_by_rank_as_the_pane_narrows() {
     // Each column costs its width plus one separator. Running totals in
     // rank order: Time 9, Code 14, Tok/s 21, Total 29, TTFB 37, In 44,
-    // Out 51, Note 62, PP/s 69, Request for 94, Client 116, Route 133.
+    // Out 51, PP/s 58, Note 69, Request for 94, Client 116, Route 133.
     // `Note` shows last but outranks the four columns before it, so it stays
     // when they have gone.
     let full = [
@@ -490,23 +490,23 @@ mod tests {
     ];
     assert_eq!(labels(115), no_client);
     assert_eq!(labels(94), no_client);
-    // `PP/s` is the next to go, and `Note` outlasts it.
+    // `Note` is the next to go, and `PP/s` outlasts it.
     let no_request_for = [
       "Time", "Code", "Tok/s", "PP/s", "Total", "TTFB", "In", "Out", "Note",
     ];
     assert_eq!(labels(93), no_request_for);
     assert_eq!(labels(69), no_request_for);
-    let no_prefill = [
-      "Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out", "Note",
+    let no_note = [
+      "Time", "Code", "Tok/s", "PP/s", "Total", "TTFB", "In", "Out",
     ];
-    assert_eq!(labels(68), no_prefill);
-    assert_eq!(labels(62), no_prefill);
+    assert_eq!(labels(68), no_note);
+    assert_eq!(labels(58), no_note);
     assert_eq!(
-      labels(61),
+      labels(57),
       vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out"]
     );
     assert_eq!(
-      labels(57),
+      labels(51),
       vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out"]
     );
     assert_eq!(
