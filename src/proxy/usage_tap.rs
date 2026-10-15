@@ -23,6 +23,11 @@ use serde_json::{Map, Value};
 pub(crate) const HEAD_CAP: usize = 4 * 1024;
 /// Bytes kept from the end of a response.
 pub(crate) const TAIL_CAP: usize = 8 * 1024;
+/// The fastest speed a row can carry, in tokens per second, reported or
+/// estimated. Nothing near this runs today; above it a number is a broken body.
+pub(crate) const SPEED_CEILING: f64 = 1_000_000.0;
+/// The longest `prompt_ms` accepted: one day, in milliseconds.
+const MAX_PROMPT_MS: f64 = 86_400_000.0;
 
 /// What the tap read. A field the response did not carry is `None`.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -51,13 +56,14 @@ impl Usage {
   /// When the server reported no speed, estimate it as the generated
   /// tokens over `window`, the time generation took by the proxy's clock.
   /// A server-reported speed is never replaced, and without a token count
-  /// there is nothing to estimate from.
+  /// or a window wide enough to say something there is nothing to estimate.
   pub fn estimate_speed(&mut self, window: std::time::Duration) {
-    let secs = window.as_secs_f64();
     match self.completion_tokens {
-      Some(tokens) if self.tokens_per_second.is_none() && tokens > 0 && secs > 0.0 => {
-        self.tokens_per_second = Some(tokens as f64 / secs);
-        self.tokens_per_second_estimated = true;
+      Some(tokens) if self.tokens_per_second.is_none() => {
+        if let Some(tps) = usable_speed(tokens as f64 / window.as_secs_f64()) {
+          self.tokens_per_second = Some(tps);
+          self.tokens_per_second_estimated = true;
+        }
       }
       _ => {}
     }
@@ -71,18 +77,20 @@ impl Usage {
   /// tokens from cache hits, and an agent prompt is mostly cache hits, so
   /// assuming none were would overstate the speed many times over.
   pub fn estimate_prefill(&mut self, window: std::time::Duration) {
-    let secs = window.as_secs_f64();
     let (Some(prompt), Some(cached)) = (self.prompt_tokens, self.cached_tokens) else {
       return;
     };
     let Some(uncached) = prompt.checked_sub(cached).filter(|n| *n > 0) else {
       return;
     };
-    if self.prefill_tokens_per_second.is_some() || secs <= 0.0 {
+    if self.prefill_tokens_per_second.is_some() {
       return;
     }
+    let Some(tps) = usable_speed(uncached as f64 / window.as_secs_f64()) else {
+      return;
+    };
     self.prefill_tokens = Some(uncached);
-    self.prefill_tokens_per_second = Some(uncached as f64 / secs);
+    self.prefill_tokens_per_second = Some(tps);
     self.prefill_estimated = true;
   }
 }
@@ -188,7 +196,7 @@ impl Fields {
     }
     for obj in objects_keyed(buf, b"\"timings\"") {
       set(&mut self.prompt_n, count(&obj, "prompt_n"));
-      set(&mut self.prompt_ms, rate(&obj, "prompt_ms"));
+      set(&mut self.prompt_ms, duration_ms(&obj, "prompt_ms"));
       set(&mut self.cache_n, count(&obj, "cache_n"));
       set(&mut self.predicted_n, count(&obj, "predicted_n"));
       set(&mut self.timings_tps, rate(&obj, "predicted_per_second"));
@@ -221,10 +229,9 @@ impl Fields {
     // bodies captured from llama-server it lands on exactly that field. A `ms`
     // small enough to overflow the quotient is no speed.
     let prefill_tps = match (self.prompt_n, self.prompt_ms) {
-      (Some(tokens), Some(ms)) if tokens > 0 => Some(tokens as f64 * 1000.0 / ms),
+      (Some(tokens), Some(ms)) if tokens > 0 => usable_speed(tokens as f64 * 1000.0 / ms),
       _ => None,
-    }
-    .filter(|tps| tps.is_finite());
+    };
     let cached = self
       .cache_n
       .or(self.cached_in_prompt_details)
@@ -266,7 +273,25 @@ fn nested_count(obj: &Map<String, Value>, key: &str, field: &str) -> Option<u64>
 }
 
 fn rate(obj: &Map<String, Value>, key: &str) -> Option<f64> {
-  obj.get(key)?.as_f64().filter(|f| f.is_finite() && *f > 0.0)
+  obj.get(key)?.as_f64().and_then(usable_speed)
+}
+
+/// A `prompt_ms` a row may use. It is a duration, not a rate, so it gets its
+/// own ceiling: one day of prompt processing. Anything longer is a body that
+/// means something else, and a totals sum lives for the life of the daemon.
+fn duration_ms(obj: &Map<String, Value>, key: &str) -> Option<f64> {
+  obj
+    .get(key)?
+    .as_f64()
+    .filter(|ms| ms.is_finite() && *ms > 0.0 && *ms <= MAX_PROMPT_MS)
+}
+
+/// Every speed a row can carry, from an engine or from the proxy's own clock,
+/// goes through here. A speed past `SPEED_CEILING` is not a speed: it prints
+/// hundreds of digits in a six-cell column, and `Totals` turns it into seconds
+/// that swallow the scope's sum and the `/metrics` sample with it.
+fn usable_speed(v: f64) -> Option<f64> {
+  (v.is_finite() && v > 0.0 && v <= SPEED_CEILING).then_some(v)
 }
 
 /// Every JSON object in `buf` that is the value of `quoted_key` (the key
@@ -348,6 +373,52 @@ mod tests {
     let usage = usage_of(body);
     assert_eq!(usage.prefill_tokens, Some(41));
     assert_eq!(usage.prefill_tokens_per_second, None);
+  }
+
+  #[test]
+  fn a_prompt_timing_longer_than_a_day_is_no_timing() {
+    // A `prompt_ms` this large is not a prompt. `Totals` divides the tokens by
+    // the speed and keeps the seconds for the life of the daemon, so an
+    // astronomic one moves `prefill_seconds_total` forever and drops the
+    // `/metrics` sample once the sum is not finite.
+    let body = r#"{"usage":{"prompt_tokens":41,"completion_tokens":3},"timings":{"cache_n":0,"prompt_n":41,"prompt_ms":86400001,"predicted_n":3,"predicted_per_second":39.6}}"#;
+    let usage = usage_of(body);
+    assert_eq!(usage.prefill_tokens_per_second, None);
+    assert_eq!(usage.tokens_per_second, Some(39.6));
+  }
+
+  #[test]
+  fn a_speed_past_the_ceiling_is_no_speed() {
+    // Reported, not estimated: a body can send anything under
+    // `predicted_per_second`, and one past the ceiling is not a speed.
+    let body = r#"{"usage":{"prompt_tokens":41,"completion_tokens":3},"timings":{"cache_n":0,"prompt_n":41,"prompt_ms":0.00004,"predicted_n":3,"predicted_per_second":5e6}}"#;
+    let usage = usage_of(body);
+    assert_eq!(usage.tokens_per_second, None);
+    // The prefill quotient clears the ceiling the same way: 41 tokens in
+    // 0.04 microseconds.
+    assert_eq!(usage.prefill_tokens_per_second, None);
+  }
+
+  #[test]
+  fn an_estimate_past_the_ceiling_is_no_estimate() {
+    // A window the clock can barely see would say a million tokens a second.
+    let mut usage = Usage {
+      completion_tokens: Some(10_000),
+      ..Usage::default()
+    };
+    usage.estimate_speed(std::time::Duration::from_nanos(1));
+    assert_eq!(usage.tokens_per_second, None);
+    assert!(!usage.tokens_per_second_estimated);
+
+    let mut prefill = Usage {
+      prompt_tokens: Some(2_000_000),
+      cached_tokens: Some(0),
+      ..Usage::default()
+    };
+    prefill.estimate_prefill(std::time::Duration::from_millis(1));
+    assert_eq!(prefill.prefill_tokens_per_second, None);
+    assert!(!prefill.prefill_estimated);
+    assert_eq!(prefill.prefill_tokens, None);
   }
 
   #[test]

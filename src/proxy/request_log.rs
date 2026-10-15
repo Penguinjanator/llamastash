@@ -220,7 +220,7 @@ impl RequestRow {
         } else {
           ""
         };
-        format!("{mark}{t:.1}")
+        format!("{mark}{}", fmt_tps(t))
       })),
       prefill: or_none(self.prefill_tokens_per_second.map(|t| {
         let mark = if self.prefill_estimated { "~" } else { "" };
@@ -291,16 +291,21 @@ fn fmt_count(n: u64) -> String {
   }
 }
 
-/// A prefill speed for a table cell: one decimal below 1000, a whole number
-/// from there up, so `~12345` still fits the six cells the column gives it.
+/// A speed for a table cell: one decimal below 1000, a whole number to
+/// 99,999.4, and whole thousands with a `k` from there up, so `~` plus the
+/// value always fits the six cells the column gives it.
 fn fmt_tps(v: f64) -> String {
   // One decimal of thousands rounds up to `1000.0` from here, which costs a
   // cell more than the column has.
   const WHOLE_FROM: f64 = 999.95;
+  // A whole number runs past the column from here, so thousands take a `k`.
+  const KILO_FROM: f64 = 99_999.5;
   if v < WHOLE_FROM {
     format!("{v:.1}")
-  } else {
+  } else if v < KILO_FROM {
     format!("{v:.0}")
+  } else {
+    format!("{:.0}k", v / 1_000.0)
   }
 }
 
@@ -370,12 +375,13 @@ pub struct RequestSummary {
   /// [`Self::connections`] over the requests in flight right now.
   pub live_connections: Option<u64>,
   pub prompt_tokens: u64,
-  /// Prompt tokens served from the KV cache.
+  /// Prompt tokens served from the KV cache, on the rows that report a prompt
+  /// count too.
   pub cached_tokens: u64,
-  /// [`Self::cached_tokens`] over the prompt tokens of the rows that carried a
-  /// cached count. `None` when none did, which is what a server that reports
-  /// neither a cached count nor `timings` reads as. A row with a cached count
-  /// and no prompt count is left out of both halves, so this never reads above 1.
+  /// [`Self::cached_tokens`] over the prompt tokens they were served from. Both
+  /// halves come from rows that reported each, so a server that reports neither
+  /// reads `None`, which is not the same answer as `0`, and the ratio is at most
+  /// 1.
   pub cache_hit_ratio: Option<f64>,
   pub completion_tokens: u64,
   /// Requests that started the model.
@@ -389,10 +395,7 @@ impl RequestSummary {
   /// for a figure no request has supplied yet.
   pub fn cells(&self, none: &str) -> Vec<(&'static str, String)> {
     let ms = |v: Option<u64>| v.map(fmt_ms).unwrap_or_else(|| none.to_string());
-    let tps = |v: Option<f64>| {
-      v.map(|t| format!("{t:.1}"))
-        .unwrap_or_else(|| none.to_string())
-    };
+    let tps = |v: Option<f64>| v.map(fmt_tps).unwrap_or_else(|| none.to_string());
     let num = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_else(|| none.to_string());
     vec![
       ("Requests", self.requests.to_string()),
@@ -409,7 +412,7 @@ impl RequestSummary {
       (
         "Agg tok/s",
         match (self.tokens_per_second_aggregate, self.busy_ms) {
-          (Some(t), Some(busy)) => format!("{:.1} over {}", t, fmt_ms(busy)),
+          (Some(t), Some(busy)) => format!("{} over {}", fmt_tps(t), fmt_ms(busy)),
           _ => none.to_string(),
         },
       ),
@@ -424,7 +427,7 @@ impl RequestSummary {
     .chain(
       self
         .tokens_per_second_session
-        .map(|t| ("Tok/s session", format!("{t:.1}"))),
+        .map(|t| ("Tok/s session", fmt_tps(t))),
     )
     .chain([
       ("Tokens in", fmt_count(self.prompt_tokens)),
@@ -635,9 +638,6 @@ struct Totals {
   /// Cached tokens, and the prompt tokens of just the rows that carried a
   /// cached count, which are the two halves of the hit ratio.
   cached_tokens: u64,
-  /// The numerator of the hit ratio: the cached counts that had a prompt count
-  /// to sit against. `cached_tokens` alone can outrun the denominator when a
-  /// row reports a cached count and no prompt count.
   ratio_cached_tokens: u64,
   cached_prompt_tokens: u64,
   prompt_tokens: u64,
@@ -678,8 +678,6 @@ impl Totals {
     }
     if let Some(cached) = row.cached_tokens {
       self.cached_tokens = self.cached_tokens.saturating_add(cached);
-      // Both halves of the ratio come from one row or from neither, and a row
-      // cannot have reused more of its prompt than the prompt it reports.
       if let Some(prompt) = row.prompt_tokens {
         self.ratio_cached_tokens = self.ratio_cached_tokens.saturating_add(cached.min(prompt));
         self.cached_prompt_tokens = self.cached_prompt_tokens.saturating_add(prompt);
@@ -2399,6 +2397,17 @@ mod tests {
       Some(1.0),
       "a ratio above 1 is not a hit rate"
     );
+  }
+
+  #[test]
+  fn speeds_pick_a_unit_by_size() {
+    assert_eq!(fmt_tps(38.9), "38.9");
+    assert_eq!(fmt_tps(999.9), "999.9");
+    assert_eq!(fmt_tps(1_000.0), "1000");
+    assert_eq!(fmt_tps(99_999.4), "99999");
+    assert_eq!(fmt_tps(99_999.5), "100k");
+    // The ceiling the tap allows, with the `~` an estimate adds: six cells.
+    assert_eq!(fmt_tps(1_000_000.0), "1000k");
   }
 
   #[test]
