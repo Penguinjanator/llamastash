@@ -324,10 +324,11 @@ enum BundledRoute<'a> {
 
 fn classify_bundled(stripped: &str) -> BundledRoute<'_> {
   let path = stripped.split('?').next().unwrap_or("/");
-  if path.split('/').any(is_dot_segment) {
-    // Dot segments are answered before the prefix tests: the forward client
-    // collapses them, so `/ui/v1/../../x` would hand the engine a path
-    // outside `/v1`.
+  if client_path(path).as_deref() != Some(path) {
+    // A path the forward client resolves to something else (a dot segment in
+    // any of its spellings) is answered from the bundle, so it can only be a
+    // 404. Checking before the prefix tests is what keeps `/v1/x/\..\..\x`
+    // from reaching the engine as `/x`.
     return BundledRoute::File(path);
   }
   if path == "/props" {
@@ -354,12 +355,17 @@ fn classify_bundled(stripped: &str) -> BundledRoute<'_> {
   }
 }
 
-/// Whether one path segment is a dot segment once percent-encoding is
-/// accounted for. The URL layer decodes `%2e` and `%2E` before it collapses
-/// dot segments, so `/ui/v1/%2e%2e/%2e%2e/health` reaches the engine the same
-/// way a literal `../..` would.
-fn is_dot_segment(segment: &str) -> bool {
-  segment.replace("%2e", ".").replace("%2E", ".") == ".."
+/// The path the forward client would put on the wire for this request path.
+/// It runs the path through the same URL parser reqwest parses its request
+/// URL with, so dot segments come out resolved in every spelling that parser
+/// accepts: literal `..`, `%2e%2e` (with any casing) and backslash separators.
+/// `None` when the path will not parse at all, which is refused the same way.
+fn client_path(path: &str) -> Option<String> {
+  reqwest::Url::parse("http://localhost")
+    .ok()?
+    .join(path)
+    .ok()
+    .map(|url| url.path().to_string())
 }
 
 /// Serve a bundled-UI request: `/props` is ours, `/v1/...` goes to the engine,
@@ -874,11 +880,12 @@ mod tests {
       "/v1/../../secret",
       "/../etc/passwd",
       "/a/../b",
-      // The URL layer decodes these before collapsing dot segments, so an
-      // encoded pair escapes exactly like a literal one.
+      // Every spelling the URL parser the forward client uses resolves:
+      // percent-encoded dots in any casing, and backslash separators.
       "/v1/%2e%2e/%2e%2e/metrics",
       "/v1/%2E%2e/%2E%2e/health",
       "/v1/.%2e/%2e./health",
+      "/v1/x/\\..\\..\\health",
     ] {
       assert!(
         matches!(classify_bundled(path), BundledRoute::File(_)),
@@ -892,6 +899,26 @@ mod tests {
     assert_eq!(ctx_to_report(Some(8192), Some(4096)), 8192);
     assert_eq!(ctx_to_report(None, Some(4096)), 4096);
     assert_eq!(ctx_to_report(None, None), 0);
+  }
+
+  /// The paths a real page asks for are untouched by the guard: the client
+  /// resolves each of them to itself.
+  #[test]
+  fn plain_bundled_paths_survive_the_normalization_guard() {
+    for path in [
+      "/",
+      "/props",
+      "/v1/models",
+      "/v1/chat/completions",
+      "/v1/streams/lookup",
+      "/_app/immutable/bundle.Bkusd0vb.js",
+    ] {
+      assert_eq!(
+        client_path(path).as_deref(),
+        Some(path),
+        "{path} must classify on its own spelling"
+      );
+    }
   }
 
   #[tokio::test]

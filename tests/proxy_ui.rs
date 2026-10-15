@@ -259,6 +259,22 @@ async fn single_running_serves_ui_and_forwards_paths() {
     "expected the forwarded /v1/models payload, got: {text}"
   );
 
+  // The engine's own page is forwarded as the client sent it: no model name is
+  // added here, so the fake answers with the `-m` path it fell back to, not
+  // the launch's served name.
+  let (_status, _h, body) = http_post(
+    addr,
+    "/ui/v1/chat/completions",
+    r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+    &[],
+  )
+  .await;
+  let frame = String::from_utf8_lossy(&body);
+  assert!(
+    frame.contains(r#""model":"/fixture/solo.gguf""#),
+    "the engine path forwards the body untouched: {frame}"
+  );
+
   let _ = model.stop(Duration::from_secs(3)).await;
   shutdown_listener(shutdown, handle).await;
   std::fs::remove_dir_all(&dir).ok();
@@ -469,6 +485,11 @@ async fn bundled_launch_serves_the_embedded_ui() {
     header_value(&headers, "content-type"),
     Some("text/html; charset=utf-8")
   );
+  assert_eq!(
+    header_value(&headers, "cache-control"),
+    Some("no-cache"),
+    "the index revalidates so a bump reaches the browser"
+  );
   let text = String::from_utf8_lossy(&body);
   assert!(
     text.contains("<!doctype html>") && !text.contains("fake-llama-webui"),
@@ -523,6 +544,11 @@ async fn bundled_launch_serves_the_embedded_ui() {
     http_get(addr, "/ui/v1/%2e%2e/%2e%2e/health", &[]).await.0,
     404,
     "an encoded dot pair stays inside the bundle"
+  );
+  assert_eq!(
+    http_get(addr, "/ui/v1/x/\\..\\..\\health", &[]).await.0,
+    404,
+    "backslash separators stay inside the bundle too"
   );
 
   // The OpenAI surface still reaches the engine.
