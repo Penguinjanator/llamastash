@@ -549,16 +549,16 @@ impl Throughput {
   /// `(tokens per second, busy wall ms)`, both `None` when no row counted.
   ///
   /// The wall is the union of the windows: a second with four streams running
-  /// is one second of the box being busy, not four.
-  fn figures(&self) -> (Option<f64>, Option<u64>) {
+  /// is one second of the box being busy, not four. Sorting is in place: a
+  /// snapshot takes this once per scope while it holds the log lock.
+  fn figures(&mut self) -> (Option<f64>, Option<u64>) {
     if self.windows.is_empty() {
       return (None, None);
     }
-    let mut windows = self.windows.clone();
-    windows.sort_unstable();
+    self.windows.sort_unstable();
     let mut busy: u64 = 0;
-    let mut run = windows[0];
-    for &(start, end) in &windows[1..] {
+    let mut run = self.windows[0];
+    for &(start, end) in &self.windows[1..] {
       if start > run.1 {
         busy = busy.saturating_add(run.1 - run.0);
         run = (start, end);
@@ -597,7 +597,7 @@ impl RowFigures {
   /// client figures always answers, so a scope with no rows left reads `Some(0)`
   /// and only an older daemon leaves them `None`. The two throughput figures are
   /// `None` until a row of the scope has both a token count and a speed.
-  fn stamp(&self, summary: &mut RequestSummary) {
+  fn stamp(&mut self, summary: &mut RequestSummary) {
     summary.hosts = Some(self.all.hosts());
     summary.connections = Some(self.all.connections());
     summary.live_hosts = Some(self.live.hosts());
@@ -999,11 +999,10 @@ impl RequestLog {
     models.sort_by(|a, b| a.key.cmp(&b.key));
     // A scope whose rows all left the ring has no counts of its own; zero is
     // the answer, not "not computed".
-    let empty = RowFigures::default();
     for model in &mut models {
       model_figures
-        .get(model.key.as_str())
-        .unwrap_or(&empty)
+        .remove(model.key.as_str())
+        .unwrap_or_default()
         .stamp(&mut model.summary);
     }
     let mut launches: Vec<LaunchTotals> = inner
@@ -1021,8 +1020,8 @@ impl RequestLog {
     }));
     for launch in &mut launches {
       launch_figures
-        .get(launch.totals.key.as_str())
-        .unwrap_or(&empty)
+        .remove(launch.totals.key.as_str())
+        .unwrap_or_default()
         .stamp(&mut launch.totals.summary);
     }
     let mut all = view(String::new(), &inner.all);
