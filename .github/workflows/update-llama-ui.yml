@@ -1,7 +1,10 @@
 name: update-llama-ui
 
-# Weekly refresh of the llama.cpp UI bundle embedded in the binary
+# Monthly refresh of the llama.cpp UI bundle embedded in the binary
 # (data/llama-ui/, served at /ui for engines with no UI of their own).
+# Monthly rather than weekly because upstream cuts many builds a week and every
+# build changes the archive: a weekly PR would commit a 3.1 MB blob to git
+# history almost every week.
 #
 # Opens a PR when upstream publishes a newer build. It never merges: a human
 # runs the manual /ui check from scripts/llama-ui/README.md first, because a
@@ -14,7 +17,7 @@ name: update-llama-ui
 
 on:
   schedule:
-    - cron: "0 4 * * 1" # Monday 04:00 UTC
+    - cron: "0 4 1 * *" # 04:00 UTC on the 1st of each month
   workflow_dispatch:
 
 permissions:

@@ -83,7 +83,7 @@ From the origin doc (see origin: `docs/brainstorms/2026-10-15-engine-web-ui-requ
 - **Embedded archive, unpacked once:** `include_bytes!` the `.tar.gz`; on the first bundled-UI request unpack it into an in-memory map (path to bytes) held in a `OnceLock`. About 10 MB of RAM after first use, zero before (R10). Lookups are map keys, never filesystem paths, so there is no path traversal surface.
 - **Version record:** `data/llama-ui/VERSION` holds the build (`b11642`) and the archive's sha256. Written only by the refresh script.
 - **NOTICE ships in release tarballs:** add a llama.cpp UI entry to `NOTICE` (MIT, the ggml authors, and that the bundle includes npm packages under their own licenses, listed in llama.cpp `tools/ui/package.json`), fix NOTICE's line that says the binary embeds none of its sources, and copy `NOTICE` into the release tarball beside `LICENSE` (R12).
-- **Weekly refresh PR:** Monday 04:00 UTC cron plus `workflow_dispatch`. Runs the same script with `latest`; opens a PR from `chore/llama-ui-<build>` with the PAT. Exits early when the secret is unset, nothing changed, or that branch already exists on the remote.
+- **Weekly refresh PR:** Monday 04:00 UTC cron plus `workflow_dispatch`. Runs the same script with `latest`; opens a PR from `chore/llama-ui-<build>` with the PAT. Exits early when the secret is unset, nothing changed, or that branch already exists on the remote. *(Cadence changed after implementation: the cron is now monthly, `0 4 1 * *`, because every upstream build changes the archive and a weekly PR would commit a fresh 3.1 MB blob to git history almost every week.)*
 
 ## Open Questions
 
