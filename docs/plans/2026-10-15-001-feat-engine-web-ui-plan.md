@@ -67,7 +67,7 @@ From the origin doc (see origin: `docs/brainstorms/2026-10-15-engine-web-ui-requ
 - `GET ./props`: required. Unguarded reads: `default_generation_settings.n_ctx`, `default_generation_settings.params`, `model_path` (basename used as the single-model name). The rest is read with `?.`: `modalities.{vision,audio,video}`, `role` (`"router"` means router mode, anything else is single-model), `build_info`, `model_alias`, `ui_settings`.
 - `GET ./v1/models`: model list in single-model mode, sent back as `model` in chat requests.
 - `POST ./v1/chat/completions`: SSE. Always sends `return_progress`, `sse_ping_interval`, `reasoning_format`. vLLM accepts unknown fields (`extra="allow"`), SGLang ignores them (pydantic default).
-- Optional, may 404: `./slots`, `./v1/stream`, `./v1/streams/lookup`, `./v1/chat/completions/control`, `/tools`, `/cors-proxy`.
+- Optional, may 404: `./slots`, `./v1/stream`, `./v1/streams/lookup`, `./v1/chat/completions/control`, `/cors-proxy`. `./tools` is the one that wants a specific status: 403 means "server tools are disabled" to the page, anything else logs an error and is retried before every message.
 - Archive: `https://huggingface.co/buckets/ggml-org/llama-ui/resolve/<bNNNN|latest>/dist.tar.gz` plus `dist.tar.gz.sha256`. `latest` was `b11642` on 2026-10-15 (3.1 MB; 10 MB unpacked; `build.json` inside holds `{"version":"b11642"}`). Not every build number is published (`b11643` returned 404).
 
 ### Facts checked during planning
@@ -110,6 +110,8 @@ From the origin doc (see origin: `docs/brainstorms/2026-10-15-engine-web-ui-requ
        Engine  -> today's forward_ui (strip /ui, forward everything)
        Bundled -> strip /ui, then:
                     /props        -> fake props JSON (ctx, vision, name)
+                    /tools        -> 403 ("server tools are not enabled")
+                    /v1/stream, /v1/streams/* -> 404 (stream resume off)
                     /v1/...       -> forward_to_upstream(entry.port), no log
                     other path    -> embedded file ("/" -> index.html) | 404
 ```
@@ -178,7 +180,7 @@ All four run in one lane, in order. None can run in parallel (U2 needs U1's arch
 - Happy path: `resolve_target` with one bundled entry and no cookie forwards to it; a cookie pinned to a bundled entry forwards to it.
 - Edge case: one none-source entry alone still shows the chooser (existing rule), and a cookie pinned to it falls through to the chooser.
 - Happy path: `chooser_html` renders a bundled entry as a green link to `/ui/?target=<id>` and a none entry as a red, non-link row.
-- Happy path: bundled path routing: `/props` and `/props?x=1` -> fake props; `/v1/models`, `/v1/chat/completions` -> forward; `/` -> `index.html`; `/slots`, `/tools`, `/nope.js` -> 404.
+- Happy path: bundled path routing: `/props` and `/props?x=1` -> fake props; `/v1/models`, `/v1/chat/completions` -> forward; `/` -> `index.html`; `/slots`, `/nope.js` and a dot-segment path -> 404; `/tools` -> 403; `/v1/stream` and `/v1/streams/lookup` -> 404.
 - Happy path: embedded lookup: `/` returns `index.html` with `text/html`; the archive's `_app/immutable/bundle.*.js` (found by scanning keys, not a hardcoded hash) returns a JavaScript content type and non-empty bytes.
 - Happy path: fake props JSON: `n_ctx` equals the ctx passed in; `modalities.vision` follows the flag; `role` is `"model"`; `model_path` equals the served name; `default_generation_settings.params` is an object.
 - Integration: existing `tests/proxy_ui.rs` (llama.cpp path) stays green unchanged.

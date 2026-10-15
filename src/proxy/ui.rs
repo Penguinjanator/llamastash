@@ -213,17 +213,24 @@ async fn collect_running(state: &Arc<ProxyState>) -> Vec<RunningEntry> {
     if !launch.ready {
       continue;
     }
-    // Whether this launch's backend serves a web UI, from the backend that
-    // owns *this launch* (keyed on launch id, the same resolver the stop path
-    // uses) rather than the one the model would route to: one GGUF can run on
-    // two servers at once, and only the launch on a UI-less engine needs the
-    // bundle. An unresolved backend falls back to the default backend's own
-    // verdict. Names no backend.
+    // Whether this launch's backend serves a web UI, from the supervisor that
+    // owns *this launch* rather than the backend the model would route to: one
+    // GGUF can run on two servers at once, and only the launch on a UI-less
+    // engine needs the bundle. Every row listed here came from the registry, so
+    // a missing one means it stopped mid-flight; the default backend's verdict
+    // is what the resolver would have answered a moment earlier. Names no
+    // backend.
     let serves_web_ui = {
       use crate::backend::Backend;
-      crate::daemon::launch_service::backend_for_launch(&state.ctx, &LaunchId(launch.id.clone()))
+      match state
+        .ctx
+        .supervisors
+        .get(&LaunchId(launch.id.clone()))
         .await
-        .serves_web_ui()
+      {
+        Some(model) => model.backend().serves_web_ui(),
+        None => crate::backend::default_backend().serves_web_ui(),
+      }
     };
     out.push(RunningEntry {
       launch_id: launch.id,
@@ -290,14 +297,40 @@ enum BundledRoute<'a> {
   /// The engine's OpenAI surface, forwarded unchanged so the model name it
   /// accepts is the one the UI sends back.
   Forward,
+  /// A route only the bundle's origin engine serves, answered here with a
+  /// fixed status so the page degrades the way it does against an engine that
+  /// started without that surface.
+  Refused {
+    status: StatusCode,
+    why: &'static str,
+  },
   /// An embedded bundle file, or a path the bundle does not carry.
   File(&'a str),
 }
 
 fn classify_bundled(stripped: &str) -> BundledRoute<'_> {
   let path = stripped.split('?').next().unwrap_or("/");
+  if path.split('/').any(|seg| seg == "..") {
+    // Dot segments are answered before the prefix tests: the forward client
+    // collapses them, so `/ui/v1/../../x` would hand the engine a path
+    // outside `/v1`.
+    return BundledRoute::File(path);
+  }
   if path == "/props" {
     BundledRoute::Props
+  } else if path == "/tools" {
+    // 403 is what the bundle's origin answers when started without server
+    // tools, and the page reads it as "tools are disabled" instead of a
+    // broken endpoint.
+    BundledRoute::Refused {
+      status: StatusCode::FORBIDDEN,
+      why: "server tools are not enabled",
+    }
+  } else if path == "/v1/stream" || path.starts_with("/v1/streams/") {
+    BundledRoute::Refused {
+      status: StatusCode::NOT_FOUND,
+      why: "stream resume is not supported",
+    }
   } else if path.starts_with("/v1/") {
     BundledRoute::Forward
   } else {
@@ -305,8 +338,9 @@ fn classify_bundled(stripped: &str) -> BundledRoute<'_> {
   }
 }
 
-/// Serve a bundled-UI request: `/props` is ours, `/v1/...` goes to the
-/// engine, and everything else is a file from the embedded bundle.
+/// Serve a bundled-UI request: `/props` is ours, `/v1/...` goes to the engine,
+/// the origin-only routes get our own answer, and everything else is a file
+/// from the embedded bundle.
 async fn serve_bundled(
   state: &Arc<ProxyState>,
   req: Request<Incoming>,
@@ -322,13 +356,14 @@ async fn serve_bundled(
       ))
     }
     BundledRoute::Forward => forward_to_launch(state, req, entry).await,
+    BundledRoute::Refused { status, why } => Ok(plain(status, why)),
     BundledRoute::File(path) => match ui_bundle::get(path) {
       Some(bytes) => Ok(static_response(
         StatusCode::OK,
         ui_bundle::content_type(path),
         Bytes::from_static(bytes),
       )),
-      None => Ok(not_found()),
+      None => Ok(plain(StatusCode::NOT_FOUND, "no such UI file")),
     },
   }
 }
@@ -345,12 +380,12 @@ async fn launch_ctx(state: &Arc<ProxyState>, launch_id: &str) -> u32 {
   else {
     return 0;
   };
-  model
-    .actuals()
-    .await
-    .resolved_ctx
-    .or(model.params().ctx)
-    .unwrap_or(0)
+  let resolved = model.actuals().await.resolved_ctx;
+  ctx_to_report(resolved, model.params().ctx)
+}
+
+fn ctx_to_report(resolved: Option<u32>, requested: Option<u32>) -> u32 {
+  resolved.or(requested).unwrap_or(0)
 }
 
 /// Whether the launch's model takes images, from its catalog row's
@@ -576,13 +611,14 @@ fn json_response(status: StatusCode, body: Value) -> Response<BoxBody<Bytes, Bod
   static_response(status, "application/json", Bytes::from(body.to_string()))
 }
 
-/// The answer for a `/ui/` path that is neither forwarded nor in the
-/// bundle. A body a browser can show, not a blank page.
-fn not_found() -> Response<BoxBody<Bytes, BodyError>> {
+/// A fixed short-text answer: the bundle's 404, and the status a route the
+/// proxy owns the answer to asks for. A body a browser can show, not a blank
+/// page.
+fn plain(status: StatusCode, why: &'static str) -> Response<BoxBody<Bytes, BodyError>> {
   static_response(
-    StatusCode::NOT_FOUND,
+    status,
     "text/plain; charset=utf-8",
-    Bytes::from_static(b"no such UI file"),
+    Bytes::from_static(why.as_bytes()),
   )
 }
 
@@ -590,7 +626,9 @@ fn not_found() -> Response<BoxBody<Bytes, BodyError>> {
 mod tests {
   use super::*;
   use crate::daemon::supervisor::ManagedState;
+  use crate::discovery::{DiscoveredModel, ModelSource, Multimodal};
   use crate::proxy::test_support::{state_with, umbrella_id};
+  use std::path::{Path, PathBuf};
 
   /// The running list is Ready rows only, in launch order (`L2` before `L10`),
   /// each carrying its port and served name, and the full model id the forward
@@ -752,11 +790,95 @@ mod tests {
       classify_bundled("/v1/chat/completions"),
       BundledRoute::Forward
     ));
-    for path in ["/", "/slots", "/tools", "/nope.js"] {
+    for path in ["/", "/slots", "/nope.js"] {
       assert!(
         matches!(classify_bundled(path), BundledRoute::File(p) if p == path),
         "{path} is a bundle lookup"
       );
+    }
+  }
+
+  /// The routes only the bundle's origin engine serves get the proxy's own
+  /// answer: a 403 on `/tools` is what the page reads as "server tools are
+  /// disabled", and stream resume answers 404 for every engine.
+  #[test]
+  fn bundled_origin_only_routes_are_answered_locally() {
+    assert!(matches!(
+      classify_bundled("/tools"),
+      BundledRoute::Refused {
+        status: StatusCode::FORBIDDEN,
+        ..
+      }
+    ));
+    for path in [
+      "/v1/stream",
+      "/v1/stream?conv_id=c&from=4",
+      "/v1/streams/lookup",
+    ] {
+      assert!(
+        matches!(
+          classify_bundled(path),
+          BundledRoute::Refused {
+            status: StatusCode::NOT_FOUND,
+            ..
+          }
+        ),
+        "{path} reports stream resume off"
+      );
+    }
+  }
+
+  /// A dot segment must not smuggle a path past the `/v1` forward prefix:
+  /// the forward client would collapse it into an engine route outside `/v1`.
+  #[test]
+  fn bundled_dot_segments_stay_inside_the_bundle() {
+    for path in ["/v1/../../secret", "/../etc/passwd", "/a/../b"] {
+      assert!(
+        matches!(classify_bundled(path), BundledRoute::File(_)),
+        "{path} is a bundle lookup, not a forward"
+      );
+    }
+  }
+
+  #[test]
+  fn ctx_to_report_prefers_resolved_then_requested_then_zero() {
+    assert_eq!(ctx_to_report(Some(8192), Some(4096)), 8192);
+    assert_eq!(ctx_to_report(None, Some(4096)), 4096);
+    assert_eq!(ctx_to_report(None, None), 0);
+  }
+
+  #[tokio::test]
+  async fn launch_vision_follows_the_catalog_record() {
+    let state = state_with(&[("L1", ManagedState::Ready, "/models/foo.gguf", 4001)]).await;
+    // With no catalog row the launch reads as text-only.
+    assert!(!launch_vision(&state, Path::new("/models/foo.gguf")).await);
+    state
+      .ctx
+      .catalog
+      .upsert(catalog_row(
+        "/models/foo.gguf",
+        Some(Multimodal {
+          vision: true,
+          audio: false,
+        }),
+      ))
+      .await;
+    assert!(launch_vision(&state, Path::new("/models/foo.gguf")).await);
+  }
+
+  fn catalog_row(path: &str, multimodal: Option<Multimodal>) -> DiscoveredModel {
+    let path = PathBuf::from(path);
+    DiscoveredModel {
+      parent: path.parent().unwrap().to_path_buf(),
+      source: ModelSource::UserPath,
+      metadata: None,
+      parse_error: None,
+      split_siblings: Vec::new(),
+      display_label: None,
+      multimodal,
+      supported_backends: Vec::new(),
+      mtp_head: None,
+      path,
     }
   }
 
