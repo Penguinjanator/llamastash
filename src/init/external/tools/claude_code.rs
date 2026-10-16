@@ -14,6 +14,9 @@
 //!   chosen local model so Claude Code's main *and* background calls
 //!   resolve through the proxy instead of its built-in `claude-*`
 //!   names. Omitted for an embedding model (Claude Code can't drive one).
+//! - `CLAUDE_CODE_MAX_CONTEXT_TOKENS` — the model's real launch window,
+//!   less the output room Claude Code keeps for itself, so it stops
+//!   sizing every non-`claude-` name at 200,000 and compacting far early.
 //!
 //! Deliberately a **separate sourceable file** rather than a write into
 //! Claude Code's `~/.claude/settings.json`: that file's `env` block
@@ -42,6 +45,16 @@ fn anthropic_base(proxy_base_url: &str) -> &str {
   trimmed.strip_suffix("/v1").unwrap_or(trimmed)
 }
 
+/// Context size to declare, so Claude Code compacts against the window the
+/// engine actually launched with. Claude Code compacts at assumed window −
+/// 33,000 and refuses to send at − 23,000, so its longest prompt is 23,000
+/// under the declared figure; the engine has to fit the same generation in
+/// too, so give back the output room beyond that 20,000 reserve. A model
+/// whose whole window is smaller than the reserve is declared as-is.
+fn declared_window(context: u64, output: u64) -> u64 {
+  context.saturating_sub(output.saturating_sub(20_000))
+}
+
 impl ToolPatcher for ClaudeCode {
   fn id(&self) -> &'static str {
     "claude-code"
@@ -65,8 +78,10 @@ impl ToolPatcher for ClaudeCode {
     let model = match ctx.primary() {
       Some(m) if !m.is_embed => format!(
         "export ANTHROPIC_MODEL=\"{id}\"\n\
-         export ANTHROPIC_SMALL_FAST_MODEL=\"{id}\"\n",
-        id = m.id
+         export ANTHROPIC_SMALL_FAST_MODEL=\"{id}\"\n\
+         export CLAUDE_CODE_MAX_CONTEXT_TOKENS=\"{window}\"\n",
+        id = m.id,
+        window = declared_window(m.declared_context(), m.declared_output())
       ),
       _ => String::new(),
     };
@@ -123,6 +138,7 @@ mod tests {
     // Chat model pins both main and small/fast.
     assert!(body.contains("export ANTHROPIC_MODEL=\"qwen3-coder-30b\""));
     assert!(body.contains("export ANTHROPIC_SMALL_FAST_MODEL=\"qwen3-coder-30b\""));
+    assert!(body.contains("export CLAUDE_CODE_MAX_CONTEXT_TOKENS="));
     // Stays Anthropic-only — no OpenAI vars leak in.
     assert!(!body.contains("OPENAI_"));
     std::fs::remove_dir_all(&dir).ok();
@@ -130,14 +146,40 @@ mod tests {
 
   #[test]
   fn omits_model_for_embedder_or_when_unknown() {
-    // No models → base + token only, no model pins.
+    // No models → base + token only, no model pins, no declared window.
     let no_model_body = ClaudeCode.raw_body(&PatchContext::fixture(&[])).unwrap();
     assert!(no_model_body.contains("export ANTHROPIC_BASE_URL="));
     assert!(!no_model_body.contains("ANTHROPIC_MODEL"));
+    assert!(!no_model_body.contains("CLAUDE_CODE_MAX_CONTEXT_TOKENS"));
     // Embedders only → still no model pins (Claude Code can't use one).
     let embed = PatchContext::fixture(&["nomic-embed-text-v1.5"]);
     let embed_body = ClaudeCode.raw_body(&embed).unwrap();
     assert!(!embed_body.contains("ANTHROPIC_MODEL"));
+    assert!(!embed_body.contains("CLAUDE_CODE_MAX_CONTEXT_TOKENS"));
+  }
+
+  #[test]
+  fn declares_the_launch_window_less_the_output_room() {
+    // 262,144 ctx → 32,000 output → 12,000 of it is Claude Code's own
+    // reserve to give back, so 250,144. Its send ceiling then lands at
+    // 227,144, inside what the engine accepts at that window.
+    let mut ctx = PatchContext::fixture(&["halogen@dual-256k"]);
+    ctx.models[0].context_window = Some(262_144);
+    let body = ClaudeCode.raw_body(&ctx).unwrap();
+    assert!(body.contains("export CLAUDE_CODE_MAX_CONTEXT_TOKENS=\"250144\""));
+  }
+
+  #[test]
+  fn a_window_already_inside_the_reserve_is_declared_as_is() {
+    // No catalog figure → the conservative default (32,768) with a 16,384
+    // output cap, which sits under the 20,000 reserve; nothing to subtract.
+    let body = ClaudeCode.raw_body(&ctx()).unwrap();
+    assert!(body.contains("export CLAUDE_CODE_MAX_CONTEXT_TOKENS=\"32768\""));
+    // Same for a small trained window (8,192 → 4,096 output).
+    let mut small = PatchContext::fixture(&["small-8k"]);
+    small.models[0].context_window = Some(8_192);
+    let small_body = ClaudeCode.raw_body(&small).unwrap();
+    assert!(small_body.contains("export CLAUDE_CODE_MAX_CONTEXT_TOKENS=\"8192\""));
   }
 
   #[cfg(unix)]
