@@ -20,6 +20,7 @@ pub mod effort;
 pub mod merge;
 pub mod models;
 pub mod proxy_url;
+pub mod stale_url;
 pub mod tools;
 pub mod write;
 

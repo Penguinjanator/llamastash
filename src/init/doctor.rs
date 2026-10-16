@@ -26,6 +26,7 @@ use crate::cli::exit_codes::CliResult;
 use crate::config::Config;
 use crate::gpu::{ClassSource, GpuInfo};
 use crate::init::detection::{detect_hardware, HardwareSnapshot, OsFamily};
+use crate::init::external::stale_url;
 use crate::init::snapshot::{self, InitSnapshot, InstallMethod};
 use crate::util::datetime::{current_yyyymmdd, days_between, parse_yyyymmdd};
 
@@ -47,7 +48,11 @@ const GTT_HINT_RATIO_HI: f64 = 0.60;
 ///
 /// v2: added the `hardware` section and the `memory_drift` / `gtt_hint`
 /// finding ids (R12-R14).
-pub const DOCTOR_JSON_SCHEMA_VERSION: u32 = 2;
+///
+/// v3: added the `tool_config_stale_url` finding and its
+/// `tool_config_proxy_url` repair. Both are additive — a reader of the
+/// previous version still parses every field it knew about.
+pub const DOCTOR_JSON_SCHEMA_VERSION: u32 = 3;
 
 /// `SnapshotStale` finding fires when the bundled snapshot is older
 /// than this many days vs today.
@@ -71,6 +76,8 @@ pub enum FixId {
   ConfigMode,
   #[serde(rename = "remove_stale_daemon_files")]
   StaleDaemonFiles,
+  #[serde(rename = "tool_config_proxy_url")]
+  ToolConfigProxyUrl,
 }
 
 impl FixId {
@@ -79,6 +86,7 @@ impl FixId {
     match self {
       Self::ConfigMode => "chmod 0600",
       Self::StaleDaemonFiles => "remove",
+      Self::ToolConfigProxyUrl => "rewrite url",
     }
   }
 }
@@ -97,6 +105,7 @@ pub enum FindingId {
   ConfigModeDrift,
   StaleDaemonFiles,
   RemoteSnapshotUnreachable,
+  ToolConfigStaleUrl,
 }
 
 impl FindingId {
@@ -111,6 +120,7 @@ impl FindingId {
       Self::ConfigModeDrift => "config_mode_drift",
       Self::StaleDaemonFiles => "stale_daemon_files",
       Self::RemoteSnapshotUnreachable => "remote_snapshot_unreachable",
+      Self::ToolConfigStaleUrl => "tool_config_stale_url",
     }
   }
 
@@ -138,6 +148,9 @@ impl FindingId {
         "run `chmod 600` on the config file (or `llamastash init --only config`)"
       }
       Self::StaleDaemonFiles => "remove `runtime.json` and `daemon.pid` from the state dir",
+      Self::ToolConfigStaleUrl => {
+        "re-run `llamastash init --integrations <ids>` (which also rewrites the model list)"
+      }
     }
   }
 
@@ -150,6 +163,7 @@ impl FindingId {
       #[cfg(unix)]
       Self::ConfigModeDrift => Some(FixId::ConfigMode),
       Self::StaleDaemonFiles => Some(FixId::StaleDaemonFiles),
+      Self::ToolConfigStaleUrl => Some(FixId::ToolConfigProxyUrl),
       _ => None,
     }
   }
@@ -845,14 +859,44 @@ fn stale_daemon_files(state_dir: &Path) -> Vec<PathBuf> {
   .collect()
 }
 
+/// One warning per tool config naming a proxy address the live proxy is not
+/// on. The caller only asks when a proxy is answering — `doctor` never spawns
+/// one to compare against — and one finding per file, because the repair is
+/// per file too.
+fn check_tool_config_urls(live: &stale_url::LiveProxy) -> Vec<Finding> {
+  stale_url::stale_files(live)
+    .into_iter()
+    .map(|file| {
+      Finding::new(
+        FindingId::ToolConfigStaleUrl,
+        Severity::Warning,
+        format!(
+          "`{}` points at a proxy address nothing listens on: {}",
+          file.path.display(),
+          stale_url::changes(&file.urls)
+        ),
+      )
+    })
+    .collect()
+}
+
 /// Apply every repair the report marks fixable, in finding order. Under
 /// `dry_run` nothing is touched and every entry comes back `would_apply`.
 /// The set is bounded on purpose: no daemon is signalled, no model is
 /// deleted, and daemon state is only removed once nothing holds the lock.
 /// A repair a finding wanted but could not get is ledged against the path it
-/// wanted, so `--fix` is never silent about what it left alone.
-fn apply_fixes(findings: &[Finding], dry_run: bool) -> Vec<FixReport> {
+/// wanted, so `--fix` is never silent about what it left alone. Short of
+/// deleting the stale daemon files, a stale proxy address is the only file
+/// content any of it rewrites.
+fn apply_fixes(
+  findings: &[Finding],
+  dry_run: bool,
+  live: Option<&stale_url::LiveProxy>,
+) -> Vec<FixReport> {
   let mut fixes: Vec<FixReport> = Vec::new();
+  // The URL rewrite covers every stale config in one pass, so it runs on the
+  // first finding that wants it rather than once per file.
+  let mut proxy_urls_done = false;
   for f in findings {
     if let Some((fix, target, why)) = &f.withheld {
       // The finding already names the path the repair wanted, so the ledger
@@ -876,6 +920,16 @@ fn apply_fixes(findings: &[Finding], dry_run: bool) -> Vec<FixReport> {
       FixId::StaleDaemonFiles => {
         if let Some(dir) = crate::util::paths::state_dir() {
           fixes.extend(fix_stale_daemon_files(&dir, dry_run));
+        }
+      }
+      FixId::ToolConfigProxyUrl => {
+        if !proxy_urls_done {
+          proxy_urls_done = true;
+          if let Some(live) = live {
+            for file in stale_url::stale_files(live) {
+              fixes.push(fix_tool_config_url(&file.path, live, dry_run));
+            }
+          }
         }
       }
     }
@@ -1001,6 +1055,84 @@ fn fix_stale_daemon_files(state_dir: &Path, dry_run: bool) -> Vec<FixReport> {
       FixOutcome::Failed,
       e.to_string(),
     )],
+  }
+}
+
+/// Point one tool config at the address the proxy actually listens on. Only
+/// each stale URL's `host:port` moves: the path the file already carries
+/// (`/v1` for the OpenAI-shape tools, none for Claude Code) and every other
+/// byte stay where they are, and a config whose URL names another host is not
+/// ours to rewrite.
+fn fix_tool_config_url(path: &Path, live: &stale_url::LiveProxy, dry_run: bool) -> FixReport {
+  let target = path.display().to_string();
+  let before = match std::fs::read_to_string(path) {
+    Ok(text) => text,
+    Err(e) => {
+      return FixReport::new(
+        FixId::ToolConfigProxyUrl,
+        target,
+        FixOutcome::Failed,
+        e.to_string(),
+      )
+    }
+  };
+  let stale = stale_url::stale_urls(&before, live);
+  if stale.is_empty() {
+    return FixReport::skipped(FixId::ToolConfigProxyUrl, target, "no stale proxy url");
+  }
+  let changes = stale_url::changes(&stale);
+  if dry_run {
+    return FixReport::new(
+      FixId::ToolConfigProxyUrl,
+      target,
+      FixOutcome::WouldApply,
+      changes,
+    );
+  }
+  let Some(body) = stale_url::rewrite(&before, live) else {
+    return FixReport::skipped(FixId::ToolConfigProxyUrl, target, "no stale proxy url");
+  };
+  // Rename-a-tempfile-in, so the mode has to be re-declared: the file's own
+  // bits, because repairing an address is not a licence to harden or loosen a
+  // config. The path arrives already resolved through any symlink, so the
+  // rename lands on the real file and leaves the link alone.
+  let mode = file_mode(path);
+  let dir = path.parent().unwrap_or_else(|| Path::new("."));
+  match crate::util::atomic_write::write_secure(
+    dir,
+    "llamastash-tool-config.tmp.",
+    path,
+    body.as_bytes(),
+    mode,
+  ) {
+    Ok(_) => FixReport::new(
+      FixId::ToolConfigProxyUrl,
+      target,
+      FixOutcome::Applied,
+      changes,
+    ),
+    Err(e) => FixReport::new(
+      FixId::ToolConfigProxyUrl,
+      target,
+      FixOutcome::Failed,
+      e.to_string(),
+    ),
+  }
+}
+
+/// A file's own permission bits, to carry them across an atomic rewrite.
+fn file_mode(path: &Path) -> Option<u32> {
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+      .ok()
+      .map(|m| m.permissions().mode() & 0o777)
+  }
+  #[cfg(not(unix))]
+  {
+    let _ = path;
+    None
   }
 }
 
@@ -1152,11 +1284,22 @@ pub async fn run(args: DoctorArgs, _cli: &Cli, config: &Config) -> CliResult {
     }
   }
 
+  // A tool config whose proxy URL went stale when the proxy moved port. What
+  // the live proxy reports is also what the repair below rewrites to, so the
+  // finding and the fix can never disagree about the target address.
+  let live_proxy = crate::init::external::proxy_url::from_running_daemon()
+    .await
+    .as_deref()
+    .and_then(stale_url::LiveProxy::from_base_url);
+  if let Some(live) = live_proxy.as_ref() {
+    report.findings.extend(check_tool_config_urls(live));
+  }
+
   // `--fix` acts on what the report found; `--dry-run` previews the same
   // list without touching anything. Either way `doctor` still exits 0: a
   // repair that failed is a reported outcome, not a failed diagnostic.
   if args.fix || args.dry_run {
-    report.fixes = apply_fixes(&report.findings, args.dry_run);
+    report.fixes = apply_fixes(&report.findings, args.dry_run, live_proxy.as_ref());
   }
 
   if args.json {
@@ -1433,6 +1576,7 @@ mod tests {
       FindingId::ConfigModeDrift,
       FindingId::StaleDaemonFiles,
       FindingId::RemoteSnapshotUnreachable,
+      FindingId::ToolConfigStaleUrl,
     ];
     for id in ids {
       assert!(!id.fix_hint().is_empty(), "{id:?} must have a fix_hint");
@@ -1531,7 +1675,7 @@ mod tests {
     assert_eq!(hs.gpu_pool_total_bytes, Some(CARVE + 124 * GIB));
     assert_eq!(hs.uma_carve_bytes, Some(CARVE));
     assert_eq!(hs.uma_shared_bytes, Some(124 * GIB));
-    assert_eq!(report.schema_version, 2);
+    assert_eq!(report.schema_version, 3);
   }
 
   #[test]
@@ -1987,7 +2131,7 @@ mod tests {
       Path::new("/x/config.yaml"),
       "is world-writable (mode 0o777)".to_string(),
     );
-    let fixes = apply_fixes(&[dir_finding, mode_finding], false);
+    let fixes = apply_fixes(&[dir_finding, mode_finding], false, None);
     assert_eq!(fixes.len(), 1, "{fixes:?}");
     assert_eq!(fixes[0].fix, FixId::ConfigMode);
     assert_eq!(fixes[0].outcome, FixOutcome::Skipped);
@@ -2005,7 +2149,85 @@ mod tests {
       "parent dir `/x` is world-writable",
       "run `chmod go-w` on that dir, or move the config out of it",
     );
-    assert!(apply_fixes(&[only_dir], false).is_empty());
+    assert!(apply_fixes(&[only_dir], false, None).is_empty());
+  }
+
+  #[test]
+  fn a_stale_tool_config_is_rewritten_in_place() {
+    let dir = crate::test_support::unique_temp_dir("doctor-fix", "tool-url");
+    std::fs::create_dir_all(&dir).unwrap();
+    let live = stale_url::LiveProxy::from_base_url("http://127.0.0.1:11437/v1").unwrap();
+    let path = dir.join("env.sh");
+    let body = "# llamastash env.sh (generated, do not edit by hand)\nexport AIDER_API_BASE=\"http://127.0.0.1:11435/v1\"\nexport ANTHROPIC_BASE_URL=\"http://127.0.0.1:11435\"\n";
+    std::fs::write(&path, body).unwrap();
+
+    let proposed = fix_tool_config_url(&path, &live, true);
+    assert_eq!(proposed.fix, FixId::ToolConfigProxyUrl);
+    assert_eq!(proposed.outcome, FixOutcome::WouldApply, "{proposed:?}");
+    assert_eq!(
+      std::fs::read_to_string(&path).unwrap(),
+      body,
+      "--dry-run must write nothing"
+    );
+
+    let applied = fix_tool_config_url(&path, &live, false);
+    assert_eq!(applied.outcome, FixOutcome::Applied, "{applied:?}");
+    assert_eq!(
+      applied.detail,
+      "http://127.0.0.1:11435/v1 \u{2192} http://127.0.0.1:11437/v1, http://127.0.0.1:11435 \u{2192} http://127.0.0.1:11437"
+    );
+    assert_eq!(
+      std::fs::read_to_string(&path).unwrap(),
+      "# llamastash env.sh (generated, do not edit by hand)\nexport AIDER_API_BASE=\"http://127.0.0.1:11437/v1\"\nexport ANTHROPIC_BASE_URL=\"http://127.0.0.1:11437\"\n",
+      "only the two stale addresses move"
+    );
+
+    // Nothing stale any more, so there is nothing to rewrite.
+    assert_eq!(
+      fix_tool_config_url(&path, &live, false).outcome,
+      FixOutcome::Skipped,
+      "a repaired file must not be rewritten again"
+    );
+
+    // A config whose URL names another host is not ours to rewrite, even
+    // though the port is the stale one.
+    let foreign = dir.join("codex.toml");
+    let foreign_body = "model = \"qwen3-coder-30b\"\nbase_url = \"http://localhost:11435/v1\"\n";
+    std::fs::write(&foreign, foreign_body).unwrap();
+    assert_eq!(
+      fix_tool_config_url(&foreign, &live, false).outcome,
+      FixOutcome::Skipped
+    );
+    assert_eq!(std::fs::read_to_string(&foreign).unwrap(), foreign_body);
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn a_stale_tool_config_finding_carries_the_rewrite_repair() {
+    // What `--json` prints for the finding and for the ledger entry, so a
+    // caller can pair the two up.
+    let finding = Finding::new(
+      FindingId::ToolConfigStaleUrl,
+      Severity::Warning,
+      "`/home/u/.config/aider/config.yaml` points at a proxy address nothing listens on",
+    );
+    assert_eq!(finding.fix, Some(FixId::ToolConfigProxyUrl));
+    assert_eq!(finding.fix_hint, FIX_WITH_DOCTOR);
+    let json = serde_json::to_string(&finding).unwrap();
+    assert!(json.contains("\"fix\":\"tool_config_proxy_url\""), "{json}");
+    let report = FixReport::new(
+      FixId::ToolConfigProxyUrl,
+      "/home/u/.config/aider/config.yaml",
+      FixOutcome::Applied,
+      "rewritten",
+    );
+    assert_eq!(report.action, "rewrite url");
+    assert!(
+      serde_json::to_string(&report)
+        .unwrap()
+        .contains("\"fix\":\"tool_config_proxy_url\""),
+      "the ledger entry names the repair"
+    );
   }
 
   #[test]
