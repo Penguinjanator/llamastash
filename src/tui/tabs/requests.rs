@@ -268,34 +268,36 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &RequestsTabState, palet
   frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// The summary figures as `Label value` cells, wrapped to `width`. A
-/// figure is never split across lines.
+/// The summary figures as `Label value` cells, in the two rows the layout
+/// asks for, each wrapped to `width` on its own. A figure is never split
+/// across lines.
 fn summary_lines(summary: &RequestSummary, width: usize, palette: &Palette) -> Vec<Line<'static>> {
   let mut lines: Vec<Line<'static>> = Vec::new();
-  let mut spans: Vec<Span<'static>> = Vec::new();
-  let mut used = 0usize;
-  for (label, value) in summary.cells(NONE) {
-    let cell_w = label.chars().count() + 1 + value.chars().count();
-    let gap = if spans.is_empty() { 0 } else { SUMMARY_GAP };
-    if !spans.is_empty() && used + gap + cell_w > width {
-      lines.push(Line::from(std::mem::take(&mut spans)));
-      used = 0;
+  for row in summary.cell_rows(NONE) {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for (label, value) in row {
+      let cell_w = label.chars().count() + 1 + value.chars().count();
+      if !spans.is_empty() && used + SUMMARY_GAP + cell_w > width {
+        lines.push(Line::from(std::mem::take(&mut spans)));
+        used = 0;
+      }
+      if !spans.is_empty() {
+        spans.push(Span::raw(" ".repeat(SUMMARY_GAP)));
+        used += SUMMARY_GAP;
+      }
+      let value_style = if label == "Errors" && summary.errors > 0 {
+        palette.error_style()
+      } else {
+        palette.text_style().add_modifier(Modifier::BOLD)
+      };
+      spans.push(Span::styled(format!("{label} "), palette.muted_style()));
+      spans.push(Span::styled(value, value_style));
+      used += cell_w;
     }
     if !spans.is_empty() {
-      spans.push(Span::raw(" ".repeat(SUMMARY_GAP)));
-      used += SUMMARY_GAP;
+      lines.push(Line::from(spans));
     }
-    let value_style = if label == "Errors" && summary.errors > 0 {
-      palette.error_style()
-    } else {
-      palette.text_style().add_modifier(Modifier::BOLD)
-    };
-    spans.push(Span::styled(format!("{label} "), palette.muted_style()));
-    spans.push(Span::styled(value, value_style));
-    used += cell_w;
-  }
-  if !spans.is_empty() {
-    lines.push(Line::from(spans));
   }
   lines
 }
@@ -666,9 +668,12 @@ mod tests {
       ..RequestSummary::default()
     };
     let wide = summary_lines(&summary, 200, palette);
-    assert_eq!(wide.len(), 1);
+    // Two rows: the counts, then the speeds and token totals.
+    assert_eq!(wide.len(), 2, "{wide:?}");
+    assert!(wide[0].to_string().starts_with("Hosts "), "{wide:?}");
+    assert!(wide[1].to_string().starts_with("Avg tok/s "), "{wide:?}");
     let narrow = summary_lines(&summary, 40, palette);
-    assert!(narrow.len() > 1);
+    assert!(narrow.len() > 2, "{narrow:?}");
     for line in &narrow {
       assert!(line.width() <= 40, "{line:?}");
     }
@@ -700,7 +705,8 @@ mod tests {
       ],
     );
     let lines = rendered(&state, 150, 8);
-    assert!(lines[0].starts_with("Requests 2"), "{lines:?}");
+    assert!(lines[0].contains("Requests 2"), "{lines:?}");
+    assert!(lines[1].starts_with("Avg tok/s "), "{lines:?}");
     // The summary wraps to as many lines as it needs; the table starts
     // one blank line under it.
     let header = lines
@@ -765,7 +771,7 @@ mod tests {
       Vec::new(),
     );
     let lines = rendered(&state, 80, 6);
-    assert!(lines[0].starts_with("Requests 0"), "{lines:?}");
+    assert!(lines[0].contains("Requests 0"), "{lines:?}");
     assert!(
       lines
         .iter()
@@ -796,10 +802,10 @@ mod tests {
       state.scroll_down();
     }
     assert_eq!(state.scroll_offset, 9);
-    // 3 lines of summary, blank and header leave 3 for rows: the last
-    // page is the 3 oldest, not a single row with blank space under it.
+    // 2 lines of summary, blank and header leave 2 for rows: the last
+    // page is the 2 oldest, not a single row with blank space under it.
     let lines = rendered(&state, 200, 6);
-    assert_eq!(&lines[3][..8], row(3).cells(NONE).time);
+    assert_eq!(&lines[4][..8], row(2).cells(NONE).time);
     assert_eq!(&lines[5][..8], row(1).cells(NONE).time);
   }
 
@@ -882,12 +888,12 @@ mod tests {
       RequestSummary::default(),
       (1..=200).rev().map(row).collect(),
     );
-    // The render fits three rows here, and that is what a scroll stops at.
+    // The render fits two rows here, and that is what a scroll stops at.
     rendered(&state, 200, 6);
     for _ in 0..500 {
       state.scroll_down();
     }
-    assert_eq!(state.scroll_offset, 197);
+    assert_eq!(state.scroll_offset, 198);
     // A window that no longer holds the row on top parks on the last page,
     // and the next Up moves it.
     state.set(
@@ -895,11 +901,11 @@ mod tests {
       RequestSummary::default(),
       (1..=200).rev().map(|seq| row(seq + 1000)).collect(),
     );
-    assert_eq!(state.scroll_offset, 197);
-    let before = rendered(&state, 200, 6)[3].clone();
+    assert_eq!(state.scroll_offset, 198);
+    let before = rendered(&state, 200, 6)[4].clone();
     state.scroll_up();
     let after = rendered(&state, 200, 6);
-    assert_ne!(before, after[3], "{after:?}");
+    assert_ne!(before, after[4], "{after:?}");
   }
 
   #[test]
@@ -911,7 +917,7 @@ mod tests {
       RequestSummary::default(),
       (1..=200).rev().map(row).collect(),
     );
-    // A short pane fits three rows, and scrolling stops on the last of them.
+    // A short pane fits two rows, and scrolling stops on the last of them.
     rendered(&state, 200, 6);
     for _ in 0..50 {
       state.scroll_down();
@@ -921,7 +927,7 @@ mod tests {
     let before = rendered(&state, 200, 26);
     state.scroll_up();
     let after = rendered(&state, 200, 26);
-    assert_ne!(before[3], after[3], "{after:?}");
+    assert_ne!(before[4], after[4], "{after:?}");
   }
 
   #[test]

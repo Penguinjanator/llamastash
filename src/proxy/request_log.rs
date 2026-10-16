@@ -399,55 +399,66 @@ impl RequestSummary {
   /// Label and text of every figure, in display order. `none` stands in
   /// for a figure no request has supplied yet.
   pub fn cells(&self, none: &str) -> Vec<(&'static str, String)> {
+    let [counts, rates] = self.cell_rows(none);
+    counts.into_iter().chain(rates).collect()
+  }
+
+  /// [`Self::cells`] split into the two rows the terminal shows: what happened
+  /// (Live, hosts, counts) and how fast (speeds, latencies, tokens). Each row
+  /// wraps on its own, so a narrow pane keeps the split rather than letting one
+  /// row's tail push the other's figures around.
+  pub fn cell_rows(&self, none: &str) -> [Vec<(&'static str, String)>; 2] {
     let ms = |v: Option<u64>| v.map(fmt_ms).unwrap_or_else(|| none.to_string());
     let tps = |v: Option<f64>| v.map(fmt_tps).unwrap_or_else(|| none.to_string());
     let num = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_else(|| none.to_string());
-    vec![
-      ("Requests", self.requests.to_string()),
-      ("Errors", self.errors.to_string()),
-    ]
-    .into_iter()
-    .chain(self.live_cell())
-    .chain([
-      ("Hosts", num(self.hosts)),
-      ("Connections", num(self.connections)),
-      ("Avg total", ms(self.avg_duration_ms)),
-      ("Avg TTFB", ms(self.avg_ttfb_ms)),
-      ("Avg tok/s", tps(self.tokens_per_second_avg)),
-      (
-        "Agg tok/s",
-        match (self.tokens_per_second_aggregate, self.busy_ms) {
-          (Some(t), Some(busy)) => format!("{} over {}", fmt_tps(t), fmt_ms(busy)),
-          _ => none.to_string(),
-        },
-      ),
-      (
-        "Prefill tok/s",
+    let counts = self
+      .live_cell()
+      .into_iter()
+      .chain([
+        ("Hosts", num(self.hosts)),
+        ("Connections", num(self.connections)),
+        ("Requests", self.requests.to_string()),
+        ("Errors", self.errors.to_string()),
+        ("Auto-starts", self.auto_starts.to_string()),
+        ("Unloaded", self.evictions.to_string()),
+      ])
+      .collect();
+    let rates = [("Avg tok/s", tps(self.tokens_per_second_avg))]
+      .into_iter()
+      .chain(
         self
-          .prefill_tokens_per_second
-          .map(fmt_tps)
-          .unwrap_or_else(|| none.to_string()),
-      ),
-    ])
-    .chain(
-      self
-        .tokens_per_second_session
-        .map(|t| ("Tok/s session", fmt_tps(t))),
-    )
-    .chain([
-      ("Tokens in", fmt_count(self.prompt_tokens)),
-      (
-        "Cached",
-        match self.cache_hit_ratio {
-          Some(ratio) => format!("{} ({:.1}%)", fmt_count(self.cached_tokens), ratio * 100.0),
-          None => none.to_string(),
-        },
-      ),
-      ("Tokens out", fmt_count(self.completion_tokens)),
-      ("Auto-starts", self.auto_starts.to_string()),
-      ("Unloaded", self.evictions.to_string()),
-    ])
-    .collect()
+          .tokens_per_second_session
+          .map(|t| ("Tok/s session", fmt_tps(t))),
+      )
+      .chain([
+        (
+          "Agg tok/s",
+          match (self.tokens_per_second_aggregate, self.busy_ms) {
+            (Some(t), Some(busy)) => format!("{} over {}", fmt_tps(t), fmt_ms(busy)),
+            _ => none.to_string(),
+          },
+        ),
+        (
+          "Avg Prefill tok/s",
+          self
+            .prefill_tokens_per_second
+            .map(fmt_tps)
+            .unwrap_or_else(|| none.to_string()),
+        ),
+        ("Avg total", ms(self.avg_duration_ms)),
+        ("Avg TTFB", ms(self.avg_ttfb_ms)),
+        ("Tokens in", fmt_count(self.prompt_tokens)),
+        (
+          "Cached",
+          match self.cache_hit_ratio {
+            Some(ratio) => format!("{} ({:.1}%)", fmt_count(self.cached_tokens), ratio * 100.0),
+            None => none.to_string(),
+          },
+        ),
+        ("Tokens out", fmt_count(self.completion_tokens)),
+      ])
+      .collect();
+    [counts, rates]
   }
 
   /// The in-flight pair as one cell: `Live N` when every host in flight is on
@@ -1551,7 +1562,7 @@ mod tests {
     assert_eq!((old.hosts, old.connections), (None, None));
     assert_eq!((old.live_hosts, old.live_connections), (None, None));
     let cells = old.cells("—");
-    assert_eq!(cells[2], ("Hosts", "—".to_string()));
+    assert_eq!(cells[0], ("Hosts", "—".to_string()));
     assert!(!cells.iter().any(|(label, _)| *label == "Live"));
   }
 
@@ -1961,8 +1972,8 @@ mod tests {
     assert_eq!(cells[at + 1], ("Agg tok/s", "50.3 over 3m34s".to_string()));
     // The prompt speed follows the two generation figures, and the token
     // counts follow it.
-    assert_eq!(cells[at + 2], ("Prefill tok/s", "—".to_string()));
-    assert_eq!(cells[at + 3].0, "Tokens in");
+    assert_eq!(cells[at + 2], ("Avg Prefill tok/s", "—".to_string()));
+    assert_eq!(cells[at + 3].0, "Avg total");
   }
 
   #[test]
@@ -2452,13 +2463,18 @@ mod tests {
 
   #[test]
   fn summary_cells_use_the_placeholder_for_missing_figures() {
+    let text = |cells: &[(&'static str, String)], label: &str| {
+      cells.iter().find(|c| c.0 == label).unwrap().1.clone()
+    };
     let cells = RequestSummary::default().cells("—");
-    assert_eq!(cells[0], ("Requests", "0".to_string()));
-    assert_eq!(cells[2], ("Hosts", "—".to_string()));
-    assert_eq!(cells[4], ("Avg total", "—".to_string()));
-    assert_eq!(cells[6], ("Avg tok/s", "—".to_string()));
-    assert_eq!(cells[7], ("Agg tok/s", "—".to_string()));
-    assert_eq!(cells[8], ("Prefill tok/s", "—".to_string()));
+    // The counts lead, one row, and the speeds and token totals follow on the
+    // second.
+    assert_eq!(cells[0], ("Hosts", "—".to_string()));
+    assert_eq!(cells[2], ("Requests", "0".to_string()));
+    assert_eq!(text(&cells, "Avg total"), "—");
+    assert_eq!(text(&cells, "Avg tok/s"), "—");
+    assert_eq!(text(&cells, "Agg tok/s"), "—");
+    assert_eq!(text(&cells, "Avg Prefill tok/s"), "—");
     let filled = RequestSummary {
       avg_duration_ms: Some(1_240),
       tokens_per_second_avg: Some(39.64),
@@ -2469,13 +2485,13 @@ mod tests {
       ..RequestSummary::default()
     };
     let filled_cells = filled.cells("—");
-    assert_eq!(filled_cells[4].1, "1.2s");
-    assert_eq!(filled_cells[6].1, "39.6");
-    assert_eq!(filled_cells[7], ("Agg tok/s", "—".to_string()));
+    assert_eq!(text(&filled_cells, "Avg total"), "1.2s");
+    assert_eq!(text(&filled_cells, "Avg tok/s"), "39.6");
+    assert_eq!(text(&filled_cells, "Agg tok/s"), "—");
     // A speed from 1000 up loses the decimal here too.
-    assert_eq!(filled_cells[8], ("Prefill tok/s", "3367".to_string()));
-    assert_eq!(filled_cells[9].1, "12.3k");
-    assert_eq!(filled_cells[10], ("Cached", "1200 (97.6%)".to_string()));
+    assert_eq!(text(&filled_cells, "Avg Prefill tok/s"), "3367");
+    assert_eq!(text(&filled_cells, "Tokens in"), "12.3k");
+    assert_eq!(text(&filled_cells, "Cached"), "1200 (97.6%)".to_string());
     // The session speed is the newest one a stream reported, and the only
     // speed on the strip besides the average.
     assert!(!filled_cells.iter().any(|c| c.0 == "Tok/s last"));

@@ -13,15 +13,15 @@
 │★ Favorites                                                                 ││                                        │
 │ ★ mistral-7b                             llama       Q4_K    8.0k    4.0G  ││ ID:L1  :41100  ● ready · 4.2G RAM · 31 │
 │────────────────────────────────────────────────────────────────────────────││ ────────────────────────────────────── │
-│m/x                                                                         ││ Requests 6   Errors 1   Live 1/2       │
-│ ★ mistral-7b                             llama       Q4_K    8.0k    4.0G  ││ Hosts 2   Connections 4                │
-│m/y                                                                         ││ Avg total 20.2s   Avg TTFB 16.0s       │
-│   phi-3                                  phi         Q4_K    8.0k    3.9G  ││ Avg tok/s 41.3                         │
+│m/x                                                                         ││ Live 1/2   Hosts 2   Connections 4     │
+│ ★ mistral-7b                             llama       Q4_K    8.0k    4.0G  ││ Requests 6   Errors 1   Auto-starts 2  │
+│m/y                                                                         ││ Unloaded 1                             │
+│   phi-3                                  phi         Q4_K    8.0k    3.9G  ││ Avg tok/s 41.3   Tok/s session 48.9    │
 │                                                                            ││ Agg tok/s 52.4 over 6.3s               │
-│                                                                            ││ Prefill tok/s 1043                     │
-│                                                                            ││ Tok/s session 48.9   Tokens in 36.9k   │
-│                                                                            ││ Cached 33.5k (90.8%)   Tokens out 328  │
-│                                                                            ││ Auto-starts 2   Unloaded 1             │
+│                                                                            ││ Avg Prefill tok/s 1043                 │
+│                                                                            ││ Avg total 20.2s   Avg TTFB 16.0s       │
+│                                                                            ││ Tokens in 36.9k   Cached 33.5k (90.8%) │
+│                                                                            ││ Tokens out 328                         │
 │                                                                            ││                                        │
 │                                                                            ││ Time     Code Tok/s  Total   TTFB      │
 │                                                                            ││ HH:MM:SS 200  41.3   4.3s    182ms     │

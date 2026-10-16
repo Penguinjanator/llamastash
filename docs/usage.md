@@ -540,20 +540,20 @@ llamastash requests [model-ref] [-n N] [--json]
 Without `model-ref` it lists every request. A `model-ref` that names a running launch — its id (`L3`), its port or its name — scopes to that launch: its own rows, and totals for what that launch served, so an earlier launch of the same model is not counted in. Any other `model-ref` names a model and keeps the wider scope, covering every launch of it. `-n` sets how many rows to print (default 100, at least 1).
 
 ```
+        Hosts  1
+    Connections  4
        Requests  4
          Errors  1
-          Hosts  1
-    Connections  4
-      Avg total  1.7s
-       Avg TTFB  1.7s
+    Auto-starts  1
+       Unloaded  0
       Avg tok/s  116.5
       Agg tok/s  114.9 over 87ms
-  Prefill tok/s  239.9
+  Avg Prefill tok/s  239.9
+      Avg total  1.7s
+       Avg TTFB  1.7s
       Tokens in  82
          Cached  40 (48.8%)
      Tokens out  10
-    Auto-starts  1
-       Unloaded  0
 
 TIME      CODE  TOK/S  PP/S   TOTAL  TTFB  IN  OUT  MODEL                     LAUNCH  CLIENT           REQUEST FOR               ROUTE             NOTE
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -565,10 +565,10 @@ TIME      CODE  TOK/S  PP/S   TOTAL  TTFB  IN  OUT  MODEL                     LA
 
 - `TOTAL` is the time from the proxy receiving the request to the end of the response. `TTFB` is the time to the first response body byte, which includes any model load.
 - `IN` / `OUT` are prompt and generated tokens. `TOK/S` is the generation speed. A leading `~` marks a speed the proxy estimated because the model's server reported none.
-- `PP/S` is the prompt-processing speed: how fast the engine computed the prompt tokens it could not reuse from its KV cache. A leading `~` marks the proxy's estimate, used wherever the server sends no prefill timing. It is `-` for a request that never reached a model. On a warm prompt the engine computes only the few uncached tokens in one small batch, and a small batch runs at about generation speed, so those rows read close to `TOK/S`: llama-server build 11658 (CPU, gemma-3-1b-it Q4_K_M) sent `prompt_n` 1 over `prompt_ms` 27.3, which is 36.6 tok/s. `Prefill tok/s` weighs rows by tokens, so the summary stays near the speed of the cold prompts.
+- `PP/S` is the prompt-processing speed: how fast the engine computed the prompt tokens it could not reuse from its KV cache. A leading `~` marks the proxy's estimate, used wherever the server sends no prefill timing. It is `-` for a request that never reached a model. On a warm prompt the engine computes only the few uncached tokens in one small batch, and a small batch runs at about generation speed, so those rows read close to `TOK/S`: llama-server build 11658 (CPU, gemma-3-1b-it Q4_K_M) sent `prompt_n` 1 over `prompt_ms` 27.3, which is 36.6 tok/s. `Avg Prefill tok/s` weighs rows by tokens, so the summary stays near the speed of the cold prompts.
 - `NOTE` is the last column in both the padded table and the tab-separated fields. It says what happened beyond the status code: `auto-start` (this request started the model), `unloaded L3` (launches unloaded to make room), `fallback (<reason>)`, `alias` (the `model` string the client sent was a `proxy.aliases` name, not a model name), `client closed`, `upstream error`, `loading model`, `in flight`, or the proxy's own error and its message (`launch_failed: auto-start of ...`).
 - `REQUEST FOR` is the `model` string the client sent. It reads the same as `MODEL` for a plain request, and names the asked-for model when an alias or a fallback answered instead.
-- On a terminal the table is padded: a summary block prints above it, and a `NOTE` longer than 60 cells wraps onto continuation lines under its column rather than running off the screen. The block leads with `Requests`, `Errors`, `Hosts` and `Connections`, and puts a single `Live` line between the errors and the hosts only while something is in flight — one number when every host in flight is on one connection, `hosts/connections` when they differ (one agent runner with two tools open reads `1/2`). The rest is the averages — `Avg total`, `Avg TTFB`, `Avg tok/s` (the mean of the per-request speeds), `Agg tok/s` with the wall it averages over (`Agg tok/s 52.4 over 6.3s`) and `Prefill tok/s` — then the token counts, where `Cached` carries the tokens served from the KV cache and the share of the prompts that reported one (`Cached 40 (48.8%)`), then auto-starts and unloads. The wrap belongs to that padded layout, so `--no-colors`, `NO_COLOR`, or piped stdout prints the header plus one tab-separated line per request with the whole note in its field. The padded table caps `MODEL` and `REQUEST FOR` at 24 cells with `...`, so one long repo id does not widen every shorter row; piped output carries both whole. The `MODEL` column is dropped when `model-ref` names one model or one launch.
+- On a terminal the table is padded: a summary block prints above it, and a `NOTE` longer than 60 cells wraps onto continuation lines under its column rather than running off the screen. The block leads with what happened — `Live` (only while something is in flight: one number when every host in flight is on one connection, `hosts/connections` when they differ, so one agent runner with two tools open reads `1/2`), `Hosts`, `Connections`, `Requests`, `Errors`, auto-starts and unloads — and then the speeds and totals: `Avg tok/s` (the mean of the per-request speeds, with `Tok/s session` beside it whenever the scope is a model rather than one launch, and only when that launch has a speed), `Agg tok/s` with the wall it averages over (`Agg tok/s 52.4 over 6.3s`), `Avg Prefill tok/s`, `Avg total`, `Avg TTFB`, and the token counts, where `Cached` carries the tokens served from the KV cache and the share of the prompts that reported one (`Cached 40 (48.8%)`). The wrap belongs to that padded layout, so `--no-colors`, `NO_COLOR`, or piped stdout prints the header plus one tab-separated line per request with the whole note in its field. The padded table caps `MODEL` and `REQUEST FOR` at 24 cells with `...`, so one long repo id does not widen every shorter row; piped output carries both whole. The `MODEL` column is dropped when `model-ref` names one model or one launch.
 
 `--json` emits `{ "summary": {...}, "requests": [...] }`. Every key of a request is always present; a value the proxy does not have is `null`:
 
@@ -2232,7 +2232,7 @@ inheritance is visible at the row level.
 
 The last tab of every model that has a launch. It shows that launch's proxy requests only — the same data as [`llamastash requests <launch-ref>`](#llamastash-requests-model-ref), refreshed twice a second while the tab is open, so an earlier launch of the same model is not counted in. A model resident in a managed multiplexer is the exception: its requests are filed under the model, not under a launch of their own, so that row shows the whole-model aggregate. The Chat, Embed and Rerank tabs talk to the launch's own port, so what they send does not appear here.
 
-- The top lines are the launch's summary: requests, errors, live hosts and connections while anything is in flight, hosts and connections over the rows the log keeps, average total time and time to first byte, tok/s (the mean of the per-request speeds, the aggregate over the wall they ran, and the session figure), the prompt-processing speed, tokens in, the tokens cached with their share, tokens out, auto-starts, and launches unloaded to make room.
+- The summary sits in two lines at the top, each wrapped on its own. The first is what happened: live hosts and connections while anything is in flight, hosts and connections over the rows the log keeps, requests, errors, auto-starts, and launches unloaded to make room. The second is how fast: tok/s (the mean of the per-request speeds, plus the session figure whenever the tab is scoped to a model rather than to one launch), the aggregate over the wall they ran, the prompt-processing speed, average total time and time to first byte, tokens in, the tokens cached with their share, and tokens out.
 - Below is the table, newest request first. `↑` / `↓` scroll it. While you are scrolled into the history, a refresh that brings newer requests keeps the row you are looking at on top; at the top it follows the newest.
 - The columns are `Time`, `Code`, `Tok/s`, `PP/s`, `Total`, `TTFB`, `In`, `Out`, `Request for`, `Client`, `Route` and `Note`. `Note` sits last so the free text grows to the right of the fixed figures instead of shifting them. As the pane narrows the columns drop by priority, not by position: `Route` first, then `Client`, then `Request for`, then `Note`, then `PP/s`, with `Time` last. `Request for` is the model the client asked for, which differs from the model the tab is scoped to whenever an alias or a fallback answered. It gets the same 24 cells the `requests` table gives a name, so a repo id reads the same in both.
 - Every row is one line. `Note` is the last column, takes the spare width, and text longer than it keeps its first words and ends in an ellipsis; `Route` keeps its own width. The tab has no wrap toggle, so the whole note is read with `llamastash requests <model-ref>`, which wraps it at 60 cells.
