@@ -881,16 +881,18 @@ fn check_tool_config_urls(live: &stale_url::LiveProxy, listen: &str) -> Vec<Find
 /// well as inside the `stale → live` list: a rewrite aimed at the wrong
 /// port has to read wrong on its own, not only when the arrow is read back.
 fn stale_url_message(path: &Path, found: &[String], listen: &str, changes: &str) -> String {
-  let named = match (found.first(), found.len()) {
-    (Some(first), 1) => first.clone(),
-    (Some(first), n) => format!("{first} and {} more", n - 1),
-    (None, _) => "a proxy address".to_string(),
+  let head = match (found.first(), found.len()) {
+    (Some(first), 1) => format!("`{}` points at {first}", path.display()),
+    (Some(first), n) => format!("`{}` points at {first} and {} more", path.display(), n - 1),
+    (None, _) => format!("`{}` points at a proxy address", path.display()),
   };
-  format!(
-    "`{}` points at {named}, which nothing listens on; the proxy listens on {listen} \
-     — {changes}",
-    path.display(),
-  )
+  // One address gets no list after it, or the same pair prints twice; several
+  // get the count once, in the head, and the capped list after it.
+  if found.len() > 1 {
+    format!("{head}, which nothing listens on; the proxy listens on {listen} — {changes}")
+  } else {
+    format!("{head}, which nothing listens on; the proxy listens on {listen}")
+  }
 }
 
 /// The finding for one scanned config. A stale address carries the repair;
@@ -979,12 +981,19 @@ fn apply_fixes(
             // without one means the proxy went away after the report was
             // built. There is then no address to rewrite to, and `--fix`
             // promised never to be silent about what it left alone.
-            None => fixes.push(FixReport::skipped(
-              FixId::ToolConfigProxyUrl,
-              "every tool config",
-              "no proxy is answering, so there is no address to rewrite to; \
-               start the daemon and run --fix again",
-            )),
+            None => {
+              // `target` names a path for every other repair, so it stays a
+              // path here even though this repair spans several files.
+              let target = crate::util::paths::config_dir()
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|| "the tool configs `init` writes".to_string());
+              fixes.push(FixReport::skipped(
+                FixId::ToolConfigProxyUrl,
+                target,
+                "no proxy is answering, so there is no address to rewrite to; \
+                 start the daemon and run --fix again",
+              ))
+            }
           }
         }
       }
@@ -2281,6 +2290,34 @@ mod tests {
     let json = serde_json::to_string(&finding).unwrap();
     assert!(!json.contains("\"fix\":"), "{json}");
     assert!(json.contains("could not be read"), "{json}");
+  }
+
+  #[test]
+  fn a_stale_finding_counts_its_addresses_once() {
+    // Past the list cap the head and the list used to count the same remainder
+    // two different ways inside one sentence, and at one address the pair was
+    // printed twice over.
+    let text = "http://127.0.0.1:11435/v1 http://127.0.0.1:11436/v1 \
+                http://127.0.0.1:11438/v1 http://127.0.0.1:11439/v1";
+    let live = stale_url::LiveProxy::from_base_url("http://127.0.0.1:11500/v1", &[11435])
+      .expect("live proxy");
+    let urls = stale_url::stale_urls(text, &live);
+    assert_eq!(urls.len(), 4);
+    let found: Vec<String> = urls.iter().map(|u| u.found.clone()).collect();
+    let msg = stale_url_message(
+      Path::new("/home/u/.config/zed/settings.json"),
+      &found,
+      "http://127.0.0.1:11500/v1",
+      &stale_url::changes(&urls),
+    );
+    assert!(msg.contains("and 3 more"), "{msg}");
+    assert!(msg.contains("(+1 more)"), "{msg}");
+    assert_eq!(
+      msg.matches("http://127.0.0.1:11435/v1").count(),
+      2,
+      "the head names the first address once: {msg}"
+    );
+    assert!(!msg.contains("and 4 more"), "{msg}");
   }
 
   #[test]

@@ -1436,23 +1436,11 @@ async fn run_integrations_step(
   let mut env_source: Option<PathBuf> = None;
   // The same walk the stale-address check reads, so the files this step
   // patches and the files `doctor` can repair are never two different sets.
-  // The walk is grouped: an entry the picker offers, then the companions that
-  // file needs — a companion is offered to nobody, so it applies with the
-  // entry above it and gets its own summary row, one per file the user can go
-  // look at.
-  let offered: Vec<&'static str> = crate::init::external::all_patchers()
-    .iter()
-    .map(|p| p.id())
-    .collect();
+  // Each chosen id brings its own companions and keeps the order the caller
+  // gave: a companion is offered to nobody, so it applies with the entry that
+  // needs it and gets its own summary row, one per file to go and look at.
   let chosen: Vec<&str> = chosen_ids.iter().map(String::as_str).collect();
-  let mut group_picked = false;
-  for target in tool_targets::tool_targets() {
-    if offered.contains(&target.id()) {
-      group_picked = chosen.contains(&target.id());
-    }
-    if !group_picked {
-      continue;
-    }
+  for target in tool_targets::targets_for(&chosen) {
     match crate::init::external::apply(target.as_ref(), &ctx, None) {
       Ok(out) => {
         if let Some(var) = target.required_env_var() {

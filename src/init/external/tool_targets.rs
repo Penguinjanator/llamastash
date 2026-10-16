@@ -25,6 +25,26 @@ pub fn tool_targets() -> Vec<Box<dyn ToolPatcher>> {
   out
 }
 
+/// The targets for `ids`, each with its companions, in the order the caller
+/// gave them. An id repeats its group, which is what a repeated `--integrations`
+/// entry always meant: write that integration again.
+pub fn targets_for(ids: &[&str]) -> Vec<Box<dyn ToolPatcher>> {
+  let offered: Vec<&str> = tools::registered().iter().map(|p| p.id()).collect();
+  let mut out: Vec<Box<dyn ToolPatcher>> = Vec::new();
+  for id in ids {
+    let mut in_group = false;
+    for target in tool_targets() {
+      if offered.contains(&target.id()) {
+        in_group = target.id() == *id;
+      }
+      if in_group {
+        out.push(target);
+      }
+    }
+  }
+  out
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -60,6 +80,26 @@ mod tests {
     for id in &registered {
       assert!(walked.contains(id), "{id} missing from the walk");
     }
+  }
+
+  #[test]
+  fn a_selection_keeps_the_callers_order_and_brings_its_companions() {
+    // The integrations step takes `--integrations a,b` and used to patch in
+    // the order the user wrote, companions with their owner. Selecting through
+    // the shared walk has to keep that, not fall back to registration order.
+    let picked: Vec<&'static str> = targets_for(&["pi", "aider"])
+      .iter()
+      .map(|t| t.id())
+      .collect();
+    assert_eq!(picked, vec!["pi", "pi-settings", "aider"]);
+    // An id named twice is applied twice: that is what a repeated flag always
+    // meant, and nothing here is order-sensitive enough to make it wrong.
+    let twice: Vec<&'static str> = targets_for(&["aider", "aider"])
+      .iter()
+      .map(|t| t.id())
+      .collect();
+    assert_eq!(twice, vec!["aider", "aider"]);
+    assert!(targets_for(&[]).is_empty());
   }
 
   #[test]

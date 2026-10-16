@@ -249,18 +249,27 @@ fn urls(text: &str) -> Vec<Url> {
 /// The config file each registered patcher (and its companions) would patch,
 /// when it exists on disk.
 fn config_files() -> Vec<PathBuf> {
-  let mut paths: Vec<PathBuf> = Vec::new();
-  for target in super::tool_targets::tool_targets() {
-    // Exactly the path `init` would write — its accepted alt when the user
-    // has one — so check and repair can never point at different files.
-    let Ok(path) = resolve_path(target.as_ref(), None) else {
-      continue;
-    };
-    if path.is_file() && !paths.contains(&path) {
-      paths.push(path);
+  distinct_existing(
+    super::tool_targets::tool_targets()
+      .iter()
+      // Exactly the path `init` would write — its accepted alt when the user
+      // has one — so check and repair can never point at different files.
+      .filter_map(|target| resolve_path(target.as_ref(), None).ok()),
+  )
+}
+
+/// The paths that are files on disk, in first-seen order, repeats dropped. Two
+/// integrations can share one file — `env.sh` is written by `env-sh` and by
+/// pi.dev's companion — and a file a scan reports once is a file the repair
+/// rewrites once and ledges once.
+fn distinct_existing(paths: impl Iterator<Item = PathBuf>) -> Vec<PathBuf> {
+  let mut out: Vec<PathBuf> = Vec::new();
+  for path in paths {
+    if path.is_file() && !out.contains(&path) {
+      out.push(path);
     }
   }
-  paths
+  out
 }
 
 #[cfg(test)]
@@ -549,18 +558,29 @@ mod tests {
   }
 
   #[test]
-  fn every_scanned_config_exists_and_is_scanned_once() {
-    let files = config_files();
-    for path in &files {
+  fn a_shared_config_is_kept_once_and_a_missing_one_never() {
+    // Written as a rule over resolved paths rather than as a walk of the real
+    // `$HOME`, which on a clean runner holds none of these files (so the walk
+    // would assert nothing) and on a dev box holds that user's own configs.
+    let dir = crate::util::test_temp::unique_temp_dir("stale-scan");
+    let shared = dir.join("env.sh");
+    std::fs::write(&shared, "x").unwrap();
+    let absent = dir.join("settings.json");
+    let picked = distinct_existing(
+      vec![shared.clone(), absent.clone(), shared.clone()]
+        .into_iter()
+        .chain(std::iter::once(shared.clone())),
+    );
+    assert_eq!(picked, vec![shared], "a shared file must be scanned once");
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn every_config_the_walk_names_is_a_file() {
+    // On a machine with none of them this is an empty list, which is the right
+    // answer rather than a vacuous pass: the walk may only name existing files.
+    for path in config_files() {
       assert!(path.is_file(), "{path:?} is not a file on disk");
     }
-    // `env.sh` is written by both `env-sh` and pi.dev's companion, so the same
-    // path can come round twice; the scan must say so once.
-    let unique = files.iter().collect::<std::collections::HashSet<_>>();
-    assert_eq!(
-      unique.len(),
-      files.len(),
-      "a shared config scanned twice: {files:?}"
-    );
   }
 }
