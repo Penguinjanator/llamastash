@@ -49,10 +49,12 @@ const GTT_HINT_RATIO_HI: f64 = 0.60;
 /// v2: added the `hardware` section and the `memory_drift` / `gtt_hint`
 /// finding ids (R12-R14).
 ///
-/// v3: added the `tool_config_stale_url` finding and its
-/// `tool_config_proxy_url` repair. Both are additive — a reader of the
-/// previous version still parses every field it knew about.
-pub const DOCTOR_JSON_SCHEMA_VERSION: u32 = 3;
+/// Finding and fix ids stay additive within a version — a reader that does not
+/// know an id still parses the report — so later additions did not bump it:
+/// `tool_config_stale_url` and its `tool_config_proxy_url` repair landed under
+/// v2, as did the backend-contributed advisories before them. Only a shape
+/// change (new section, renamed or retyped field) earns a bump.
+pub const DOCTOR_JSON_SCHEMA_VERSION: u32 = 2;
 
 /// `SnapshotStale` finding fires when the bundled snapshot is older
 /// than this many days vs today.
@@ -864,18 +866,28 @@ fn stale_daemon_files(state_dir: &Path) -> Vec<PathBuf> {
 /// one to compare against — and one finding per file, because the repair is
 /// per file too.
 fn check_tool_config_urls(live: &stale_url::LiveProxy) -> Vec<Finding> {
-  stale_url::stale_files(live)
+  stale_url::scan(live)
     .into_iter()
-    .map(|file| {
-      Finding::new(
+    .map(|scan| match scan {
+      stale_url::Scan::Stale { path, urls } => Finding::new(
         FindingId::ToolConfigStaleUrl,
         Severity::Warning,
         format!(
           "`{}` points at a proxy address nothing listens on: {}",
-          file.path.display(),
-          stale_url::changes(&file.urls)
+          path.display(),
+          stale_url::changes(&urls)
         ),
-      )
+      ),
+      // Not a repair that failed — an address that could not be read is one
+      // nothing checked, which is not the same as nothing found.
+      stale_url::Scan::Unreadable { path, reason } => Finding::new(
+        FindingId::ToolConfigStaleUrl,
+        Severity::Warning,
+        format!(
+          "`{}` could not be read, so its proxy address was not checked: {reason}",
+          path.display()
+        ),
+      ),
     })
     .collect()
 }
@@ -926,8 +938,19 @@ fn apply_fixes(
         if !proxy_urls_done {
           proxy_urls_done = true;
           if let Some(live) = live {
-            for file in stale_url::stale_files(live) {
-              fixes.push(fix_tool_config_url(&file.path, live, dry_run));
+            for scan in stale_url::scan(live) {
+              match scan {
+                stale_url::Scan::Stale { path, .. } => {
+                  fixes.push(fix_tool_config_url(&path, live, dry_run))
+                }
+                // The finding said so; the ledger says it here too, so
+                // `--fix` is not quiet about the file it left alone.
+                stale_url::Scan::Unreadable { path, reason } => fixes.push(FixReport::skipped(
+                  FixId::ToolConfigProxyUrl,
+                  path.display().to_string(),
+                  format!("could not read: {reason}"),
+                )),
+              }
             }
           }
         }
@@ -1290,7 +1313,7 @@ pub async fn run(args: DoctorArgs, _cli: &Cli, config: &Config) -> CliResult {
   let live_proxy = crate::init::external::proxy_url::from_running_daemon()
     .await
     .as_deref()
-    .and_then(stale_url::LiveProxy::from_base_url);
+    .and_then(|base| stale_url::LiveProxy::from_base_url(base, &stale_url::bind_bases(config)));
   if let Some(live) = live_proxy.as_ref() {
     report.findings.extend(check_tool_config_urls(live));
   }
@@ -1675,7 +1698,7 @@ mod tests {
     assert_eq!(hs.gpu_pool_total_bytes, Some(CARVE + 124 * GIB));
     assert_eq!(hs.uma_carve_bytes, Some(CARVE));
     assert_eq!(hs.uma_shared_bytes, Some(124 * GIB));
-    assert_eq!(report.schema_version, 3);
+    assert_eq!(report.schema_version, 2);
   }
 
   #[test]
@@ -2156,7 +2179,11 @@ mod tests {
   fn a_stale_tool_config_is_rewritten_in_place() {
     let dir = crate::test_support::unique_temp_dir("doctor-fix", "tool-url");
     std::fs::create_dir_all(&dir).unwrap();
-    let live = stale_url::LiveProxy::from_base_url("http://127.0.0.1:11437/v1").unwrap();
+    let live = stale_url::LiveProxy::from_base_url(
+      "http://127.0.0.1:11437/v1",
+      &stale_url::bind_bases(&Config::default()),
+    )
+    .unwrap();
     let path = dir.join("env.sh");
     let body = "# llamastash env.sh (generated, do not edit by hand)\nexport AIDER_API_BASE=\"http://127.0.0.1:11435/v1\"\nexport ANTHROPIC_BASE_URL=\"http://127.0.0.1:11435\"\n";
     std::fs::write(&path, body).unwrap();

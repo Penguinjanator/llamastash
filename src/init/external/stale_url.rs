@@ -6,6 +6,13 @@
 //! itself notices. This reads those files back and finds the mismatch so
 //! [`crate::init::doctor`] can repair it.
 //!
+//! Only a port the proxy could itself have bound counts as stale: the
+//! configured port and both mode defaults, each with the scan window the
+//! listener probes above it. The scanned files are shared configs — Zed's and
+//! OpenCode's settings also carry MCP servers and other local engines — and a
+//! URL outside that window belongs to whoever wrote it. Repointing one at
+//! llamastash would break it, silently and ledged as a success.
+//!
 //! The repair is textual, not a re-run of a patcher: re-patching would also
 //! rewrite the model list to the current defaults, which is a much bigger
 //! change than the one broken value. Only the `host:port` authority is
@@ -14,35 +21,69 @@
 //! carries (`/v1` for the OpenAI-shape tools, none for Claude Code) is kept.
 
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use regex::Regex;
 
+use crate::config::{Config, ProxyConfig};
+use crate::proxy::server::DEFAULT_PORT_SCAN_MAX_OFFSET;
+
 use super::{resolve_path, tools};
 
-/// The proxy address a running daemon reports, split so a config's `host:port`
-/// can be compared against it.
+/// The proxy address a running daemon reports, plus the ports it could itself
+/// have been asked to bind.
 pub struct LiveProxy {
-  pub host: String,
-  pub port: u16,
+  host: String,
+  port: u16,
+  /// Each one carries [`DEFAULT_PORT_SCAN_MAX_OFFSET`] ports above it, which
+  /// is as far as the listener roams.
+  bases: Vec<u16>,
 }
 
 impl LiveProxy {
-  /// Split the base URL
+  /// The live proxy from the base URL
   /// [`crate::init::external::proxy_url::from_running_daemon`] returns
-  /// (`http://127.0.0.1:11437/v1`).
-  pub fn from_base_url(base_url: &str) -> Option<Self> {
+  /// (`http://127.0.0.1:11437/v1`) and the bases from [`bind_bases`].
+  pub fn from_base_url(base_url: &str, bases: &[u16]) -> Option<Self> {
     let url = urls(base_url).into_iter().next()?;
     Some(Self {
       host: url.host,
       port: url.port,
+      bases: bases.to_vec(),
+    })
+  }
+
+  /// Whether `port` is one this proxy could have bound. Anything else on the
+  /// same host is another program's server.
+  fn could_bind(&self, port: u16) -> bool {
+    self.bases.iter().any(|base| {
+      let high = base.saturating_add(DEFAULT_PORT_SCAN_MAX_OFFSET);
+      port >= *base && port <= high
     })
   }
 
   fn authority(&self) -> String {
     format!("{}:{}", self.host, self.port)
   }
+}
+
+/// The ports the proxy could have been asked to bind: the configured one and
+/// the two mode defaults. Each one owns the scan window above it, so a config
+/// written at a port none of them covers — an old one-shot `--proxy-port`,
+/// say — is left for its owner to edit.
+pub fn bind_bases(config: &Config) -> Vec<u16> {
+  let mut bases: Vec<u16> = Vec::new();
+  for base in [
+    config.proxy.effective_port(),
+    ProxyConfig::DEFAULT_PORT,
+    ProxyConfig::DEFAULT_OLLAMA_COMPAT_PORT,
+  ] {
+    if !bases.contains(&base) {
+      bases.push(base);
+    }
+  }
+  bases
 }
 
 /// One `http://host:port` occurrence in a text, as the file writes it.
@@ -69,6 +110,7 @@ impl Url {
 
 /// A URL in a config that names a port other than the live proxy's, with what
 /// it becomes once rewritten.
+#[derive(Debug)]
 pub struct StaleUrl {
   /// The URL exactly as the file writes it.
   pub found: String,
@@ -78,19 +120,23 @@ pub struct StaleUrl {
   authority: Range<usize>,
 }
 
-/// One config file and the stale URLs in it.
-pub struct StaleFile {
-  pub path: PathBuf,
-  pub urls: Vec<StaleUrl>,
+/// One scanned config file and what the scan could say about it.
+#[derive(Debug)]
+pub enum Scan {
+  /// The file names proxy addresses the live proxy has moved off.
+  Stale { path: PathBuf, urls: Vec<StaleUrl> },
+  /// The file exists but is not readable text, so what it names is unknown.
+  /// Reporting that beats letting an unreadable config read as a clean one.
+  Unreadable { path: PathBuf, reason: String },
 }
 
-/// Every stale URL in `text`. A URL is stale when its host is the live
-/// proxy's and its port is not; a different host is somebody else's server
-/// and a URL naming no port is not an address we could move.
+/// Every stale URL in `text` — the one predicate both the finding and the
+/// repair use: the live proxy's host, a port it is not on now, and a port it
+/// could have bound.
 pub fn stale_urls(text: &str, live: &LiveProxy) -> Vec<StaleUrl> {
   urls(text)
     .into_iter()
-    .filter(|url| url.host == live.host && url.port != live.port)
+    .filter(|url| url.host == live.host && url.port != live.port && live.could_bind(url.port))
     .map(|url| StaleUrl {
       found: url.text(),
       rewritten: url.with_authority(&live.authority()),
@@ -118,28 +164,50 @@ pub fn rewrite(text: &str, live: &LiveProxy) -> Option<String> {
   Some(out)
 }
 
-/// The `stale → live` pairs of `urls`, one line per file — what a finding
-/// about a config says and what the repair ledges against it.
+/// How many `stale → live` pairs one message names before counting the rest.
+const CHANGES_SHOWN: usize = 3;
+
+/// The `stale → live` pairs of `urls` — what a finding about a config says and
+/// what the repair ledges against it. One settings file can hold many local
+/// servers, so the list is capped and the remainder counted.
 pub fn changes(urls: &[StaleUrl]) -> String {
-  urls
+  let mut line = urls
     .iter()
+    .take(CHANGES_SHOWN)
     .map(|url| format!("{} \u{2192} {}", url.found, url.rewritten))
     .collect::<Vec<_>>()
-    .join(", ")
+    .join(", ");
+  let rest = urls.len().saturating_sub(CHANGES_SHOWN);
+  if rest > 0 {
+    line.push_str(&format!(" (+{rest} more)"));
+  }
+  line
 }
 
-/// Every config `init` writes, filtered to the ones naming a stale port.
-pub fn stale_files(live: &LiveProxy) -> Vec<StaleFile> {
+/// Every config `init` writes, filtered to the ones that name a stale port or
+/// could not be read at all.
+pub fn scan(live: &LiveProxy) -> Vec<Scan> {
   config_files()
-    .into_iter()
-    .filter_map(|path| {
-      // Undecidable rather than stale: a file we cannot read is not one a
-      // textual repair may touch.
-      let text = std::fs::read_to_string(&path).ok()?;
-      let urls = stale_urls(&text, live);
-      (!urls.is_empty()).then_some(StaleFile { path, urls })
-    })
+    .iter()
+    .filter_map(|path| scan_file(path, live))
     .collect()
+}
+
+/// What can be said about one config file. `None` when it holds no stale URL.
+fn scan_file(path: &Path, live: &LiveProxy) -> Option<Scan> {
+  match std::fs::read_to_string(path) {
+    Ok(text) => {
+      let urls = stale_urls(&text, live);
+      (!urls.is_empty()).then(|| Scan::Stale {
+        path: path.to_path_buf(),
+        urls,
+      })
+    }
+    Err(e) => Some(Scan::Unreadable {
+      path: path.to_path_buf(),
+      reason: e.to_string(),
+    }),
+  }
 }
 
 /// The `http://host:port…` occurrences in `text`. The URL ends at a quote,
@@ -195,17 +263,20 @@ mod tests {
   use super::*;
 
   fn live() -> LiveProxy {
-    LiveProxy::from_base_url("http://127.0.0.1:11437/v1").expect("live base splits")
+    // A default install whose proxy roamed to 11437, so the ports it could
+    // have been asked to bind are the two mode defaults.
+    LiveProxy::from_base_url("http://127.0.0.1:11437/v1", &bind_bases(&Config::default()))
+      .expect("live base splits")
   }
 
   #[test]
   fn the_live_base_splits_into_host_and_port() {
-    let live = LiveProxy::from_base_url("http://127.0.0.1:11437/v1").expect("ipv4 base");
+    let live = LiveProxy::from_base_url("http://127.0.0.1:11437/v1", &[11435]).expect("ipv4 base");
     assert_eq!((live.host.as_str(), live.port), ("127.0.0.1", 11437));
     // A wildcard bind arrives as loopback; an IPv6 loopback keeps its brackets.
-    let v6 = LiveProxy::from_base_url("http://[::1]:11437/v1").expect("ipv6 base");
+    let v6 = LiveProxy::from_base_url("http://[::1]:11437/v1", &[11435]).expect("ipv6 base");
     assert_eq!((v6.host.as_str(), v6.port), ("[::1]", 11437));
-    assert!(LiveProxy::from_base_url("not a url").is_none());
+    assert!(LiveProxy::from_base_url("not a url", &[11435]).is_none());
   }
 
   #[test]
@@ -224,6 +295,81 @@ mod tests {
     assert!(stale_urls(r#"base_url = "http://192.168.1.20:11435/v1""#, &live()).is_empty());
     // No port named at all: not an address a repair could move.
     assert!(stale_urls("http://127.0.0.1/v1", &live()).is_empty());
+  }
+
+  #[test]
+  fn a_port_the_proxy_could_not_have_bound_belongs_to_another_program() {
+    // An MCP server on 8080 or a second engine on 12000 is not the proxy
+    // having moved, and is never found or rewritten.
+    let text = r#"{"mcp":{"api":"http://127.0.0.1:8080/v1"},"other":"http://127.0.0.1:12000/v1"}"#;
+    assert!(stale_urls(text, &live()).is_empty(), "{text}");
+    // Window edges: the six-port scan reaches 11434..=11440 from the two
+    // mode defaults, so 11433 and 11441 are somebody else's listener.
+    assert_eq!(stale_urls("http://127.0.0.1:11440/v1", &live()).len(), 1);
+    assert_eq!(stale_urls("http://127.0.0.1:11434/v1", &live()).len(), 1);
+    assert!(stale_urls("http://127.0.0.1:11441/v1", &live()).is_empty());
+    assert!(stale_urls("http://127.0.0.1:11433/v1", &live()).is_empty());
+  }
+
+  #[test]
+  fn the_configured_port_widens_the_window_to_wherever_it_is() {
+    // `proxy.port: 11500` means a config written there is repairable; a port
+    // far from every base is still not.
+    let mut config = Config::default();
+    config.proxy.port = Some(11500);
+    let pinned =
+      LiveProxy::from_base_url("http://127.0.0.1:11502/v1", &bind_bases(&config)).unwrap();
+    assert_eq!(stale_urls("http://127.0.0.1:11505/v1", &pinned).len(), 1);
+    assert!(stale_urls("http://127.0.0.1:11506/v1", &pinned).is_empty());
+    assert!(stale_urls("http://127.0.0.1:8080/v1", &pinned).is_empty());
+  }
+
+  #[test]
+  fn the_bind_bases_are_the_configured_port_and_both_mode_defaults() {
+    assert_eq!(
+      bind_bases(&Config::default()),
+      vec![
+        ProxyConfig::DEFAULT_PORT,
+        ProxyConfig::DEFAULT_OLLAMA_COMPAT_PORT
+      ]
+    );
+    let mut config = Config::default();
+    config.proxy.port = Some(11500);
+    assert_eq!(
+      bind_bases(&config),
+      vec![
+        11500,
+        ProxyConfig::DEFAULT_PORT,
+        ProxyConfig::DEFAULT_OLLAMA_COMPAT_PORT
+      ]
+    );
+    // Compat mode's effective port is already a default, so it is not listed
+    // twice.
+    let mut compat = Config::default();
+    compat.proxy.ollama_compat = true;
+    assert_eq!(
+      bind_bases(&compat),
+      vec![
+        ProxyConfig::DEFAULT_OLLAMA_COMPAT_PORT,
+        ProxyConfig::DEFAULT_PORT
+      ]
+    );
+  }
+
+  #[test]
+  fn a_config_holding_both_kinds_of_url_rewrites_only_the_stale_one() {
+    // The regression: a settings file holding the llamastash provider the
+    // proxy moved away from, and the user's own endpoint on a port the proxy
+    // could never have bound.
+    let text = r#"{"provider":{"llamastash":{"options":{"baseURL":"http://127.0.0.1:11435/v1"}},"mcp":{"options":{"baseURL":"http://127.0.0.1:8080/v1"}}}}"#;
+    let stale = stale_urls(text, &live());
+    assert_eq!(stale.len(), 1, "{text}");
+    assert_eq!(stale[0].found, "http://127.0.0.1:11435/v1");
+    let out = rewrite(text, &live()).expect("the stale one rewritten");
+    assert_eq!(
+      out,
+      r#"{"provider":{"llamastash":{"options":{"baseURL":"http://127.0.0.1:11437/v1"}},"mcp":{"options":{"baseURL":"http://127.0.0.1:8080/v1"}}}}"#
+    );
   }
 
   #[test]
@@ -263,5 +409,54 @@ mod tests {
     assert!(rewrite("base_url = \"http://127.0.0.1:11437/v1\"\n", &live()).is_none());
     assert!(rewrite("base_url = \"http://localhost:11435/v1\"\n", &live()).is_none());
     assert!(rewrite("", &live()).is_none());
+  }
+
+  #[test]
+  fn a_file_that_cannot_be_read_is_reported_not_skipped() {
+    let dir = crate::test_support::unique_temp_dir("stale-url", "unreadable");
+    std::fs::create_dir_all(&dir).unwrap();
+    let binary = dir.join("config.yaml");
+    // Not UTF-8: whatever address it holds, the repair cannot know.
+    std::fs::write(&binary, [0xff_u8, 0xfe, 0x00, 0x90]).unwrap();
+    let clean = dir.join("clean.json");
+    std::fs::write(&clean, r#"{"baseURL":"http://127.0.0.1:11437/v1"}"#).unwrap();
+    let stale = dir.join("stale.json");
+    std::fs::write(&stale, r#"{"baseURL":"http://127.0.0.1:11435/v1"}"#).unwrap();
+
+    let reason = match scan_file(&binary, &live()) {
+      Some(Scan::Unreadable { path, reason }) => {
+        assert_eq!(path, binary);
+        reason
+      }
+      other => panic!("an unreadable config must not vanish: {other:?}"),
+    };
+    assert!(!reason.is_empty(), "the finding needs a reason to print");
+    assert!(
+      scan_file(&clean, &live()).is_none(),
+      "a live address is not a finding"
+    );
+    assert!(matches!(
+      scan_file(&stale, &live()),
+      Some(Scan::Stale { .. })
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn a_long_change_list_is_capped_and_counted() {
+    let many = "http://127.0.0.1:11435/v1 http://127.0.0.1:11436/v1 http://127.0.0.1:11438/v1 \
+                http://127.0.0.1:11439/v1 http://127.0.0.1:11440/v1";
+    let stale = stale_urls(many, &live());
+    assert_eq!(stale.len(), 5);
+    let line = changes(&stale);
+    assert_eq!(
+      line,
+      "http://127.0.0.1:11435/v1 \u{2192} http://127.0.0.1:11437/v1, \
+       http://127.0.0.1:11436/v1 \u{2192} http://127.0.0.1:11437/v1, \
+       http://127.0.0.1:11438/v1 \u{2192} http://127.0.0.1:11437/v1 (+2 more)"
+    );
+    // At the cap nothing is counted, and an empty list stays empty.
+    assert!(!changes(&stale[..3]).contains("more"));
+    assert_eq!(changes(&[]), "");
   }
 }
