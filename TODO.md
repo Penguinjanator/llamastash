@@ -492,6 +492,7 @@ _Shared context: `src/init/external/tools/`, the `doctor` findings, and what `--
 
 - [ ] Nvidia + intel multi gpu detection issues
 - [ ] launch settings key col width should accomodate longer keys, make dynamic
+- [ ] `llamastash session claude|pi|codex|opencode` should launch the harness with active model or start a default model if none is active (configurable, with an alias or model name or model name@preset)
 
 ### Batch 6: Generic-backend engines and the multiplexer decision
 
