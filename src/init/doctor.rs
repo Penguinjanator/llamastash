@@ -868,23 +868,44 @@ fn stale_daemon_files(state_dir: &Path) -> Vec<PathBuf> {
 /// One warning per tool config naming a proxy address the live proxy is not
 /// on. The caller only asks when a proxy is answering — `doctor` never spawns
 /// one to compare against — and one finding per file, because the repair is
-/// per file too.
-fn check_tool_config_urls(live: &stale_url::LiveProxy) -> Vec<Finding> {
-  stale_url::scan(live).into_iter().map(url_finding).collect()
+/// per file too. `listen` is the address the daemon reports, the same one the
+/// repair rewrites to.
+fn check_tool_config_urls(live: &stale_url::LiveProxy, listen: &str) -> Vec<Finding> {
+  stale_url::scan(live)
+    .into_iter()
+    .map(|scan| url_finding(scan, listen))
+    .collect()
+}
+
+/// The message of a stale-address finding. Both addresses appear in words as
+/// well as inside the `stale → live` list: a rewrite aimed at the wrong
+/// port has to read wrong on its own, not only when the arrow is read back.
+fn stale_url_message(path: &Path, found: &[String], listen: &str, changes: &str) -> String {
+  let named = match (found.first(), found.len()) {
+    (Some(first), 1) => first.clone(),
+    (Some(first), n) => format!("{first} and {} more", n - 1),
+    (None, _) => "a proxy address".to_string(),
+  };
+  format!(
+    "`{}` points at {named}, which nothing listens on; the proxy listens on {listen} \
+     — {changes}",
+    path.display(),
+  )
 }
 
 /// The finding for one scanned config. A stale address carries the repair;
 /// an unreadable file carries no repair at all, because the only thing `--fix`
 /// could do with it is refuse — and its hint is the hand step instead.
-fn url_finding(scan: stale_url::Scan) -> Finding {
+fn url_finding(scan: stale_url::Scan, listen: &str) -> Finding {
   match scan {
     stale_url::Scan::Stale { path, urls } => Finding::new(
       FindingId::ToolConfigStaleUrl,
       Severity::Warning,
-      format!(
-        "`{}` points at a proxy address nothing listens on: {}",
-        path.display(),
-        stale_url::changes(&urls)
+      stale_url_message(
+        &path,
+        &urls.iter().map(|u| u.found.clone()).collect::<Vec<_>>(),
+        listen,
+        &stale_url::changes(&urls),
       ),
     ),
     // Not a repair that failed — an address that could not be read is one
@@ -946,12 +967,24 @@ fn apply_fixes(
       FixId::ToolConfigProxyUrl => {
         if !proxy_urls_done {
           proxy_urls_done = true;
-          if let Some(live) = live {
-            for scan in stale_url::scan(live) {
-              if let stale_url::Scan::Stale { path, .. } = scan {
-                fixes.push(fix_tool_config_url(&path, live, dry_run))
+          match live {
+            Some(live) => {
+              for scan in stale_url::scan(live) {
+                if let stale_url::Scan::Stale { path, .. } = scan {
+                  fixes.push(fix_tool_config_url(&path, live, dry_run))
+                }
               }
             }
+            // The finding only fires while a proxy answers, so reaching here
+            // without one means the proxy went away after the report was
+            // built. There is then no address to rewrite to, and `--fix`
+            // promised never to be silent about what it left alone.
+            None => fixes.push(FixReport::skipped(
+              FixId::ToolConfigProxyUrl,
+              "every tool config",
+              "no proxy is answering, so there is no address to rewrite to; \
+               start the daemon and run --fix again",
+            )),
           }
         }
       }
@@ -1310,12 +1343,12 @@ pub async fn run(args: DoctorArgs, _cli: &Cli, config: &Config) -> CliResult {
   // A tool config whose proxy URL went stale when the proxy moved port. What
   // the live proxy reports is also what the repair below rewrites to, so the
   // finding and the fix can never disagree about the target address.
-  let live_proxy = crate::init::external::proxy_url::from_running_daemon()
-    .await
+  let live_base = crate::init::external::proxy_url::from_running_daemon().await;
+  let live_proxy = live_base
     .as_deref()
     .and_then(|base| stale_url::LiveProxy::from_base_url(base, &stale_url::bind_bases(config)));
-  if let Some(live) = live_proxy.as_ref() {
-    report.findings.extend(check_tool_config_urls(live));
+  if let (Some(base), Some(live)) = (live_base.as_deref(), live_proxy.as_ref()) {
+    report.findings.extend(check_tool_config_urls(live, base));
   }
 
   // `--fix` acts on what the report found; `--dry-run` previews the same
@@ -2233,10 +2266,13 @@ mod tests {
   fn an_unreadable_tool_config_promises_no_repair() {
     // A finding `--fix` can only refuse must not advertise a repair: an agent
     // that branches on `fix` would run a fix that answers `skipped`.
-    let finding = url_finding(stale_url::Scan::Unreadable {
-      path: std::path::PathBuf::from("/home/u/.aider.conf.yml"),
-      reason: "stream did not contain valid UTF-8".to_string(),
-    });
+    let finding = url_finding(
+      stale_url::Scan::Unreadable {
+        path: std::path::PathBuf::from("/home/u/.aider.conf.yml"),
+        reason: "stream did not contain valid UTF-8".to_string(),
+      },
+      "http://127.0.0.1:11437/v1",
+    );
     assert_eq!(finding.id, "tool_config_stale_url");
     assert_eq!(finding.severity, Severity::Warning);
     assert_eq!(finding.fix, None, "no repair is advertised");
@@ -2245,6 +2281,46 @@ mod tests {
     let json = serde_json::to_string(&finding).unwrap();
     assert!(!json.contains("\"fix\":"), "{json}");
     assert!(json.contains("could not be read"), "{json}");
+  }
+
+  #[test]
+  fn a_stale_finding_names_both_addresses_in_words() {
+    // The live address and the file's own address have to be readable without
+    // parsing the `old → new` list back: that list is where a wrong rewrite is
+    // easiest to miss.
+    let one = stale_url_message(
+      Path::new("/home/u/.aider.conf.yml"),
+      &["http://127.0.0.1:11435/v1".to_string()],
+      "http://127.0.0.1:11437/v1",
+      "http://127.0.0.1:11435/v1 \u{2192} http://127.0.0.1:11437/v1",
+    );
+    assert!(
+      one.contains("points at http://127.0.0.1:11435/v1, which nothing listens on"),
+      "{one}"
+    );
+    assert!(
+      one.contains("the proxy listens on http://127.0.0.1:11437/v1"),
+      "{one}"
+    );
+    assert!(one.ends_with("http://127.0.0.1:11437/v1"), "{one}");
+    assert!(!one.contains("more"), "one address is not counted: {one}");
+
+    // Several in one file: the first is named and the rest counted, the same
+    // shape the pair list keeps.
+    let many = stale_url_message(
+      Path::new("/home/u/.config/zed/settings.json"),
+      &[
+        "http://127.0.0.1:11435/v1".to_string(),
+        "http://127.0.0.1:11435".to_string(),
+      ],
+      "http://127.0.0.1:11437/v1",
+      "http://127.0.0.1:11435/v1 \u{2192} http://127.0.0.1:11437/v1, http://127.0.0.1:11435 \u{2192} http://127.0.0.1:11437",
+    );
+    assert!(many.contains("and 1 more"), "{many}");
+    assert!(
+      many.contains("the proxy listens on http://127.0.0.1:11437/v1"),
+      "{many}"
+    );
   }
 
   #[test]
@@ -2272,6 +2348,31 @@ mod tests {
         .unwrap()
         .contains("\"fix\":\"tool_config_proxy_url\""),
       "the ledger entry names the repair"
+    );
+  }
+
+  #[test]
+  fn a_rewrite_with_no_live_proxy_is_ledged_not_dropped() {
+    // `--fix` is never silent about what it left alone, so a stale-config
+    // finding whose repair could not run answers with the reason rather than
+    // nothing at all — once, however many files the report flagged.
+    let findings = [
+      Finding::new(FindingId::ToolConfigStaleUrl, Severity::Warning, "a"),
+      Finding::new(FindingId::ToolConfigStaleUrl, Severity::Warning, "b"),
+    ];
+    let fixes = apply_fixes(&findings, false, None);
+    assert_eq!(fixes.len(), 1, "{fixes:?}");
+    assert_eq!(fixes[0].fix, FixId::ToolConfigProxyUrl);
+    assert_eq!(fixes[0].outcome, FixOutcome::Skipped, "{fixes:?}");
+    assert!(
+      fixes[0].detail.contains("no proxy is answering"),
+      "{fixes:?}"
+    );
+    assert!(
+      serde_json::to_string(&fixes[0])
+        .unwrap()
+        .contains("\"outcome\":\"skipped\""),
+      "the ledger entry reaches --json"
     );
   }
 

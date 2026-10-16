@@ -2,8 +2,8 @@
 //!
 //! `init` writes the address the proxy was answering on at patch time. When
 //! the proxy later moves — a busy port, `daemon start --proxy-port` /
-//! `--host` — every config still names the old one, and nothing but the tool
-//! itself notices. This reads those files back and finds the mismatch so
+//! `--proxy-host` — every config still names the old one, and nothing but the
+//! tool itself notices. This reads those files back and finds the mismatch so
 //! [`crate::init::doctor`] can repair it.
 //!
 //! Only a port the proxy could itself have bound counts as stale: the
@@ -32,7 +32,7 @@ use regex::Regex;
 use crate::config::{Config, ProxyConfig};
 use crate::proxy::server::DEFAULT_PORT_SCAN_MAX_OFFSET;
 
-use super::{resolve_path, tools};
+use super::resolve_path;
 
 /// The proxy address a running daemon reports, plus the ports it could itself
 /// have been asked to bind.
@@ -219,11 +219,13 @@ fn scan_file(path: &Path, live: &LiveProxy) -> Option<Scan> {
 
 /// The `http://host:port…` occurrences in `text`. The URL ends at a quote,
 /// whitespace or `<` — the delimiters the generated `.sh` files and the JSON,
-/// TOML and YAML configs use.
+/// TOML and YAML configs use — or at one of `, ] ) }`, which close a YAML flow
+/// list, a JSON array or an inline table and are never part of the address.
 fn urls(text: &str) -> Vec<Url> {
   static RE: OnceLock<Regex> = OnceLock::new();
   let re = RE.get_or_init(|| {
-    Regex::new(r#"http://([^\s"'<>/?#]+):([0-9]{1,5})([^\s"'<>]*)"#).expect("static pattern")
+    Regex::new(r#"http://([^\s"'<>/?#]+):([0-9]{1,5})([^\s"'<>,\\\]\)\}]*)"#)
+      .expect("static pattern")
   });
   re.captures_iter(text)
     .filter_map(|cap| {
@@ -248,18 +250,14 @@ fn urls(text: &str) -> Vec<Url> {
 /// when it exists on disk.
 fn config_files() -> Vec<PathBuf> {
   let mut paths: Vec<PathBuf> = Vec::new();
-  for patcher in tools::registered() {
-    let companions = patcher.companions();
-    let targets = std::iter::once(patcher.as_ref()).chain(companions.iter().map(|c| c.as_ref()));
-    for target in targets {
-      // Exactly the path `init` would write — its accepted alt when the user
-      // has one — so check and repair can never point at different files.
-      let Ok(path) = resolve_path(target, None) else {
-        continue;
-      };
-      if path.is_file() && !paths.contains(&path) {
-        paths.push(path);
-      }
+  for target in super::tool_targets::tool_targets() {
+    // Exactly the path `init` would write — its accepted alt when the user
+    // has one — so check and repair can never point at different files.
+    let Ok(path) = resolve_path(target.as_ref(), None) else {
+      continue;
+    };
+    if path.is_file() && !paths.contains(&path) {
+      paths.push(path);
     }
   }
   paths
@@ -415,6 +413,64 @@ mod tests {
   }
 
   #[test]
+  fn a_yaml_flow_list_names_every_url_on_the_line() {
+    // Two proxy addresses on one flow-list line: neither comma nor the closing
+    // `]` is part of a URL, so both are found and both are repaired.
+    let text = "proxy_urls: [http://127.0.0.1:11435/v1, http://127.0.0.1:11436/v1]\n";
+    let stale = stale_urls(text, &live());
+    assert_eq!(stale.len(), 2, "{text}");
+    assert_eq!(stale[0].found, "http://127.0.0.1:11435/v1");
+    assert_eq!(stale[1].found, "http://127.0.0.1:11436/v1");
+    assert_eq!(
+      rewrite(text, &live()).expect("both repaired"),
+      "proxy_urls: [http://127.0.0.1:11437/v1, http://127.0.0.1:11437/v1]\n"
+    );
+
+    // The same pair with no space after the comma: the first URL must not
+    // swallow everything after it, or the second is never even seen.
+    let tight = "proxy_urls=http://127.0.0.1:11435/v1,http://127.0.0.1:11436/v1\n";
+    assert_eq!(stale_urls(tight, &live()).len(), 2, "{tight}");
+  }
+
+  #[test]
+  fn a_url_in_a_json_array_or_inline_table_yields_the_url_and_nothing_more() {
+    let array = r#"{"base_urls":["http://127.0.0.1:11435/v1","http://127.0.0.1:8080/v1"]}"#;
+    let array_stale = stale_urls(array, &live());
+    assert_eq!(array_stale.len(), 1, "{array}");
+    assert_eq!(array_stale[0].found, "http://127.0.0.1:11435/v1");
+
+    // An unquoted YAML flow mapping closes the URL with `}` instead of a quote.
+    let table = "provider: {base_url: http://127.0.0.1:11435/v1}\n";
+    let table_stale = stale_urls(table, &live());
+    assert_eq!(table_stale.len(), 1, "{table}");
+    assert_eq!(table_stale[0].found, "http://127.0.0.1:11435/v1");
+    assert_eq!(
+      rewrite(table, &live()).expect("the stale one repaired"),
+      "provider: {base_url: http://127.0.0.1:11437/v1}\n"
+    );
+  }
+
+  #[test]
+  fn a_bracketed_ipv6_config_url_matches_a_bracketed_ipv6_live_proxy() {
+    // `from_base_url` keeps the brackets in the host it stores, so the
+    // comparison is bracket-for-bracket and a config writes them too.
+    let live = LiveProxy::from_base_url("http://[::1]:11437/v1", &[ProxyConfig::DEFAULT_PORT])
+      .expect("ipv6 live base");
+    let text = "base_url = \"http://[::1]:11435/v1\"\n";
+    let stale = stale_urls(text, &live);
+    assert_eq!(stale.len(), 1, "{text}");
+    assert_eq!(stale[0].found, "http://[::1]:11435/v1");
+    assert_eq!(stale[0].rewritten, "http://[::1]:11437/v1");
+    assert_eq!(
+      rewrite(text, &live).expect("the stale one repaired"),
+      "base_url = \"http://[::1]:11437/v1\"\n"
+    );
+    // The host is compared literally, so an address written without its
+    // brackets is another host as far as this check is concerned.
+    assert!(stale_urls("base_url = \"http://::1:11435/v1\"\n", &live).is_empty());
+  }
+
+  #[test]
   fn the_rewrite_changes_only_the_stale_authority() {
     let body = "[provider]\nname = \"llamastash\"\nbase_url = \"http://127.0.0.1:11435/v1\"\nmodel = \"qwen3-coder-30b\"\n";
     let out = rewrite(body, &live()).expect("stale url rewritten");
@@ -490,5 +546,21 @@ mod tests {
     // At the cap nothing is counted, and an empty list stays empty.
     assert!(!changes(&stale[..3]).contains("more"));
     assert_eq!(changes(&[]), "");
+  }
+
+  #[test]
+  fn every_scanned_config_exists_and_is_scanned_once() {
+    let files = config_files();
+    for path in &files {
+      assert!(path.is_file(), "{path:?} is not a file on disk");
+    }
+    // `env.sh` is written by both `env-sh` and pi.dev's companion, so the same
+    // path can come round twice; the scan must say so once.
+    let unique = files.iter().collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+      unique.len(),
+      files.len(),
+      "a shared config scanned twice: {files:?}"
+    );
   }
 }

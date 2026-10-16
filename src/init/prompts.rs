@@ -945,8 +945,8 @@ pub async fn confirm_tui_handoff(args: &InitArgs) -> Result<bool, CliExit> {
 }
 
 /// cliclack multiselect over the registered external-tool patchers.
-/// Returns the picked patcher ids (caller resolves them back via
-/// [`crate::init::external::patcher_by_id`]). Non-TTY skips the
+/// Returns the picked patcher ids; the integrations step matches them
+/// against the shared patch-target walk. Non-TTY skips the
 /// picker and returns an empty list — the wizard's `--integrations`
 /// flag is the non-interactive opt-in.
 pub async fn pick_integrations() -> Result<Vec<String>, CliExit> {

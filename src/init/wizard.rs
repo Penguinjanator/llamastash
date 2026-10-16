@@ -28,6 +28,7 @@ use crate::init::benchmark::load_bundled;
 use crate::init::detection::{
   detect_binary, detect_hardware, BinaryPresence, DetectBinaryInputs, HardwareSnapshot,
 };
+use crate::init::external::tool_targets;
 use crate::init::fetch::{build_with_offline_check, FetchClient, FetchClientConfig};
 use crate::init::install::{
   default_install_method, gh_releases, BinaryInstall, GhBuild, InstallChoice, InstallError,
@@ -1433,47 +1434,52 @@ async fn run_integrations_step(
   // the file this run wrote that defines it (when the user picked it).
   let mut env_needed: Vec<(&'static str, String)> = Vec::new();
   let mut env_source: Option<PathBuf> = None;
-  for id in chosen_ids {
-    let Some(patcher) = crate::init::external::patcher_by_id(&id) else {
-      summary.failed.push(FailedTool {
-        id,
-        error: "unknown tool id".into(),
-      });
+  // The same walk the stale-address check reads, so the files this step
+  // patches and the files `doctor` can repair are never two different sets.
+  // The walk is grouped: an entry the picker offers, then the companions that
+  // file needs — a companion is offered to nobody, so it applies with the
+  // entry above it and gets its own summary row, one per file the user can go
+  // look at.
+  let offered: Vec<&'static str> = crate::init::external::all_patchers()
+    .iter()
+    .map(|p| p.id())
+    .collect();
+  let chosen: Vec<&str> = chosen_ids.iter().map(String::as_str).collect();
+  let mut group_picked = false;
+  for target in tool_targets::tool_targets() {
+    if offered.contains(&target.id()) {
+      group_picked = chosen.contains(&target.id());
+    }
+    if !group_picked {
       continue;
-    };
-    // A companion is the same integration's second file, so it lands in
-    // the same summary — one row per file the user can go look at.
-    let companions = patcher.companions();
-    let targets = std::iter::once(patcher.as_ref()).chain(companions.iter().map(|c| c.as_ref()));
-    for target in targets {
-      match crate::init::external::apply(target, &ctx, None) {
-        Ok(out) => {
-          if let Some(var) = target.required_env_var() {
-            env_needed.push((var, out.display_name.to_string()));
-          }
-          if target.provides_env_var().is_some() {
-            env_source = Some(out.path.clone());
-          }
-          summary.applied.push(AppliedTool {
-            id: out.tool_id.to_string(),
-            display_name: out.display_name.to_string(),
-            path: out.path,
-            written_bytes: out.written_bytes,
-            diff_json: out.diff_json,
-          })
+    }
+    match crate::init::external::apply(target.as_ref(), &ctx, None) {
+      Ok(out) => {
+        if let Some(var) = target.required_env_var() {
+          env_needed.push((var, out.display_name.to_string()));
         }
-        Err(e) => {
-          if !args.json {
-            eprintln!(
-              "{}",
-              colors::warning(&format!("{}: skipped ({e})", target.display_name()))
-            );
-          }
-          summary.failed.push(FailedTool {
-            id: target.id().to_string(),
-            error: e.to_string(),
-          });
+        if target.provides_env_var().is_some() {
+          env_source = Some(out.path.clone());
         }
+        summary.applied.push(AppliedTool {
+          id: out.tool_id.to_string(),
+          display_name: out.display_name.to_string(),
+          path: out.path,
+          written_bytes: out.written_bytes,
+          diff_json: out.diff_json,
+        })
+      }
+      Err(e) => {
+        if !args.json {
+          eprintln!(
+            "{}",
+            colors::warning(&format!("{}: skipped ({e})", target.display_name()))
+          );
+        }
+        summary.failed.push(FailedTool {
+          id: target.id().to_string(),
+          error: e.to_string(),
+        });
       }
     }
   }
