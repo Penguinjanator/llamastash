@@ -1053,6 +1053,17 @@ fn model_series(doc: &mut Document, label: &str, totals: &ScopeTotals, live: &Cl
       tps,
     );
   }
+  // The prompt side of the same figure, so a model that prefills several prompts
+  // at once reads above the token-weighted mean above.
+  if let Some(tps) = s.prefill_tokens_per_second_aggregate {
+    doc.sample(
+      "llamastash:request_prefill_tokens_per_second_aggregate",
+      "Prompt tokens per second over the prompt-computation time of the requests the log holds",
+      "gauge",
+      &labels,
+      tps,
+    );
+  }
 }
 
 /// The `model` label a live scope answers with before any row exists: the
@@ -1939,6 +1950,28 @@ mod tests {
     let printed = text_of(&snapshot_with_throughput(Some(20.0), Some(10_000)));
     assert!(
       printed.contains("llamastash:request_tokens_per_second_aggregate{model=\"m1\"} 20\n"),
+      "{printed}"
+    );
+  }
+
+  #[test]
+  fn the_prompt_throughput_gauge_prints_only_when_the_scope_has_one() {
+    let text_of = |snap: &LogSnapshot| {
+      let mut doc = Document::new(true);
+      render(&mut doc, snap, &[], &Scope::default(), 1, 1);
+      doc.render()
+    };
+    let mut snap = snapshot_with_throughput(None, None);
+    let text = text_of(&snap);
+    assert!(
+      !text.contains("request_prefill_tokens_per_second_aggregate"),
+      "{text}"
+    );
+    snap.models[0].summary.prefill_tokens_per_second_aggregate = Some(1_000.0);
+    let printed = text_of(&snap);
+    assert!(
+      printed
+        .contains("llamastash:request_prefill_tokens_per_second_aggregate{model=\"m1\"} 1000\n"),
       "{printed}"
     );
   }

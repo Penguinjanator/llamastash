@@ -573,6 +573,9 @@ fn seeded_requests_view_app() -> App {
       tokens_per_second_last: Some(41.27),
       prompt_tokens: 36_864,
       prefill_tokens_per_second: Some(1042.6),
+      // Two prompts computed at once: the box prefilled faster than either.
+      prefill_tokens_per_second_aggregate: Some(1_800.0),
+      prefill_busy_ms: Some(3_700),
       cached_tokens: 33_472,
       cache_hit_ratio: Some(0.908),
       completion_tokens: 328,

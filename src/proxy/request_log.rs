@@ -365,6 +365,18 @@ pub struct RequestSummary {
   /// much faster, and a plain mean would mostly report the small turns. Engine
   /// figures and estimates both count, and so do rows however they ended.
   pub prefill_tokens_per_second: Option<f64>,
+  /// Prompt tokens per second across the box: every prefill token the retained
+  /// rows carry over the wall time prompts were being computed, a second two
+  /// requests computed in counted once. Where
+  /// [`Self::prefill_tokens_per_second`] answers how fast one prompt ran,
+  /// this answers how fast the box prefills, so it rises when requests compute
+  /// prompts together. With no overlap it is the same number as the weighted
+  /// mean, which is why the strips only print it when it differs.
+  pub prefill_tokens_per_second_aggregate: Option<f64>,
+  /// The prompt-computation wall
+  /// [`Self::prefill_tokens_per_second_aggregate`] divides by, in ms. Present
+  /// exactly when it is.
+  pub prefill_busy_ms: Option<u64>,
   /// The most recent speed a request reported. Kept in the JSON and in the
   /// row table, but no longer on the summary strips: the session figure says
   /// the same thing about what is running now.
@@ -405,8 +417,8 @@ impl RequestSummary {
 
   /// [`Self::cells`] split into the two rows the terminal shows: what happened
   /// (Live, hosts, counts) and how fast it went (speeds, latencies, token
-  /// totals). Each row wraps on its own, so a narrow pane keeps the split
-  /// rather than letting one row's tail push the other's figures around.
+  /// totals). Each row wraps on its own, so a narrow pane keeps the split rather
+  /// than letting one row's tail push the other's figures around.
   pub fn cell_rows(&self, none: &str) -> [Vec<(&'static str, String)>; 2] {
     let ms = |v: Option<u64>| v.map(fmt_ms).unwrap_or_else(|| none.to_string());
     let tps = |v: Option<f64>| v.map(fmt_tps).unwrap_or_else(|| none.to_string());
@@ -423,28 +435,27 @@ impl RequestSummary {
         ("Unloaded", self.evictions.to_string()),
       ])
       .collect();
-    let speeds_and_totals = [("Avg tok/s", tps(self.tokens_per_second_avg))]
+    let speeds = [("Avg tok/s", tps(self.tokens_per_second_avg))]
       .into_iter()
       .chain(
         self
           .tokens_per_second_session
           .map(|t| ("Tok/s session", fmt_tps(t))),
       )
+      .chain(Self::aggregate_cell(
+        self.tokens_per_second_avg,
+        self.tokens_per_second_aggregate,
+        self.busy_ms,
+        "Agg tok/s",
+      ))
+      .chain([("Avg PP tok/s", tps(self.prefill_tokens_per_second))])
+      .chain(Self::aggregate_cell(
+        self.prefill_tokens_per_second,
+        self.prefill_tokens_per_second_aggregate,
+        self.prefill_busy_ms,
+        "Agg PP tok/s",
+      ))
       .chain([
-        (
-          "Agg tok/s",
-          match (self.tokens_per_second_aggregate, self.busy_ms) {
-            (Some(t), Some(busy)) => format!("{} over {}", fmt_tps(t), fmt_ms(busy)),
-            _ => none.to_string(),
-          },
-        ),
-        (
-          "Avg PP tok/s",
-          self
-            .prefill_tokens_per_second
-            .map(fmt_tps)
-            .unwrap_or_else(|| none.to_string()),
-        ),
         ("Avg total", ms(self.avg_duration_ms)),
         ("Avg TTFB", ms(self.avg_ttfb_ms)),
         ("Tokens in", fmt_count(self.prompt_tokens)),
@@ -458,7 +469,30 @@ impl RequestSummary {
         ("Tokens out", fmt_count(self.completion_tokens)),
       ])
       .collect();
-    [counts, speeds_and_totals]
+    [counts, speeds]
+  }
+
+  /// The `X over <wall>` cell of an aggregate figure: absent when nothing
+  /// produced it, and absent when it prints the number its own average prints,
+  /// because with nothing running together the two are the same figure and the
+  /// cells the aggregate costs are better spent on the ones that differ.
+  fn aggregate_cell(
+    avg: Option<f64>,
+    aggregate: Option<f64>,
+    busy_ms: Option<u64>,
+    label: &'static str,
+  ) -> Option<(&'static str, String)> {
+    let (Some(value), Some(busy_ms)) = (aggregate, busy_ms) else {
+      return None;
+    };
+    let printed = fmt_tps(value);
+    // An average that never landed prints the placeholder, so it is not the
+    // same number and the aggregate stands on its own.
+    let differs = match avg {
+      Some(avg) => printed != fmt_tps(avg),
+      None => true,
+    };
+    differs.then(|| (label, format!("{printed} over {}", fmt_ms(busy_ms))))
   }
 
   /// The in-flight pair as one cell: `Live N` when every host in flight is on
@@ -530,6 +564,49 @@ struct Throughput {
 }
 
 impl Throughput {
+  /// Take one row's prompt-computation contribution: the tokens the engine had
+  /// to compute, over the window it spent computing them. That window ends at
+  /// the first generated token, so it sits at the front of the request where
+  /// [`Self::add`]'s window sits at the back.
+  ///
+  /// An engine-reported `prompt_ms` is compute time and carries no queue wait,
+  /// and a proxy estimate is measured from receipt, so the two are not the same
+  /// quantity and a scope mixing them mixes the two.
+  fn add_prefill(&mut self, row: &RequestRow) {
+    let (Some(tokens), Some(pps), Some(ttfb)) = (
+      row.prefill_tokens,
+      row.prefill_tokens_per_second,
+      row.ttfb_ms,
+    ) else {
+      return;
+    };
+    if row.state == RequestState::InFlight || tokens == 0 || pps <= 0.0 || ttfb == 0 {
+      return;
+    }
+    // A response that arrives whole sends its first byte at the end of
+    // generation, so the prompt finished a generation-span earlier; a stream's
+    // first byte is about where its first token is. The earlier of the two
+    // lands on the end of prompt computation for both.
+    let generated = match (row.completion_tokens, row.tokens_per_second) {
+      (Some(generated), Some(tps)) if generated > 0 && tps > 0.0 => {
+        (generated as f64 / tps * 1000.0).round() as u64
+      }
+      _ => 0,
+    };
+    let wait = row
+      .duration_ms
+      .unwrap_or(ttfb)
+      .saturating_sub(generated)
+      .min(ttfb);
+    let end = row.started_at_ms.saturating_add(wait);
+    let span = (tokens as f64 / pps * 1000.0).round() as u64;
+    let start = end.saturating_sub(span).max(row.started_at_ms);
+    if start >= end {
+      return;
+    }
+    self.push(start, end, tokens);
+  }
+
   /// Take one row's contribution. A row counts when it has a speed, a duration
   /// and generated tokens — the three the figure is made of — so in-flight rows
   /// and rows that never saw a usage block are in neither sum, and a newer idle
@@ -559,6 +636,10 @@ impl Throughput {
     if start >= end {
       return;
     }
+    self.push(start, end, tokens);
+  }
+
+  fn push(&mut self, start: u64, end: u64, tokens: u64) {
     self.windows.push((start, end));
     self.tokens = self.tokens.saturating_add(tokens);
   }
@@ -599,6 +680,7 @@ struct RowFigures {
   all: Clients,
   live: Clients,
   throughput: Throughput,
+  prefill: Throughput,
 }
 
 impl RowFigures {
@@ -608,6 +690,7 @@ impl RowFigures {
       self.live.add(row);
     }
     self.throughput.add(row);
+    self.prefill.add_prefill(row);
   }
 
   /// Stamp the row-derived figures onto `summary`. A daemon that computes the
@@ -622,6 +705,9 @@ impl RowFigures {
     let (tps, busy_ms) = self.throughput.figures();
     summary.tokens_per_second_aggregate = tps;
     summary.busy_ms = busy_ms;
+    let (prefill_tps, prefill_busy_ms) = self.prefill.figures();
+    summary.prefill_tokens_per_second_aggregate = prefill_tps;
+    summary.prefill_busy_ms = prefill_busy_ms;
   }
 }
 
@@ -724,6 +810,8 @@ impl Totals {
       // totals has no notion of "the newest launch".
       tokens_per_second_session: None,
       tokens_per_second_last: self.tps_last,
+      prefill_tokens_per_second_aggregate: None,
+      prefill_busy_ms: None,
       // Both throughput figures come from the rows behind the totals, which a
       // set of totals no longer holds; `tail` and `snapshot` fill them in.
       tokens_per_second_aggregate: None,
@@ -1894,6 +1982,100 @@ mod tests {
   }
 
   #[test]
+  fn the_prefill_aggregate_counts_a_shared_prompt_wall_once() {
+    // Two 1,000-token prompts computed at the same moment at 500 tok/s each:
+    // the box put out 2,000 tokens over one wall second, where the mean of the
+    // per-request speeds still reads 500.
+    let row = |start: u64| RequestRow {
+      started_at_ms: start,
+      state: RequestState::Done,
+      status: Some(200),
+      ttfb_ms: Some(2_000),
+      duration_ms: Some(2_000),
+      prefill_tokens: Some(1_000),
+      prefill_tokens_per_second: Some(500.0),
+      ..RequestRow::default()
+    };
+    let figures = |rows: Vec<RequestRow>| {
+      let mut figures = RowFigures::default();
+      for each in rows {
+        figures.add(&each);
+      }
+      let mut summary = RequestSummary {
+        prefill_tokens_per_second: Some(500.0),
+        ..RequestSummary::default()
+      };
+      figures.stamp(&mut summary);
+      summary
+    };
+    let together = figures(vec![row(0), row(0)]);
+    assert_eq!(together.prefill_busy_ms, Some(2_000));
+    assert_eq!(together.prefill_tokens_per_second_aggregate, Some(1_000.0));
+    assert!(
+      together
+        .cells("—")
+        .iter()
+        .any(|(label, text)| *label == "Agg PP tok/s" && text == "1000 over 2.0s"),
+      "{together:?}"
+    );
+    // Run one after the other and the wall is the sum of the two, so the
+    // aggregate is the mean again and the cell drops out of the strip.
+    let apart = figures(vec![row(0), row(2_000)]);
+    assert_eq!(apart.prefill_busy_ms, Some(4_000));
+    assert_eq!(apart.prefill_tokens_per_second_aggregate, Some(500.0));
+    assert!(
+      !apart
+        .cells("—")
+        .iter()
+        .any(|(label, _)| *label == "Agg PP tok/s"),
+      "{:?}",
+      apart.cells("—")
+    );
+  }
+
+  #[test]
+  fn an_aggregate_that_prints_its_averages_number_is_left_off_the_strip() {
+    let labels =
+      |summary: &RequestSummary| summary.cells("—").iter().map(|c| c.0).collect::<Vec<_>>();
+    // Both pair 1 and pair 2 round to the same printed number as their average,
+    // so neither is worth the cells it costs.
+    let same = RequestSummary {
+      tokens_per_second_avg: Some(41.26),
+      tokens_per_second_aggregate: Some(41.29),
+      busy_ms: Some(60_000),
+      prefill_tokens_per_second: Some(1_043.0),
+      prefill_tokens_per_second_aggregate: Some(1_043.4),
+      prefill_busy_ms: Some(60_000),
+      ..RequestSummary::default()
+    };
+    assert_eq!(
+      labels(&same)
+        .iter()
+        .filter(|label| label.starts_with("Agg "))
+        .copied()
+        .collect::<Vec<_>>(),
+      Vec::<&str>::new()
+    );
+    let apart = RequestSummary {
+      tokens_per_second_avg: Some(41.3),
+      tokens_per_second_aggregate: Some(52.4),
+      busy_ms: Some(6_300),
+      prefill_tokens_per_second: Some(1_043.0),
+      prefill_tokens_per_second_aggregate: Some(2_100.0),
+      prefill_busy_ms: Some(6_300),
+      ..RequestSummary::default()
+    };
+    assert_eq!(
+      labels(&apart)
+        .iter()
+        .filter(|label| label.starts_with("Agg "))
+        .copied()
+        .collect::<Vec<_>>(),
+      ["Agg tok/s", "Agg PP tok/s"]
+    );
+  }
+
+  #[test]
   fn a_scopes_throughput_counts_only_its_own_rows() {
     let log = RequestLog::new();
     // Two models, one launch each, two rows per model 10 s apart at 10 tok/s.
@@ -2473,8 +2655,10 @@ mod tests {
     assert_eq!(cells[2], ("Requests", "0".to_string()));
     assert_eq!(text(&cells, "Avg total"), "—");
     assert_eq!(text(&cells, "Avg tok/s"), "—");
-    assert_eq!(text(&cells, "Agg tok/s"), "—");
     assert_eq!(text(&cells, "Avg PP tok/s"), "—");
+    // An aggregate nothing produced has no cell at all, not a placeholder: a
+    // figure with no rows behind it is not the same answer as zero.
+    assert!(!cells.iter().any(|c| c.0.starts_with("Agg ")));
     let filled = RequestSummary {
       avg_duration_ms: Some(1_240),
       tokens_per_second_avg: Some(39.64),
@@ -2487,7 +2671,6 @@ mod tests {
     let filled_cells = filled.cells("—");
     assert_eq!(text(&filled_cells, "Avg total"), "1.2s");
     assert_eq!(text(&filled_cells, "Avg tok/s"), "39.6");
-    assert_eq!(text(&filled_cells, "Agg tok/s"), "—");
     // A speed from 1000 up loses the decimal here too.
     assert_eq!(text(&filled_cells, "Avg PP tok/s"), "3367");
     assert_eq!(text(&filled_cells, "Tokens in"), "12.3k");
@@ -2517,7 +2700,6 @@ mod tests {
       labels(&speeds),
       [
         "Avg tok/s",
-        "Agg tok/s",
         "Avg PP tok/s",
         "Avg total",
         "Avg TTFB",

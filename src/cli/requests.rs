@@ -563,13 +563,29 @@ mod tests {
     });
     assert!(strip.contains("Agg tok/s"), "{strip}");
     assert!(strip.contains("52.4 over 6.3s"), "{strip}");
-    // No throughput: the placeholder every other cell uses, not a zero.
+    // No throughput: no cell at all, rather than a placeholder that reads as a
+    // figure of zero.
     let empty = summary_on_terminal(RequestSummary::default());
-    let line = empty
-      .lines()
-      .find(|line| line.contains("Agg tok/s"))
-      .unwrap_or_default();
-    assert!(line.ends_with('-'), "{line}");
+    assert!(!empty.contains("Agg tok/s"), "{empty}");
+  }
+
+  #[test]
+  fn the_summary_block_prints_the_prompt_aggregate_beyond_the_mean() {
+    let strip = summary_on_terminal(RequestSummary {
+      prefill_tokens_per_second: Some(500.0),
+      prefill_tokens_per_second_aggregate: Some(1_000.0),
+      prefill_busy_ms: Some(2_000),
+      ..RequestSummary::default()
+    });
+    assert!(strip.contains("Agg PP tok/s  1000 over 2.0s"), "{strip}");
+    // The same speed as the mean is the same figure twice, so it is not printed.
+    let alone = summary_on_terminal(RequestSummary {
+      prefill_tokens_per_second: Some(500.0),
+      prefill_tokens_per_second_aggregate: Some(500.0),
+      prefill_busy_ms: Some(4_000),
+      ..RequestSummary::default()
+    });
+    assert!(!alone.contains("Agg PP tok/s"), "{alone}");
   }
 
   #[test]
@@ -616,7 +632,6 @@ mod tests {
         "Auto-starts",
         "Unloaded",
         "Avg tok/s",
-        "Agg tok/s",
         "Avg PP tok/s",
         "Avg total",
         "Avg TTFB",
