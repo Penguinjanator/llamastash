@@ -481,14 +481,6 @@ _Shared context: The `/ui` reverse proxy and which engines serve a UI of their o
 - [x] ~~Bundle the llamacpp UI for other engines with no UI? Start on first request.~~ — done: the UI ships in the binary (`data/llama-ui/`, unpacked on the first request that needs it), and a chat launch on an engine with no UI gets it at `/ui`. The proxy answers the one llama.cpp-only route the page needs and forwards its `/v1` traffic to the engine. Plan: [`docs/plans/2026-10-15-001-feat-engine-web-ui-plan.md`](docs/plans/2026-10-15-001-feat-engine-web-ui-plan.md).
 - [ ] **Log the `/ui` page's chats in the request log.** Everything under `/ui` skips the log by design (R13 in [`docs/brainstorms/2026-10-15-engine-web-ui-requirements.md`](docs/brainstorms/2026-10-15-engine-web-ui-requirements.md), and the "not logged" list in `docs/usage.md` § `llamastash requests`), so a chat sent from the built-in UI never shows in `llamastash requests`, the TUI request rows or the throughput stats. Hit 2026-10-15: Halogen used from the page on another machine over LAN, and the log stayed empty. Log the page's `/v1` generation calls (`/ui/v1/chat/completions` and the like) the way `/v1/*` is logged, with a note that marks them as from the UI; keep assets, `/props` and the stream lookup out. The bundled forward is in [`ui.rs`](src/proxy/ui.rs), the logged path goes through `answered` in [`router.rs`](src/proxy/router.rs). Update R13 and the docs list in the same change.
 
-### Batch 6: Generic-backend engines and the multiplexer decision
-
-_Shared context: The generic backend's declared entries, the Lemonade umbrella, `docs/usage.md`, the hardware UAT write-ups._
-
-- [ ] Consider dropping support for Lemonade and test/document as generic server. Should multiplexer generic backend be still supported?
-  - [ ] If removed, remove associated open TODOs and docs/website etc except for one usage example as well.
-- [ ] Test and document NPU engines as generic server, for example FLM or something similar.
-
 ### Batch 7: `init` tool integrations and doctor repairs
 
 _Shared context: `src/init/external/tools/`, the `doctor` findings, and what `--fix` is allowed to write._
@@ -500,6 +492,14 @@ _Shared context: `src/init/external/tools/`, the `doctor` findings, and what `--
 
 - [ ] Nvidia + intel multi gpu detection issues
 - [ ] launch settings key col width should accomodate longer keys, make dynamic
+
+### Batch 6: Generic-backend engines and the multiplexer decision
+
+_Shared context: The generic backend's declared entries, the Lemonade umbrella, `docs/usage.md`, the hardware UAT write-ups._
+
+- [ ] Consider dropping support for Lemonade and test/document as generic server. Should multiplexer generic backend be still supported?
+  - [ ] If removed, remove associated open TODOs and docs/website etc except for one usage example as well.
+- [ ] Test and document NPU engines as generic server, for example FLM or something similar.
 
 ### Batch 1: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
 
