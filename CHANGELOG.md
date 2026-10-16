@@ -13,6 +13,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ### Changed
 
+- A chat sent from a `/ui` page now shows up in `llamastash requests`, the TUI request rows and the throughput stats under its own `/v1/...` route, marked `ui`; the page's assets, `/props` and stream lookup stay out.
 - The TUI Requests tab gives `Request for` the same 24 cells the `requests` table gives a name, and `requests` caps `MODEL` at 24 too, so one long repo id stops widening every shorter row (#112).
 - `Note` moved to the end of the requests table, in the TUI tab and in `llamastash requests`, so the free text no longer sits between the figures and the names (#112).
 - `llamastash requests` puts `PP/S` right after `TOK/S`, which shifts the tab-separated fields that follow it (#112).

@@ -65,6 +65,21 @@ pub type ProxyResponse = Result<Response<BoxBody<Bytes, BodyError>>, hyper::Erro
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ClientAddr(pub std::net::SocketAddr);
 
+/// The `POST` routes that reach a model, and the only ones the request log
+/// keeps a row for. The `/ui` surface matches its stripped paths against this
+/// list, so a chat sent from a web page is filed under the same path an API
+/// client sends — the row's `ui` flag is what tells them apart.
+pub(crate) const GENERATION_ROUTES: [&str; 8] = [
+  "/v1/chat/completions",
+  "/v1/completions",
+  "/v1/embeddings",
+  "/v1/rerank",
+  "/v1/messages",
+  "/v1/messages/count_tokens",
+  "/v1/responses",
+  "/v1/responses/input_tokens",
+];
+
 /// Entry point invoked by the `service_fn` closure. Returns a fully
 /// constructed `Response`; the caller hands it back to hyper.
 pub async fn route(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyResponse {
@@ -107,26 +122,24 @@ pub async fn route(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyRespo
     (&Method::GET | &Method::HEAD, "/") => root_identity(state),
     (&Method::GET, "/health") => health(state).await,
     (&Method::GET, "/v1/models") => list_models(state).await,
-    (&Method::POST, "/v1/chat/completions") => forward_request(state, req).await,
-    (&Method::POST, "/v1/completions") => forward_request(state, req).await,
-    (&Method::POST, "/v1/embeddings") => forward_request(state, req).await,
-    (&Method::POST, "/v1/rerank") => forward_request(state, req).await,
-    // Anthropic Messages API. llama-server (b6961+) speaks `/v1/messages`
+    // Everything that reaches a model, and the only traffic the request log keeps
+    // a row for. The list is [`GENERATION_ROUTES`], shared with the `/ui` surface,
+    // which files a page's generation call under the same canonical path.
+    //
+    // Anthropic Messages API: llama-server (b6961+) speaks `/v1/messages`
     // + `/v1/messages/count_tokens` natively, translating to its OpenAI
     // pipeline internally, so the proxy just byte-pipes them like any
     // other `/v1` route — same body-`model` resolution, same streaming.
     // Tool calling on this surface needs the backend launched with
     // `--jinja` (config `jinja: true` by default). Lets Claude Code and
     // other Anthropic-shape clients attach via `ANTHROPIC_BASE_URL`.
-    (&Method::POST, "/v1/messages") => forward_request(state, req).await,
-    (&Method::POST, "/v1/messages/count_tokens") => forward_request(state, req).await,
-    // OpenAI Responses API. llama-server speaks it natively
+    //
+    // OpenAI Responses API: llama-server speaks it natively
     // (`POST /v1/responses` + `/v1/responses/input_tokens`), as do other engines,
     // so the proxy byte-pipes it like any other `/v1` route (same body-`model`
     // resolution, same streaming). Agents that prefer the Responses surface
     // attach through the one stable proxy URL.
-    (&Method::POST, "/v1/responses") => forward_request(state, req).await,
-    (&Method::POST, "/v1/responses/input_tokens") => forward_request(state, req).await,
+    (&Method::POST, p) if GENERATION_ROUTES.contains(&p) => forward_request(state, req).await,
     // Ollama-compat Tier 1: discovery-only endpoints.
     (&Method::GET, "/api/tags") => ollama_tags(state).await,
     (&Method::GET, "/api/version") => ollama_version(),

@@ -47,7 +47,7 @@ What the llama.cpp UI (prebuilt `b11642`) needs from a server:
 - R12. The llama.cpp MIT license notice ships with the binary.
 
 **Behavior kept as is**
-- R13. Bundled-UI chat traffic stays out of the request log, like all `/ui` traffic today.
+- R13. Bundled-UI chat traffic stays out of the request log, like all `/ui` traffic today. — superseded the same day: a page's `/v1` generation calls are logged under their canonical route and marked `ui`; its assets, `/props` and stream lookup stay out.
 - R14. Cookie pin, chooser, `/ui/switch`, `?target=` and LAN Basic auth work the same for bundled-UI launches.
 
 **Docs**

@@ -94,7 +94,7 @@ pub(crate) struct Target<'a> {
 /// enforcement here.
 ///
 /// `record` is the request's log row. `None` for traffic that is not
-/// logged (the `/ui` reverse proxy).
+/// logged (a `/ui` asset, `/props`, the stream lookup).
 pub(crate) async fn forward_to_upstream(
   state: &Arc<ProxyState>,
   inbound: InboundRequest,
