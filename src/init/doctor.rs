@@ -67,6 +67,11 @@ pub const REMOTE_UNREACHABLE_THRESHOLD: u32 = 3;
 /// The hint every finding with an automatic repair carries.
 const FIX_WITH_DOCTOR: &str = "llamastash doctor --fix";
 
+/// The hint for a tool config no repair can reach because it cannot be read.
+/// Naming `--fix` here would advertise a repair that only answers `skipped`.
+const FIX_TOOL_CONFIG_BY_HAND: &str =
+  "read the file yourself and point it at the address in `llamastash status --json | jq .proxy.listen`";
+
 /// A mechanical repair `doctor --fix` knows how to apply, serialized as
 /// the id on the finding (`fix`) and on its `fixes[]` entry, so an agent
 /// can tell which findings are auto-repairable without a table of its own.
@@ -217,7 +222,6 @@ impl Finding {
   /// A finding about something `--fix` cannot fix at all, whose hint is the
   /// hand step the reader takes instead. Promises no repair and withholds
   /// none.
-  #[cfg(unix)]
   fn manual(
     id: FindingId,
     severity: Severity,
@@ -866,30 +870,35 @@ fn stale_daemon_files(state_dir: &Path) -> Vec<PathBuf> {
 /// one to compare against — and one finding per file, because the repair is
 /// per file too.
 fn check_tool_config_urls(live: &stale_url::LiveProxy) -> Vec<Finding> {
-  stale_url::scan(live)
-    .into_iter()
-    .map(|scan| match scan {
-      stale_url::Scan::Stale { path, urls } => Finding::new(
-        FindingId::ToolConfigStaleUrl,
-        Severity::Warning,
-        format!(
-          "`{}` points at a proxy address nothing listens on: {}",
-          path.display(),
-          stale_url::changes(&urls)
-        ),
+  stale_url::scan(live).into_iter().map(url_finding).collect()
+}
+
+/// The finding for one scanned config. A stale address carries the repair;
+/// an unreadable file carries no repair at all, because the only thing `--fix`
+/// could do with it is refuse — and its hint is the hand step instead.
+fn url_finding(scan: stale_url::Scan) -> Finding {
+  match scan {
+    stale_url::Scan::Stale { path, urls } => Finding::new(
+      FindingId::ToolConfigStaleUrl,
+      Severity::Warning,
+      format!(
+        "`{}` points at a proxy address nothing listens on: {}",
+        path.display(),
+        stale_url::changes(&urls)
       ),
-      // Not a repair that failed — an address that could not be read is one
-      // nothing checked, which is not the same as nothing found.
-      stale_url::Scan::Unreadable { path, reason } => Finding::new(
-        FindingId::ToolConfigStaleUrl,
-        Severity::Warning,
-        format!(
-          "`{}` could not be read, so its proxy address was not checked: {reason}",
-          path.display()
-        ),
+    ),
+    // Not a repair that failed — an address that could not be read is one
+    // nothing checked, which is not the same as nothing found.
+    stale_url::Scan::Unreadable { path, reason } => Finding::manual(
+      FindingId::ToolConfigStaleUrl,
+      Severity::Warning,
+      format!(
+        "`{}` could not be read, so its proxy address was not checked: {reason}",
+        path.display()
       ),
-    })
-    .collect()
+      FIX_TOOL_CONFIG_BY_HAND,
+    ),
+  }
 }
 
 /// Apply every repair the report marks fixable, in finding order. Under
@@ -939,17 +948,8 @@ fn apply_fixes(
           proxy_urls_done = true;
           if let Some(live) = live {
             for scan in stale_url::scan(live) {
-              match scan {
-                stale_url::Scan::Stale { path, .. } => {
-                  fixes.push(fix_tool_config_url(&path, live, dry_run))
-                }
-                // The finding said so; the ledger says it here too, so
-                // `--fix` is not quiet about the file it left alone.
-                stale_url::Scan::Unreadable { path, reason } => fixes.push(FixReport::skipped(
-                  FixId::ToolConfigProxyUrl,
-                  path.display().to_string(),
-                  format!("could not read: {reason}"),
-                )),
+              if let stale_url::Scan::Stale { path, .. } = scan {
+                fixes.push(fix_tool_config_url(&path, live, dry_run))
               }
             }
           }
@@ -2227,6 +2227,24 @@ mod tests {
     );
     assert_eq!(std::fs::read_to_string(&foreign).unwrap(), foreign_body);
     std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn an_unreadable_tool_config_promises_no_repair() {
+    // A finding `--fix` can only refuse must not advertise a repair: an agent
+    // that branches on `fix` would run a fix that answers `skipped`.
+    let finding = url_finding(stale_url::Scan::Unreadable {
+      path: std::path::PathBuf::from("/home/u/.aider.conf.yml"),
+      reason: "stream did not contain valid UTF-8".to_string(),
+    });
+    assert_eq!(finding.id, "tool_config_stale_url");
+    assert_eq!(finding.severity, Severity::Warning);
+    assert_eq!(finding.fix, None, "no repair is advertised");
+    assert_ne!(finding.fix_hint, FIX_WITH_DOCTOR);
+    assert!(finding.safe_to_log);
+    let json = serde_json::to_string(&finding).unwrap();
+    assert!(!json.contains("\"fix\":"), "{json}");
+    assert!(json.contains("could not be read"), "{json}");
   }
 
   #[test]

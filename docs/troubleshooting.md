@@ -192,7 +192,7 @@ llamastash doctor --dry-run                   # what it would rewrite
 llamastash doctor --fix                       # rewrite them
 ```
 
-Each rewritten line is ledged, and only the address changes — the model list and everything else in the file stays as it was. A client you configured by hand, and a shell that sourced `~/.config/llamastash/env.sh`, have to be pointed at the new port themselves (re-source the file, or open a new terminal).
+Up to three rewritten addresses per file are named — in the finding and in the ledger — and the rest are counted, so a file full of stale URLs stays readable; all of them are rewritten either way. Only the address changes: the model list and everything else in the file stays as it was. A client you configured by hand, and a shell that sourced `~/.config/llamastash/env.sh`, have to be pointed at the new port themselves (re-source the file, or open a new terminal). A config `doctor` cannot read at all is reported with that reason and the hand step, because there is no repair that can reach it.
 
 ## An agent got an error from the proxy, or a request hangs
 

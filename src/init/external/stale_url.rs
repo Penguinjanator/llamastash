@@ -7,11 +7,14 @@
 //! [`crate::init::doctor`] can repair it.
 //!
 //! Only a port the proxy could itself have bound counts as stale: the
-//! configured port and both mode defaults, each with the scan window the
-//! listener probes above it. The scanned files are shared configs — Zed's and
-//! OpenCode's settings also carry MCP servers and other local engines — and a
-//! URL outside that window belongs to whoever wrote it. Repointing one at
-//! llamastash would break it, silently and ledged as a success.
+//! configured port and the default of the mode it runs in, each with the scan
+//! window the listener probes above it. The scanned files are shared configs —
+//! Zed's and OpenCode's settings also carry MCP servers and other local
+//! engines — and a URL outside that window belongs to whoever wrote it.
+//! Repointing one at llamastash would break it, silently and ledged as a
+//! success. In particular default mode never claims `11434`: that port is what
+//! llamastash leaves to Ollama on purpose, so an Ollama URL in a shared config
+//! is another program's live server, not a moved proxy.
 //!
 //! The repair is textual, not a re-run of a patcher: re-patching would also
 //! rewrite the model list to the current defaults, which is a much bigger
@@ -36,8 +39,9 @@ use super::{resolve_path, tools};
 pub struct LiveProxy {
   host: String,
   port: u16,
-  /// Each one carries [`DEFAULT_PORT_SCAN_MAX_OFFSET`] ports above it, which
-  /// is as far as the listener roams.
+  /// The ports this proxy could have been asked to bind; each one carries
+  /// [`DEFAULT_PORT_SCAN_MAX_OFFSET`] ports above it, which is as far as the
+  /// listener roams.
   bases: Vec<u16>,
 }
 
@@ -69,21 +73,24 @@ impl LiveProxy {
 }
 
 /// The ports the proxy could have been asked to bind: the configured one and
-/// the two mode defaults. Each one owns the scan window above it, so a config
-/// written at a port none of them covers — an old one-shot `--proxy-port`,
-/// say — is left for its owner to edit.
+/// the default of the mode it runs in. Each one owns the scan window above it,
+/// so a config written at a port none of them covers is left for its owner to
+/// edit — an old one-shot `--proxy-port`, or the other mode's default. Missing
+/// those is the safe direction: the tool keeps its own endpoint and fails with
+/// a connection error the user can see, and the finding's `init --integrations`
+/// hint covers the re-point.
 pub fn bind_bases(config: &Config) -> Vec<u16> {
-  let mut bases: Vec<u16> = Vec::new();
-  for base in [
-    config.proxy.effective_port(),
-    ProxyConfig::DEFAULT_PORT,
-    ProxyConfig::DEFAULT_OLLAMA_COMPAT_PORT,
-  ] {
-    if !bases.contains(&base) {
-      bases.push(base);
-    }
+  let mode_default = if config.proxy.ollama_compat {
+    ProxyConfig::DEFAULT_OLLAMA_COMPAT_PORT
+  } else {
+    ProxyConfig::DEFAULT_PORT
+  };
+  let base = config.proxy.effective_port();
+  if base == mode_default {
+    vec![base]
+  } else {
+    vec![base, mode_default]
   }
-  bases
 }
 
 /// One `http://host:port` occurrence in a text, as the file writes it.
@@ -263,8 +270,8 @@ mod tests {
   use super::*;
 
   fn live() -> LiveProxy {
-    // A default install whose proxy roamed to 11437, so the ports it could
-    // have been asked to bind are the two mode defaults.
+    // A default install whose proxy roamed to 11437, so the one port it could
+    // have been asked to bind is default mode's.
     LiveProxy::from_base_url("http://127.0.0.1:11437/v1", &bind_bases(&Config::default()))
       .expect("live base splits")
   }
@@ -303,12 +310,31 @@ mod tests {
     // having moved, and is never found or rewritten.
     let text = r#"{"mcp":{"api":"http://127.0.0.1:8080/v1"},"other":"http://127.0.0.1:12000/v1"}"#;
     assert!(stale_urls(text, &live()).is_empty(), "{text}");
-    // Window edges: the six-port scan reaches 11434..=11440 from the two
-    // mode defaults, so 11433 and 11441 are somebody else's listener.
+    // Window edges: default mode scans 11435..=11440, so 11441 and 11434 are
+    // somebody else's listener — 11434 is the port llamastash keeps Ollama on
+    // purpose, so an Ollama URL there survives every repair.
     assert_eq!(stale_urls("http://127.0.0.1:11440/v1", &live()).len(), 1);
-    assert_eq!(stale_urls("http://127.0.0.1:11434/v1", &live()).len(), 1);
     assert!(stale_urls("http://127.0.0.1:11441/v1", &live()).is_empty());
-    assert!(stale_urls("http://127.0.0.1:11433/v1", &live()).is_empty());
+    assert!(stale_urls("http://127.0.0.1:11434/v1", &live()).is_empty());
+    assert!(rewrite("http://127.0.0.1:11434/v1", &live()).is_none());
+  }
+
+  #[test]
+  fn ollama_keeps_its_port_beside_a_proxy_on_another_base() {
+    // The repro: `proxy.port: 11500` in default mode with Ollama live on
+    // 11434, both named in one merged config. Ollama's URL is untouched.
+    let mut config = Config::default();
+    config.proxy.port = Some(11500);
+    let proxy =
+      LiveProxy::from_base_url("http://127.0.0.1:11501/v1", &bind_bases(&config)).unwrap();
+    let text = r#"{"ollama":{"options":{"baseURL":"http://127.0.0.1:11434/v1"}},"stash":{"options":{"baseURL":"http://127.0.0.1:11500/v1"}}}"#;
+    let stale = stale_urls(text, &proxy);
+    assert_eq!(stale.len(), 1, "{text}");
+    assert_eq!(stale[0].found, "http://127.0.0.1:11500/v1");
+    assert_eq!(
+      rewrite(text, &proxy).expect("the moved one rewritten"),
+      r#"{"ollama":{"options":{"baseURL":"http://127.0.0.1:11434/v1"}},"stash":{"options":{"baseURL":"http://127.0.0.1:11501/v1"}}}"#
+    );
   }
 
   #[test]
@@ -325,35 +351,41 @@ mod tests {
   }
 
   #[test]
-  fn the_bind_bases_are_the_configured_port_and_both_mode_defaults() {
+  fn the_bind_bases_are_the_configured_port_and_this_modes_default() {
+    // Default mode never reaches Ollama's port, compat mode never reaches the
+    // default-mode one: each mode owns a six-port window from its own base.
     assert_eq!(
       bind_bases(&Config::default()),
-      vec![
-        ProxyConfig::DEFAULT_PORT,
-        ProxyConfig::DEFAULT_OLLAMA_COMPAT_PORT
-      ]
+      vec![ProxyConfig::DEFAULT_PORT]
     );
-    let mut config = Config::default();
-    config.proxy.port = Some(11500);
-    assert_eq!(
-      bind_bases(&config),
-      vec![
-        11500,
-        ProxyConfig::DEFAULT_PORT,
-        ProxyConfig::DEFAULT_OLLAMA_COMPAT_PORT
-      ]
-    );
-    // Compat mode's effective port is already a default, so it is not listed
-    // twice.
     let mut compat = Config::default();
     compat.proxy.ollama_compat = true;
     assert_eq!(
       bind_bases(&compat),
-      vec![
-        ProxyConfig::DEFAULT_OLLAMA_COMPAT_PORT,
-        ProxyConfig::DEFAULT_PORT
-      ]
+      vec![ProxyConfig::DEFAULT_OLLAMA_COMPAT_PORT]
     );
+    // A pinned port adds this mode's default, because a config written before
+    // the pin still names it.
+    let mut config = Config::default();
+    config.proxy.port = Some(11500);
+    assert_eq!(bind_bases(&config), vec![11500, ProxyConfig::DEFAULT_PORT]);
+    let mut pinned_compat = Config::default();
+    pinned_compat.proxy.port = Some(11500);
+    pinned_compat.proxy.ollama_compat = true;
+    assert_eq!(
+      bind_bases(&pinned_compat),
+      vec![11500, ProxyConfig::DEFAULT_OLLAMA_COMPAT_PORT]
+    );
+    // The windows are exactly six ports wide, so Ollama's port sits outside a
+    // default-mode window and inside a compat-mode one.
+    let default_mode =
+      LiveProxy::from_base_url("http://127.0.0.1:11436/v1", &bind_bases(&Config::default()))
+        .unwrap();
+    assert!(!default_mode.could_bind(ProxyConfig::DEFAULT_OLLAMA_COMPAT_PORT));
+    let compat_mode =
+      LiveProxy::from_base_url("http://127.0.0.1:11437/v1", &bind_bases(&compat)).unwrap();
+    assert!(compat_mode.could_bind(ProxyConfig::DEFAULT_OLLAMA_COMPAT_PORT));
+    assert!(!compat_mode.could_bind(ProxyConfig::DEFAULT_OLLAMA_COMPAT_PORT + 6));
   }
 
   #[test]
