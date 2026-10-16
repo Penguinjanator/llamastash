@@ -140,6 +140,9 @@ pub struct RequestRow {
   /// flag rather than read off `requested_model != model` so a fallback row
   /// still says the client used an alias.
   pub alias: bool,
+  /// The request arrived on the proxy's `/ui` web page instead of an API
+  /// client. `route` holds the canonical `/v1/...` path it was served under.
+  pub ui: bool,
   /// Launches unloaded to make room for this request's auto-start.
   pub evicted: Vec<String>,
   /// Why another model answered (`launch_failed` / `family_mismatch`).
@@ -258,6 +261,9 @@ impl RequestRow {
     }
     if self.alias {
       parts.push("alias".to_string());
+    }
+    if self.ui {
+      parts.push("ui".to_string());
     }
     if self.auto_start && self.state != RequestState::InFlight {
       parts.push("auto-start".to_string());
@@ -1226,6 +1232,11 @@ impl RequestRecord {
   /// Stamp that a `proxy.aliases` entry is what routed this request.
   pub fn set_alias(&mut self) {
     self.row.alias = true;
+  }
+
+  /// Stamp that this request came from the proxy's own `/ui` web page.
+  pub fn set_ui(&mut self) {
+    self.row.ui = true;
   }
 
   pub fn set_evicted(&mut self, launches: Vec<String>) {

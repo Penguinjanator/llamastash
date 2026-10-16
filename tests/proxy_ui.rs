@@ -26,6 +26,7 @@ use llamastash::discovery::{DiscoveredModel, ModelCatalog, ModelSource};
 use llamastash::gguf::identity::ModelId;
 use llamastash::launch::mode::LaunchMode;
 use llamastash::launch::params::LaunchParams;
+use llamastash::proxy::request_log::LogScope;
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
 use llamastash::test_support::{
@@ -173,6 +174,29 @@ async fn build_state_with_cap(
     max_body_size,
     &Default::default(),
   )
+}
+
+/// Like [`build_state`] but also returns the [`MethodContext`] the state reads,
+/// so a test can read the request log the proxy wrote into.
+async fn build_state_and_ctx(
+  models: Vec<DiscoveredModel>,
+  supervisors: SupervisorRegistry,
+) -> (Arc<ProxyState>, MethodContext) {
+  let catalog = ModelCatalog::new();
+  for m in models {
+    catalog.upsert(m).await;
+  }
+  let ctx =
+    MethodContext::with_catalog(ShutdownToken::new(), catalog).with_supervisors(supervisors);
+  let state = ProxyState::from_context_with_auth(
+    &ctx,
+    false,
+    true,
+    None,
+    DEFAULT_BODY_LIMIT_BYTES,
+    &Default::default(),
+  );
+  (state, ctx)
 }
 
 /// Standard base64 (padded) — the test crate doesn't pull the `base64`
@@ -455,6 +479,151 @@ async fn auth_enforced_ui_challenges_basic_and_accepts_credentials() {
   let bearer = format!("Bearer {key}");
   let (status, _h, _b) = http_get(addr, "/ui/", &[("Authorization", &bearer)]).await;
   assert_eq!(status, 200, "Bearer with the key must still pass");
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A chat sent from a web page is logged the way the same call to
+/// `/v1/chat/completions` is, marked `ui` and filed under the canonical route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_ui_chat_is_logged_under_the_canonical_route() {
+  let dir = unique_temp("log-engine");
+  let registry = SupervisorRegistry::new();
+  let model = spawn_fake("/fixture/solo.gguf", &dir).await;
+  registry.insert(registry.next_id(), model.clone()).await;
+  let (state, ctx) = build_state_and_ctx(
+    vec![discovered("/fixture/solo.gguf", Some("solo"))],
+    registry,
+  )
+  .await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+
+  let (status, _h, body) = http_post(
+    addr,
+    "/ui/v1/chat/completions",
+    r#"{"model":"solo","messages":[{"role":"user","content":"hi"}]}"#,
+    &[],
+  )
+  .await;
+  assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+
+  let rows = ctx.requests.tail(LogScope::All, 10).rows;
+  assert_eq!(rows.len(), 1, "one chat, one row: {rows:?}");
+  let row = &rows[0];
+  assert_eq!(
+    row.route, "/v1/chat/completions",
+    "the row carries the canonical route, not the `/ui` path"
+  );
+  assert!(row.ui, "the row is marked as UI traffic");
+  assert_eq!(row.requested_model.as_deref(), Some("solo"));
+  assert_eq!(row.model.as_deref(), Some("solo"));
+  assert_eq!(row.model_path.as_deref(), Some("/fixture/solo.gguf"));
+  assert_eq!(row.status, Some(200));
+  assert!(row.launch_id.is_some(), "the row names the launch");
+  assert!(row.note().contains("ui"), "note: {:?}", row.note());
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Everything else the page asks for stays out of the log: its index and
+/// assets, the engine's model list, `/props`, a stream lookup, and a refused
+/// route. Both pages (the engine's own and the embedded one) are covered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ui_page_traffic_stays_out_of_the_log() {
+  let dir = unique_temp("log-assets");
+  let registry = SupervisorRegistry::new();
+  let model = spawn_fake("/fixture/solo.gguf", &dir).await;
+  registry.insert(registry.next_id(), model.clone()).await;
+  let (state, ctx) = build_state_and_ctx(
+    vec![discovered("/fixture/solo.gguf", Some("solo"))],
+    registry,
+  )
+  .await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+
+  for path in [
+    "/ui/",
+    "/ui/v1/models",
+    "/ui/props",
+    "/ui/bundle.js",
+    "/ui/nope",
+  ] {
+    http_get(addr, path, &[]).await;
+  }
+  http_post(
+    addr,
+    "/ui/v1/streams/lookup",
+    r#"{"conversation_ids":["x"]}"#,
+    &[],
+  )
+  .await;
+
+  let rows = ctx.requests.tail(LogScope::All, 10).rows;
+  assert!(
+    rows.is_empty(),
+    "page traffic must log nothing: {:?}",
+    rows.iter().map(|r| &r.route).collect::<Vec<_>>()
+  );
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The embedded page sends no `model` in single-model mode. The row still names
+/// the model that answered, and `requested_model` stays what the browser sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bundled_ui_chat_is_logged_without_a_requested_model() {
+  let dir = unique_temp("log-bundled");
+  let registry = SupervisorRegistry::new();
+  let model = spawn_fake_tagged("/fixture/solo.gguf", &dir, "generic", Some(2048)).await;
+  registry.insert(registry.next_id(), model.clone()).await;
+  let (state, ctx) = build_state_and_ctx(
+    vec![discovered("/fixture/solo.gguf", Some("solo"))],
+    registry,
+  )
+  .await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+
+  let (status, _h, _body) = http_post(
+    addr,
+    "/ui/v1/chat/completions",
+    r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+    &[],
+  )
+  .await;
+  assert_eq!(status, 200);
+  // The embedded page's own surface, answered by the proxy.
+  for path in ["/ui/", "/ui/props"] {
+    http_get(addr, path, &[]).await;
+  }
+  http_post(
+    addr,
+    "/ui/v1/streams/lookup",
+    r#"{"conversation_ids":["x"]}"#,
+    &[],
+  )
+  .await;
+
+  let rows = ctx.requests.tail(LogScope::All, 10).rows;
+  assert_eq!(
+    rows.len(),
+    1,
+    "only the generation call is logged: {:?}",
+    rows.iter().map(|r| &r.route).collect::<Vec<_>>()
+  );
+  let row = &rows[0];
+  assert_eq!(row.route, "/v1/chat/completions");
+  assert!(row.ui);
+  assert_eq!(
+    row.requested_model, None,
+    "the page sent no model, so nothing is invented for it"
+  );
+  assert_eq!(row.model.as_deref(), Some("solo"));
 
   let _ = model.stop(Duration::from_secs(3)).await;
   shutdown_listener(shutdown, handle).await;

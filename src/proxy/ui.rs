@@ -34,7 +34,7 @@ use hyper::body::{Bytes, Incoming};
 use hyper::header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE};
 use hyper::{HeaderMap, Request, Response, StatusCode};
 
-use super::router::{BodyError, ProxyResponse};
+use super::router::{BodyError, ClientAddr, ProxyResponse, GENERATION_ROUTES};
 use super::state::ProxyState;
 use super::{forward, metrics, route, ui_bundle};
 use crate::daemon::registry::LaunchId;
@@ -243,6 +243,18 @@ async fn collect_running(state: &Arc<ProxyState>) -> Vec<RunningEntry> {
   out
 }
 
+/// Which logged route this stripped `/ui` path is, or `None` when it is UI
+/// plumbing (an asset, `/props`, the stream lookup). Matched on the path alone,
+/// so a query string cannot turn a logged route into an unlogged one, and on the
+/// exact fixed strings the router forwards — nothing user-controlled is stored.
+fn logged_ui_route(stripped: &str) -> Option<&'static str> {
+  let path = stripped.split('?').next().unwrap_or("/");
+  GENERATION_ROUTES
+    .iter()
+    .copied()
+    .find(|route| *route == path)
+}
+
 /// Strip the `/ui` prefix and forward the request to `entry`'s backend.
 /// The UI's relative assets (`/ui/bundle.js`) and base-relative API
 /// calls (`/ui/v1/chat/completions`, `/ui/props`) all land here and
@@ -259,7 +271,9 @@ async fn forward_to_launch(
   entry: &RunningEntry,
   model_when_absent: Option<&str>,
 ) -> ProxyResponse {
+  let client = req.extensions().get::<ClientAddr>().map(|c| c.0);
   let stripped = strip_ui_prefix(req.uri());
+  let logged = logged_ui_route(&stripped);
   let (method, _uri, headers, body) = forward::deconstruct(req);
   // Buffer the body under the daemon's cap via the same helper the
   // data plane uses. UI asset GETs are bodyless; the base-relative API
@@ -269,6 +283,17 @@ async fn forward_to_launch(
     Ok(b) => b,
     Err(e) => return route::body_error_response(e, cap),
   };
+  // Opened after the body is in hand so the row can carry what the page
+  // actually asked for, and before `model_when_absent` fills the body in, so
+  // `requested_model` stays what the browser sent.
+  let record = logged.map(|route| {
+    let mut record = state.ctx.requests.begin(route, client);
+    record.set_requested_model(route::model_in_body(&body_bytes).as_deref());
+    record.set_model(&entry.name, &entry.model_id.path.to_string_lossy());
+    record.set_ui();
+    record.publish();
+    record
+  });
   let body_bytes = match model_when_absent {
     Some(name) => forward::with_model_added(body_bytes, name),
     None => body_bytes,
@@ -293,8 +318,9 @@ async fn forward_to_launch(
       fallback: false,
       fallback_reason: None,
     },
-    // Web-UI traffic stays out of the request log.
-    None,
+    // Web-UI traffic that reaches a model is logged (`ui` marks the row);
+    // everything else under `/ui` is not.
+    record,
   )
   .await
 }
@@ -667,6 +693,38 @@ mod tests {
   use crate::discovery::{DiscoveredModel, ModelSource, Multimodal};
   use crate::proxy::test_support::{state_with, umbrella_id};
   use std::path::{Path, PathBuf};
+
+  /// The log matches a `/ui` request on its path alone, against the fixed
+  /// routes the router forwards: a query string cannot hide a generation call,
+  /// and nothing else the page asks for becomes a row.
+  #[test]
+  fn only_generation_routes_on_the_ui_surface_are_logged() {
+    assert_eq!(
+      logged_ui_route("/v1/chat/completions"),
+      Some("/v1/chat/completions"),
+      "the chat call is logged under its own path"
+    );
+    assert_eq!(
+      logged_ui_route("/v1/responses?stream=1"),
+      Some("/v1/responses"),
+      "a query keeps the route logged, and stays out of the row"
+    );
+    for path in [
+      "/",
+      "/bundle.js",
+      "/props",
+      "/v1/models",
+      "/v1/streams/lookup",
+      "/v1/chat/completions/../props",
+      "/v1/chat/completionsx",
+    ] {
+      assert_eq!(
+        logged_ui_route(path),
+        None,
+        "{path} is page traffic, not a generation call"
+      );
+    }
+  }
 
   /// The running list is Ready rows only, in launch order (`L2` before `L10`),
   /// each carrying its port and served name, and the full model id the forward

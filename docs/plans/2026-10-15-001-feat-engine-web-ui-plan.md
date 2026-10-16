@@ -30,7 +30,7 @@ From the origin doc (see origin: `docs/brainstorms/2026-10-15-engine-web-ui-requ
 - R10. Nothing unpacked until the first bundled-UI request.
 - R11. Pinned version recorded in the repo, plus a refresh script that checks sha256.
 - R12. llama.cpp MIT notice ships with the binary.
-- R13. Bundled-UI traffic stays out of the request log.
+- R13. Bundled-UI traffic stays out of the request log. — superseded the same day: the page's `/v1` generation calls are logged and marked `ui`; assets, `/props` and the stream lookup stay out.
 - R14. Cookie pin, chooser, `/ui/switch`, `?target=`, LAN Basic auth unchanged.
 - R15. `docs/usage.md` § Web UI covers engines and limits.
 - R16. `TODO.md`: router-mode follow-up added, batch 5 item struck.
@@ -78,7 +78,7 @@ From the origin doc (see origin: `docs/brainstorms/2026-10-15-engine-web-ui-requ
 ## Key Technical Decisions
 
 - **Three UI sources per launch:** the engine's own UI (backend `serves_web_ui`), the bundled UI (UI-less backend and chat mode), or none. A small enum on `RunningEntry` replaces the `serves_ui` bool. Keeps R4: only the trait call and the launch mode decide.
-- **Bundled routing by path:** `/props` is answered by the proxy; `/v1/...` is forwarded unchanged to the launch's port with the same `forward::forward_to_upstream` call `forward_ui` uses today (no request log, R13); everything else is an embedded file (`/` serves `index.html`) or 404. Forwarding `/v1/models` straight to the engine gives the UI the name the engine accepts (R8), including gufo's `--served-model-name`.
+- **Bundled routing by path:** `/props` is answered by the proxy; `/v1/...` is forwarded unchanged to the launch's port with the same `forward::forward_to_upstream` call `forward_ui` uses today (generation calls are logged and marked `ui`, superseding R13); everything else is an embedded file (`/` serves `index.html`) or 404. Forwarding `/v1/models` straight to the engine gives the UI the name the engine accepts (R8), including gufo's `--served-model-name`.
 - **Fake `/props` is minimal:** `role: "model"`, `model_path` = the launch's served name, `default_generation_settings: {n_ctx, params: {}}`, `modalities: {vision, audio: false, video: false}`, `build_info` naming llamastash and its version. `total_slots` is left out: the page only displays it and the launch's real slot count is not what a single bundled page needs. `n_ctx` is the launch's `resolved_ctx` when its backend reports one (llama.cpp, vLLM and SGLang implement `fetch_actuals`), else the launch's requested ctx (`params.ctx`, what `status` shows as `ctx`; for a generic entry it comes from the `ctx: true` knob), else `0`. The generic backend reports no actuals, so generic launches always take the second value.
 - **Embedded archive, unpacked once:** `include_bytes!` the `.tar.gz`; on the first bundled-UI request unpack it into an in-memory map (path to bytes) held in a `OnceLock`. About 10 MB of RAM after first use, zero before (R10). Lookups are map keys, never filesystem paths, so there is no path traversal surface.
 - **Version record:** `data/llama-ui/VERSION` holds the build (`b11642`) and the archive's sha256. Written only by the refresh script.

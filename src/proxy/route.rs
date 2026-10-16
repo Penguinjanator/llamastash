@@ -190,6 +190,18 @@ pub(crate) async fn buffer_and_extract(
   Ok(ParsedBody { bytes, model })
 }
 
+/// The `model` a buffered body names, or `None` for a body that is empty, is
+/// not JSON, or names nothing. Unlike [`buffer_and_extract`] this never fails,
+/// so a caller can label a row without deciding the body's validity — the
+/// `/ui` forwarder forwards the bytes either way and lets the engine judge.
+pub(crate) fn model_in_body(bytes: &[u8]) -> Option<String> {
+  serde_json::from_slice::<JustModel>(bytes)
+    .ok()?
+    .model
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+}
+
 /// Drain an inbound body under `cap`, distinguishing the cap-overflow
 /// (413) case from a read failure (400). `http-body-util::Limited`
 /// wraps the inner error in a `Box<dyn Error>`; the overflow case is
