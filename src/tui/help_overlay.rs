@@ -234,8 +234,9 @@ fn build_sections(app: &App) -> Vec<Section> {
 /// suffix on the Host panel's `MEM` row (unified memory — Apple Metal /
 /// AMD UMA APUs where the GPU draws from the same physical pool, so the
 /// `VRAM` row is the GPU's view of that same memory, not an additional
-/// pool), and the `◉`/`♪` modality glyphs the right-pane title carries
-/// when a model has an auto-detected mmproj projector.
+/// pool), the `PP` shorthand the request tables and summaries use for
+/// prompt processing, and the `◉`/`♪` modality glyphs the right-pane
+/// title carries when a model has an auto-detected mmproj projector.
 fn legend_section() -> Section {
   let mut rows = vec![
     (
@@ -245,6 +246,10 @@ fn legend_section() -> Section {
     (
       "GPU*".to_string(),
       "combined usage + hottest temp across multiple GPUs".to_string(),
+    ),
+    (
+      "PP".to_string(),
+      "prompt processing (prefill): prompt tokens the engine computed, not the ones it reused from its KV cache".to_string(),
     ),
     (
       format!(
@@ -452,6 +457,19 @@ mod tests {
     assert!(
       frame.contains("GPU*") && frame.contains("combined usage"),
       "GPU* legend row missing:\n{frame}"
+    );
+  }
+
+  #[test]
+  fn overlay_shows_pp_legend() {
+    // The Requests tab and `llamastash requests` abbreviate prompt
+    // processing to `PP` (`PP/S`, `Avg PP tok/s`); the Legend row is the
+    // only place the TUI spells it out.
+    let app = App::new(AppOptions::default());
+    let frame = render_to_string(140, 40, &app);
+    assert!(
+      frame.contains("prompt processing (prefill)"),
+      "PP legend row missing:\n{frame}"
     );
   }
 

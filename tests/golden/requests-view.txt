@@ -18,13 +18,13 @@
 │m/y                                                                         ││ Unloaded 1                             │
 │   phi-3                                  phi         Q4_K    8.0k    3.9G  ││ Avg tok/s 41.3   Tok/s session 48.9    │
 │                                                                            ││ Agg tok/s 52.4 over 6.3s               │
-│                                                                            ││ Avg Prefill tok/s 1043                 │
-│                                                                            ││ Avg total 20.2s   Avg TTFB 16.0s       │
-│                                                                            ││ Tokens in 36.9k   Cached 33.5k (90.8%) │
-│                                                                            ││ Tokens out 328                         │
+│                                                                            ││ Avg PP tok/s 1043   Avg total 20.2s    │
+│                                                                            ││ Avg TTFB 16.0s   Tokens in 36.9k       │
+│                                                                            ││ Cached 33.5k (90.8%)   Tokens out 328  │
 │                                                                            ││                                        │
 │                                                                            ││ Time     Code Tok/s  Total   TTFB      │
 │                                                                            ││ HH:MM:SS 200  41.3   4.3s    182ms     │
 │                                                                            ││ HH:MM:SS 200  —      —       182ms     │
 │                                                                            ││ HH:MM:SS 200  —      —       182ms     │
+│                                                                            ││ HH:MM:SS 200  —      4.3s    182ms     │
 └ ◌ launching · ◐ loading · ● ready · ▲ error · ○ stopped · ⇪ external ──────┘└────────────────────────────────────────┘

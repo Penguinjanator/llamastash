@@ -581,14 +581,14 @@ mod tests {
       cache_hit_ratio: Some(0.9756),
       ..RequestSummary::default()
     });
-    assert!(filled.contains("Prefill tok/s  3367"), "{filled}");
+    assert!(filled.contains("Avg PP tok/s  3367"), "{filled}");
     assert!(filled.contains("Cached  40.0k (97.6%)"), "{filled}");
     // Nothing reported a cached count: the placeholder every other cell uses,
     // not a zero that reads as a total miss.
     let empty = summary_on_terminal(RequestSummary::default());
     let prefill = empty
       .lines()
-      .find(|line| line.contains("Prefill tok/s"))
+      .find(|line| line.contains("Avg PP tok/s"))
       .unwrap_or_default();
     assert!(prefill.ends_with('-'), "{prefill}");
     let cached = empty
@@ -596,5 +596,35 @@ mod tests {
       .find(|line| line.contains("Cached"))
       .unwrap_or_default();
     assert!(cached.ends_with('-'), "{cached}");
+  }
+
+  #[test]
+  fn the_summary_block_prints_the_counts_then_the_speeds() {
+    let strip = summary_on_terminal(RequestSummary::default());
+    let keys: Vec<&str> = strip
+      .lines()
+      .take_while(|line| !line.trim().is_empty())
+      .map(|line| line.trim().split("  ").next().unwrap_or_default())
+      .collect();
+    assert_eq!(
+      keys,
+      [
+        "Hosts",
+        "Connections",
+        "Requests",
+        "Errors",
+        "Auto-starts",
+        "Unloaded",
+        "Avg tok/s",
+        "Agg tok/s",
+        "Avg PP tok/s",
+        "Avg total",
+        "Avg TTFB",
+        "Tokens in",
+        "Cached",
+        "Tokens out"
+      ],
+      "{strip}"
+    );
   }
 }

@@ -404,9 +404,9 @@ impl RequestSummary {
   }
 
   /// [`Self::cells`] split into the two rows the terminal shows: what happened
-  /// (Live, hosts, counts) and how fast (speeds, latencies, tokens). Each row
-  /// wraps on its own, so a narrow pane keeps the split rather than letting one
-  /// row's tail push the other's figures around.
+  /// (Live, hosts, counts) and how fast it went (speeds, latencies, token
+  /// totals). Each row wraps on its own, so a narrow pane keeps the split
+  /// rather than letting one row's tail push the other's figures around.
   pub fn cell_rows(&self, none: &str) -> [Vec<(&'static str, String)>; 2] {
     let ms = |v: Option<u64>| v.map(fmt_ms).unwrap_or_else(|| none.to_string());
     let tps = |v: Option<f64>| v.map(fmt_tps).unwrap_or_else(|| none.to_string());
@@ -423,7 +423,7 @@ impl RequestSummary {
         ("Unloaded", self.evictions.to_string()),
       ])
       .collect();
-    let rates = [("Avg tok/s", tps(self.tokens_per_second_avg))]
+    let speeds_and_totals = [("Avg tok/s", tps(self.tokens_per_second_avg))]
       .into_iter()
       .chain(
         self
@@ -439,7 +439,7 @@ impl RequestSummary {
           },
         ),
         (
-          "Avg Prefill tok/s",
+          "Avg PP tok/s",
           self
             .prefill_tokens_per_second
             .map(fmt_tps)
@@ -458,7 +458,7 @@ impl RequestSummary {
         ("Tokens out", fmt_count(self.completion_tokens)),
       ])
       .collect();
-    [counts, rates]
+    [counts, speeds_and_totals]
   }
 
   /// The in-flight pair as one cell: `Live N` when every host in flight is on
@@ -1972,7 +1972,7 @@ mod tests {
     assert_eq!(cells[at + 1], ("Agg tok/s", "50.3 over 3m34s".to_string()));
     // The prompt speed follows the two generation figures, and the token
     // counts follow it.
-    assert_eq!(cells[at + 2], ("Avg Prefill tok/s", "—".to_string()));
+    assert_eq!(cells[at + 2], ("Avg PP tok/s", "—".to_string()));
     assert_eq!(cells[at + 3].0, "Avg total");
   }
 
@@ -2474,7 +2474,7 @@ mod tests {
     assert_eq!(text(&cells, "Avg total"), "—");
     assert_eq!(text(&cells, "Avg tok/s"), "—");
     assert_eq!(text(&cells, "Agg tok/s"), "—");
-    assert_eq!(text(&cells, "Avg Prefill tok/s"), "—");
+    assert_eq!(text(&cells, "Avg PP tok/s"), "—");
     let filled = RequestSummary {
       avg_duration_ms: Some(1_240),
       tokens_per_second_avg: Some(39.64),
@@ -2489,12 +2489,58 @@ mod tests {
     assert_eq!(text(&filled_cells, "Avg tok/s"), "39.6");
     assert_eq!(text(&filled_cells, "Agg tok/s"), "—");
     // A speed from 1000 up loses the decimal here too.
-    assert_eq!(text(&filled_cells, "Avg Prefill tok/s"), "3367");
+    assert_eq!(text(&filled_cells, "Avg PP tok/s"), "3367");
     assert_eq!(text(&filled_cells, "Tokens in"), "12.3k");
     assert_eq!(text(&filled_cells, "Cached"), "1200 (97.6%)".to_string());
     // The session speed is the newest one a stream reported, and the only
     // speed on the strip besides the average.
     assert!(!filled_cells.iter().any(|c| c.0 == "Tok/s last"));
+  }
+
+  #[test]
+  fn each_summary_row_holds_its_figures_in_order() {
+    let labels = |cells: &[(&'static str, String)]| cells.iter().map(|c| c.0).collect::<Vec<_>>();
+    let summary = RequestSummary::default();
+    let [counts, speeds] = summary.cell_rows("—");
+    assert_eq!(
+      labels(&counts),
+      [
+        "Hosts",
+        "Connections",
+        "Requests",
+        "Errors",
+        "Auto-starts",
+        "Unloaded"
+      ]
+    );
+    assert_eq!(
+      labels(&speeds),
+      [
+        "Avg tok/s",
+        "Agg tok/s",
+        "Avg PP tok/s",
+        "Avg total",
+        "Avg TTFB",
+        "Tokens in",
+        "Cached",
+        "Tokens out"
+      ]
+    );
+    // `cells` is the two rows end to end, which is the order `requests` prints.
+    assert_eq!(
+      summary.cells("—"),
+      counts.into_iter().chain(speeds).collect::<Vec<_>>()
+    );
+    // The two optional figures join the row they belong to.
+    let [live_counts, live_speeds] = RequestSummary {
+      live_hosts: Some(1),
+      live_connections: Some(2),
+      tokens_per_second_session: Some(40.0),
+      ..RequestSummary::default()
+    }
+    .cell_rows("—");
+    assert_eq!(labels(&live_counts)[0], "Live");
+    assert_eq!(labels(&live_speeds)[1], "Tok/s session");
   }
 
   #[tokio::test]
