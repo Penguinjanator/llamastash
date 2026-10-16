@@ -144,7 +144,7 @@ The CLI and TUI respawn the daemon on the next attach, so for them this costs a 
 
 **Symptom:** `llamastash status --json | jq .proxy` shows `"status": "port_in_use"` (and `bind_error` is `null`). Agents pointed at `http://127.0.0.1:11434/v1` get connection-refused or hit Ollama instead of llamastash.
 
-**This is the design.** The proxy refuses to auto-roam to a free port — the `:11434` default exists so OpenAI-client wrappers that hard-code Ollama's well-known port discover llamastash without reconfiguration; silently moving would break that contract. The most common cause is Ollama running on the same box.
+**How far the proxy will move.** It does not stay glued to one port, but it does not roam far either: it tries the base port (`11434` in Ollama-compat mode, `11435` in default mode, or `proxy.port` / `--proxy-port` if you set one) and then the five ports above it — six attempts in total, so `11434..=11439` in compat mode. `port_in_use` means all six were taken. The window is deliberately narrow rather than ephemeral-range-wide, so the port stays predictable enough to pin into an agent config. When it lands on a different port than your configs name, `llamastash doctor --fix` repoints the ones `init` wrote. The most common cause of the whole window being busy is Ollama running on the same box.
 
 **Fix (pick one):**
 
@@ -167,7 +167,7 @@ The CLI and TUI respawn the daemon on the next attach, so for them this costs a 
     port: 11500
   ```
 
-  Agents then point at `http://127.0.0.1:11500/v1`. `--proxy-port 0` binds an ephemeral port; the actual address is reported via `llamastash status --json | jq .proxy.listen`.
+  Agents then point at `http://127.0.0.1:11500/v1` — or run `llamastash doctor --fix`, which rewrites that address in every tool config `init` wrote; an endpoint you configured by hand is yours to edit. `--proxy-port 0` binds an ephemeral port; the actual address is reported via `llamastash status --json | jq .proxy.listen`.
 
 ## Agent reports "could not reach API" / connection refused on `:11434`
 
@@ -183,6 +183,18 @@ llamastash status --json | jq .proxy
 ```
 
 If `status` is `"disabled"` instead of `"listening"`, your config has `proxy.enabled: false` — flip it back and restart the daemon. If `status` is `"port_in_use"`, see the previous section.
+
+When the daemon *is* listening but on another port — it found the configured one busy and took the next free slot in its window — the client is pointing at an address nothing answers on any more. Check the port it actually got and let `doctor` repoint the configs `init` wrote:
+
+```bash
+llamastash status --json | jq .proxy.listen   # e.g. 127.0.0.1:11436
+llamastash doctor --dry-run                   # what it would rewrite
+llamastash doctor --fix                       # rewrite them
+```
+
+One limit is worth knowing: inside that window the repair has no way to tell the proxy's own old port from something else listening on it, so a second llamastash daemon (or any other listener) on one of those six ports gets repointed along with everything else, and the ledger line reads as a success. Every rewrite names the address it found and the one it wrote, so a surprise is visible in `doctor --dry-run` before it is applied. Outside the window nothing is touched.
+
+Up to three rewritten addresses per file are named — in the finding and in the ledger — and the rest are counted, so a file full of stale URLs stays readable; all of them are rewritten either way. Only the address changes: the model list and everything else in the file stays as it was. A client you configured by hand, and a shell that sourced `~/.config/llamastash/env.sh`, have to be pointed at the new port themselves (re-source the file, or open a new terminal). A config `doctor` cannot read at all is reported with that reason and the hand step, because there is no repair that can reach it.
 
 ## An agent got an error from the proxy, or a request hangs
 

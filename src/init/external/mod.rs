@@ -20,6 +20,8 @@ pub mod effort;
 pub mod merge;
 pub mod models;
 pub mod proxy_url;
+pub mod stale_url;
+pub mod tool_targets;
 pub mod tools;
 pub mod write;
 
@@ -416,12 +418,6 @@ fn resolve_path(
 /// order the picker displays.
 pub fn all_patchers() -> Vec<Box<dyn ToolPatcher>> {
   tools::registered()
-}
-
-/// Resolve a patcher by its [`ToolPatcher::id`]. Used by the wizard's
-/// `--integrations <id>,...` non-interactive form.
-pub fn patcher_by_id(id: &str) -> Option<Box<dyn ToolPatcher>> {
-  all_patchers().into_iter().find(|p| p.id() == id)
 }
 
 #[cfg(test)]

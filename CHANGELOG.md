@@ -21,6 +21,9 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 ### Fixed
 
 - External `llama-server` rows refresh every 30 s instead of only at daemon start, so a server started after boot appears, one that exits disappears, and the port its argv carries shows in `status` and the TUI (#111).
+- `integrations claude-code` exports `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, so Claude Code sizes the session to the context the proxy actually serves instead of the 200,000 it assumes for a model name it does not know (#114).
+- `doctor --fix` repoints a tool config at the port the proxy actually listens on, so a proxy that moved off the port `init` wrote no longer leaves every configured tool failing with a connection error (#114).
+- `doctor --fix` reads every proxy address on a line rather than just the first, keeps a same-host port that is not the proxy's own window alone, and ledges a rewrite it could not make instead of staying silent (#114).
 
 ### Security
 

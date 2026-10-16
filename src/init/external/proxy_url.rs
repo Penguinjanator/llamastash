@@ -1,8 +1,8 @@
 //! The proxy URL written into tool configs.
 //!
 //! The running daemon's address comes first: the proxy moves up to five
-//! ports past a busy one, and `daemon start --proxy-port` / `--host` never
-//! reach `config.yaml`, so config alone can name a port nothing serves.
+//! ports past a busy one, and `daemon start --proxy-port` / `--proxy-host`
+//! never reach `config.yaml`, so config alone can name a port nothing serves.
 //! Config, then the built-in default, cover a daemon that cannot be
 //! reached.
 

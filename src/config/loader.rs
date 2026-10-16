@@ -508,6 +508,13 @@ impl<'de> Deserialize<'de> for ProxyAliases {
 }
 
 impl ProxyConfig {
+  /// Base port of default mode: next to Ollama's, so an existing Ollama
+  /// install keeps [`Self::DEFAULT_OLLAMA_COMPAT_PORT`].
+  pub const DEFAULT_PORT: u16 = 11435;
+  /// Base port of Ollama-compat mode — Ollama's own well-known port, which
+  /// the proxy takes over in that mode.
+  pub const DEFAULT_OLLAMA_COMPAT_PORT: u16 = 11434;
+
   fn default_enabled() -> bool {
     true
   }
@@ -515,9 +522,11 @@ impl ProxyConfig {
   /// Port the listener tries first. Falls through to the
   /// `ollama_compat`-derived default when `port` is unset.
   pub fn effective_port(&self) -> u16 {
-    self
-      .port
-      .unwrap_or(if self.ollama_compat { 11434 } else { 11435 })
+    self.port.unwrap_or(if self.ollama_compat {
+      Self::DEFAULT_OLLAMA_COMPAT_PORT
+    } else {
+      Self::DEFAULT_PORT
+    })
   }
 
   /// Address the listener binds. Falls back to loopback
