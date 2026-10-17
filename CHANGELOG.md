@@ -1,33 +1,38 @@
-# Changelog
-
-All notable changes to LlamaStash will be documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project intends to follow [SemVer](https://semver.org/spec/v2.0.0.html) starting with the first stable release.
-
 ## [Unreleased]
+
+## [0.8.0] — 2026-10-17
+
+This release is about reading the box under load. `PP/S` on every request row and `Avg PP tok/s` and `Cached` in the summary cover the wait before the first token, and `Agg tok/s` and `Agg PP tok/s` beside the two averages count a second shared by four streams once, so concurrent requests read as what the machine put out rather than one slot each. `/ui` opens a chat page on engines that ship no web UI of their own, and a chat sent from it lands in the log marked `ui`. An external `llama-server` now appears within 30 s instead of only at daemon start. Setup got repairs: `integrations claude-code` exports the context size the proxy actually serves, and `doctor --fix` repoints a tool config at the port the proxy listens on.
 
 ### Added
 
-- `/ui` opens a chat page for engines that ship no web UI of their own (vLLM, SGLang, generic entries) (#113).
-- Request summaries report aggregate throughput beside the average: `Agg tok/s` and `Agg PP tok/s` over the wall time the tokens were produced, so concurrent streams read as what the box put out. Either prints only when it differs from the average beside it (#112).
-- The request log shows prompt processing: `PP/S` per row, `Avg PP tok/s` and `Cached` in the summary, so the wait before the first token reads without starting the engine with `--metrics`. Where an engine reports no prefill timing the proxy estimates one and marks it `~` (#112).
-- A request that a `proxy.aliases` name routed is marked `alias` (#112).
+- `/ui` opens a chat page for engines that ship no web UI of their own (vLLM, SGLang, generic entries) ([#113](https://github.com/llamastash/llamastash/pull/113)).
+- Request summaries report aggregate throughput beside the average: `Agg tok/s` and `Agg PP tok/s` over the wall time the tokens were produced, so concurrent streams read as what the box put out. Either prints only when it differs from the average beside it ([#112](https://github.com/llamastash/llamastash/pull/112)).
+- The request log shows prompt processing: `PP/S` per row, `Avg PP tok/s` and `Cached` in the summary, so the wait before the first token reads without starting the engine with `--metrics`. Where an engine reports no prefill timing the proxy estimates one and marks it `~` ([#112](https://github.com/llamastash/llamastash/pull/112)).
+- A request that a `proxy.aliases` name routed is marked `alias` ([#112](https://github.com/llamastash/llamastash/pull/112)).
 
 ### Changed
 
-- A chat sent from a `/ui` page shows up in `llamastash requests` and the TUI under its own `/v1/...` route, marked `ui` (#113).
-- The requests table moves `Note` to the end and `PP/S` beside `TOK/S`, which shifts the tab-separated fields that follow it, and gives a model name the same 24 cells in the CLI and the TUI (#112).
-- The request summary splits into two rows, counts then speeds, and `Prefill tok/s` is now `Avg PP tok/s` (#112).
+- A chat sent from a `/ui` page shows up in `llamastash requests` and the TUI under its own `/v1/...` route, marked `ui` ([#113](https://github.com/llamastash/llamastash/pull/113)).
+- The requests table moves `Note` to the end and `PP/S` beside `TOK/S`, which shifts the tab-separated fields that follow it, and gives a model name the same 24 cells in the CLI and the TUI ([#112](https://github.com/llamastash/llamastash/pull/112)).
+- The request summary splits into two rows, counts then speeds, and `Prefill tok/s` is now `Avg PP tok/s` ([#112](https://github.com/llamastash/llamastash/pull/112)).
 
 ### Fixed
 
-- External `llama-server` rows refresh every 30 s instead of only at daemon start, so a server started after boot appears and one that exits disappears (#111).
-- `integrations claude-code` exports `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, so Claude Code sizes the session to the context the proxy actually serves instead of the 200,000 it assumes for a model name it does not know (#114).
-- `doctor --fix` repoints a tool config at the port the proxy actually listens on, so a proxy that moved off the port `init` wrote no longer leaves every configured tool failing with a connection error (#114).
-- `doctor --fix` reads every proxy address on a line rather than just the first, keeps a same-host port that is not the proxy's own window alone, and ledges a rewrite it could not make instead of staying silent (#114).
+- External `llama-server` rows refresh every 30 s instead of only at daemon start, so a server started after boot appears and one that exits disappears ([#111](https://github.com/llamastash/llamastash/pull/111)).
+- `integrations claude-code` exports `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, so Claude Code sizes the session to the context the proxy actually serves instead of the 200,000 it assumes for a model name it does not know ([#114](https://github.com/llamastash/llamastash/pull/114)).
+- `doctor --fix` repoints a tool config at the port the proxy actually listens on, so a proxy that moved off the port `init` wrote no longer leaves every configured tool failing with a connection error ([#114](https://github.com/llamastash/llamastash/pull/114)).
+- `doctor --fix` reads every proxy address on a line rather than just the first, keeps a same-host port that is not the proxy's own window alone, and ledges a rewrite it could not make instead of staying silent ([#114](https://github.com/llamastash/llamastash/pull/114)).
 
 ### Security
 
 - zip 5.1.1 → 9.0.4, clearing [RUSTSEC-2026-0367](https://rustsec.org/advisories/RUSTSEC-2026-0367), [RUSTSEC-2026-0368](https://rustsec.org/advisories/RUSTSEC-2026-0368) and [RUSTSEC-2026-0369](https://rustsec.org/advisories/RUSTSEC-2026-0369): `extract()` follows symlinks when it applies Unix modes, writes symlink targets outside the destination, and keeps SUID/SGID bits. Windows-only here, and it unpacks engine archives without ever calling `extract()`: entries are walked one by one, with traversal, symlink and size refusals of our own.
 - rustls 0.23.45 → 0.23.46, clearing [RUSTSEC-2026-0346](https://rustsec.org/advisories/RUSTSEC-2026-0346), [RUSTSEC-2026-0347](https://rustsec.org/advisories/RUSTSEC-2026-0347), [RUSTSEC-2026-0348](https://rustsec.org/advisories/RUSTSEC-2026-0348) and [RUSTSEC-2026-0349](https://rustsec.org/advisories/RUSTSEC-2026-0349): TLS secrets in `Debug` output, buffered data sent after an ECH rejection, a 1 GiB allocation while decompressing a certificate, and a key-exchange downgrade. Transitive via reqwest.
+
+### Contributors
+
+- [@deepu105](https://github.com/deepu105): everything
+
 
 ## [0.7.0] — 2026-10-13
 
