@@ -2,11 +2,18 @@
 
 ### Added
 
+- `rows_from` on a `backend.generic` entry mints one row per model an engine's own listing reports, with that model's arch, params, quant, context and size, so `llamastash start qwen3:0.6b` and a proxy request naming it work with no `proxy.aliases` lines ([#115](https://github.com/llamastash/llamastash/pull/115)).
 - Verified generic-entry recipes for Lemonade, FastFlowLM on an AMD NPU, and whisper.cpp in `docs/usage.md`, with the limits each one hits.
 
 ### Removed
 
+- The managed-multiplexer plumbing (`LaunchPlan::DelegateToManager`, `ManagedMultiplexer`, umbrella launches and their status fields) had no producer left once the Lemonade backend went, so it is gone: a backend either spawns a process or does not.
 - **Breaking: the dedicated Lemonade backend.** Run `lemond` as a `backend.generic` server: one declared entry plus one `proxy.aliases` line per model, and the same models answer on the proxy at the same speeds. A config with a `backend.lemonade:` block is rejected with a pointer to the steps, and `--lemonade` / `LLAMASTASH_LEMONADE` are gone. See [Running Lemonade as a generic server](docs/usage.md#running-lemonade-as-a-generic-server).
+
+### Fixed
+
+- A `backend.generic` `env` value that starts with `~/` resolves against the home directory like `binary` does, so an engine that needs `LD_LIBRARY_PATH` beside its binary no longer dies with `exit code 127` and a loader error that does not name the path ([#115](https://github.com/llamastash/llamastash/pull/115)).
+- Request rows carry the speed an engine reports under `usage` as `decoding_speed_tps` and `prefill_speed_tps`, so FastFlowLM rows show its measured rate instead of one estimated from the proxy's clock ([#115](https://github.com/llamastash/llamastash/pull/115)).
 
 ## [0.8.0] — 2026-10-17
 

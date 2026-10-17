@@ -913,13 +913,50 @@ Two shapes:
 | `args` | no | argv after `binary`, with placeholders. |
 | `knobs` | no | Knob declarations, below. |
 | `env` | no | Extra env for the child, with placeholders. |
-| `memory_gib` | no | Admission demand for a row without `model` (a `model` launch is sized from its GGUF). Unset means no memory gating. |
+| `memory_gib` | no | Admission demand for a row without `model` (a `model` launch is sized from its GGUF). Unset means no memory gating. With `rows_from` it is the fallback for items whose own size field is missing. |
+| `rows_from` | no | Mint one row per model an engine reports instead of writing them out. See [Minting rows from an engine's own listing](#minting-rows-from-an-engines-own-listing). |
 | `stop_grace_secs` | no | Minimum SIGTERM-to-SIGKILL grace on every stop path: `stop`, `stop --all`, idle eviction, daemon shutdown. A shorter `--grace` is raised to it. |
 | `ready_timeout_secs` | no | Readiness timeout, replacing the default probe budget. |
 | `modes` | no | The endpoints the server answers: any of `chat`, `embedding`, `rerank` (e.g. `[chat]`). The proxy refuses a `/v1/embeddings` or `/v1/rerank` request for an entry that doesn't list that mode with a `400 unsupported_endpoint`, before starting it, and `/v1/models` lists the entry under its first mode. Default: all modes, so the engine answers or refuses each request itself. |
 | `arch`, `params`, `quant`, `ctx` | no | Row info for an entry without `model`, for the Arch, Params, Quant and Ctx columns of `list`, `show` and the TUI (`params: 80B`, `quant: Q4_K_M`, `ctx: 262144`). Strings show as written; the TUI shortens Ctx (`256k`). `arch` also ranks proxy fallback candidates like a GGUF's arch, but picks no `arch_defaults`. `ctx` defaults to the `ctx: true` knob's `default`; Size comes from `memory_gib` and Mode from `modes`. Refused with `model`, since those rows read their GGUF. A `ctx` below a `--ctx` you pass prints the "exceeds native context" warning. |
 | `vision`, `reasoning_effort`, `reasoning_effort_default` | no | What the server accepts, for an entry without `model`, since there is no GGUF to read it from. `vision: true` marks it as taking images, and `reasoning_effort` lists the effort levels it accepts (e.g. `[low, medium, xhigh]`), which also marks it as a reasoning model. Levels are lowercase letters, digits, `-` and `_`, sent as written. `none` in the list means thinking can be turned off; `[none]` alone marks a reasoning model with no levels to pick, so Zed sends earlier thinking back and no tool gets an effort control. `reasoning_effort_default` names the level the server uses when a request sends none; it must be in the list and not `none`. Unset, Codex and Zed, which write one level, write the highest. `integrations` writes all of this into tool configs the way it does for a GGUF with a vision projector and a chat-template effort list (see [`integrations`](#llamastash-integrations-tools)), and the TUI shows the vision glyph. LlamaStash does not check any of it against the server. Refused with `model`. |
 | `rewrite_model` | no | `true` makes the proxy replace `body.model` with the launch's `{name}` value. Set it for a server that refuses any other model name (gufo's `--served-model-name`), so a plain id sent to a named launch, or `<model>@<other>` sent to the unnamed one, still reaches it. Default `false`: the body is forwarded unchanged. With it on, the proxy rebuilds each JSON body's top level (keys in their original order, nested values copied byte for byte), so a large body is held twice while it is rewritten. |
+
+### Minting rows from an engine's own listing
+
+An engine that owns its model store knows which models are installed, what context each one wants and what it costs to keep. `rows_from` asks it, once per rescan, and mints a row per model, so `config.yaml` carries the launch and nothing else:
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: flm
+        binary: ~/.local/opt/fastflowlm/flm
+        args: [serve, "{name}", --host, "{host}", -p, "{port}", --cors, "0"]
+        ready: /v1/version
+        rows_from:
+          command: [~/.local/opt/fastflowlm/flm, list, --filter, installed, --json]
+          items: models
+          name: model
+          when: installed
+          arch: details.family
+          params: details.parameter_size
+          quant: details.quantization_level
+          ctx: default_context_length
+          memory_gib: footprint
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `command` | yes | The listing command, argv-style. No shell, so no quoting. The first word may start with `~/`. |
+| `items` | no | Dot path to the array of models in the JSON body (`models` above). Omit when the body is the array. |
+| `name` | yes | Dot path to the model's name in one item. It becomes the row name, `{name}` at launch, and the name clients send, so it must be the tag the engine reads from a request (`qwen3:0.6b`). It cannot contain a space, `/`, `@` or `\|`. |
+| `when` | no | Keep only items that pass: a bare dot path taken as truthy (`installed`), or `{path: label, contains: audio}`, or `{path: details.family, equals: qwen3}`. |
+| `arch`, `params`, `quant`, `ctx`, `memory_gib` | no | Dot paths to each model's own Arch, Params, Quant, Ctx and size in GiB. `ctx` and `memory_gib` fall back to the entry's `ctx` and `memory_gib` when an item has no such field; the size feeds the Size column, the probe budget and the admission gate per model. |
+
+What the minted rows look like: one row per kept item, named by its own tag, published at `generic://<entry>/<tag>` and served by that entry, so `llamastash start qwen3:0.6b`, a proxy request naming it and `--ctx` for it all work with no `proxy.aliases` line. Knobs, `modes`, `ready`, `args` and `binary` come from the entry and are shared by its rows, so a `ctx: true` knob default applies to every model of that entry; leave such a default out and the engine uses each model's own context. Rows refresh on `llamastash rescan`; `llamastash status` lists them like any other row.
+
+Two limits follow from the shape. A listing command that is missing, fails or prints something that is not JSON mints nothing and logs one line, so an engine that is briefly unavailable empties its own rows rather than the catalog. And minting assumes one process per model, because each row launches the entry on its own port: an engine that fronts every model in one server (Lemonade's `lemond`) needs the alias form in [Running Lemonade as a generic server](#running-lemonade-as-a-generic-server) instead.
 
 **Placeholders** in `args` and `env`: `{port}`, `{host}` (always `127.0.0.1`), `{name}` (the id `/v1/models` publishes for the model, repo-qualified when another model shares its name; `id@launch` for a named launch), `{model}`, and `{<knob id>}`. An unknown placeholder is refused at config load. Braces that don't hold a plain identifier (`{"a": 1}`) stay literal.
 
@@ -1252,9 +1289,38 @@ backend:
 
 The `name` is the load-bearing line. FLM switches models on the `model` field of a request and the proxy forwards that field unchanged, so the row id has to be the engine's tag: an entry called `flm-qwen3-06b` got `{"error":"Failed to load flm-qwen3-06b model!"}`, and naming it `qwen3:0.6b` (with `{name}` in `args`, so the tag is written once) works. Verified: 82.9 t/s decode for `qwen3:0.6b` on the NPU through the proxy, 0.66 s round trip, `--ctx 8192` reaching the child as `--ctx-len 8192` through the `ctx: true` knob.
 
+To carry every tag you have downloaded rather than one, mint the rows from FLM's own store and drop the per-model blocks:
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: flm
+        binary: ~/.local/opt/fastflowlm/flm
+        args: [serve, "{name}", --host, "{host}", -p, "{port}", --cors, "0"]
+        ready: /v1/version
+        ready_timeout_secs: 180
+        stop_grace_secs: 20
+        modes: [chat]
+        rows_from:
+          command: [~/.local/opt/fastflowlm/flm, list, --filter, installed, --json]
+          items: models
+          name: model
+          when: {path: label, contains: reasoning}   # LLM tags only; ASR is its own entry
+          arch: details.family
+          params: details.parameter_size
+          quant: details.quantization_level
+          ctx: default_context_length
+          memory_gib: footprint
+        knobs:
+          - {flag: --pmode, default: performance}    # powersaver | balanced | performance | turbo
+```
+
+`llamastash rescan` then lists `qwen3:0.6b` and every other installed reasoning tag with FLM's own arch, params, quant, context and footprint, and each one starts and answers by name with no `proxy.aliases` line. No `--ctx-len` default is declared, so each model keeps the context FLM's listing gives it (32768 for `qwen3:0.6b`, 131072 for `llama3.2:3b`). See [Minting rows from an engine's own listing](#minting-rows-from-an-engines-own-listing).
+
 ASR and embedding are separate processes, one NPU model per type: `flm serve --asr 1` (or `-e 1`) takes no model tag and answers `POST /v1/audio/transcriptions`. That route is not one the llamastash proxy forwards (see the caveat in [Proxy routes](#proxy-openai-compatible-listener)), so an ASR entry is supervised, ready-polled and stopped by llamastash but its clients post to the launch port from `llamastash status` directly. FLM also answers the Ollama shapes (`/api/tags`, `/api/chat`, `/api/generate`, `/api/ps`, `/api/npu/status`) on the same port.
 
-Three FLM notes: `/v1/models` lists FLM's whole model list (36 tags), not what you downloaded; a request for a tag you do not have makes FLM try to download it; and its speed lands in `usage.decoding_speed_tps`, which llamastash's request log does not read, so `llamastash requests` shows an estimated `~` rate for FLM rows.
+Three FLM notes: `/v1/models` lists FLM's whole model list, not what you downloaded; a request for a tag you do not have makes FLM try to download it; and its speed lands in `usage.decoding_speed_tps` and `usage.prefill_speed_tps`, which the request log reads, so `llamastash requests` shows FLM's own numbers rather than an estimate.
 
 ### Running whisper.cpp as a generic server
 
@@ -1269,12 +1335,12 @@ backend:
         args: [-m, /path/to/huggingface/hub/models--ggerganov--whisper.cpp/snapshots/<rev>/ggml-tiny.bin,
                --host, "{host}", --port, "{port}"]
         env:
-          LD_LIBRARY_PATH: /opt/whisper.cpp/bin   # absolute path, not ~/...
+          LD_LIBRARY_PATH: ~/.cache/whisper.cpp/bin   # a leading ~/ resolves here too
         ready: /health
         memory_gib: 1
 ```
 
-Two gotchas: the binary needs `LD_LIBRARY_PATH` set to its own directory or it dies with `libwhisper.so.1: cannot open shared object file` (exit 127), and `env` values are literal, only `binary` expands a leading `~/`. Its weights are `ggml-*.bin`, which the model scanner does not list, so the path lives in the entry. Like any ASR engine, it is launch-managed only: `/inference` is not a proxied route.
+Two gotchas: the binary needs `LD_LIBRARY_PATH` set to its own directory or it dies with `libwhisper.so.1: cannot open shared object file` (exit 127), and a leading `~/` in an `env` value resolves to your home directory the way `binary` does (the rest of the value is passed through, so a `~` in the middle of a path list is literal). Its weights are `ggml-*.bin`, which the model scanner does not list, so the path lives in the entry. Like any ASR engine, it is launch-managed only: `/inference` is not a proxied route.
 
 ## Proxy (OpenAI-compatible listener)
 

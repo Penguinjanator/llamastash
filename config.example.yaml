@@ -722,6 +722,27 @@ backend:
         # vision: true                     # takes image input
         # reasoning_effort: [low, medium, xhigh]   # also marks it a reasoning model
         # reasoning_effort_default: medium  # what the server uses when none is sent
+      # Instead of writing one entry per model an engine owns, mint a row per
+      # model its own listing reports. `command` is argv (no shell); the rest are
+      # dot paths into one item of its JSON. `name` is required and becomes the
+      # row name and `{name}`; `when` keeps truthy items, or use
+      # `{path: label, contains: audio}` / `{path: details.family, equals: qwen3}`.
+      # Missing, failing or non-JSON output mints nothing. See docs/usage.md §
+      # Minting rows from an engine's own listing.
+      # - name: flm
+      #   binary: ~/.local/opt/fastflowlm/flm
+      #   args: [serve, "{name}", --port, "{port}"]
+      #   ready: /v1/version
+      #   rows_from:
+      #     command: [~/.local/opt/fastflowlm/flm, list, --filter, installed, --json]
+      #     items: models            # omit when the body is the array itself
+      #     name: model
+      #     when: installed
+      #     arch: details.family
+      #     params: details.parameter_size
+      #     quant: details.quantization_level
+      #     ctx: default_context_length
+      #     memory_gib: footprint     # GiB
 
 # ─── Keybindings ──────────────────────────────────────────────────
 #
