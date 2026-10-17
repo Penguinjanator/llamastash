@@ -422,7 +422,10 @@ pub fn safe_extract_zip<R: Read + std::io::Seek>(
     let mut entry = archive
       .by_index(i)
       .map_err(|e| InstallError::Io(format!("zip entry {i}: {e}")))?;
-    let raw_name = entry.name().to_string();
+    // `name()` decodes the stored bytes and fails on a header that does not
+    // decode. This string only names the entry in a refusal, so it reads the
+    // raw bytes; `enclosed_name()` is what decides whether the entry is usable.
+    let raw_name = String::from_utf8_lossy(entry.name_raw()).into_owned();
     // `zip` exposes a sanitized `enclosed_name()` that already rejects
     // absolute paths, `..` traversal, and Windows drive prefixes — but
     // we re-validate via `safe_relative_path` to keep the refusal

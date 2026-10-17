@@ -26,6 +26,7 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ### Security
 
+- zip 5.1.1 → 9.0.4, clearing [RUSTSEC-2026-0367](https://rustsec.org/advisories/RUSTSEC-2026-0367), [RUSTSEC-2026-0368](https://rustsec.org/advisories/RUSTSEC-2026-0368) and [RUSTSEC-2026-0369](https://rustsec.org/advisories/RUSTSEC-2026-0369): `extract()` follows symlinks when it applies Unix modes, writes symlink targets outside the destination, and keeps SUID/SGID bits. Windows-only here, and it unpacks engine archives without ever calling `extract()`: entries are walked one by one, with traversal, symlink and size refusals of our own.
 - rustls 0.23.45 → 0.23.46, clearing [RUSTSEC-2026-0346](https://rustsec.org/advisories/RUSTSEC-2026-0346), [RUSTSEC-2026-0347](https://rustsec.org/advisories/RUSTSEC-2026-0347), [RUSTSEC-2026-0348](https://rustsec.org/advisories/RUSTSEC-2026-0348) and [RUSTSEC-2026-0349](https://rustsec.org/advisories/RUSTSEC-2026-0349): TLS secrets in `Debug` output, buffered data sent after an ECH rejection, a 1 GiB allocation while decompressing a certificate, and a key-exchange downgrade. Transitive via reqwest.
 
 ## [0.7.0] — 2026-10-13
