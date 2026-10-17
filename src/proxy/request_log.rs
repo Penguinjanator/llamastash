@@ -408,11 +408,13 @@ pub struct RequestSummary {
 }
 
 impl RequestSummary {
-  /// Label and text of every figure, in display order. `none` stands in
-  /// for a figure no request has supplied yet.
+  /// Label and text of the figures, in display order. `none` stands in for a
+  /// figure no request has supplied yet, except for the two `Agg` figures,
+  /// which drop out entirely when nothing produced them or when they print the
+  /// number their own average prints.
   pub fn cells(&self, none: &str) -> Vec<(&'static str, String)> {
-    let [counts, rates] = self.cell_rows(none);
-    counts.into_iter().chain(rates).collect()
+    let [counts, speeds_and_totals] = self.cell_rows(none);
+    counts.into_iter().chain(speeds_and_totals).collect()
   }
 
   /// [`Self::cells`] split into the two rows the terminal shows: what happened
@@ -435,7 +437,7 @@ impl RequestSummary {
         ("Unloaded", self.evictions.to_string()),
       ])
       .collect();
-    let speeds = [("Avg tok/s", tps(self.tokens_per_second_avg))]
+    let speeds_and_totals = [("Avg tok/s", tps(self.tokens_per_second_avg))]
       .into_iter()
       .chain(
         self
@@ -469,7 +471,7 @@ impl RequestSummary {
         ("Tokens out", fmt_count(self.completion_tokens)),
       ])
       .collect();
-    [counts, speeds]
+    [counts, speeds_and_totals]
   }
 
   /// The `X over <wall>` cell of an aggregate figure: absent when nothing
@@ -570,8 +572,10 @@ impl Throughput {
   /// [`Self::add`]'s window sits at the back.
   ///
   /// An engine-reported `prompt_ms` is compute time and carries no queue wait,
-  /// and a proxy estimate is measured from receipt, so the two are not the same
-  /// quantity and a scope mixing them mixes the two.
+  /// while a proxy estimate is measured from receipt, so an estimated window is
+  /// longer than the compute inside it by whatever the request waited. A scope
+  /// mixing the two divides by a wall that runs long, and its aggregate reads
+  /// below the average it belongs to.
   fn add_prefill(&mut self, row: &RequestRow) {
     let (Some(tokens), Some(pps), Some(ttfb)) = (
       row.prefill_tokens,
@@ -2034,6 +2038,122 @@ mod tests {
   }
 
   #[test]
+  fn a_whole_responses_prompt_window_sits_before_its_generation() {
+    // A response that arrives whole sends its first byte when generation ends,
+    // so its prompt ran at the front of the request: 1,000 prompt tokens at
+    // 500 tok/s inside a 5 s wait that spent the last 2 s generating puts its
+    // window at [1000, 3000], not at the tail.
+    let whole = RequestRow {
+      started_at_ms: 0,
+      state: RequestState::Done,
+      status: Some(200),
+      ttfb_ms: Some(5_000),
+      duration_ms: Some(5_000),
+      completion_tokens: Some(1_000),
+      tokens_per_second: Some(500.0),
+      prefill_tokens: Some(1_000),
+      prefill_tokens_per_second: Some(500.0),
+      ..RequestRow::default()
+    };
+    // A streamed prompt over [0, 2000], so it shares part of the wait.
+    let streamed = RequestRow {
+      started_at_ms: 0,
+      state: RequestState::Done,
+      status: Some(200),
+      ttfb_ms: Some(2_000),
+      duration_ms: Some(2_000),
+      prefill_tokens: Some(1_000),
+      prefill_tokens_per_second: Some(500.0),
+      ..RequestRow::default()
+    };
+    let mut figures = RowFigures::default();
+    figures.add(&whole);
+    figures.add(&streamed);
+    let mut summary = RequestSummary::default();
+    figures.stamp(&mut summary);
+    // [0, 3000] merged, not 2 s + 2 s: the two windows overlap by one second.
+    assert_eq!(summary.prefill_busy_ms, Some(3_000));
+    assert_eq!(
+      summary.prefill_tokens_per_second_aggregate,
+      Some(2_000.0 * 1_000.0 / 3_000.0)
+    );
+  }
+
+  #[test]
+  fn a_row_without_both_halves_of_its_prompt_adds_no_window() {
+    let aggregate_for = |row: RequestRow| {
+      let mut figures = RowFigures::default();
+      figures.add(&row);
+      let mut summary = RequestSummary::default();
+      figures.stamp(&mut summary);
+      summary.prefill_tokens_per_second_aggregate
+    };
+    let base = RequestRow {
+      started_at_ms: 0,
+      state: RequestState::Done,
+      status: Some(200),
+      ttfb_ms: Some(2_000),
+      duration_ms: Some(2_000),
+      prefill_tokens: Some(1_000),
+      prefill_tokens_per_second: Some(500.0),
+      ..RequestRow::default()
+    };
+    assert_eq!(aggregate_for(base.clone()), Some(500.0));
+    // Each of these leaves nothing to place, so none opens a window.
+    for broken in [
+      RequestRow {
+        state: RequestState::InFlight,
+        ..base.clone()
+      },
+      RequestRow {
+        prefill_tokens: Some(0),
+        ..base.clone()
+      },
+      RequestRow {
+        prefill_tokens: None,
+        ..base.clone()
+      },
+      RequestRow {
+        prefill_tokens_per_second: Some(0.0),
+        ..base.clone()
+      },
+      RequestRow {
+        prefill_tokens_per_second: None,
+        ..base.clone()
+      },
+      RequestRow {
+        ttfb_ms: Some(0),
+        ..base.clone()
+      },
+      RequestRow {
+        ttfb_ms: None,
+        ..base.clone()
+      },
+    ] {
+      assert_eq!(aggregate_for(broken), None);
+    }
+    // A prompt that had finished before its response began: no wall left to
+    // place it in.
+    assert_eq!(
+      aggregate_for(RequestRow {
+        completion_tokens: Some(1_000),
+        tokens_per_second: Some(500.0),
+        ..base.clone()
+      }),
+      None
+    );
+    // A prompt claiming more time than the request had is clamped to the
+    // request rather than stretching the wall: a 10 s claim inside a 2 s row.
+    assert_eq!(
+      aggregate_for(RequestRow {
+        prefill_tokens_per_second: Some(100.0),
+        ..base.clone()
+      }),
+      Some(500.0)
+    );
+  }
+
+  #[test]
   fn an_aggregate_that_prints_its_averages_number_is_left_off_the_strip() {
     let labels =
       |summary: &RequestSummary| summary.cells("—").iter().map(|c| c.0).collect::<Vec<_>>();
@@ -2073,6 +2193,22 @@ mod tests {
         .collect::<Vec<_>>(),
       ["Agg tok/s", "Agg PP tok/s"]
     );
+    // Each aggregate sits beside the average it belongs to, and one with no
+    // average to answer to prints on its own.
+    assert_eq!(
+      labels(&apart)
+        .windows(2)
+        .filter(|pair| pair[0] == "Avg tok/s" || pair[0] == "Avg PP tok/s")
+        .map(|pair| (pair[0], pair[1]))
+        .collect::<Vec<_>>(),
+      [("Avg tok/s", "Agg tok/s"), ("Avg PP tok/s", "Agg PP tok/s")]
+    );
+    let no_average = RequestSummary {
+      tokens_per_second_aggregate: Some(52.4),
+      busy_ms: Some(6_300),
+      ..RequestSummary::default()
+    };
+    assert!(labels(&no_average).contains(&"Agg tok/s"));
   }
 
   #[test]
@@ -2684,7 +2820,7 @@ mod tests {
   fn each_summary_row_holds_its_figures_in_order() {
     let labels = |cells: &[(&'static str, String)]| cells.iter().map(|c| c.0).collect::<Vec<_>>();
     let summary = RequestSummary::default();
-    let [counts, speeds] = summary.cell_rows("—");
+    let [counts, speeds_and_totals] = summary.cell_rows("—");
     assert_eq!(
       labels(&counts),
       [
@@ -2697,7 +2833,7 @@ mod tests {
       ]
     );
     assert_eq!(
-      labels(&speeds),
+      labels(&speeds_and_totals),
       [
         "Avg tok/s",
         "Avg PP tok/s",
@@ -2711,7 +2847,10 @@ mod tests {
     // `cells` is the two rows end to end, which is the order `requests` prints.
     assert_eq!(
       summary.cells("—"),
-      counts.into_iter().chain(speeds).collect::<Vec<_>>()
+      counts
+        .into_iter()
+        .chain(speeds_and_totals)
+        .collect::<Vec<_>>()
     );
     // The two optional figures join the row they belong to.
     let [live_counts, live_speeds] = RequestSummary {
