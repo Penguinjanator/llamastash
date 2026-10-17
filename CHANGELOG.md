@@ -7,7 +7,6 @@
 
 ### Removed
 
-- The managed-multiplexer plumbing (`LaunchPlan::DelegateToManager`, `ManagedMultiplexer`, umbrella launches and their status fields) had no producer left once the Lemonade backend went, so it is gone: a backend either spawns a process or does not.
 - **Breaking: the dedicated Lemonade backend.** Run `lemond` as a `backend.generic` server: one declared entry plus one `proxy.aliases` line per model, and the same models answer on the proxy at the same speeds. A config with a `backend.lemonade:` block is rejected with a pointer to the steps, and `--lemonade` / `LLAMASTASH_LEMONADE` are gone. See [Running Lemonade as a generic server](docs/usage.md#running-lemonade-as-a-generic-server).
 
 ### Fixed
