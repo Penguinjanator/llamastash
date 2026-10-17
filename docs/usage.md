@@ -1198,6 +1198,88 @@ What the dedicated backend did that the generic entry doesn't:
 
 Two `ds4-server` behaviors to know about. Its `/v1/models` always lists both `deepseek-v4-flash` and `deepseek-v4-pro`, whatever is loaded; chat requests echo back the `model` you send, so no `rewrite_model` is needed. And `--kv-disk-dir` is ds4's own persistent cache: it holds conversation data under ds4's permissions at exactly the path you give, so point it at a private directory. See [DSpark speculative decoding](#dspark-speculative-decoding) for the DSpark caveats.
 
+### Running Lemonade as a generic server
+
+[Lemonade](https://github.com/lemonade-sdk/lemonade) runs one long-lived `lemond` that serves every model it has downloaded and loads each one on the first request that names it. Tested on a Strix Halo host on 2026-10-17 with `lemond` 2026.42.1 (the upstream release of that date), its `llamacpp:rocm` backend at b11395, and `unsloth/Qwen3-0.6B-GGUF`. Full write-up: [`docs/testing/2026-10-17-batch1-lemonade-flm-whisper.md`](testing/2026-10-17-batch1-lemonade-flm-whisper.md).
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: lemonade                              # server id: generic-lemonade
+        binary: /usr/bin/lemond
+        args: ["--port", "{port}", "--host", "{host}", "--no-broadcast",
+               "--log-file", "disabled"]
+        ready: /live
+        ready_timeout_secs: 90
+        stop_grace_secs: 20                         # lemond needs ~6 s to exit on SIGTERM
+        memory_gib: 1
+
+proxy:
+  aliases:
+    Qwen3-0.6B-GGUF: lemonade                      # one alias per Lemonade model you name
+```
+
+`lemond` picks its own port for nothing and takes the one llamastash reserves, so it publishes one row (`lemonade`) no client can send as `body.model`. The alias is what clients use, and the alias string survives into the forwarded body, which is how `lemond` finds the model: `curl :11435/v1/chat/completions -d '{"model":"Qwen3-0.6B-GGUF",...}'` came back in 1.9 s (cold, including Lemonade's own model load) at 103 t/s, and auto-start through the alias works. `GET http://127.0.0.1:13305/api/v1/models?show_all=true` lists every name the engine will accept (179 on that build). `stop_grace_secs` is not decoration: `lemond` takes about 6 s to exit, over the 5 s default grace.
+
+What one entry does not do:
+
+- **The model list is not the catalog.** LlamaStash shows one `lemonade` row, not Lemonade's models. Each name a client should use needs its own `proxy.aliases` line, and nothing warns you when an alias names a model Lemonade does not have.
+- **One launch, one umbrella, every model inside it.** `stop` takes the umbrella down (measured 4.7 s), not one model. Two launched models means two `lemond` processes at about 38 MB each idle, and no shared residency.
+- **No context control.** `lemond` takes context as the `ctx_size` field of its `POST /api/v1/load`, which argv cannot reach. You get whatever `~/.config/lemonade/config.json` says, and `--ctx` on a generic entry does nothing here.
+- **`lemond`'s own children show up as `external`.** The `llama-server` it spawns appears in `status` as an unmanaged row.
+
+### Running an AMD NPU engine (FastFlowLM) as a generic server
+
+[FastFlowLM](https://github.com/ROCm/FastFlowLM) (`flm`) runs LLMs, Whisper ASR and embedding models on AMD XDNA2 NPUs. It speaks the OpenAI shape, so it needs no dedicated backend. Tested 2026-10-17 with `flm` v1.0.9 (portable `fastflowlm_1.0.9_linux.tar.gz`) on kernel 7.2.10 with the in-tree `amdxdna`, firmware 1.1.2.65, `xrt` + `xrt-plugin-amdxdna`, and `flm validate` passing.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: "qwen3:0.6b"                          # the name must be flm's own model tag
+        binary: ~/.local/opt/fastflowlm/flm
+        args: [serve, "{name}", --host, "{host}", -p, "{port}", --cors, "0"]
+        ready: /v1/version          # flm serves no /health; it loads before it binds
+        ready_timeout_secs: 180
+        stop_grace_secs: 20
+        memory_gib: 2
+        arch: qwen3
+        params: 0.6B
+        quant: q4nx
+        ctx: 32768
+        modes: [chat]
+        knobs:
+          - {flag: --ctx-len, id: ctx-len, ctx: true, default: "32768"}
+          - {flag: --pmode, default: performance}    # powersaver | balanced | performance | turbo
+```
+
+The `name` is the load-bearing line. FLM switches models on the `model` field of a request and the proxy forwards that field unchanged, so the row id has to be the engine's tag: an entry called `flm-qwen3-06b` got `{"error":"Failed to load flm-qwen3-06b model!"}`, and naming it `qwen3:0.6b` (with `{name}` in `args`, so the tag is written once) works. Verified: 82.9 t/s decode for `qwen3:0.6b` on the NPU through the proxy, 0.66 s round trip, `--ctx 8192` reaching the child as `--ctx-len 8192` through the `ctx: true` knob.
+
+ASR and embedding are separate processes, one NPU model per type: `flm serve --asr 1` (or `-e 1`) takes no model tag and answers `POST /v1/audio/transcriptions`. That route is not one the llamastash proxy forwards (see the caveat in [Proxy routes](#proxy-openai-compatible-listener)), so an ASR entry is supervised, ready-polled and stopped by llamastash but its clients post to the launch port from `llamastash status` directly. FLM also answers the Ollama shapes (`/api/tags`, `/api/chat`, `/api/generate`, `/api/ps`, `/api/npu/status`) on the same port.
+
+Three FLM notes: `/v1/models` lists FLM's whole model list (36 tags), not what you downloaded; a request for a tag you do not have makes FLM try to download it; and its speed lands in `usage.decoding_speed_tps`, which llamastash's request log does not read, so `llamastash requests` shows an estimated `~` rate for FLM rows.
+
+### Running whisper.cpp as a generic server
+
+`whisper-server` (whisper.cpp v1.8.4 tested 2026-10-17, from `lemonade backends install whispercpp:cpu`) has **no OpenAI surface**: `/v1/audio/transcriptions` and `/v1/models` are 404. Its own API is `GET /health` and `POST /inference` (multipart `file=@clip.wav`, replies `{"text": ...}`), and `--request-path /v1/audio` only renames those routes, it does not translate them.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: whisper-tiny
+        binary: ~/.cache/lemonade/bin/whispercpp/cpu/whisper-server
+        args: [-m, /path/to/huggingface/hub/models--ggerganov--whisper.cpp/snapshots/<rev>/ggml-tiny.bin,
+               --host, "{host}", --port, "{port}"]
+        env:
+          LD_LIBRARY_PATH: /home/deepu/.cache/lemonade/bin/whispercpp/cpu   # absolute path, not ~/...
+        ready: /health
+        memory_gib: 1
+```
+
+Two gotchas: the binary needs `LD_LIBRARY_PATH` set to its own directory or it dies with `libwhisper.so.1: cannot open shared object file` (exit 127), and `env` values are literal, only `binary` expands a leading `~/`. Its weights are `ggml-*.bin`, which the model scanner does not list, so the path lives in the entry. Like any ASR engine, it is launch-managed only: `/inference` is not a proxied route.
+
 ## Proxy (OpenAI-compatible listener)
 
 The daemon binds a single OpenAI-compatible HTTP proxy on `127.0.0.1:11435` (default mode) so any agent that speaks the OpenAI REST shape — OpenCode, Pi (pi.dev), the OpenAI SDKs, Cline, llm-cli — can talk to every discovered model through one stable URL. The default port is `11435` (one above Ollama's `11434`) so llamastash co-exists with an installed Ollama daemon without a collision. If the base port is taken the listener walks up to `11440` and binds the first free slot — the actual address is reported via `llamastash status` / the TUI Daemon pane under `proxy.listen`.
@@ -1206,7 +1288,7 @@ The installable Agent Skills bundle for this flow lives under [`skills/llamastas
 
 The proxy resolves `body.model` against the same fuzzy matcher `llamastash start <ref>` uses, forwards the request byte-for-byte to the matching `llama-server` child, and streams the response back. If the named model isn't running, the proxy auto-starts it (replaying `last_params`, else `arch_defaults`). A model that is already *loading* is waited on rather than started again, no matter which surface launched it, so a request arriving mid-load never yields a second copy of the same model. The launch mode follows the endpoint that triggered it (`/v1/embeddings` starts the model in embedding mode, `/v1/rerank` in rerank mode), then the recorded `last_params` mode, then the GGUF's own hint; a model whose hint says `chat` is never started in embedding or rerank mode, since that would lock it out of chat completions for its whole lifetime. If the launch fails and another model is already Ready, the proxy falls back to it and stamps `x-llamastash-served-by` + `x-llamastash-fallback-reason: launch_failed` headers on the response. Substitution is observable; no extra round-trip is needed to discover what served the request. The full mechanism — coalesced launches, family-MRU fallback selection, scope boundaries — is documented in [`docs/plans/2026-05-21-001-feat-proxy-router-plan.md`](https://github.com/llamastash/llamastash/blob/main/docs/plans/2026-05-21-001-feat-proxy-router-plan.md).
 
-Routes served: `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/rerank`, the OpenAI `/v1/responses` (+ `/v1/responses/input_tokens`), and the Anthropic `/v1/messages` + `/v1/messages/count_tokens`.
+Routes served: `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/rerank`, the OpenAI `/v1/responses` (+ `/v1/responses/input_tokens`), and the Anthropic `/v1/messages` + `/v1/messages/count_tokens`. Nothing else is forwarded, including `/v1/audio/transcriptions`: a server whose only API is off that list (whisper.cpp, or FastFlowLM's ASR endpoint) is launched and supervised by llamastash but only reachable on its own port from `llamastash status`.
 
 ### Model ids on the proxy
 
@@ -1250,7 +1332,7 @@ A value is any reference `llamastash list` shows — a plain name, a repo-qualif
 
 A listed alias is a second row for a model that already has its own id, and both listings sort by name, so a client that defaults to the first row may land on the alias instead of the model's own name — same model, different label. In `/api/tags` the alias row carries the model's `digest` and `details`, so a client that identifies models by digest sees one model under two names.
 
-An alias whose value names no model outright 404s, and the daemon logs one warning naming the alias and what it points at — which covers a value that matches nothing and one that only matches as a substring. A value two models answer to comes back as the same `ambiguous_model` answer with both candidates that a client sending that name itself would get, and the same warning says naming one of them is your call. So the daemon warns once about an alias that takes a name some longer file name already answered to on its own, since that moves clients that were working. The request body keeps the name the client sent, as it does for any reference the proxy resolves: an engine that answers only to the name it was served with needs `rewrite_model: true` on its generic entry (see [Generic backend](#generic-backend)). vLLM also answers only to the name it serves (the repo id) and has no such hatch yet, so an alias of a vLLM model gets vLLM's `404`. A managed multiplexer (Lemonade) chooses its model from that name and has no such hatch, so an alias of a model it serves does not reach it.
+An alias whose value names no model outright 404s, and the daemon logs one warning naming the alias and what it points at — which covers a value that matches nothing and one that only matches as a substring. A value two models answer to comes back as the same `ambiguous_model` answer with both candidates that a client sending that name itself would get, and the same warning says naming one of them is your call. So the daemon warns once about an alias that takes a name some longer file name already answered to on its own, since that moves clients that were working. The request body keeps the name the client sent, as it does for any reference the proxy resolves: an engine that answers only to the name it was served with needs `rewrite_model: true` on its generic entry (see [Generic backend](#generic-backend)). vLLM also answers only to the name it serves (the repo id) and has no such hatch yet, so an alias of a vLLM model gets vLLM's `404`. A managed multiplexer (Lemonade) picks its model from that same name, so an alias does reach it: the alias string survives into the forwarded body and the engine loads the model it names (verified with `lemond` 2026.42.1 on 2026-10-17). It is also how a generic entry that fronts a multi-model engine gets addressed per model (see [Running Lemonade as a generic server](#running-lemonade-as-a-generic-server)).
 
 Alias names match case-insensitively, like model references do. Editing the map takes a daemon restart.
 

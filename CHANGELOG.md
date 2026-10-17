@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Added
+
+- Verified generic-entry recipes for Lemonade, FastFlowLM on an AMD NPU, and whisper.cpp in `docs/usage.md`, with the limits each one hits.
+
 ## [0.8.0] — 2026-10-17
 
 This release is about reading the box under load. `PP/S` on every request row and `Avg PP tok/s` and `Cached` in the summary cover the wait before the first token, and `Agg tok/s` and `Agg PP tok/s` beside the two averages count a second shared by four streams once, so concurrent requests read as what the machine put out rather than one slot each. `/ui` opens a chat page on engines that ship no web UI of their own, and a chat sent from it lands in the log marked `ui`. An external `llama-server` now appears within 30 s instead of only at daemon start. Setup got repairs: `integrations claude-code` exports the context size the proxy actually serves, and `doctor --fix` repoints a tool config at the port the proxy listens on.

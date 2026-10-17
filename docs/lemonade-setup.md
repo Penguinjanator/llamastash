@@ -9,6 +9,19 @@ AMD Ryzen AI / XDNA hardware, plus ROCm, ONNX, and others.
 > Expect rough edges; behaviour, config keys, and the discovery/routing
 > surface may change without notice. llama.cpp remains the stable default.
 
+> **Under review for removal (2026-10-17).** Re-checked against `lemond`
+> 2026.42.1, the dedicated backend has four reproducible defects (registry rows
+> missing for up to 5 minutes after a daemon start, registry rows not
+> addressable, a refused load reported as a successful start, `stop` then
+> `start` refused inside `lemond`'s exit window), and the Linux Lemonade
+> registry holds no `flm` models at all, so the NPU path it exists for is not
+> reachable through it here. Running `lemond` as a
+> [generic server entry](usage.md#running-lemonade-as-a-generic-server) was
+> verified end to end as a replacement, and `flm` runs on the NPU as its own
+> [generic entry](usage.md#running-an-amd-npu-engine-fastflowlm-as-a-generic-server)
+> without Lemonade. Decision and removal scope:
+> [`docs/plans/2026-10-17-002-refactor-drop-lemonade-backend-plan.md`](plans/2026-10-17-002-refactor-drop-lemonade-backend-plan.md).
+
 It is **default-on when the `lemond` binary resolves** (mirroring vLLM): if
 `lemond` is on your `PATH`, or `backend.lemonade.servers` points at it, LlamaStash
 auto-enables the backend unless you set `backend.lemonade.enabled: false`. When no
