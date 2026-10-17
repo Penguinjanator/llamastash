@@ -217,6 +217,74 @@ async fn a_minted_row_launches_with_its_tag_as_the_name() {
   shutdown(client, daemon).await;
 }
 
+/// A named launch qualifies the published id (`tag@coder`) so two launches of
+/// one model stay addressable, but the engine only knows the bare tag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_named_minted_launch_still_sends_the_bare_tag() {
+  let (mut client, daemon) = boot(opts(unique_temp("named"), None)).await;
+  assert!(!minted_rows(&mut client).await.is_empty());
+  let resp = client
+    .call(
+      "start_model",
+      Some(json!({
+        "model": "listed:three",
+        "model_path": "generic://listed/listed:three",
+        "name": "coder",
+      })),
+    )
+    .await
+    .expect("start_model");
+  let id = resp["launch_id"].as_str().unwrap();
+  let deadline = Instant::now() + Duration::from_secs(30);
+  let argv = loop {
+    let status = client.call("status", None).await.unwrap();
+    let ready = status["models"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .any(|m| m["launch_id"] == json!(id) && m["state"]["state"] == "ready");
+    if ready {
+      break log_lines(&mut client, id).await;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "named minted row never came up: {status}"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+  };
+  assert!(
+    argv.iter().any(|l| l.contains("-m listed:three ")),
+    "the tag is sent bare, not `listed:three@coder`: {argv:?}"
+  );
+  shutdown(client, daemon).await;
+}
+
+/// The log tail of a launch, one helper for both launch tests.
+async fn log_lines(client: &mut Client, launch_id: &str) -> Vec<String> {
+  let deadline = Instant::now() + Duration::from_secs(5);
+  loop {
+    let body = client
+      .call(
+        "logs_tail",
+        Some(json!({"launch_id": launch_id, "lines": 200})),
+      )
+      .await
+      .unwrap();
+    let lines: Vec<String> = body["lines"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .filter_map(|l| l.as_str())
+      .filter(|l| l.contains("argv --port"))
+      .map(str::to_string)
+      .collect();
+    if !lines.is_empty() || Instant::now() >= deadline {
+      return lines;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+  }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_broken_listing_mints_nothing_and_keeps_the_rest() {
   let (mut client, daemon) = boot(opts(unique_temp("broken"), None)).await;

@@ -49,7 +49,9 @@ async fn run(spec: &RowsFrom) -> Result<String, String> {
   let mut cmd = tokio::process::Command::new(&program);
   cmd
     .args(&spec.command[1..])
-    .stdin(std::process::Stdio::null());
+    .stdin(std::process::Stdio::null())
+    // A listing that hangs must not leave a process behind on every rescan.
+    .kill_on_drop(true);
   let out = tokio::time::timeout(COMMAND_TIMEOUT, cmd.output())
     .await
     .map_err(|_| format!("`{}` timed out", spec.command.join(" ")))?
@@ -407,7 +409,7 @@ servers:
     let server = recipe("installed");
     let spec = server.rows_from.clone().unwrap();
     for bad in ["", "a b", "a/b", "a@b"] {
-      let body = format!(r#"{{"models":[{{"model":"{bad}"}}]}}"#);
+      let body = format!(r#"{{"models":[{{"model":"{bad}","installed":true}}]}}"#);
       assert!(
         rows_from_json(&server, &spec, &body).is_empty(),
         "`{bad}` must not mint a row"

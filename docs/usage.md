@@ -1306,7 +1306,7 @@ backend:
           command: [~/.local/opt/fastflowlm/flm, list, --filter, installed, --json]
           items: models
           name: model
-          when: {path: label, contains: reasoning}   # LLM tags only; ASR is its own entry
+          when: {path: label, contains: reasoning}   # reasoning LLMs; see the note below
           arch: details.family
           params: details.parameter_size
           quant: details.quantization_level
@@ -1316,7 +1316,7 @@ backend:
           - {flag: --pmode, default: performance}    # powersaver | balanced | performance | turbo
 ```
 
-`llamastash rescan` then lists `qwen3:0.6b` and every other installed reasoning tag with FLM's own arch, params, quant, context and footprint, and each one starts and answers by name with no `proxy.aliases` line. No `--ctx-len` default is declared, so each model keeps the context FLM's listing gives it (32768 for `qwen3:0.6b`, 131072 for `llama3.2:3b`). See [Minting rows from an engine's own listing](#minting-rows-from-an-engines-own-listing).
+`llamastash rescan` then lists `qwen3:0.6b` and every other installed tag FLM labels `reasoning`, each with its own arch, params, quant, context and footprint, and each one starts and answers by name with no `proxy.aliases` line. No `--ctx-len` default is declared, so each model keeps the context FLM's listing gives it (`default_context_length`, 32768 for `qwen3:0.6b`). Pick the filter by what FLM actually labels: on v1.0.9 the reasoning filter keeps the reasoning models and drops audio, but LLMs with no label at all (gemma3, llama3.1, llama3.2, lfm2, phi4-mini, qwen2.5-it) are dropped too, while `when: installed` keeps everything installed including whisper. There is no "not" filter, so a filter that means "LLMs only" has to name what you want. See [Minting rows from an engine's own listing](#minting-rows-from-an-engines-own-listing).
 
 ASR and embedding are separate processes, one NPU model per type: `flm serve --asr 1` (or `-e 1`) takes no model tag and answers `POST /v1/audio/transcriptions`. That route is not one the llamastash proxy forwards (see the caveat in [Proxy routes](#proxy-openai-compatible-listener)), so an ASR entry is supervised, ready-polled and stopped by llamastash but its clients post to the launch port from `llamastash status` directly. FLM also answers the Ollama shapes (`/api/tags`, `/api/chat`, `/api/generate`, `/api/ps`, `/api/npu/status`) on the same port.
 
@@ -1335,7 +1335,7 @@ backend:
         args: [-m, /path/to/huggingface/hub/models--ggerganov--whisper.cpp/snapshots/<rev>/ggml-tiny.bin,
                --host, "{host}", --port, "{port}"]
         env:
-          LD_LIBRARY_PATH: ~/.cache/whisper.cpp/bin   # a leading ~/ resolves here too
+          LD_LIBRARY_PATH: ~/.cache/lemonade/bin/whispercpp/cpu   # the binary's own dir
         ready: /health
         memory_gib: 1
 ```

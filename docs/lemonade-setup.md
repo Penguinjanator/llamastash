@@ -51,7 +51,12 @@ proxy:
 
 Full recipe with the measured numbers and the limits:
 [usage.md](usage.md#running-lemonade-as-a-generic-server). Model names come
-from `GET http://127.0.0.1:13305/api/v1/models?show_all=true`.
+from the running entry's own port, which `llamastash status` shows:
+`curl http://127.0.0.1:<launch-port>/api/v1/models?show_all=true`. Write the
+alias key in exactly the case `lemond` uses (`Qwen3-0.6B-GGUF`, not
+`qwen3-0.6b-gguf`): `lemond` matches names case-sensitively, while
+`/v1/models` lists an alias lowercased, so a client that copies the listed id
+gets a 404.
 
 ## 3. Verify
 
@@ -63,8 +68,8 @@ llamastash requests Qwen3-0.6B-GGUF     # after a chat through the alias
 
 ## 4. Troubleshooting
 
-- **`503 backend_unavailable`** — the entry isn't running. `llamastash start
-  lemonade`, then check `llamastash logs lemonade`.
+- **`404 model_not_found` naming no alias** — the entry is not up. `llamastash
+  start lemonade`, then check `llamastash logs lemonade`.
 - **A model name 404s through the alias** — `lemond` only answers names it
   has; check the `show_all=true` list and add the exact name to
   `proxy.aliases`.

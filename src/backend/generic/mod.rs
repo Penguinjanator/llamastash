@@ -171,12 +171,17 @@ impl GenericBackend {
     let (argv, env, ready, probe, grace) = match &entry {
       Some(e) => {
         let s = &e.server;
-        let published = params
-          .launch_config
-          .get(PUBLISHED_NAME_KEY)
-          .cloned()
-          .or_else(|| minted_name_from_path(&params.model_path).map(str::to_string))
-          .unwrap_or_else(|| s.name.clone());
+        // A minted row always launches with its bare tag: the published id is
+        // qualified (`tag@coder`) or escalated (`entry/tag`) exactly when the
+        // engine would reject it, and the engine picks the model from the tag.
+        let published = match minted_name_from_path(&params.model_path) {
+          Some(tag) => tag.to_string(),
+          None => params
+            .launch_config
+            .get(PUBLISHED_NAME_KEY)
+            .cloned()
+            .unwrap_or_else(|| s.name.clone()),
+        };
         // `resolve_knobs` already refused a placeholder knob with no value, so
         // an error here means the params changed under us; spawn nothing
         // useful rather than panic.
