@@ -6,30 +6,27 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ### Added
 
-- `/ui` opens a chat page for engines that ship no web UI of their own (vLLM, SGLang, generic entries): a copy of the llama.cpp UI rides in the binary, so every chat launch has one.
-- Request summaries carry an aggregate throughput beside the average: `Agg tok/s` and `/metrics` report the scope's generated tokens over the wall time they were produced, so concurrent streams read as what the box put out instead of one slot each (#112).
-- The request log shows prompt processing: `PP/S` per row and `Avg PP tok/s` and `Cached` in the summary, backed by `/metrics` counters, so the wait before the first token reads without starting the engine with `--metrics`. Where an engine reports no prefill timing the proxy estimates one and marks it `~` (#112).
-- A request that a `proxy.aliases` name routed is marked `alias`, in the row note and on the wire, so an alias answer no longer reads as the model it names (#112).
-- The request summary carries the box's prompt throughput beside its own average: `Agg PP tok/s` and a `/metrics` gauge report prompt tokens over the wall time prompts were being computed, so several prompts computed at once read above the mean. Either `Agg` figure now prints only when it differs from the average it belongs to.
+- `/ui` opens a chat page for engines that ship no web UI of their own (vLLM, SGLang, generic entries) (#113).
+- Request summaries report aggregate throughput beside the average: `Agg tok/s` and `Agg PP tok/s` over the wall time the tokens were produced, so concurrent streams read as what the box put out. Either prints only when it differs from the average beside it (#112).
+- The request log shows prompt processing: `PP/S` per row, `Avg PP tok/s` and `Cached` in the summary, so the wait before the first token reads without starting the engine with `--metrics`. Where an engine reports no prefill timing the proxy estimates one and marks it `~` (#112).
+- A request that a `proxy.aliases` name routed is marked `alias` (#112).
 
 ### Changed
 
-- A chat sent from a `/ui` page now shows up in `llamastash requests`, the TUI request rows and the throughput stats under its own `/v1/...` route, marked `ui`; the page's assets, `/props` and stream lookup stay out.
-- The TUI Requests tab gives `Request for` the same 24 cells the `requests` table gives a name, and `requests` caps `MODEL` at 24 too, so one long repo id stops widening every shorter row (#112).
-- `Note` moved to the end of the requests table, in the TUI tab and in `llamastash requests`, so the free text no longer sits between the figures and the names (#112).
-- `llamastash requests` puts `PP/S` right after `TOK/S`, which shifts the tab-separated fields that follow it (#112).
-- The request summary reads in two groups, in the TUI tab and in `llamastash requests`: the counts first (`Live`, `Hosts`, `Connections`, `Requests`, `Errors`, auto-starts, unloads), then the speeds and token totals, and `Prefill tok/s` is now `Avg PP tok/s`, which the help overlay's Legend spells out. Each group wraps on its own in the tab.
+- A chat sent from a `/ui` page shows up in `llamastash requests` and the TUI under its own `/v1/...` route, marked `ui` (#113).
+- The requests table moves `Note` to the end and `PP/S` beside `TOK/S`, which shifts the tab-separated fields that follow it, and gives a model name the same 24 cells in the CLI and the TUI (#112).
+- The request summary splits into two rows, counts then speeds, and `Prefill tok/s` is now `Avg PP tok/s` (#112).
 
 ### Fixed
 
-- External `llama-server` rows refresh every 30 s instead of only at daemon start, so a server started after boot appears, one that exits disappears, and the port its argv carries shows in `status` and the TUI (#111).
+- External `llama-server` rows refresh every 30 s instead of only at daemon start, so a server started after boot appears and one that exits disappears (#111).
 - `integrations claude-code` exports `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, so Claude Code sizes the session to the context the proxy actually serves instead of the 200,000 it assumes for a model name it does not know (#114).
 - `doctor --fix` repoints a tool config at the port the proxy actually listens on, so a proxy that moved off the port `init` wrote no longer leaves every configured tool failing with a connection error (#114).
 - `doctor --fix` reads every proxy address on a line rather than just the first, keeps a same-host port that is not the proxy's own window alone, and ledges a rewrite it could not make instead of staying silent (#114).
 
 ### Security
 
-- rustls 0.23.45 → 0.23.46, clearing [RUSTSEC-2026-0346](https://rustsec.org/advisories/RUSTSEC-2026-0346), [RUSTSEC-2026-0347](https://rustsec.org/advisories/RUSTSEC-2026-0347), [RUSTSEC-2026-0348](https://rustsec.org/advisories/RUSTSEC-2026-0348) and [RUSTSEC-2026-0349](https://rustsec.org/advisories/RUSTSEC-2026-0349): TLS secrets in `Debug` output, buffered data sent to the outer server after an ECH rejection, up to 1 GiB allocated while decompressing a certificate before authentication, and an unauthenticated ServerHello that could downgrade later connections to classical key exchange. Transitive via reqwest.
+- rustls 0.23.45 → 0.23.46, clearing [RUSTSEC-2026-0346](https://rustsec.org/advisories/RUSTSEC-2026-0346), [RUSTSEC-2026-0347](https://rustsec.org/advisories/RUSTSEC-2026-0347), [RUSTSEC-2026-0348](https://rustsec.org/advisories/RUSTSEC-2026-0348) and [RUSTSEC-2026-0349](https://rustsec.org/advisories/RUSTSEC-2026-0349): TLS secrets in `Debug` output, buffered data sent after an ECH rejection, a 1 GiB allocation while decompressing a certificate, and a key-exchange downgrade. Transitive via reqwest.
 
 ## [0.7.0] — 2026-10-13
 
