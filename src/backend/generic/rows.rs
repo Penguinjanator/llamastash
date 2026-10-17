@@ -216,9 +216,14 @@ fn keeps(when: Option<&super::config::When>, item: &Value) -> bool {
       };
       match (equals, contains) {
         (Some(want), None) => v.as_str().is_some_and(|s| s == want),
-        (None, Some(want)) => v
-          .as_array()
-          .is_some_and(|arr| arr.iter().any(|e| e.as_str() == Some(want.as_str()))),
+        (None, Some(want)) => match v {
+          // A list matches on a member, a string on a substring, so an engine
+          // that reports `["reasoning"]` and one that reports `"reasoning"`
+          // both work.
+          Value::Array(arr) => arr.iter().any(|e| e.as_str() == Some(want.as_str())),
+          Value::String(s) => s.contains(want.as_str()),
+          _ => false,
+        },
         (Some(_), Some(_)) | (None, None) => false,
       }
     }
@@ -417,9 +422,30 @@ servers:
     }
   }
 
+  /// A string label matches on a substring; a missing path or a non-string
+  /// against `equals` fails closed.
   #[test]
-  fn an_entry_without_rows_from_mints_nothing() {
-    let server = entry(
+  fn contains_matches_a_substring_and_equals_fails_closed() {
+    let server = recipe("{path: label, contains: reason}");
+    let spec = server.rows_from.clone().unwrap();
+    let body = r#"{"models":[{"model":"a","label":"vision-reasoning"},
+                          {"model":"b","label":"audio"},
+                          {"model":"c"},{"model":"d","label":7}]}"#;
+    assert_eq!(
+      rows_from_json(&server, &spec, body)
+        .into_iter()
+        .map(|m| m.display_label.unwrap())
+        .collect::<Vec<_>>(),
+      ["a"]
+    );
+    let eq = recipe(r#"{path: n, equals: "2"}"#);
+    let eq_spec = eq.rows_from.clone().unwrap();
+    assert!(rows_from_json(&eq, &eq_spec, r#"{"models":[{"model":"d","n":2}]}"#).is_empty());
+  }
+
+  #[tokio::test]
+  async fn an_entry_without_rows_from_or_with_a_dead_listing_mints_nothing() {
+    let plain = entry(
       r#"
 servers:
   - name: plain
@@ -429,6 +455,25 @@ servers:
     memory_gib: 1
 "#,
     );
-    assert!(server.rows_from.is_none());
+    assert!(plain.rows_from.is_none());
+    assert!(mint(&plain).await.is_empty(), "no listing command, no rows");
+    let dead = entry(
+      r#"
+servers:
+  - name: dead
+    binary: /opt/x
+    args: [--port, "{port}"]
+    ready: /health
+    memory_gib: 1
+    rows_from:
+      command: [/nonexistent-engine-xyz, list]
+      items: models
+      name: model
+"#,
+    );
+    assert!(
+      mint(&dead).await.is_empty(),
+      "a missing listing binary mints nothing"
+    );
   }
 }

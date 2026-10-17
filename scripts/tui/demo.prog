@@ -3,7 +3,7 @@ comment: then a TUI tour, with an NPU engine declared as a generic server so the
 comment: dashboard shows both engines.
 comment: Flow: `llamastash init` answered by hand (existing llama-server, a small
 comment: model pasted by HF id), then "Launch the TUI now?" hands straight into the
-comment: TUI: launch gemma-4-E2B on llama.cpp, start qwen3.5-4b-FLM on the NPU
+comment: TUI: launch gemma-4-E2B on llama.cpp, start a model on the NPU
 comment: engine (running 3, dual backend), HuggingFace pull, theme cycle, chat gemma.
 comment:
 comment: Prereq: a daemon whose `config.yaml` declares the NPU engine as a
@@ -87,7 +87,7 @@ wait:7
 key:enter
 wait:5
 
-# ── launch gemma-4-E2B on llama.cpp (Home→lemond, ↓↓→gemma in Favorites; no filter) ──
+# ── launch gemma-4-E2B on llama.cpp (Home→the generic engine row, ↓↓→gemma in Favorites; no filter) ──
 key:home
 wait:0.4
 key:down
