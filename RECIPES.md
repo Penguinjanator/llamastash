@@ -42,7 +42,23 @@ A Vulkan build on a host that probes as AMD or NVIDIA works. It changes the bina
 
 ## vLLM and SGLang
 
-Both serve safetensors HuggingFace repos; a GGUF still runs on llama.cpp. Install steps and the `servers` entry are in [vLLM setup](docs/vllm-setup.md) and [SGLang setup](docs/sglang-setup.md).
+Both serve safetensors HuggingFace repos; a GGUF still runs on llama.cpp. Install steps, the container route and distro caveats are in [vLLM setup](docs/vllm-setup.md) and [SGLang setup](docs/sglang-setup.md).
+
+Point each backend at its launcher. LlamaStash only checks that the path exists, so a wrapper script around `docker run` works too. With no `servers` entry it looks for `vllm` / `sglang` on `$PATH`, and either backend is on whenever its launcher is found.
+
+```yaml
+backend:
+  vllm:
+    # enabled: false                    # keep it off while the path stays set
+    servers:
+      - binary: /home/you/.venvs/vllm/bin/vllm
+    cors: false                         # vLLM allows every origin by default, and the proxy relays that
+  sglang:
+    servers:
+      - binary: /home/you/.venvs/sglang/bin/sglang
+```
+
+With both installed, a repo lists both backends and `auto` picks vLLM. Pick SGLang with `start <repo> --backend sglang` or a preset's `backend:` line, as below.
 
 On a unified-memory host (an APU such as Strix Halo or DGX Spark) LlamaStash caps the KV cache itself when you leave the memory knobs unset. To pick the size yourself, set one in a preset; either knob turns the automatic cap off. Neither is remembered for the next plain `start`.
 
@@ -56,7 +72,7 @@ presets:
           kv-cache-memory-bytes: 16G   # absolute cap; wins over the fraction
           # gpu-memory-utilization: 0.5  # or a fraction of the whole pool
       sglang-128k:
-        backend: sglang                # with both installed, auto picks vLLM
+        backend: sglang
         knobs:
           max-total-tokens: 131072     # SGLang caps in tokens, not bytes
           # mem-fraction-static: 0.5

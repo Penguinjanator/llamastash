@@ -24,12 +24,8 @@ python3 -m venv ~/.venvs/sglang
 
 ### Pointing LlamaStash at it
 
-```yaml
-backend:
-  sglang:
-    servers:
-      - binary: /home/you/.venvs/sglang/bin/sglang
-```
+Set `backend.sglang.servers[0].binary` to the `sglang` console script. The
+config block is in [RECIPES.md § vLLM and SGLang](../RECIPES.md#vllm-and-sglang).
 
 Check the install before wiring it up:
 

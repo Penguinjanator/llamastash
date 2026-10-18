@@ -39,12 +39,8 @@ lists what is current. ROCm 7.0.2 or newer is required for gfx1151.
 
 ### Pointing LlamaStash at it
 
-```yaml
-backend:
-  vllm:
-    servers:
-      - binary: /home/you/.venvs/vllm/bin/vllm
-```
+Set `backend.vllm.servers[0].binary` to the `vllm` launcher. The config block
+is in [RECIPES.md § vLLM and SGLang](../RECIPES.md#vllm-and-sglang).
 
 ### Distro caveats
 
