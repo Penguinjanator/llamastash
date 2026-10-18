@@ -488,10 +488,10 @@ _Shared context: `src/init/external/tools/`, the `doctor` findings, and what `--
 - [x] ~~**`integrations claude-code` writes no context size, so Claude Code assumes 200,000.** [`claude_code.rs`](src/init/external/tools/claude_code.rs) exports the base URL, the token and the two model names only. Claude Code 2.1.292 gives a model name it does not know a 200,000 window, compacts at window − 33,000 and refuses to send at window − 23,000. Seen 2026-10-07 on `flash-next-halogen@dual-256k` (262,144 ctx): four auto-compactions at 166,873 to 167,737 tokens. A model that launches under 200,000 should be worse, since the prompt passes the server's limit before Claude Code compacts (not tested). Fix: also export `CLAUDE_CODE_MAX_CONTEXT_TOKENS` from the primary model's `PatchModel::context_window`; Claude Code reads it for names that do not start with `claude-`. Open: write the launch context or a little under it. Halogen reserves prompt + `max_tokens` (up to 32,768) inside the window, so at 262,144 it accepts a 229,376 prompt while Claude Code sends up to 239,144; 250,000 keeps Claude Code's limit (227,000) under it. Update the Claude Code section of `docs/usage.md` in the same change.~~ — done: `claude-code.sh` exports `CLAUDE_CODE_MAX_CONTEXT_TOKENS` beside the base URL, set to the launch context less the output room Claude Code does not keep for itself (262,144 → 250,144). Plan: [`docs/plans/2026-10-16-001-feat-r15-batch7-plan.md`](docs/plans/2026-10-16-001-feat-r15-batch7-plan.md).
 - [x] ~~A `doctor --fix` repair for a tool config whose proxy URL names a port the proxy no longer listens on — needs that check first~~ — done: `doctor` warns on `tool_config_stale_url` when a config names a port the running proxy is not on, and `--fix` rewrites the address to the live one (only the `host:port`, one ledger line per file). Plan: [`docs/plans/2026-10-16-001-feat-r15-batch7-plan.md`](docs/plans/2026-10-16-001-feat-r15-batch7-plan.md).
 
-## Next
+## R16 (v0.9.0 checklist)
 
 - [ ] Agg PP tok/s seems wrong. Shows 3055 over 37.1s when there is only one connection and avg is 1211.
-- [ ] Consider making Requests the first tab for running launches, followed by Logs, Settings, Chat*
+- [ ] Consider making Requests the first tab for running launches, followed by Logs, Settings, Chat\*
 
 ### Batch 1: Generic-backend engines and the multiplexer decision
 
@@ -499,17 +499,25 @@ _Shared context: The generic backend's declared entries, the Lemonade umbrella, 
 
 - [x] ~~Consider dropping support for Lemonade and test/document as generic server. Should multiplexer generic backend be still supported?~~ — **tested and decided 2026-10-17: drop it, and the multiplexer shape with it.** `lemond` 2026.42.1 (upstream's own release) runs behind one generic entry plus one `proxy.aliases` line per model and served real traffic (1.9 s cold through the alias, 103 t/s), while the dedicated backend reproduced four defects against it. Findings: [`docs/testing/2026-10-17-batch1-lemonade-flm-whisper.md`](docs/testing/2026-10-17-batch1-lemonade-flm-whisper.md); decision and removal scope: [`docs/plans/2026-10-17-002-refactor-drop-lemonade-backend-plan.md`](docs/plans/2026-10-17-002-refactor-drop-lemonade-backend-plan.md). No second user for the multiplexer: `flm` is one process per model type and needs no umbrella.
   - [x] ~~Execute the removal: `src/backend/lemonade/` plus the central wiring, `--lemonade` / `LLAMASTASH_LEMONADE`, `LemonadeConfig`, the `lemonade://` path scheme, `fake_lemond`, and the doc sweep the plan lists (keep one generic-entry recipe in `docs/usage.md`). Refuse a leftover `backend.lemonade:` block with a message that names the replacement, and strike the open Lemonade TODO items it retires.~~ — **done 2026-10-17.** Four backends left (`llamacpp`, `vLLM`, SGLang, generic); `docs/lemonade-setup.md` is now the migration page. A `backend.lemonade:` block (or a `lemonade_install*` key) fails the load with a pointer to the recipe.
-- [ ] **No test that a `rows_from` listing hits its timeout.** `COMMAND_TIMEOUT` is 30 s and hard-coded (`src/backend/generic/rows.rs`), so a test would need it injected or shortened. The kill-on-drop path is covered only by construction. A slow listing also delays every catalog update, since it runs on each rescan including watcher events.
-- [ ] **Daemon-booting integration tests leave their engines running when an assert panics.** 13 files boot with `tokio::spawn(run_foreground(..))` and only call `shutdown` on the happy path, so a failed assert drops the daemon without stopping its children (seven `fake_llama_server` orphans from `generic_rows_from_test` and `generic_backend_test` runs, found 2026-10-18). `proxy_metrics`, `proxy_routing` and `proxy_ollama_compat` spawn fixtures through their own harness and left orphans too. On Windows tokio reads child pipes on blocking threads, so the runtime then waits on them and the test hangs to nextest's 180 s timeout instead of failing. `tests/generic_rows_from_test.rs` has the fix (`with_daemon` runs the body in a task and shuts down before re-raising the panic); move it into `test_support` and use it in the rest.
-- [ ] **Alias keys are lowercased on load, so a case-sensitive engine cannot be reached by the id `/v1/models` publishes.** `src/proxy/alias.rs` does `name.trim().to_ascii_lowercase()`, so `Qwen3-0.6B-GGUF` is stored and published as `qwen3-0.6b-gguf`; `lemond` matches names case-sensitively and answers 404 for the lowercased id (verified on `lemond` 2026.42.1: the exact-case name returns 200, the lowercase one 404). Either keep the configured case in the published id or send the configured name upstream. Documented as a limitation in `docs/lemonade-setup.md`; seen 2026-10-17.
-- [ ] **The port free-check passes on a TIME-WAIT port.** `src/daemon/ports.rs` probes with `TcpListener::bind`, and std sets `SO_REUSEADDR`, so a port a launch just released reads as free and the engine fails to bind it (`lemond`: `Failed to bind IPv4 HTTP server to 127.0.0.1:47100`, launch to error; reproduced twice on 2026-10-17, worked once the TIME-WAIT cleared). Probe with `SO_REUSEADDR` off (socket2) or rotate instead of lowest-first.
   - [ ] **The managed-multiplexer plumbing has no producer left.** Nothing can build a `LaunchPlan::DelegateToManager`, an `umbrella_launch_id`, an infra launch, or the `RouteDecision::BackendUnavailable` arm, so the tests that needed one are gone (idle's infra-umbrella case, proxy `collect_running`'s infra skip, the metrics umbrella row, the TUI delegated-poll case, the proxy's engine-unavailable 503). Delete the plumbing — `DelegateToManager`, `ManagedMultiplexer`, `umbrella_launch_id`, `is_infra_launch`, `is_managed_multiplexer`, `Daemon::managed` / `refresh_managed`, the umbrella branch in `proxy/route.rs` — unless an engine that really needs one shows up. Mapped 2026-10-17 at `07cac9f2`: **287 mentions in 38 files**, concentrated in `src/backend/mod.rs` (58: the `Lifecycle::ManagedMultiplexer` variant, `LaunchPlan::DelegateToManager` + `ManagerLaunchSpec` + `ManagerModelRef`, the `umbrella_launch_id` / `umbrella_openai_prefix` / `supervise_at_boot` hooks, `is_infra_launch`, `umbrella_owner`, `is_managed_multiplexer`), `proxy/eviction.rs` (35: `umbrella_idle_rows`, `delegated_rows`, two `umbrella_owner` branches), `proxy/route.rs` (26: `BackendUnavailable`, `decide_umbrella_route`, two infra skips), `daemon/launch_service.rs` (24: `multiplexer_refuses_name`, `backend_for_launch`'s owner branch), `daemon/registry.rs` (19: delegated-state record/forget), then `cli/output.rs` (the `umbrella` and `lifecycle` fields of the `backends` JSON), `tui/{app,launch_picker}.rs`, `ipc/{methods,status}.rs` (`logs_tail`'s umbrella lookup, `status`'s owner resolve), `daemon/{state_store,idle,mod,supervisor}.rs`, `proxy/{state,forward,router,ui,metrics}.rs` (`umbrella_client`, the upstream path prefix, the four infra-skip walkers). `Lifecycle` and the `backends` JSON fields are wire-visible, so this wants its own PR with a docs pass on `docs/usage.md` + `docs/architecture.md` rather than a ride-along commit.
-  - [ ] **A launch that fails after the port is reserved no longer has a test.** The only fixture that reserved a port and then failed on binary resolution rode on the removed engine, so `compose_and_spawn`'s release-on-error path is untested. Re-add it with an engine-neutral fixture.
 - [x] ~~Test and document NPU engines as generic server, for example FLM or something similar.~~ — **done 2026-10-17**: FastFlowLM v1.0.9 (portable tarball) verified on the XDNA2 NPU of a Strix Halo box as a generic entry: `qwen3:0.6b` at 82.9 t/s decode through the proxy, `--ctx` reaching the child as `--ctx-len` through a `ctx: true` knob, and `whisper-v3:turbo` ASR answering `/v1/audio/transcriptions` on the NPU. Recipe and caveats: [`docs/usage.md` § Running an AMD NPU engine (FastFlowLM) as a generic server](docs/usage.md#running-an-amd-npu-engine-fastflowlm-as-a-generic-server). whisper.cpp was tested the same way: it serves `GET /health` + `POST /inference`, and `--request-path /v1/audio --inference-path /transcriptions` renames those onto the OpenAI transcription route (verified 2026-10-17 on v1.8.4).
-- [ ] **The proxy has no route for audio, so an ASR engine is launch-managed only.** `GENERATION_ROUTES` covers 8 paths and `/v1/audio/transcriptions` is not one, so FLM's NPU Whisper answers on its launch port and never through `:11435`. Wants that route plus a `transcription` mode (`LaunchMode` has chat / embedding / rerank, and Lemonade's `transcription` label already maps to `ModeHint::Unknown`), or a written decision to keep ASR out of the proxy's scope. Seen 2026-10-17.
 - [x] ~~No server-reported speed for a generic engine that reports it under `usage`.~~ FLM sends `usage.decoding_speed_tps` and `usage.prefill_speed_tps`; the usage tap reads `timings.predicted_per_second` and `metrics.tokens_per_second` only, so `llamastash requests` printed an estimated `~18.1` for an FLM row against `138.1` reported-by-server for a `lemond` row, and FLM's real number (82.9 t/s) matched neither. One more `*_tps` source in [`src/proxy/usage_tap.rs`](src/proxy/usage_tap.rs). Seen 2026-10-17. Fixed 2026-10-17 in `52b7ab45`: the usage tap reads `usage.decoding_speed_tps` and `usage.prefill_speed_tps`.
 - [x] ~~`GenericServer` env values are literal, and only `binary` expands a leading `~/`.~~ `env: {LD_LIBRARY_PATH: ~/.cache/...}` produced `exit code 127`, `libwhisper.so.1: cannot open shared object file`, with no hint that the path was the problem; the absolute path worked. Either expand `~/` there too (only `~/` is unambiguous) or say so at the `env` row of the field table. Seen 2026-10-17.
 - [x] ~~A managed launch that the engine refuses still reports a successful start.~~ — retired with the backend that produced it (2026-10-17): a generic entry either spawns or fails, and a failed spawn already reports the error.
+
+### Batch 10: launch settings column width
+
+_Shared context: `kv_label_width` in `src/tui/fmt.rs` and the Settings tab rows in `src/tui/tabs/settings.rs`._
+
+- [ ] launch settings key col width should accomodate longer keys, make dynamic
+
+### Batch 11: `llamastash session` launcher
+
+_Shared context: `src/cli/` and `src/ipc/methods.rs` for the start and wait-for-ready round trip, the per-tool env scripts in `src/init/external/tools/` (`claude_code.rs`, `codex.rs`, `opencode.rs`, `pi_dev/`), and `api_key` plus `daemon.status` for the proxy URL, auth and the active model._
+
+- [ ] `llamastash session claude|pi|codex|opencode` should launch the harness with active model or start a default model if none is active (configurable, with an alias or model name or model name@preset)
+
+## Next
 
 ### Batch 2: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
 
@@ -538,23 +546,13 @@ _Shared context: the `src/gpu/` probes (nvidia, vulkan, sysfs, dxgi), the per-se
 
 - [ ] Nvidia + intel multi gpu detection issues
 
-### Batch 10: launch settings column width
-
-_Shared context: `kv_label_width` in `src/tui/fmt.rs` and the Settings tab rows in `src/tui/tabs/settings.rs`._
-
-- [ ] launch settings key col width should accomodate longer keys, make dynamic
-
-### Batch 11: `llamastash session` launcher
-
-_Shared context: `src/cli/` and `src/ipc/methods.rs` for the start and wait-for-ready round trip, the per-tool env scripts in `src/init/external/tools/` (`claude_code.rs`, `codex.rs`, `opencode.rs`, `pi_dev/`), and `api_key` plus `daemon.status` for the proxy URL, auth and the active model._
-
-- [ ] `llamastash session claude|pi|codex|opencode` should launch the harness with active model or start a default model if none is active (configurable, with an alias or model name or model name@preset)
-
 ## General Roadmap
 
 Items are grouped into batches by what a work session loads to do them - the same modules, docs and test surface. A batch is one unit of work.
 
 ### High priority
+
+- [ ] **The proxy has no route for audio, so an ASR engine is launch-managed only.** `GENERATION_ROUTES` covers 8 paths and `/v1/audio/transcriptions` is not one, so FLM's NPU Whisper answers on its launch port and never through `:11435`. Wants that route plus a `transcription` mode (`LaunchMode` has chat / embedding / rerank, and Lemonade's `transcription` label already maps to `ModeHint::Unknown`), or a written decision to keep ASR out of the proxy's scope. Seen 2026-10-17.
 
 #### Batch H1 - New CLI verbs on the agent contract
 
@@ -640,6 +638,12 @@ _Shared context: `Throughput` in `src/proxy/request_log.rs`, the 1000-row ring, 
 - [ ] Aggregate windows (`Throughput::add` and `add_prefill` in `src/proxy/request_log.rs`) take `started_at_ms` from the wall clock and `duration_ms` from a monotonic timer. A clock step or a suspend while rows sit in the 1000-row ring moves their windows apart, so `busy_ms` and `prefill_busy_ms` read high and `Agg tok/s` / `Agg PP tok/s` low until those rows roll out. Carry a monotonic start on the row (`#[serde(skip)]`) and build the windows from it.
 
 ### Low priority
+
+- [ ] **No test that a `rows_from` listing hits its timeout.** `COMMAND_TIMEOUT` is 30 s and hard-coded (`src/backend/generic/rows.rs`), so a test would need it injected or shortened. The kill-on-drop path is covered only by construction. A slow listing also delays every catalog update, since it runs on each rescan including watcher events.
+- [ ] **Daemon-booting integration tests leave their engines running when an assert panics.** 13 files boot with `tokio::spawn(run_foreground(..))` and only call `shutdown` on the happy path, so a failed assert drops the daemon without stopping its children (seven `fake_llama_server` orphans from `generic_rows_from_test` and `generic_backend_test` runs, found 2026-10-18). `proxy_metrics`, `proxy_routing` and `proxy_ollama_compat` spawn fixtures through their own harness and left orphans too. On Windows tokio reads child pipes on blocking threads, so the runtime then waits on them and the test hangs to nextest's 180 s timeout instead of failing. `tests/generic_rows_from_test.rs` has the fix (`with_daemon` runs the body in a task and shuts down before re-raising the panic); move it into `test_support` and use it in the rest.
+- [ ] **Alias keys are lowercased on load, so a case-sensitive engine cannot be reached by the id `/v1/models` publishes.** `src/proxy/alias.rs` does `name.trim().to_ascii_lowercase()`, so `Qwen3-0.6B-GGUF` is stored and published as `qwen3-0.6b-gguf`; `lemond` matches names case-sensitively and answers 404 for the lowercased id (verified on `lemond` 2026.42.1: the exact-case name returns 200, the lowercase one 404). Either keep the configured case in the published id or send the configured name upstream. Documented as a limitation in `docs/lemonade-setup.md`; seen 2026-10-17.
+- [ ] **The port free-check passes on a TIME-WAIT port.** `src/daemon/ports.rs` probes with `TcpListener::bind`, and std sets `SO_REUSEADDR`, so a port a launch just released reads as free and the engine fails to bind it (`lemond`: `Failed to bind IPv4 HTTP server to 127.0.0.1:47100`, launch to error; reproduced twice on 2026-10-17, worked once the TIME-WAIT cleared). Probe with `SO_REUSEADDR` off (socket2) or rotate instead of lowest-first.
+  - [ ] **A launch that fails after the port is reserved no longer has a test.** The only fixture that reserved a port and then failed on binary resolution rode on the removed engine, so `compose_and_spawn`'s release-on-error path is untested. Re-add it with an engine-neutral fixture.
 
 #### Batch L1 - Proxy routing, auto-start and load adoption
 
