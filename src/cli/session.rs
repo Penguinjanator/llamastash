@@ -65,9 +65,26 @@ pub async fn handle(args: SessionArgs, cli: &Cli, config: &Config) -> CliResult 
   let secret = config.proxy.effective_api_key();
   let api_key = secret.clone().unwrap_or_else(|| KEYLESS_STUB.to_string());
 
-  let files_dir = session_files_dir()?;
   let mut target = resolve_target(&catalog, &status.models, &args, config)?;
-  let mut launch = describe(args.tool, &target, &proxy_base_url, &api_key, &files_dir)?;
+  let mut launch = describe(
+    args.tool,
+    &target,
+    &proxy_base_url,
+    &api_key,
+    Path::new(NO_FILES_DIR),
+  )?;
+  // Only a tool that generates a file needs the cache dir, and only a launch
+  // that carries one says so. Resolving it up front would fail a `claude` or
+  // `aider` session — which write nothing — on a machine with no cache dir.
+  // A second describe with the real dir gives pi its file path; the first pass
+  // only answers whether one is needed.
+  let files_dir = if launch.files.is_empty() {
+    PathBuf::from(NO_FILES_DIR)
+  } else {
+    let dir = session_files_dir()?;
+    launch = describe(args.tool, &target, &proxy_base_url, &api_key, &dir)?;
+    dir
+  };
   // The tool binary is looked up before a model is started: a tool that is not
   // installed should cost nothing, and the program does not depend on the model.
   // A dry run still prints: it describes a command, it does not need to run one.
@@ -91,6 +108,10 @@ pub async fn handle(args: SessionArgs, cli: &Cli, config: &Config) -> CliResult 
   }
   run(program, launch, &args.tool_args)
 }
+
+/// Stand-in for a launch that writes no file. Only a tool that generates one
+/// (pi) ever has its real path read, and by then the real dir is in hand.
+const NO_FILES_DIR: &str = "";
 
 /// The tool's launch for this target: what to exec, with what.
 fn describe(
@@ -155,8 +176,6 @@ impl Target {
   }
 }
 
-/// Resolve what to run. Starts a model only when one is missing and `--dry-run`
-/// was not given; writes nothing.
 /// Resolve what to run. Reads only: nothing is started here, and nothing is
 /// written.
 fn resolve_target(
@@ -180,15 +199,6 @@ fn resolve_target(
       let aliases = AliasTable::from_config(&config.proxy.aliases);
       let reference = alias_target(&aliases, catalog, reference);
       let (row, name) = resolve_model_or_launch(catalog, running, &reference)?;
-      if let Some(kind) = non_chat_mode(&row, &published_id(catalog, &row)) {
-        return Err(CliExit::new(
-          USAGE,
-          format!(
-            "`{}` is {kind} model; session tools need a chat model",
-            row.name()
-          ),
-        ));
-      }
       let launch = launch_by_identity(running, reference.as_ref(), &row.path)
         .or_else(|| matching_launch(running, &row.path, name.as_deref()));
       (row, name, launch)
@@ -202,6 +212,15 @@ fn resolve_target(
     context_window: None,
   };
   fill(&mut target, catalog, config);
+  if let Some(kind) = non_chat_mode(&target) {
+    return Err(CliExit::new(
+      USAGE,
+      format!(
+        "`{}` is {kind} model; session tools need a chat model",
+        target.row.name()
+      ),
+    ));
+  }
   Ok(target)
 }
 
@@ -383,19 +402,24 @@ fn launch_number(row: &RunningRow) -> u64 {
 fn launch_by_identity(running: &[RunningRow], reference: &str, path: &str) -> Option<RunningRow> {
   running
     .iter()
-    .find(|r| r.model_path == path && (r.launch_id == reference || r.port.to_string() == reference))
+    .find(|r| {
+      r.model_path == path
+        && (r.launch_id.eq_ignore_ascii_case(reference) || r.port.to_string() == reference)
+    })
     .cloned()
 }
 
-/// `Some(…)` for a model that cannot carry a chat session, phrased for the
-/// error: "is an embedding model". The decision is the patchers' own: the mode
-/// hint when there is one, else the id heuristic behind `PatchModel::is_embed`,
-/// so a gate and a launch can never disagree.
-fn non_chat_mode(row: &CatalogRow, id: &str) -> Option<&'static str> {
-  match row.mode_hint.as_deref() {
-    Some("embedding") => Some("an embedding"),
+/// `Some(…)` for a target that cannot carry a chat session, phrased for the
+/// error: "is an embedding model". The embedding decision is the patchers' own,
+/// made on the same `PatchModel` they get (id with the `@<name>` suffix and
+/// all), so a target that passes this gate is one they will take. The rerank
+/// hint is checked here because `is_embed` says nothing about rerank models.
+fn non_chat_mode(target: &Target) -> Option<&'static str> {
+  if target.patch_model().is_embed {
+    return Some("an embedding");
+  }
+  match target.row.mode_hint.as_deref() {
     Some("rerank") => Some("a rerank"),
-    _ if PatchModel::from_id(id.to_string()).is_embed => Some("an embedding"),
     _ => None,
   }
 }
@@ -738,6 +762,13 @@ mod tests {
       "L2",
       "a port is one too"
     );
+    assert_eq!(
+      launch_by_identity(&running, "l2", "/m/chat.gguf")
+        .expect("lower case id")
+        .launch_id,
+      "L2",
+      "the id is matched the way `stop` matches it, case included"
+    );
     assert!(launch_by_identity(&running, "chat.gguf", "/m/chat.gguf").is_none());
     assert!(
       launch_by_identity(&running, "L2", "/m/other.gguf").is_none(),
@@ -786,23 +817,34 @@ mod tests {
 
   #[test]
   fn a_model_that_cannot_chat_is_refused_as_a_usage_error() {
-    let mut embed = chat("/m/embed.gguf");
-    embed.mode_hint = Some("embedding".into());
-    assert_eq!(non_chat_mode(&embed, "embed"), Some("an embedding"));
-    let mut rerank = chat("/m/rerank.gguf");
-    rerank.mode_hint = Some("rerank".into());
-    assert_eq!(non_chat_mode(&rerank, "rerank"), Some("a rerank"));
-    assert_eq!(non_chat_mode(&chat("/m/chat.gguf"), "chat"), None);
-    // A GGUF with no mode hint is called embedding by the same id rule the
-    // patchers use, so the gate cannot let it through to a launch that refuses.
-    let mut hintless = chat("/m/nomic-embed.gguf");
-    hintless.mode_hint = None;
+    let catalog = vec![chat("/m/x.gguf")];
+    let gated = |hint: Option<&str>, name: Option<&str>| {
+      let mut row = chat("/m/x.gguf");
+      row.mode_hint = hint.map(str::to_string);
+      target(&catalog, row, name, None)
+    };
     assert_eq!(
-      non_chat_mode(&hintless, "nomic-embed"),
-      Some("an embedding"),
-      "the patchers would refuse this one too"
+      non_chat_mode(&gated(Some("embedding"), None)),
+      Some("an embedding")
     );
-    assert_eq!(non_chat_mode(&hintless, "chat"), None);
+    assert_eq!(
+      non_chat_mode(&gated(Some("rerank"), None)),
+      Some("a rerank")
+    );
+    assert_eq!(non_chat_mode(&gated(None, None)), None);
+    assert_eq!(non_chat_mode(&gated(Some("chat"), None)), None);
+    // A GGUF with no mode hint is called embedding by the patchers' own id rule,
+    // and on the id with the launch name on it, which is the one they are given.
+    assert_eq!(
+      non_chat_mode(&gated(None, Some("embed-test"))),
+      Some("an embedding"),
+      "the same id the patcher refuses is the id the gate refuses"
+    );
+    assert_eq!(
+      non_chat_mode(&gated(None, Some("coder"))),
+      None,
+      "a name that says nothing does not trip it"
+    );
     assert_eq!(
       launch_failed(&live("L1", "/m/x.gguf", "chat", None)).code,
       LAUNCH_FAILED

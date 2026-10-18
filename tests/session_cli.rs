@@ -432,6 +432,38 @@ fn a_pi_session_writes_its_extension_under_the_cache_dir() {
     })
     .collect();
   assert_eq!(written.len(), 1, "one extension file for one session");
+  let mode = std::fs::metadata(&written[0])
+    .expect("the file the session wrote")
+    .permissions()
+    .mode();
+  assert_eq!(
+    mode & 0o777,
+    0o600,
+    "the extension names no secret but stays private"
+  );
+}
+
+#[test]
+fn a_tool_that_writes_no_file_needs_no_cache_dir() {
+  let daemon = Daemon::start(None);
+  daemon.start_model();
+  // No HOME and no XDG cache means `cache_dir()` resolves to nothing. Only a
+  // tool that generates a file has to care.
+  let out = daemon
+    .cmd()
+    .env_remove("LLAMASTASH_CACHE_DIR")
+    .env_remove("HOME")
+    .env_remove("XDG_CACHE_HOME")
+    .args(["session", "claude", "chat", "--dry-run", "--json"])
+    .output()
+    .expect("run session");
+  assert!(
+    out.status.success(),
+    "no cache dir is no obstacle for a tool that writes nothing: {}{}",
+    String::from_utf8_lossy(&out.stdout),
+    String::from_utf8_lossy(&out.stderr)
+  );
+  assert_eq!(stdout_json(&out)["program"], "claude");
 }
 
 #[test]
