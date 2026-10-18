@@ -218,7 +218,7 @@ U1 → U2 → U3 run in one lane, in that order. U4 is docs only and can run in 
 
 **Verification:** `cargo nextest run --features test-fixtures --lib init::external` passes.
 
-- [ ] **Unit 2: reusable start-and-wait in `start.rs`**
+- [x] **Unit 2: reusable start-and-wait in `start.rs`**
 
 **Goal:** `session` can start a catalog row (optional preset) and wait for Ready without duplicating `start`.
 
