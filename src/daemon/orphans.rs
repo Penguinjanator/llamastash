@@ -222,22 +222,13 @@ pub async fn sweep(inputs: SweepInputs<'_>) -> SweepReport {
     let backend = crate::backend::Backends::from_id(&snap.resolved_backend)
       .unwrap_or_else(crate::backend::default_backend);
     // Orphan re-adoption is process-based, so it needs a path to confirm
-    // against. Keyed on **lifecycle**, not identity shape: a managed
-    // multiplexer is served by the shared umbrella and has no re-adoptable
-    // child of its own, but a process-per-model backend spawns a real child
-    // with a real path even when its identity is not a GGUF. Dropping those
-    // unprobed left the server alive, holding its port and its GPU
-    // allocation, in neither `running` nor `external` and reachable by no
-    // stop command.
+    // against. Every backend spawns a real child with a real path, even when
+    // its identity is not a GGUF. Dropping those unprobed left the server alive,
+    // holding its port and its GPU allocation, in neither `running` nor
+    // `external` and reachable by no stop command.
     let path = match snap.id.as_gguf() {
       Some(g) => g.path.clone(),
-      None if backend.lifecycle() == crate::backend::Lifecycle::ProcessPerModel => {
-        snap.params.model_path.clone()
-      }
-      None => {
-        stale.push(snap);
-        continue;
-      }
+      None => snap.params.model_path.clone(),
     };
     // Three-factor confirmation: PID alive (above), port listening, and the
     // identity match — but the id contract is backend-specific (D-adopt), so

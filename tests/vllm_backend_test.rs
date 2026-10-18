@@ -300,12 +300,9 @@ mod lifecycle {
   /// A live child must survive a daemon restart.
   ///
   /// The orphan sweep gated re-adoption on the snapshot carrying a GGUF
-  /// identity, on the reasoning that a non-GGUF row is a managed multiplexer
-  /// with no child of its own. This backend is the first that is non-GGUF
-  /// *and* process-per-model, so that inference was wrong: the row was dropped
-  /// as stale without ever probing the port, leaving the server running with
-  /// its GPU allocation and port held, in neither `running` nor `external` and
-  /// reachable by no stop command.
+  /// identity, so a non-GGUF row was dropped as stale without ever probing the
+  /// port, leaving the server running with its GPU allocation and port held, in
+  /// neither `running` nor `external` and reachable by no stop command.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn a_live_child_is_readopted_rather_than_dropped_as_stale() {
     use llamastash::backend::identity::{BackendModelId, ModelIdentity};

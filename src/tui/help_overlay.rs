@@ -251,13 +251,6 @@ fn legend_section() -> Section {
       "PP".to_string(),
       "prompt processing (prefill): prompt tokens the engine computed, not the ones it reused from its KV cache".to_string(),
     ),
-    (
-      format!(
-        "RAM/CPU/port{}",
-        crate::tui::right_pane::SHARED_UMBRELLA_MARKER
-      ),
-      "shared umbrella (one process serves every model of that backend)".to_string(),
-    ),
   ];
   for (glyph, desc) in crate::discovery::Multimodal::LEGEND {
     rows.push((glyph.to_string(), desc.to_string()));

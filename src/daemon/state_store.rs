@@ -136,12 +136,10 @@ pub struct RunningSnapshot {
   /// JSON stays human-readable.
   pub started_at: u64,
   /// The `L#` launch handle assigned by [`crate::daemon::registry::SupervisorRegistry::next_id`].
-  /// Stamped on every row: a **delegated** (multiplexer) row has no supervisor of
-  /// its own, so the snapshot is the sole home for its id (`status` reads it,
-  /// `stop_model` reverse-maps it to the umbrella model name); a **process** row
-  /// records it too so `backend_for_launch` can resolve the launch's backend and
-  /// dispatch its stop to the right one. The boot sweep clears `running`, so a
-  /// persisted id never survives a restart to collide with the fresh counter.
+  /// Stamped on every row so `backend_for_launch` can resolve the launch's
+  /// backend and dispatch its stop to the right one, and so `status` can key its
+  /// per-launch lookups on it. The boot sweep clears `running`, so a persisted id
+  /// never survives a restart to collide with the fresh counter.
   /// `None` only on a legacy/adopted row that predates the stamp.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub launch_id: Option<LaunchId>,
@@ -159,7 +157,7 @@ pub struct RunningSnapshot {
   pub preset: Option<String>,
   pub params: LaunchParams,
   /// What `--fit` actually chose, read from the child's `/props` once
-  /// on Ready. Empty for adopted/external/delegated rows and until
+  /// on Ready. Empty for adopted/external rows and until
   /// the fetch lands. `#[serde(default)]` keeps older rows loading.
   #[serde(default)]
   pub actuals: crate::daemon::actuals::Actuals,
@@ -182,11 +180,9 @@ pub struct RunningSnapshot {
   /// priced in — so the two cannot disagree.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub projected_demand_bytes: Option<u64>,
-  /// Where this launch came from, read by the eviction gates. A delegated
-  /// (managed-multiplexer) row has no supervisor of its own, so the snapshot is
-  /// the only home its origin can have; process rows carry it too so one rule
-  /// covers both. Not persisted: `state.running` is cleared on every boot, so an
-  /// adopted row never needs it and a stale one must not outlive its daemon.
+  /// Where this launch came from, read by the eviction gates. Not persisted:
+  /// `state.running` is cleared on every boot, so an adopted row never needs it
+  /// and a stale one must not outlive its daemon.
   #[serde(skip)]
   pub origin: Option<crate::daemon::supervisor::LaunchOrigin>,
 }
@@ -194,19 +190,6 @@ pub struct RunningSnapshot {
 impl RunningSnapshot {
   pub fn started_at_system(&self) -> SystemTime {
     SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(self.started_at)
-  }
-
-  /// The [`BackendModelId`](crate::backend::identity::BackendModelId) behind a
-  /// delegated (managed-multiplexer) row, or `None` for a process-per-model row
-  /// (GGUF identity). The one predicate shared by the `status` projection, the
-  /// `stop_model` snapshot sweeps, and the proxy eviction filter, so "is this a
-  /// delegated row" can't drift between them. Names no backend — a delegated row
-  /// is any backend-identity row whose backend is a managed multiplexer.
-  pub fn delegated_backend_id(&self) -> Option<&crate::backend::identity::BackendModelId> {
-    self
-      .id
-      .as_backend()
-      .filter(|b| crate::backend::is_managed_multiplexer(&b.backend))
   }
 
   /// Is this row the launch `launch_id` (falling back to `port`), and does it

@@ -4,8 +4,8 @@
 //! Both surfaces need the same sequence: ask the running daemon to shut down,
 //! wait for the process to actually release its lockfile, and only then bring a
 //! replacement up. The `shutdown` RPC only *requests* teardown, so a caller
-//! that returns as soon as it is answered races the dying daemon's `flock` (and
-//! any umbrella it is still stopping) and walks straight into "already running".
+//! that returns as soon as it is answered races the dying daemon's `flock` and
+//! walks straight into "already running".
 
 use std::{
   path::Path,

@@ -151,7 +151,7 @@ async fn launch_start(opts: DaemonOptions, foreground: bool) -> Result<()> {
   // can't initialize. `--force` opts out (start degraded; the failed backend is
   // simply unavailable). Skipped when a daemon is already running — that call
   // short-circuits to AlreadyRunning, and a precheck would wrongly flag the
-  // umbrella port the running daemon legitimately holds.
+  // ports the running daemon legitimately holds.
   if !force && existing_daemon_pid(&opts.state_dir).is_none() {
     if let Err(msg) = precheck_indicated_backends(&opts) {
       anyhow::bail!(msg);

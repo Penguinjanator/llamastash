@@ -229,11 +229,6 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
       resolved_row,
       alias,
       ..
-    }
-    | RouteDecision::BackendUnavailable {
-      resolved_row,
-      alias,
-      ..
     } => {
       record.set_model(
         &route::served_name_for_row(resolved_row),
@@ -316,7 +311,6 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
       served_model_id,
       served_model_key,
       model_path: _,
-      upstream_path_prefix,
       alias: _,
       fallback,
       fallback_reason,
@@ -334,7 +328,6 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
           port,
           served_model_id: &served_model_id,
           served_model_key: &served_model_key,
-          upstream_path_prefix: upstream_path_prefix.as_deref(),
           fallback,
           fallback_reason: fallback_reason.as_deref(),
         },
@@ -386,20 +379,6 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
       "the `model` field is required",
       "model_required",
       Some("model"),
-    ),
-    RouteDecision::BackendUnavailable {
-      backend,
-      requested_model,
-      resolved_row: _,
-      alias: _,
-    } => error_response(
-      StatusCode::SERVICE_UNAVAILABLE,
-      "backend_unavailable",
-      &format!(
-        "`{requested_model}` is served by the {backend} backend, but the llamastash managed \
-         instance is not running; set up {backend}, enable it, and start it again \
-         (see `docs/usage.md`)"
-      ),
     ),
   };
   answered(record, response)
@@ -567,10 +546,9 @@ fn alias_rows<'a>(
 /// then 400s `ambiguous_model` on the model half — a listed id that cannot be
 /// reached.
 ///
-/// Every named row published here routes: a managed multiplexer serves all its
-/// models from one shared umbrella process, so a name cannot name a second
-/// instance there, and the daemon refuses `--name` on such a launch rather than
-/// letting this list publish an address `decide` has no target for.
+/// Every named row published here routes: each one is built from a running
+/// supervised launch, which `decide` walks, so this list never publishes an
+/// address `decide` has no target for.
 fn named_launch_ids<'a>(
   running: &'a [RunningSnapshot],
   ids: &HashMap<String, String>,
@@ -661,13 +639,7 @@ async fn ollama_ps(state: Arc<ProxyState>) -> ProxyResponse {
   let ids = published_ids(&cat_snap);
   let by_path = route::index_catalog_by_path(&cat_snap);
   let mut models: Vec<PsModel> = Vec::new();
-  for (launch_id, sup) in sup_snap.into_iter() {
-    // An infrastructure launch (a managed-multiplexer umbrella) is a supervised
-    // process, not a servable model — exclude it from /api/ps just as the
-    // fallback and /ui walkers do.
-    if crate::backend::is_infra_launch(&launch_id) {
-      continue;
-    }
+  for (_launch_id, sup) in sup_snap.into_iter() {
     if !matches!(sup.state().await, ManagedState::Ready) {
       continue;
     }

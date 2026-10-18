@@ -114,7 +114,7 @@ The toast prints the URL inline when every backend fails, so you can still paste
 
 **Symptom:** the daemon exits after you stop every model and close the TUI/CLI.
 
-**Cause:** `daemon.idle_timeout_secs` is set above `0`. The daemon shuts itself down once nothing has needed it for that long — no live model, and no CLI, TUI, or proxy traffic. A managed multiplexer's shared umbrella doesn't count as a running model, so a host running one still idles out.
+**Cause:** `daemon.idle_timeout_secs` is set above `0`. The daemon shuts itself down once nothing has needed it for that long — no live model, and no CLI, TUI, or proxy traffic.
 
 **Fix:** set `daemon.idle_timeout_secs: 0` to disable the timer.
 

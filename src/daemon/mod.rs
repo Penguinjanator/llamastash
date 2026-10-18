@@ -286,7 +286,7 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
 
   // 2. State directory: created lazily by the lockfile / state-store /
   // runtime-file writers. No socket file to clear — the control plane
-  // binds a TCP listener (§8c) and writes its URL+token into
+  // binds a TCP listener (§8d) and writes its URL+token into
   // `runtime.json` instead.
 
   // Config load installs this too; repeating it here covers a daemon built
@@ -402,7 +402,7 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
   // `status` handler and the proxy listener task share the same
   // handle. The cell surfaces via `status.proxy`; it is seeded with
   // the `Disabled` variant so a daemon with
-  // `proxy.enabled: false` reads as disabled even before §8b runs.
+  // `proxy.enabled: false` reads as disabled even before §8c runs.
   let proxy_status_cell = proxy::server::new_status_cell();
   // Aggregate backend config + per-backend force-enable map, both already
   // post-env-override (`build_options` applied `LLAMASTASH_FIT_CTX_FLOOR` /
@@ -467,24 +467,12 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
     });
   }
 
-  // 8a-i. Periodic external resweep. Step 6 ran the sweep once, so without this
+  // 8a. Periodic external resweep. Step 6 ran the sweep once, so without this
   // the list is frozen at boot: a server started afterwards never appears and a
   // row whose process exited never leaves. Same slot `status` reads.
   orphans::spawn_resweep(token.clone(), ctx.external.clone());
 
-  // 8a. Per-backend boot infrastructure supervision (opt-in). A managed
-  // multiplexer brings up its one shared umbrella here so discovery (which
-  // probes its port) and proxy routing (which forwards to the registered
-  // umbrella) both work before the user issues an explicit `start`. Each
-  // backend self-gates on its own availability and runs the bring-up in its own
-  // detached task, so boot never blocks on a readiness probe; a
-  // process-per-model backend does nothing. Names no backend.
-  let boot_probe_timeout = opts.probe_timeout_secs.map(std::time::Duration::from_secs);
-  for backend in crate::backend::Backends::all() {
-    crate::backend::Backend::supervise_at_boot(&backend, &ctx, &opts.log_dir, boot_probe_timeout);
-  }
-
-  // 8a-ii. Idle auto-shutdown (opt-in via `daemon.idle_timeout_secs`).
+  // 8b. Idle auto-shutdown (opt-in via `daemon.idle_timeout_secs`).
   if let Some(timeout) = opts.idle_timeout {
     idle::spawn(
       ctx.supervisors.clone(),
@@ -495,7 +483,7 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
     );
   }
 
-  // 8b. OpenAI-compat proxy listener. Spawned between the
+  // 8c. OpenAI-compat proxy listener. Spawned between the
   // host-metrics sampler (which the proxy doesn't depend on but
   // which is the canonical "background sampler" anchor) and the
   // unix-socket accept loop so the IPC ctx is fully populated
@@ -604,7 +592,7 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
     }
   }
 
-  // 8c. Control-plane HTTP listener — the daemon's only RPC surface.
+  // 8d. Control-plane HTTP listener — the daemon's only RPC surface.
   // Binds a loopback TCP port; auth is bearer-token; the token + URL
   // are written to `runtime.json` under `state_dir` so attaching CLI
   // / TUI clients can pick them up. Bind failure is fatal here (the
@@ -667,7 +655,7 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
     }
   });
 
-  // 8d. Boot preload: `daemon.preload:` entries plus any preset pinning
+  // 8e. Boot preload: `daemon.preload:` entries plus any preset pinning
   // `preload: true`. Spawned last so the catalog, the proxy and the control
   // plane all exist before the first launch — entries resolve against the
   // catalog, and a preloaded model should be routable the moment it is Ready.

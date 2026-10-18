@@ -321,8 +321,8 @@ impl ManagedModel {
   /// [`spawn`] returns at `Loading` and flips to `Ready` only once the
   /// background probe sees the child's endpoint answer — so a caller that
   /// must talk to that endpoint has to wait for it, or it races the
-  /// child's bind and hits connection-refused on a cold start (the
-  /// delegated preload path). Polls the state until `Ready` (`Ok`), a
+  /// child's bind and hits connection-refused on a cold start. Polls the state
+  /// until `Ready` (`Ok`), a
   /// terminal non-ready state (`Err` with the cause), or `timeout`
   /// elapses while still starting up (`Err`).
   pub async fn wait_until_ready(&self, timeout: Duration) -> Result<(), String> {
@@ -845,10 +845,6 @@ pub enum SpawnError {
   /// Log file could not be opened.
   #[error("could not open log file: {0}")]
   Log(String),
-  /// A managed-umbrella port is already held by another process, so
-  /// llamastash cannot bind it to supervise its own instance.
-  #[error("127.0.0.1:{0} is already in use; cannot supervise a managed umbrella on it")]
-  PortInUse(u16),
 }
 
 async fn pump_stream<R>(
@@ -1313,7 +1309,7 @@ mod tests {
 
   #[tokio::test]
   async fn wait_until_ready_observes_a_late_ready_transition() {
-    // The delegated preload's exact shape: handle is at Loading, a
+    // The shape a cold start takes: the handle is at Loading, a
     // separate task flips it to Ready shortly after — the waiter must
     // see it rather than racing ahead.
     let m = test_model(ManagedState::Loading);

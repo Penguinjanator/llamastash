@@ -67,12 +67,8 @@ pub(crate) enum RouteDecision {
     /// by the time we connect.
     served_model_key: ModelId,
     /// Catalog path of the model that answers. The request log files the
-    /// row under it. Differs from `served_model_key.path` for a model inside
-    /// a managed multiplexer, whose key is the umbrella's.
+    /// row under it.
     model_path: String,
-    /// Upstream OpenAI path prefix (`None` → the direct backend's `/v1/...`,
-    /// `Some("/api")` → a managed-multiplexer umbrella's `/api/v1/...`).
-    upstream_path_prefix: Option<String>,
     /// A `proxy.aliases` entry named this model.
     alias: bool,
     fallback: bool,
@@ -112,19 +108,6 @@ pub(crate) enum RouteDecision {
   /// `body.model` is absent or empty. Emits 400
   /// `invalid_request` with `code: "model_required"`.
   ModelRequired,
-  /// The resolved model is served by a managed-multiplexer backend whose
-  /// umbrella isn't running. Emitted for such a row when no umbrella is
-  /// registered/Ready — a clean 503 instead of routing a GGUF-shaped
-  /// auto-start that would fail on the missing local file.
-  BackendUnavailable {
-    backend: String,
-    requested_model: String,
-    /// The catalog entry asked for, so the request log files the 503
-    /// under the model.
-    resolved_row: Box<CatalogRow>,
-    /// A `proxy.aliases` entry named this model.
-    alias: bool,
-  },
 }
 
 /// Errors raised before [`decide`] returns — these escape the
@@ -300,20 +283,6 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
   let resolved = found.row;
   let alias = found.alias;
 
-  // Managed-multiplexer models are served by a shared umbrella process, not a
-  // per-model supervisor: route them to the umbrella's port. Handled before
-  // the GGUF supervisor walk because such a row has no local file for the
-  // path-match (or the GGUF auto-start) to key on.
-  //
-  // Any `@name` is dropped here rather than honored: the daemon refuses `--name`
-  // on such a launch, so no named row of this model exists to select and none is
-  // published. A stale id from before still reaches the model it asks for.
-  if crate::discovery::ModelSource::from_label(&resolved.source)
-    .is_some_and(|s| crate::backend::is_managed_multiplexer(s.backend_id()))
-  {
-    return decide_umbrella_route(state, requested, &resolved, alias).await;
-  }
-
   // Walk the supervisor snapshot for Ready entries serving the resolved row's
   // path. When a name is present we must map a launch back to its name to
   // confirm the match; read the state snapshot once (not per-iteration).
@@ -388,7 +357,6 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
       served_model_id: served_name_for_row(&resolved),
       served_model_key: model.id().clone(),
       model_path: resolved.path.clone(),
-      upstream_path_prefix: None,
       alias,
       fallback: false,
       fallback_reason: None,
@@ -612,59 +580,6 @@ fn is_named(
   })
 }
 
-/// Routing decision for a managed-multiplexer-backed model. A managed
-/// multiplexer serves every one of its models from one shared umbrella
-/// process, so this forwards to the umbrella's port when it is registered +
-/// Ready, and returns [`RouteDecision::BackendUnavailable`] otherwise. The
-/// umbrella's chat endpoint autoloads, so no per-model launch is needed on the
-/// hot path. Resolves the owning backend from the source and reads its
-/// [`Backend::umbrella_launch_id`] — names no backend.
-async fn decide_umbrella_route(
-  state: &Arc<ProxyState>,
-  requested: String,
-  resolved: &CatalogRow,
-  alias: bool,
-) -> RouteDecision {
-  use crate::backend::{Backend, Backends};
-  let backend_id =
-    crate::discovery::ModelSource::from_label(&resolved.source).map(|s| s.backend_id());
-  let backend = backend_id.and_then(Backends::from_id);
-  let umbrella_id = backend.as_ref().and_then(|b| b.umbrella_launch_id());
-  let umbrella = match umbrella_id {
-    Some(id) => state.ctx.supervisors.get(&id).await,
-    None => None,
-  };
-  match umbrella {
-    Some(umbrella) if matches!(umbrella.state().await, ManagedState::Ready) => {
-      RouteDecision::ReadyAt {
-        port: umbrella.port(),
-        served_model_id: served_name_for_row(resolved),
-        // The umbrella's own ModelId — the forward path re-verifies and
-        // takes an inflight guard against this supervisor entry.
-        served_model_key: umbrella.id().clone(),
-        model_path: resolved.path.clone(),
-        // The OpenAI path prefix the owning backend's umbrella serves under
-        // (its `umbrella_openai_prefix`), so this arm names no backend.
-        upstream_path_prefix: backend
-          .as_ref()
-          .and_then(|b| b.umbrella_openai_prefix())
-          .map(str::to_string),
-        alias,
-        fallback: false,
-        fallback_reason: None,
-      }
-    }
-    _ => RouteDecision::BackendUnavailable {
-      backend: backend_id
-        .unwrap_or(crate::backend::DEFAULT_BACKEND_ID)
-        .to_string(),
-      requested_model: requested,
-      resolved_row: Box::new(resolved.clone()),
-      alias,
-    },
-  }
-}
-
 /// The backend a **running** model (keyed by its [`ModelId`]) is actually
 /// served by, or `None` for the default (llama.cpp) backend. Prefers the
 /// `resolved_backend` tag stamped on `last_params` — the launch's real backend,
@@ -783,7 +698,6 @@ pub(crate) async fn handle_not_running(
           port,
           served_model_id: &served,
           served_model_key: &model_id,
-          upstream_path_prefix: None,
           fallback: false,
           fallback_reason: None,
         },
@@ -822,7 +736,6 @@ pub(crate) async fn handle_not_running(
             port: pick.port,
             served_model_id: &pick.served_model_id,
             served_model_key: &pick.model_id,
-            upstream_path_prefix: None,
             fallback: true,
             fallback_reason: Some(reason),
           },
@@ -928,13 +841,7 @@ async fn collect_fallback_candidates(state: &Arc<ProxyState>) -> Vec<FallbackCan
   let by_path = index_catalog_by_path(&cat_snap);
 
   let mut out: Vec<FallbackCandidate> = Vec::with_capacity(sup_snap.len());
-  for (launch_id, model) in sup_snap.into_iter() {
-    // An infrastructure launch (a managed-multiplexer umbrella) is a supervised
-    // process, not a servable model — never offer it as a family-MRU fallback
-    // (a bare `/v1` forward to a multiplexer's own API 404s anyway).
-    if crate::backend::is_infra_launch(&launch_id) {
-      continue;
-    }
+  for (_launch_id, model) in sup_snap.into_iter() {
     if !matches!(model.state().await, ManagedState::Ready) {
       continue;
     }

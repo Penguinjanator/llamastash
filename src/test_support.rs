@@ -143,7 +143,7 @@ pub fn running_row(path: &str) -> RunningRow {
 }
 
 impl RunningRow {
-  /// Replace the GGUF identity with a backend (delegated / registry) one.
+  /// Replace the GGUF identity with a backend (registry) one.
   pub fn identity(mut self, id: crate::backend::identity::ModelIdentity) -> Self {
     self.0.id = id;
     self

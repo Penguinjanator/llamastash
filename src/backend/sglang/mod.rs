@@ -19,8 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::identity::{BackendModelId, ModelIdentity};
 use super::{
-  Accelerator, AcceleratorSupport, Backend, LaunchPlan, Lifecycle, ProcessLaunchSpec, Readiness,
-  CREDENTIAL_ENV_STRIP,
+  Accelerator, AcceleratorSupport, Backend, ProcessLaunchSpec, Readiness, CREDENTIAL_ENV_STRIP,
 };
 use crate::daemon::context::MethodContext;
 use crate::daemon::probe::ProbeOptions;
@@ -138,10 +137,6 @@ impl Backend for SglangBackend {
 
   fn id(&self) -> &'static str {
     SGLANG_BACKEND_ID
-  }
-
-  fn lifecycle(&self) -> Lifecycle {
-    Lifecycle::ProcessPerModel
   }
 
   fn enabled_in_config(
@@ -342,8 +337,8 @@ impl Backend for SglangBackend {
     port: u16,
     binary: PathBuf,
     probe: ProbeOptions,
-  ) -> LaunchPlan {
-    LaunchPlan::SpawnProcess(ProcessLaunchSpec {
+  ) -> ProcessLaunchSpec {
+    ProcessLaunchSpec {
       binary,
       argv: sglang_argv(params, port),
       env_remove: CREDENTIAL_ENV_STRIP.to_vec(),
@@ -351,7 +346,7 @@ impl Backend for SglangBackend {
       min_stop_grace: std::time::Duration::ZERO,
       readiness: readiness(&served_model_name(&params.model_path)),
       probe,
-    })
+    }
   }
 
   async fn resolve_knobs(
@@ -608,10 +603,9 @@ mod tests {
   }
 
   #[test]
-  fn id_and_lifecycle() {
+  fn id_is_stable() {
     let b = SglangBackend::new();
     assert_eq!(b.id(), "sglang");
-    assert_eq!(b.lifecycle(), Lifecycle::ProcessPerModel);
   }
 
   #[test]

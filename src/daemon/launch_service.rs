@@ -7,10 +7,8 @@
 //! last-params recorder. The IPC `start_model` handler and the proxy's
 //! auto-start path both call it, so the two surfaces can never drift in
 //! how a launch is composed. It ends by handing a [`LaunchExec`] to the
-//! resolved backend's [`crate::backend::Backend::start`]: a process-per-model
-//! backend runs the default supervised spawn (`spawn_supervised`); a
-//! managed-multiplexer backend overrides `start` to anchor on its shared
-//! umbrella. This path never branches on lifecycle.
+//! resolved backend's [`crate::backend::Backend::start`], whose default runs
+//! the supervised spawn (`spawn_supervised`).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -180,14 +178,12 @@ pub struct StartedLaunch {
 /// Everything a backend's [`crate::backend::Backend::start`] needs to execute a
 /// launch, once `compose_and_spawn` has done the backend-agnostic prep
 /// (validation, identity, port reservation, layered knob resolution). The
-/// backend decides *how* to start — a supervised child process (the default) or
-/// a delegation to a managed-multiplexer umbrella — so the caller never branches
-/// on lifecycle. Consumed by value.
+/// backend decides *how* to start it; the default is the supervised child
+/// spawn. Consumed by value.
 pub struct LaunchExec {
   /// The fully-resolved launch params (knobs argv-ified from these).
   pub(crate) params: LaunchParams,
-  /// The reserved launch-pool port. A process-per-model backend spawns on it; a
-  /// managed multiplexer releases it (its umbrella binds a configured port).
+  /// The reserved launch-pool port, released on any path that does not spawn on it.
   pub(crate) reserved_port: u16,
   /// The device-owning default binary the orchestrator chose; a backend with its
   /// own server overrides via [`crate::backend::Backend::resolve_launch_binary`].
@@ -356,28 +352,6 @@ pub(crate) async fn model_presets(
   )
 }
 
-/// The refusal for `--name` on a managed-multiplexer model, or `None` when the
-/// name is fine.
-///
-/// Such a backend serves every one of its models from one shared umbrella
-/// process, so a second launch under a name is not a second instance and
-/// `<model-id>@<name>` has nothing of its own to route to. Refused rather than
-/// recorded, so a name never reaches `status` or `/v1/models` as an address
-/// that resolves to nothing. Names no backend — the lifecycle does.
-fn multiplexer_refuses_name(identity: &ModelIdentity, name: Option<&str>) -> Option<ErrorObject> {
-  let name = name?;
-  let backend = identity.as_backend()?;
-  crate::backend::is_managed_multiplexer(&backend.backend).then(|| {
-    ErrorObject::new(
-      ErrorCode::InvalidParams,
-      format!(
-        "`{}` serves every model from one shared process, so `{name}` cannot name a separate launch",
-        backend.backend
-      ),
-    )
-  })
-}
-
 /// The one launch-composition pipeline, for callers that already have a
 /// parsed [`StartParams`]: the IPC `start_model` handler and the proxy's
 /// auto-start path. Performs validation → arch resolve → port
@@ -515,13 +489,6 @@ pub(crate) async fn compose_and_spawn(
       }
     },
   )?;
-
-  if let Some(err) = multiplexer_refuses_name(&identity, parsed.name.as_deref()) {
-    if !name_from_preset {
-      return Err(err);
-    }
-    parsed.name = None;
-  }
 
   // Pre-spawn refusal (D-guard): on an auto-routed launch, ask every backend
   // whether it declines this model (e.g. a distributed/split GGUF half a
@@ -1147,10 +1114,8 @@ pub(crate) async fn compose_and_spawn(
   let bypasses_admission = inference_backend.bypasses_admission(&launch_params);
   let force_admission = parsed.force;
 
-  // Hand the launch to the resolved backend: it decides *how* to start — a
-  // supervised child process (the default `start`) or a delegation to its
-  // managed-multiplexer umbrella — so this path never branches on lifecycle and
-  // names no backend.
+  // Hand the launch to the resolved backend: it decides *how* to start, so this
+  // path names no backend.
   let exec = LaunchExec {
     params: launch_params,
     reserved_port: port,
@@ -1182,8 +1147,8 @@ pub(crate) async fn compose_and_spawn(
 /// Execute a **process-per-model** launch: the pre-spawn memory admission gate,
 /// the supervised spawn, the persisted running snapshot, and the background
 /// last-params + admission-settle recorders. This is the backend-agnostic body
-/// of a process backend's [`crate::backend::Backend::start`] — a managed
-/// multiplexer overrides `start` and never reaches here. `spec` is the argv the
+/// of a backend's [`crate::backend::Backend::start`] (the default). `spec` is
+/// the argv the
 /// backend composed. Consumes `exec` (destructured back into the original local
 /// names, so this body is a verbatim lift of the old inline spawn path).
 pub(crate) async fn spawn_supervised(
@@ -1235,152 +1200,143 @@ pub(crate) async fn spawn_supervised(
   // What the gate priced this launch at, kept for the running row so make-room
   // can later credit it for exactly that much when it is unloaded.
   let mut projected_demand_bytes = None;
-  // A non-GGUF identity used to skip the gate entirely, so a
-  // process-per-model backend serving a directory could OOM the host with no
-  // pre-spawn refusal at all. It has no header to project from, but the
-  // weight bytes are recoverable — from the catalog, or by measuring the
-  // directory — and the backend has already resolved its own cache budget,
+  // Every launch is gated. A non-GGUF identity has no header to project from,
+  // but its weight bytes are recoverable — from the catalog, or by measuring
+  // the directory — and the backend has already resolved its own cache budget,
   // which is enough for the same arithmetic. Gating on a non-zero catalog
-  // size here would put the zero-size case (a launch by absolute path from
-  // outside the scan roots) back outside the gate, which is the one case
-  // that most needs it.
-  let gate_applies = identity.as_gguf().is_some()
-    || crate::backend::Backends::from_id(&resolved_backend_id).map(|b| b.lifecycle())
-      == Some(crate::backend::Lifecycle::ProcessPerModel);
-  if gate_applies {
-    if let Some(host_slot) = ctx.host_metrics.as_ref() {
-      let snapshot = host_slot.read().await.clone();
-      if crate::launch::admission::is_sampled(&snapshot) {
-        // Project demand against the pinned ctx, else the backend's admission
-        // floor (llama.cpp's `--fit-ctx` floor), else a neutral default.
-        let effective_ctx = launch_params
-          .ctx
-          .or(admission_floor)
-          .unwrap_or(crate::config::DEFAULT_FIT_CTX_FLOOR);
-        let backend = crate::backend::Backends::from_id(&resolved_backend_id);
-        // Free and pool total must come from the same pool, so both take one flag.
-        let budget = |layer_count: Option<u64>| {
-          let gpu_resident = backend
-            .as_ref()
-            .is_some_and(|b| crate::backend::Backend::gpu_resident(b, &launch_params, layer_count));
-          let gtt_only = crate::launch::admission::gtt_only_budget(&snapshot, gpu_resident);
-          (
-            crate::launch::admission::effective_free_bytes_for(&snapshot, gtt_only),
-            gtt_only,
-          )
+  // size would put the zero-size case (a launch by absolute path from outside
+  // the scan roots) back outside the gate, which is the one case that most
+  // needs it.
+  if let Some(host_slot) = ctx.host_metrics.as_ref() {
+    let snapshot = host_slot.read().await.clone();
+    if crate::launch::admission::is_sampled(&snapshot) {
+      // Project demand against the pinned ctx, else the backend's admission
+      // floor (llama.cpp's `--fit-ctx` floor), else a neutral default.
+      let effective_ctx = launch_params
+        .ctx
+        .or(admission_floor)
+        .unwrap_or(crate::config::DEFAULT_FIT_CTX_FLOOR);
+      let backend = crate::backend::Backends::from_id(&resolved_backend_id);
+      // Free and pool total must come from the same pool, so both take one flag.
+      let budget = |layer_count: Option<u64>| {
+        let gpu_resident = backend
+          .as_ref()
+          .is_some_and(|b| crate::backend::Backend::gpu_resident(b, &launch_params, layer_count));
+        let gtt_only = crate::launch::admission::gtt_only_budget(&snapshot, gpu_resident);
+        (
+          crate::launch::admission::effective_free_bytes_for(&snapshot, gtt_only),
+          gtt_only,
+        )
+      };
+      let gpu_backend = snapshot.gpu_backend.clone();
+      let model_path = launch_params.model_path.clone();
+      let knobs = launch_params.knobs.clone();
+      let arch_owned = arch.clone();
+      let mtp_active = launch_params.mtp_directive.is_some();
+      let demand_and_free = if identity.as_gguf().is_some() {
+        let demand_backend_id = resolved_backend_id.clone();
+        tokio::task::spawn_blocking(move || {
+          let header = read_gguf_header(&model_path, HeaderReadOptions::default())
+            .ok()?
+            .header;
+          let layer_count = header
+            .string(&["general.architecture"])
+            .and_then(|a| header.u64(&[format!("{a}.block_count")]));
+          let demand = crate::launch::admission::project_demand(
+            &header,
+            arch_owned.as_deref(),
+            &knobs,
+            &demand_backend_id,
+            effective_ctx,
+            &gpu_backend,
+            resident_weight_bytes,
+            mtp_active,
+          );
+          Some((demand, layer_count))
+        })
+        .await
+        .ok()
+        .flatten()
+        .map(|(demand, layer_count)| (demand, budget(layer_count).0))
+      } else {
+        let (free, gtt_only) = budget(None);
+        // No header, so no per-layer KV estimate. Weights come from
+        // `launch_resident_bytes`, which measures a directory when neither
+        // the catalog nor `stat` can size it — the same figure the backend
+        // priced its cache against, so the gate and the cap cannot disagree.
+        if resident_weight_bytes == 0 {
+          log::warn!(
+            "admission: no weight size for {} — gate cannot engage",
+            model_path.display()
+          );
+        }
+        // Only the backend can price the rest, since the figure lives in its
+        // own knob vocabulary and may be a pool fraction rather than bytes.
+        let host_inputs = crate::launch::admission::DemandInputs {
+          free_bytes: free,
+          pool_total_bytes: crate::launch::admission::engine_pool_total_bytes(&snapshot, gtt_only),
+          weights_bytes: resident_weight_bytes,
         };
-        let gpu_backend = snapshot.gpu_backend.clone();
-        let model_path = launch_params.model_path.clone();
-        let knobs = launch_params.knobs.clone();
-        let arch_owned = arch.clone();
-        let mtp_active = launch_params.mtp_directive.is_some();
-        let demand_and_free = if identity.as_gguf().is_some() {
-          let demand_backend_id = resolved_backend_id.clone();
-          tokio::task::spawn_blocking(move || {
-            let header = read_gguf_header(&model_path, HeaderReadOptions::default())
-              .ok()?
-              .header;
-            let layer_count = header
-              .string(&["general.architecture"])
-              .and_then(|a| header.u64(&[format!("{a}.block_count")]));
-            let demand = crate::launch::admission::project_demand(
-              &header,
-              arch_owned.as_deref(),
-              &knobs,
-              &demand_backend_id,
-              effective_ctx,
-              &gpu_backend,
-              resident_weight_bytes,
-              mtp_active,
-            );
-            Some((demand, layer_count))
+        backend
+          .as_ref()
+          .and_then(|b| {
+            crate::backend::Backend::projected_cache_bytes(b, &launch_params, &host_inputs)
           })
-          .await
-          .ok()
-          .flatten()
-          .map(|(demand, layer_count)| (demand, budget(layer_count).0))
-        } else {
-          let (free, gtt_only) = budget(None);
-          // No header, so no per-layer KV estimate. Weights come from
-          // `launch_resident_bytes`, which measures a directory when neither
-          // the catalog nor `stat` can size it — the same figure the backend
-          // priced its cache against, so the gate and the cap cannot disagree.
-          if resident_weight_bytes == 0 {
-            log::warn!(
-              "admission: no weight size for {} — gate cannot engage",
-              model_path.display()
+          .filter(|_| resident_weight_bytes > 0)
+          .map(|cache| {
+            let demand = resident_weight_bytes
+              .saturating_add(cache)
+              .saturating_add(crate::launch::headroom::overhead_band_bytes(&gpu_backend));
+            (demand, free)
+          })
+      };
+      if let Some((demand, free)) = demand_and_free {
+        if let Err(refusal) = ctx.admission.try_admit(u64::from(port), demand, free) {
+          if force_admission {
+            // Never suppressed by another advisory the way the bypass note
+            // is: the caller asked for this, and the projection is the only
+            // warning they get before the host decides for them. It reaches
+            // both the human output and the `--json` body; only `-q` drops
+            // the human line.
+            let msg = format!(
+              "--force overrode the memory admission gate — {}",
+              format_admission_refusal(&refusal)
             );
-          }
-          // Only the backend can price the rest, since the figure lives in its
-          // own knob vocabulary and may be a pool fraction rather than bytes.
-          let host_inputs = crate::launch::admission::DemandInputs {
-            free_bytes: free,
-            pool_total_bytes: crate::launch::admission::engine_pool_total_bytes(
-              &snapshot, gtt_only,
-            ),
-            weights_bytes: resident_weight_bytes,
-          };
-          backend
-            .as_ref()
-            .and_then(|b| {
-              crate::backend::Backend::projected_cache_bytes(b, &launch_params, &host_inputs)
-            })
-            .filter(|_| resident_weight_bytes > 0)
-            .map(|cache| {
-              let demand = resident_weight_bytes
-                .saturating_add(cache)
-                .saturating_add(crate::launch::headroom::overhead_band_bytes(&gpu_backend));
-              (demand, free)
-            })
-        };
-        if let Some((demand, free)) = demand_and_free {
-          if let Err(refusal) = ctx.admission.try_admit(u64::from(port), demand, free) {
-            if force_admission {
-              // Never suppressed by another advisory the way the bypass note
-              // is: the caller asked for this, and the projection is the only
-              // warning they get before the host decides for them. It reaches
-              // both the human output and the `--json` body; only `-q` drops
-              // the human line.
+            log::warn!("{msg}");
+            warnings.push(msg);
+            // Reserve anyway. `try_admit` records nothing when it refuses,
+            // so without this the forced launch's demand is invisible to the
+            // next launch's check and a second one is admitted against
+            // memory this one is already taking.
+            ctx.admission.reserve(u64::from(port), demand);
+            admitted = true;
+          } else if bypasses_admission {
+            if !bypass_note_suppressed {
               let msg = format!(
-                "--force overrode the memory admission gate — {}",
+                "this launch bypasses the memory admission gate (streaming from disk) — {}",
                 format_admission_refusal(&refusal)
               );
               log::warn!("{msg}");
               warnings.push(msg);
-              // Reserve anyway. `try_admit` records nothing when it refuses,
-              // so without this the forced launch's demand is invisible to the
-              // next launch's check and a second one is admitted against
-              // memory this one is already taking.
-              ctx.admission.reserve(u64::from(port), demand);
-              admitted = true;
-            } else if bypasses_admission {
-              if !bypass_note_suppressed {
-                let msg = format!(
-                  "this launch bypasses the memory admission gate (streaming from disk) — {}",
-                  format_admission_refusal(&refusal)
-                );
-                log::warn!("{msg}");
-                warnings.push(msg);
-              }
-            } else {
-              ctx.supervisors.release_reserved_port(port).await;
-              return Err(ErrorObject::with_data(
-                ErrorCode::ResourceExhausted,
-                format_admission_refusal(&refusal),
-                serde_json::json!({
-                  "cause": "launch_refused",
-                  "demand_bytes": refusal.demand_bytes,
-                  "effective_free_bytes": refusal.effective_free_bytes,
-                  "reserved_bytes": refusal.reserved_bytes,
-                }),
-              ));
             }
           } else {
-            admitted = true;
+            ctx.supervisors.release_reserved_port(port).await;
+            return Err(ErrorObject::with_data(
+              ErrorCode::ResourceExhausted,
+              format_admission_refusal(&refusal),
+              serde_json::json!({
+                "cause": "launch_refused",
+                "demand_bytes": refusal.demand_bytes,
+                "effective_free_bytes": refusal.effective_free_bytes,
+                "reserved_bytes": refusal.reserved_bytes,
+              }),
+            ));
           }
-          if admitted {
-            projected_demand_bytes = Some(demand);
-          }
+        } else {
+          admitted = true;
+        }
+        if admitted {
+          projected_demand_bytes = Some(demand);
         }
       }
     }
@@ -1496,8 +1452,7 @@ pub(crate) async fn spawn_supervised(
 /// Stop a **supervised child process** launch: SIGTERM (bounded by `grace_secs`),
 /// deregister it, and drop its running snapshot. The backend-agnostic body of a
 /// process backend's [`crate::backend::Backend::stop`] (the default) — the
-/// counterpart to [`spawn_supervised`]. A managed multiplexer overrides `stop`
-/// and calls this only to tear its own umbrella process down. Returns the
+/// counterpart to [`spawn_supervised`]. Returns the
 /// `{launch_id, state}` stop response, or `InvalidParams` for an unknown id.
 pub(crate) async fn stop_supervised(
   ctx: &MethodContext,
@@ -1557,19 +1512,14 @@ pub(crate) async fn drop_running_snapshots(ctx: &MethodContext, stopped: &[(Laun
     .await;
 }
 
-/// The backend that owns a running launch: an umbrella's owner (via
-/// [`crate::backend::umbrella_owner`]), else the resolved backend recorded on
+/// The backend that owns a running launch: the resolved backend recorded on
 /// the launch's running snapshot, else the default backend. Lets the stop path
-/// hand a launch to its backend without the caller knowing whether it is a
-/// supervised child or a delegated model — the registry resolves the owner, the
-/// backend decides *how* to stop.
+/// hand a launch to its backend without the caller naming one — the registry
+/// resolves the owner, the backend decides *how* to stop.
 pub(crate) async fn backend_for_launch(
   ctx: &MethodContext,
   launch_id: &LaunchId,
 ) -> crate::backend::Backends {
-  if let Some(owner) = crate::backend::umbrella_owner(launch_id) {
-    return owner;
-  }
   let backend_id = ctx
     .state
     .snapshot()
@@ -2749,45 +2699,6 @@ mod tests {
     crate::test_support::running_row(path)
       .maybe_name(name)
       .build()
-  }
-
-  /// A managed multiplexer has one shared process per backend, so a name
-  /// cannot select an instance there — the launch is refused rather than
-  /// stamping a name the proxy would publish and then fail to route.
-  #[test]
-  fn a_name_is_refused_for_a_managed_multiplexer_model() {
-    use crate::backend::{Backend, Backends, Lifecycle};
-    let Some(mux) = Backends::all()
-      .into_iter()
-      .find(|b| b.lifecycle() == Lifecycle::ManagedMultiplexer)
-    else {
-      return;
-    };
-    let delegated = ModelIdentity::Backend(crate::backend::identity::BackendModelId {
-      backend: mux.id().to_string(),
-      name: "some/model".to_string(),
-    });
-    let err = multiplexer_refuses_name(&delegated, Some("coder"))
-      .expect("a name on a multiplexer model is refused");
-    assert_eq!(err.code, ErrorCode::InvalidParams.as_i32());
-    assert!(
-      err.message.contains("coder") && err.message.contains(mux.id()),
-      "the refusal names the launch name and the backend, got: {}",
-      err.message
-    );
-    assert!(
-      multiplexer_refuses_name(&delegated, None).is_none(),
-      "an unnamed launch of the same model is untouched"
-    );
-
-    let gguf = ModelIdentity::Gguf(ModelId {
-      path: PathBuf::from("/m/a.gguf"),
-      header_blake3: [7u8; 32],
-    });
-    assert!(
-      multiplexer_refuses_name(&gguf, Some("coder")).is_none(),
-      "a process-per-model launch keeps its name"
-    );
   }
 
   /// D3: a second launch of the *same* model with the *same* name is refused
