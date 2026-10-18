@@ -60,40 +60,55 @@ pub async fn handle(args: SessionArgs, cli: &Cli, config: &Config) -> CliResult 
       ),
     )
   })?;
-  // A real bearer key is a secret, so `--dry-run` prints it masked. The stub a
-  // keyless proxy ignores is safe to show.
-  let configured_key = config.proxy.effective_api_key();
-  let mask = configured_key.is_some();
-  let api_key = configured_key.unwrap_or_else(|| KEYLESS_STUB.to_string());
+  // A real bearer key is the only secret in this launch, so it is the only value
+  // `--dry-run` masks. The stub a keyless proxy ignores is safe to show.
+  let secret = config.proxy.effective_api_key();
+  let api_key = secret.clone().unwrap_or_else(|| KEYLESS_STUB.to_string());
 
-  let target = resolve_target(&mut client, &catalog, &status.models, &args, config).await?;
-  let patcher = patcher_for(args.tool).ok_or_else(|| no_launch(args.tool))?;
   let files_dir = session_files_dir()?;
-  let ctx = PatchContext {
-    proxy_base_url,
-    api_key,
-    models: vec![target.patch_model()],
-  };
-  let launch = patcher
-    .session(&ctx, &files_dir)
-    .ok_or_else(|| no_launch(args.tool))?;
-
+  let mut target = resolve_target(&catalog, &status.models, &args, config)?;
+  let mut launch = describe(args.tool, &target, &proxy_base_url, &api_key, &files_dir)?;
+  // The tool binary is looked up before a model is started: a tool that is not
+  // installed should cost nothing, and the program does not depend on the model.
+  // A dry run still prints: it describes a command, it does not need to run one.
+  let found = which::which(launch.program);
   if args.dry_run {
-    return emit_dry_run(&args, &target, &launch, mask);
+    return emit_dry_run(&args, &target, &launch, secret.as_deref());
   }
-  // Everything that can fail is checked before the process is handed over: once
-  // the tool is exec'd there is nothing of ours left to report a late failure.
-  let program = which::which(launch.program).map_err(|_| {
+  let program = found.map_err(|_| {
     CliExit::new(
       BINARY_NOT_FOUND,
       format!("`{}` not found on PATH", launch.program),
     )
   })?;
+  // Everything that can fail is checked before the process is handed over: once
+  // the tool is exec'd there is nothing of ours left to report a late failure.
+  settle(&mut client, &catalog, config, &mut target).await?;
+  launch = describe(args.tool, &target, &proxy_base_url, &api_key, &files_dir)?;
   write_session_files(&launch)?;
   if !cli.quiet {
     eprintln!("{}", target.note(args.tool.as_str()));
   }
   run(program, launch, &args.tool_args)
+}
+
+/// The tool's launch for this target: what to exec, with what.
+fn describe(
+  tool: SessionTool,
+  target: &Target,
+  proxy_base_url: &str,
+  api_key: &str,
+  files_dir: &Path,
+) -> Result<SessionLaunch, CliExit> {
+  let patcher = patcher_for(tool).ok_or_else(|| no_launch(tool))?;
+  let ctx = PatchContext {
+    proxy_base_url: proxy_base_url.to_string(),
+    api_key: api_key.to_string(),
+    models: vec![target.patch_model()],
+  };
+  patcher
+    .session(&ctx, files_dir)
+    .ok_or_else(|| no_launch(tool))
 }
 
 fn no_launch(tool: SessionTool) -> CliExit {
@@ -107,10 +122,13 @@ fn no_launch(tool: SessionTool) -> CliExit {
 /// `--dry-run` of a model that is not running).
 struct Target {
   row: CatalogRow,
+  /// The launch name the reference asked for. Kept even when no launch exists:
+  /// a dry run has to print the id the real run will use.
+  name: Option<String>,
   launch: Option<RunningRow>,
   /// The id to hand the tool: what `/v1/models` publishes, plus `@<name>` when
-  /// the chosen launch is named. Without the suffix the proxy would auto-start a
-  /// second, unnamed copy of the same model.
+  /// the launch is or will be named. Without the suffix the proxy would
+  /// auto-start a second, unnamed copy of the same model.
   id: String,
   context_window: Option<u64>,
 }
@@ -139,14 +157,15 @@ impl Target {
 
 /// Resolve what to run. Starts a model only when one is missing and `--dry-run`
 /// was not given; writes nothing.
-async fn resolve_target(
-  client: &mut Client,
+/// Resolve what to run. Reads only: nothing is started here, and nothing is
+/// written.
+fn resolve_target(
   catalog: &[CatalogRow],
   running: &[RunningRow],
   args: &SessionArgs,
   config: &Config,
 ) -> Result<Target, CliExit> {
-  let (row, launch) = match args.model.as_deref() {
+  let (row, name, launch) = match args.model.as_deref() {
     None => {
       let found = latest_chat_launch(running).ok_or_else(|| {
         CliExit::new(
@@ -154,19 +173,14 @@ async fn resolve_target(
           "no chat model is running; start one or pass a MODEL",
         )
       })?;
-      let row = catalog_row(catalog, &found.model_path)?;
-      let launch = if args.dry_run {
-        found
-      } else {
-        wait_until_ready(client, &row, found).await?
-      };
-      (row, Some(launch))
+      let name = found.name.clone();
+      (catalog_row(catalog, &found.model_path)?, name, Some(found))
     }
     Some(reference) => {
       let aliases = AliasTable::from_config(&config.proxy.aliases);
       let reference = alias_target(&aliases, catalog, reference);
       let (row, name) = resolve_model_or_launch(catalog, running, &reference)?;
-      if let Some(kind) = non_chat_mode(&row) {
+      if let Some(kind) = non_chat_mode(&row, &published_id(catalog, &row)) {
         return Err(CliExit::new(
           USAGE,
           format!(
@@ -175,59 +189,69 @@ async fn resolve_target(
           ),
         ));
       }
-      let launch = match matching_launch(running, &row.path, name.as_deref()) {
-        Some(found) if args.dry_run => Some(found),
-        Some(found) => Some(wait_until_ready(client, &row, found).await?),
-        None if args.dry_run => None,
-        None => {
-          // `@<name>` is both the address and the preset to launch with;
-          // anything else takes the model's own default preset, as `start` does.
-          // The mode is stated because a session can only be chat: a model with
-          // no mode hint would otherwise hit `start`'s "pass --mode" error, and
-          // this command has no such flag.
-          let resp =
-            start_row_with_preset(client, &row, name.as_deref(), Some(LaunchMode::Chat)).await?;
-          let launch_id = resp.get("launch_id").and_then(Value::as_str);
-          match poll_until_settled(client, launch_id, &row.path).await? {
-            Some(settled) if settled.state == "ready" => Some(settled),
-            Some(settled) => return Err(launch_failed(&settled)),
-            None => {
-              return Err(CliExit::new(
-                LAUNCH_FAILED,
-                format!("{} did not become ready in time", row.name()),
-              ))
-            }
-          }
-        }
-      };
-      (row, launch)
+      let launch = launch_by_identity(running, reference.as_ref(), &row.path)
+        .or_else(|| matching_launch(running, &row.path, name.as_deref()));
+      (row, name, launch)
     }
   };
-  Ok(target(catalog, row, launch))
+  let mut target = Target {
+    row,
+    name,
+    launch,
+    id: String::new(),
+    context_window: None,
+  };
+  fill(&mut target, catalog, config);
+  Ok(target)
 }
 
-/// Wait for a live launch to be usable. A launch that settles in error or
-/// stopped, or never settles, is the documented launch failure.
-async fn wait_until_ready(
+/// Start the model when nothing serves it yet, and wait for the launch to be
+/// usable. Called after the tool binary is found and after `--dry-run` has
+/// returned, so a dry run never reaches this.
+async fn settle(
   client: &mut Client,
-  row: &CatalogRow,
-  launch: RunningRow,
-) -> Result<RunningRow, CliExit> {
-  if launch.state == "ready" {
-    return Ok(launch);
+  catalog: &[CatalogRow],
+  config: &Config,
+  target: &mut Target,
+) -> Result<(), CliExit> {
+  if target.launch.as_ref().is_some_and(|l| l.state == "ready") {
+    return Ok(());
   }
-  match poll_until_settled(client, Some(&launch.launch_id), &row.path).await? {
-    Some(settled) if settled.state == "ready" => Ok(settled),
-    Some(settled) => Err(launch_failed(&settled)),
-    None => Err(CliExit::new(
+  let poll = match target.launch.as_ref() {
+    Some(live) => poll_until_settled(client, Some(&live.launch_id), &target.row.path).await?,
+    None => {
+      // `@<name>` is both the address and the preset to launch with; anything
+      // else takes the model's own default preset, as `start` does. The mode is
+      // stated because a session can only be chat: a model with no mode hint
+      // would otherwise hit `start`'s "pass --mode" error, and this command has
+      // no such flag.
+      let resp = start_row_with_preset(
+        client,
+        &target.row,
+        target.name.as_deref(),
+        Some(LaunchMode::Chat),
+      )
+      .await?;
+      let launch_id = resp.get("launch_id").and_then(Value::as_str);
+      poll_until_settled(client, launch_id, &target.row.path).await?
+    }
+  };
+  let settled = poll.ok_or_else(|| {
+    let which = match target.launch.as_ref() {
+      Some(live) => format!("{} ({})", target.row.name(), live.launch_id),
+      None => target.row.name(),
+    };
+    CliExit::new(
       LAUNCH_FAILED,
-      format!(
-        "{} ({}) did not become ready in time",
-        row.name(),
-        launch.launch_id
-      ),
-    )),
+      format!("{which} did not become ready in time"),
+    )
+  })?;
+  if settled.state != "ready" {
+    return Err(launch_failed(&settled));
   }
+  target.launch = Some(settled);
+  fill(target, catalog, config);
+  Ok(())
 }
 
 fn launch_failed(launch: &RunningRow) -> CliExit {
@@ -242,22 +266,59 @@ fn launch_failed(launch: &RunningRow) -> CliExit {
   )
 }
 
-fn target(catalog: &[CatalogRow], row: CatalogRow, launch: Option<RunningRow>) -> Target {
-  let published = published_ids_for(catalog, std::slice::from_ref(&row))
-    .into_iter()
-    .next()
-    .unwrap_or_else(|| row.public_id());
-  let id = match launch.as_ref().and_then(|l| l.name.clone()) {
+/// The id and the window to hand the tool, from whatever is known about the
+/// launch: the live launch's own name and window when there is one, else the
+/// reference's name and the window the preset `start` would use. A dry run of a
+/// model that is not up has to print what the real run will.
+fn fill(target: &mut Target, catalog: &[CatalogRow], config: &Config) {
+  let published = published_id(catalog, &target.row);
+  let name = target
+    .launch
+    .as_ref()
+    .and_then(|l| l.name.clone())
+    .or_else(|| target.name.clone());
+  target.id = match name {
     Some(name) => join_named_reference(&published, &name),
     None => published,
   };
-  let context_window = declared_ctx(launch.as_ref(), &row);
-  Target {
-    row,
-    launch,
-    id,
-    context_window,
-  }
+  target.context_window = declared_ctx(
+    target.launch.as_ref(),
+    &target.row,
+    preset_ctx(config, catalog, &target.row, target.name.as_deref()),
+  );
+}
+
+fn published_id(catalog: &[CatalogRow], row: &CatalogRow) -> String {
+  published_ids_for(catalog, std::slice::from_ref(row))
+    .into_iter()
+    .next()
+    .unwrap_or_else(|| row.public_id())
+}
+
+/// The context the preset `start` would launch this row with: the one named by
+/// the reference, else the model's own `default:`. `None` when neither pins a
+/// context, or when the default is the `auto` sentinel.
+fn preset_ctx(
+  config: &Config,
+  catalog: &[CatalogRow],
+  row: &CatalogRow,
+  name: Option<&str>,
+) -> Option<u64> {
+  let effective = crate::launch::presets::effective_presets(
+    &row.name(),
+    &row.path,
+    row.arch.as_deref(),
+    &config.presets,
+    catalog,
+  );
+  let wanted = name.or(effective.default.as_deref())?;
+  let preset = effective.presets.get(wanted)?;
+  preset
+    .params
+    .knobs
+    .u32(crate::launch::knobs::kid("ctx-size"))
+    .or(preset.params.ctx)
+    .map(u64::from)
 }
 
 fn catalog_row(catalog: &[CatalogRow], path: &str) -> Result<CatalogRow, CliExit> {
@@ -314,12 +375,27 @@ fn launch_number(row: &RunningRow) -> u64 {
     .unwrap_or(0)
 }
 
+/// The live launch a reference names outright: `L4` or `41100`. Those are
+/// identities, so matching on them cannot drift to another launch of the same
+/// model the way a path-and-name search can. `path` is the model the reference
+/// resolved to, which keeps a model actually named `L4` from answering for the
+/// launch of that id.
+fn launch_by_identity(running: &[RunningRow], reference: &str, path: &str) -> Option<RunningRow> {
+  running
+    .iter()
+    .find(|r| r.model_path == path && (r.launch_id == reference || r.port.to_string() == reference))
+    .cloned()
+}
+
 /// `Some(…)` for a model that cannot carry a chat session, phrased for the
-/// error: "is an embedding model".
-fn non_chat_mode(row: &CatalogRow) -> Option<&'static str> {
+/// error: "is an embedding model". The decision is the patchers' own: the mode
+/// hint when there is one, else the id heuristic behind `PatchModel::is_embed`,
+/// so a gate and a launch can never disagree.
+fn non_chat_mode(row: &CatalogRow, id: &str) -> Option<&'static str> {
   match row.mode_hint.as_deref() {
     Some("embedding") => Some("an embedding"),
     Some("rerank") => Some("a rerank"),
+    _ if PatchModel::from_id(id.to_string()).is_embed => Some("an embedding"),
     _ => None,
   }
 }
@@ -341,8 +417,8 @@ fn alias_target<'a>(
 }
 
 /// The window to hand the tool: what the engine settled on, else what the launch
-/// asked for, else the trained window.
-fn declared_ctx(launch: Option<&RunningRow>, row: &CatalogRow) -> Option<u64> {
+/// asked for, else what the preset pins, else the trained window.
+fn declared_ctx(launch: Option<&RunningRow>, row: &CatalogRow, preset: Option<u64>) -> Option<u64> {
   launch
     .and_then(|l| l.resolved_ctx.map(u64::from))
     .or_else(|| {
@@ -351,6 +427,7 @@ fn declared_ctx(launch: Option<&RunningRow>, row: &CatalogRow) -> Option<u64> {
         .and_then(|p| p.get("ctx"))
         .and_then(Value::as_u64)
     })
+    .or(preset)
     .or(row.native_ctx)
 }
 
@@ -375,7 +452,7 @@ fn write_session_files(launch: &SessionLaunch) -> Result<(), CliExit> {
       "session-",
       &file.path,
       file.content.as_bytes(),
-      None,
+      Some(0o600),
     )
     .map_err(|e| {
       CliExit::new(
@@ -387,10 +464,11 @@ fn write_session_files(launch: &SessionLaunch) -> Result<(), CliExit> {
   Ok(())
 }
 
-/// The key is the one value a dry run must not repeat when the proxy enforces
-/// one. The keyless stub is not a secret, so it prints as is.
-fn shown_value(mask: bool, value: &str) -> String {
-  if mask && value != KEYLESS_STUB {
+/// Only the bearer key is a secret, so only a value equal to it is masked. The
+/// stub a keyless proxy ignores is not one, and with no key configured nothing is
+/// masked at all: a dry run you cannot paste back is useless.
+fn shown_value(secret: Option<&str>, value: &str) -> String {
+  if secret == Some(value) {
     "***".to_string()
   } else {
     value.to_string()
@@ -402,12 +480,12 @@ fn emit_dry_run(
   args: &SessionArgs,
   target: &Target,
   launch: &SessionLaunch,
-  mask: bool,
+  secret: Option<&str>,
 ) -> CliResult {
   let body = if args.json {
     let mut env = Map::new();
     for (name, value) in &launch.env {
-      env.insert(name.clone(), json!(shown_value(mask, value)));
+      env.insert(name.clone(), json!(shown_value(secret, value)));
     }
     crate::cli::output::pretty_json(&json!({
       "tool": args.tool.as_str(),
@@ -427,7 +505,7 @@ fn emit_dry_run(
     for (name, value) in &launch.env {
       line.push_str(&format!(
         "{name}={} ",
-        shell_quote(&shown_value(mask, value))
+        shell_quote(&shown_value(secret, value))
       ));
     }
     line.push_str(launch.program);
@@ -517,6 +595,42 @@ mod tests {
     row
   }
 
+  /// A target the way `resolve_target` builds one, so the id and window come out
+  /// through the same `fill` the command uses.
+  fn target(
+    catalog: &[CatalogRow],
+    row: CatalogRow,
+    name: Option<&str>,
+    launch: Option<RunningRow>,
+  ) -> Target {
+    let mut t = Target {
+      row,
+      name: name.map(str::to_string),
+      launch,
+      id: String::new(),
+      context_window: None,
+    };
+    fill(&mut t, catalog, &Config::default());
+    t
+  }
+
+  /// A config whose `chat.gguf` has one preset, `coder`, pinning a 64k window.
+  fn presets_config(default: Option<&str>) -> Config {
+    use crate::config::{ConfigPresetBlock, PresetBody};
+    let body = PresetBody {
+      knobs: crate::knobset! { ctx: 65_536 },
+      ..PresetBody::default()
+    };
+    let block = ConfigPresetBlock {
+      default: default.map(str::to_string),
+      entries: [("coder".to_string(), body)].into_iter().collect(),
+    };
+    Config {
+      presets: [("chat.gguf".to_string(), block)].into_iter().collect(),
+      ..Config::default()
+    }
+  }
+
   #[test]
   fn every_session_tool_maps_to_a_patcher_with_a_launch() {
     use clap::ValueEnum;
@@ -571,7 +685,7 @@ mod tests {
     let unnamed = matching_launch(&running, "/m/chat.gguf", None).expect("unnamed launch");
     assert_eq!(unnamed.launch_id, "L3");
     assert_eq!(
-      target(&catalog, catalog[0].clone(), Some(unnamed)).id,
+      target(&catalog, catalog[0].clone(), None, Some(unnamed)).id,
       "chat",
       "an unnamed launch keeps the plain published id"
     );
@@ -592,7 +706,7 @@ mod tests {
     );
     let coder = matching_launch(&running, "/m/chat.gguf", Some("coder")).expect("named launch");
     assert_eq!(
-      target(&catalog, catalog[0].clone(), Some(coder)).id,
+      target(&catalog, catalog[0].clone(), None, Some(coder)).id,
       "chat@coder",
       "without the suffix the proxy would start a second, unnamed copy"
     );
@@ -603,14 +717,92 @@ mod tests {
   }
 
   #[test]
+  fn a_reference_to_a_live_launch_id_is_that_exact_launch() {
+    let running = vec![
+      live("L2", "/m/chat.gguf", "chat", Some("coder")),
+      live("L9", "/m/chat.gguf", "chat", None),
+    ];
+    // Both are the same model, so a path-and-name search would answer L9 for an
+    // unnamed `L2`.
+    assert_eq!(
+      launch_by_identity(&running, "L2", "/m/chat.gguf")
+        .expect("L2")
+        .launch_id,
+      "L2",
+      "a launch id is an identity, not a model reference"
+    );
+    assert_eq!(
+      launch_by_identity(&running, "41100", "/m/chat.gguf")
+        .expect("by port")
+        .launch_id,
+      "L2",
+      "a port is one too"
+    );
+    assert!(launch_by_identity(&running, "chat.gguf", "/m/chat.gguf").is_none());
+    assert!(
+      launch_by_identity(&running, "L2", "/m/other.gguf").is_none(),
+      "the identity only answers for the model it belongs to"
+    );
+  }
+
+  #[test]
+  fn a_dry_run_of_a_model_that_is_not_up_keeps_the_name_and_the_preset_window() {
+    let catalog = vec![chat("/m/chat.gguf")];
+    let mut named = Target {
+      row: catalog[0].clone(),
+      name: Some("coder".into()),
+      launch: None,
+      id: String::new(),
+      context_window: None,
+    };
+    fill(&mut named, &catalog, &presets_config(None));
+    assert_eq!(named.id, "chat@coder", "the id the real run will use");
+    assert_eq!(
+      named.context_window,
+      Some(65_536),
+      "the window the preset pins, not the trained one"
+    );
+
+    // With no name in the reference, `start` would use the model's own
+    // `default:` preset, so that is the window a dry run reports.
+    let mut plain = Target {
+      row: catalog[0].clone(),
+      name: None,
+      launch: None,
+      id: String::new(),
+      context_window: None,
+    };
+    fill(&mut plain, &catalog, &presets_config(Some("coder")));
+    assert_eq!(plain.context_window, Some(65_536));
+    assert_eq!(plain.id, "chat");
+    // A live launch wins over both: what the engine serves is the answer.
+    let mut live_row = live("L1", "/m/chat.gguf", "chat", None);
+    live_row.resolved_ctx = Some(8192);
+    named.launch = Some(live_row);
+    named.name = None;
+    fill(&mut named, &catalog, &presets_config(None));
+    assert_eq!(named.context_window, Some(8192));
+  }
+
+  #[test]
   fn a_model_that_cannot_chat_is_refused_as_a_usage_error() {
     let mut embed = chat("/m/embed.gguf");
     embed.mode_hint = Some("embedding".into());
-    assert_eq!(non_chat_mode(&embed), Some("an embedding"));
+    assert_eq!(non_chat_mode(&embed, "embed"), Some("an embedding"));
     let mut rerank = chat("/m/rerank.gguf");
     rerank.mode_hint = Some("rerank".into());
-    assert_eq!(non_chat_mode(&rerank), Some("a rerank"));
-    assert_eq!(non_chat_mode(&chat("/m/chat.gguf")), None);
+    assert_eq!(non_chat_mode(&rerank, "rerank"), Some("a rerank"));
+    assert_eq!(non_chat_mode(&chat("/m/chat.gguf"), "chat"), None);
+    // A GGUF with no mode hint is called embedding by the same id rule the
+    // patchers use, so the gate cannot let it through to a launch that refuses.
+    let mut hintless = chat("/m/nomic-embed.gguf");
+    hintless.mode_hint = None;
+    assert_eq!(
+      non_chat_mode(&hintless, "nomic-embed"),
+      Some("an embedding"),
+      "the patchers would refuse this one too"
+    );
+    assert_eq!(non_chat_mode(&hintless, "chat"), None);
     assert_eq!(
       launch_failed(&live("L1", "/m/x.gguf", "chat", None)).code,
       LAUNCH_FAILED
@@ -652,23 +844,32 @@ mod tests {
     row.native_ctx = Some(131_072);
     let mut launch = live("L1", "/m/chat.gguf", "chat", None);
     assert_eq!(
-      declared_ctx(Some(&launch), &row),
+      declared_ctx(Some(&launch), &row, None),
       Some(131_072),
       "catalog figure"
     );
     launch.params = Some(json!({ "ctx": 32768 }));
     assert_eq!(
-      declared_ctx(Some(&launch), &row),
+      declared_ctx(Some(&launch), &row, None),
       Some(32768),
       "what the launch asked for"
     );
     launch.resolved_ctx = Some(8192);
     assert_eq!(
-      declared_ctx(Some(&launch), &row),
+      declared_ctx(Some(&launch), &row, Some(65_536)),
       Some(8192),
       "what the engine served"
     );
-    assert_eq!(declared_ctx(None, &row), Some(131_072), "no launch at all");
+    assert_eq!(
+      declared_ctx(None, &row, None),
+      Some(131_072),
+      "no launch at all"
+    );
+    assert_eq!(
+      declared_ctx(None, &row, Some(65_536)),
+      Some(65_536),
+      "a preset outranks the trained window when nothing is running"
+    );
   }
 
   #[test]
@@ -680,7 +881,7 @@ mod tests {
     }];
     let mut launch = live("L3", "/m/chat.gguf", "chat", Some("coder"));
     launch.resolved_ctx = Some(32_768);
-    let t = target(&catalog, catalog[0].clone(), Some(launch));
+    let t = target(&catalog, catalog[0].clone(), None, Some(launch));
     let model = t.patch_model();
     assert_eq!(model.id, "chat@coder");
     assert_eq!(model.context_window, Some(32_768));
@@ -688,10 +889,15 @@ mod tests {
   }
 
   #[test]
-  fn only_a_real_key_is_masked_in_a_dry_run() {
-    assert_eq!(shown_value(true, "s3cr3t"), "***");
-    assert_eq!(shown_value(true, KEYLESS_STUB), KEYLESS_STUB);
-    assert_eq!(shown_value(false, "s3cr3t"), "s3cr3t");
+  fn only_the_bearer_key_is_masked_in_a_dry_run() {
+    assert_eq!(shown_value(Some("s3cr3t"), "s3cr3t"), "***");
+    assert_eq!(
+      shown_value(Some("s3cr3t"), "http://127.0.0.1:11435"),
+      "http://127.0.0.1:11435",
+      "the base URL has to survive being pasted back"
+    );
+    assert_eq!(shown_value(Some("s3cr3t"), KEYLESS_STUB), KEYLESS_STUB);
+    assert_eq!(shown_value(None, "s3cr3t"), "s3cr3t");
   }
 
   #[test]

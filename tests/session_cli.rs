@@ -70,6 +70,12 @@ impl Daemon {
       llamastash::gguf::test_fixtures::build_minimal_gguf("llama"),
     )
     .expect("write hint-less fixture model");
+    // A model that cannot carry a chat session at all.
+    std::fs::write(
+      model_dir.join("embed.gguf"),
+      FixtureBuilder::new().with_arch("bert").build(),
+    )
+    .expect("write embedding fixture model");
     let proxy_port = free_port();
     // Each daemon needs its own launch range too, or parallel tests both hand
     // their fake engine port 41100 and the second launch dies on bind.
@@ -142,6 +148,37 @@ impl Daemon {
       String::from_utf8_lossy(&out.stdout),
       String::from_utf8_lossy(&out.stderr)
     );
+  }
+
+  /// How many launches the daemon has. A session that fails must leave this at 0.
+  fn running(&self) -> usize {
+    let out = self
+      .cmd()
+      .args(["status", "--json"])
+      .output()
+      .expect("status");
+    stdout_json(&out)["models"]
+      .as_array()
+      .expect("models array")
+      .len()
+  }
+
+  /// A config that enforces a bearer key, for what a dry run may print.
+  fn keyed_config(&self) -> PathBuf {
+    let keyed = self.state.join("keyed.yaml");
+    std::fs::write(
+      &keyed,
+      format!(
+        "proxy:\n  port: {}\n  api_key: \"sk-real-key\"\n",
+        self.proxy_port
+      ),
+    )
+    .expect("write keyed config");
+    keyed
+  }
+
+  fn sessions_dir(&self) -> PathBuf {
+    self.cache.join("sessions")
   }
 }
 
@@ -281,26 +318,163 @@ fn a_dry_run_prints_the_launch_and_changes_nothing() {
   );
   assert!(body["context_window"].is_number(), "ctx: {body}");
 
-  // Under enforced auth the key is a secret, so the dry run masks it. The
-  // daemon is unaffected: a dry run never reads the key from it.
-  let keyed = daemon.state.join("keyed.yaml");
-  std::fs::write(
-    &keyed,
-    format!(
-      "proxy:\n  port: {}\n  api_key: \"sk-real-key\"\n",
-      daemon.proxy_port
-    ),
-  )
-  .expect("write keyed config");
-  let masked = daemon
-    .cmd_with_config(&keyed)
-    .args(["session", "codex", "--dry-run", "--json"])
-    .output()
-    .expect("run masked dry run");
-  let body = stdout_json(&masked);
+  // Under enforced auth only the bearer key is a secret. Everything else has to
+  // print as it is, or the line cannot be pasted back. The daemon is unaffected:
+  // a dry run never reads the key from it.
+  let keyed = daemon.keyed_config();
+  let dry = |tool: &str| {
+    let out = daemon
+      .cmd_with_config(&keyed)
+      .args(["session", tool, "--dry-run", "--json"])
+      .output()
+      .expect("run masked dry run");
+    assert!(
+      out.status.success(),
+      "{} dry run failed: {}{}",
+      tool,
+      String::from_utf8_lossy(&out.stdout),
+      String::from_utf8_lossy(&out.stderr)
+    );
+    stdout_json(&out)
+  };
+  let body = dry("codex");
   assert_eq!(
     body["env"]["LLAMASTASH_API_KEY"], "***",
     "the key must not be printed: {body}"
+  );
+
+  let body = dry("claude");
+  assert_eq!(
+    body["env"]["ANTHROPIC_AUTH_TOKEN"], "***",
+    "claude carries the key as its auth token: {body}"
+  );
+  assert_eq!(
+    body["env"]["ANTHROPIC_BASE_URL"],
+    format!("http://127.0.0.1:{}", daemon.proxy_port),
+    "the address a masked dry run prints must still be runnable: {body}"
+  );
+  assert_eq!(body["env"]["ANTHROPIC_MODEL"], "chat", "{body}");
+
+  let body = dry("aider");
+  assert_eq!(body["env"]["AIDER_OPENAI_API_KEY"], "***", "{body}");
+  assert_eq!(
+    body["env"]["AIDER_OPENAI_API_BASE"],
+    format!("http://127.0.0.1:{}/v1", daemon.proxy_port),
+    "{body}"
+  );
+  assert_eq!(body["env"]["AIDER_MODEL"], "openai/chat", "{body}");
+
+  // OpenCode takes the key through an env var, so its config content holds no
+  // secret and prints whole.
+  let body = dry("opencode");
+  let content = body["env"]["OPENCODE_CONFIG_CONTENT"]
+    .as_str()
+    .expect("opencode config content");
+  assert!(
+    !content.contains("sk-real-key"),
+    "the key is not in that content: {content}"
+  );
+  assert!(content.contains("baseURL"), "{content}");
+  assert!(
+    content.contains("{env:LLAMASTASH_API_KEY}"),
+    "the key is referenced, never inlined: {content}"
+  );
+}
+
+#[test]
+fn a_dry_run_writes_no_file_anywhere() {
+  let daemon = Daemon::start(None);
+  daemon.start_model();
+  // pi is the one tool whose launch needs a generated file.
+  let out = daemon
+    .cmd()
+    .args(["session", "pi", "--dry-run", "--json"])
+    .output()
+    .expect("run session");
+  assert!(
+    out.status.success(),
+    "{}",
+    String::from_utf8_lossy(&out.stderr)
+  );
+  assert_eq!(stdout_json(&out)["files"].as_array().unwrap().len(), 1);
+  assert!(
+    !daemon.sessions_dir().exists(),
+    "a dry run describes a file, it does not write one"
+  );
+}
+
+#[test]
+fn a_pi_session_writes_its_extension_under_the_cache_dir() {
+  let daemon = Daemon::start(None);
+  daemon.start_model();
+  let tools = temp("tools");
+  let dump = tools.join("dump");
+  fake_tool(&tools, "pi", &dump);
+  let out = daemon
+    .cmd()
+    .env("PATH", path_with(&tools))
+    .args(["session", "pi"])
+    .output()
+    .expect("run session");
+  assert!(
+    out.status.success(),
+    "session failed: {}{}",
+    String::from_utf8_lossy(&out.stdout),
+    String::from_utf8_lossy(&out.stderr)
+  );
+  let written: Vec<PathBuf> = std::fs::read_dir(daemon.sessions_dir())
+    .expect("sessions dir written under the cache dir")
+    .filter_map(|e| e.ok().map(|e| e.path()))
+    .filter(|p| {
+      p.file_name()
+        .map(|n| n.to_string_lossy().starts_with("pi-"))
+        .unwrap_or(false)
+    })
+    .collect();
+  assert_eq!(written.len(), 1, "one extension file for one session");
+}
+
+#[test]
+fn nothing_running_and_no_model_named_is_a_model_not_found() {
+  let daemon = Daemon::start(None);
+  let out = daemon
+    .cmd()
+    .args(["session", "claude"])
+    .output()
+    .expect("run");
+  assert_eq!(
+    out.status.code(),
+    Some(66),
+    "{}",
+    String::from_utf8_lossy(&out.stderr)
+  );
+  assert_eq!(daemon.running(), 0, "nothing was started");
+}
+
+#[test]
+fn a_model_that_cannot_carry_a_chat_session_is_refused_before_it_starts() {
+  let daemon = Daemon::start(None);
+  let out = daemon
+    .cmd()
+    .args(["session", "claude", "embed"])
+    .output()
+    .expect("run");
+  assert_eq!(
+    out.status.code(),
+    Some(64),
+    "{}",
+    String::from_utf8_lossy(&out.stderr)
+  );
+  assert!(
+    String::from_utf8_lossy(&out.stderr)
+      .to_string()
+      .contains("need a chat model"),
+    "the message says why"
+  );
+  assert_eq!(
+    daemon.running(),
+    0,
+    "an embedding model never gets launched"
   );
 }
 
@@ -351,13 +525,12 @@ fn a_model_with_no_mode_hint_starts_as_chat_for_a_session() {
 #[test]
 fn a_tool_that_is_not_installed_is_a_binary_not_found() {
   let daemon = Daemon::start(None);
-  daemon.start_model();
   let empty = temp("empty-bin");
   std::fs::create_dir_all(&empty).expect("empty dir");
   let out = daemon
     .cmd()
     .env("PATH", &empty)
-    .args(["session", "aider"])
+    .args(["session", "aider", "chat"])
     .output()
     .expect("run session");
   assert_eq!(out.status.code(), Some(70), "exit 70 expected");
@@ -367,4 +540,25 @@ fn a_tool_that_is_not_installed_is_a_binary_not_found() {
       .contains("not found on PATH"),
     "message names the missing program"
   );
+  // The tool is looked up before a model is started, so a missing tool costs no
+  // load and no launch.
+  assert_eq!(
+    daemon.running(),
+    0,
+    "nothing was started for a missing tool"
+  );
+  // A dry run still prints what it would have run.
+  let dry = daemon
+    .cmd()
+    .env("PATH", &empty)
+    .args(["session", "aider", "chat", "--dry-run", "--json"])
+    .output()
+    .expect("run dry run");
+  assert!(
+    dry.status.success(),
+    "a dry run does not need the binary: {}{}",
+    String::from_utf8_lossy(&dry.stdout),
+    String::from_utf8_lossy(&dry.stderr)
+  );
+  assert_eq!(stdout_json(&dry)["program"], "aider");
 }
