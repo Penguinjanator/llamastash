@@ -120,33 +120,18 @@ pub fn rows_from_json(server: &GenericServer, spec: &RowsFrom, body: &str) -> Ve
       );
       break;
     }
-    let arch = spec
-      .arch
-      .as_ref()
-      .and_then(|p| field(item, p))
-      .and_then(|v| v.string);
-    let params = spec
-      .params
-      .as_ref()
-      .and_then(|p| field(item, p))
-      .and_then(|v| v.string);
-    let quant = spec
-      .quant
-      .as_ref()
-      .and_then(|p| field(item, p))
-      .and_then(|v| v.string);
-    let ctx = spec
-      .ctx
-      .as_ref()
-      .and_then(|p| field(item, p))
-      .and_then(|v| v.number)
-      .map(|n| n as u64);
-    let memory_gib = spec
-      .memory_gib
-      .as_ref()
-      .and_then(|p| field(item, p))
-      .and_then(|v| v.number);
-    out.push(row(server, &tag, arch, params, quant, ctx, memory_gib));
+    let found = |path: &Option<String>| path.as_deref().and_then(|p| field(item, p));
+    let text = |path: &Option<String>| found(path).and_then(|v| v.string);
+    let number = |path: &Option<String>| found(path).and_then(|v| v.number);
+    out.push(row(
+      server,
+      &tag,
+      text(&spec.arch),
+      text(&spec.params),
+      text(&spec.quant),
+      number(&spec.ctx).map(|n| n as u64),
+      number(&spec.memory_gib),
+    ));
   }
   out
 }

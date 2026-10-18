@@ -192,13 +192,7 @@ impl KnobSpec {
 impl GenericServer {
   /// `binary` with a leading `~` expanded.
   pub fn binary_path(&self) -> PathBuf {
-    let raw = self.binary.to_string_lossy();
-    if let Some(rest) = raw.strip_prefix("~/") {
-      if let Some(home) = crate::util::paths::home_dir() {
-        return home.join(rest);
-      }
-    }
-    self.binary.clone()
+    crate::util::paths::expand_user_path(&self.binary)
   }
 
   /// Whether this entry's `model` names the catalog model at `path`. Uses the
@@ -214,12 +208,9 @@ impl GenericServer {
     if path_str.contains("://") {
       return false;
     }
-    let want = match want.strip_prefix("~/") {
-      Some(rest) => crate::util::paths::home_dir()
-        .map(|h| h.join(rest).to_string_lossy().into_owned())
-        .unwrap_or_else(|| want.to_string()),
-      None => want.to_string(),
-    };
+    let want = crate::util::paths::expand_user_path(Path::new(want))
+      .to_string_lossy()
+      .into_owned();
     let file_label = crate::util::paths::model_file_label(path);
     crate::launch::presets::preset_key_matches(&want, &file_label, path_str)
       || (!crate::util::glob::is_pattern(&want)
