@@ -490,6 +490,9 @@ _Shared context: `src/init/external/tools/`, the `doctor` findings, and what `--
 
 ## Next
 
+- [ ] Agg PP tok/s seems wrong. Shows 3055 over 37.1s when there is only one connection and avg is 1211.
+- [ ] Consider making Requests the first tab for running launches, followed by Logs, Settings, Chat*
+
 ### Batch 1: Generic-backend engines and the multiplexer decision
 
 _Shared context: The generic backend's declared entries, the Lemonade umbrella, `docs/usage.md`, the hardware UAT write-ups._
