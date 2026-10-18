@@ -37,7 +37,7 @@ A new CLI verb that launches a coding tool (Claude Code, Codex, OpenCode, pi, Ai
 ## CLI contract (shared by the implementation and docs units)
 
 ```
-llamastash session <TOOL> [MODEL] [--dry-run] [--json] [-- <TOOL_ARGS>...]
+llamastash session [TOOL] [MODEL] [--dry-run] [--json] [-- <TOOL_ARGS>...]
 TOOL: claude | claude-code | codex | opencode | pi | aider
 ```
 
@@ -48,7 +48,8 @@ Global `--quiet` and `--no-spawn` apply as on other commands.
 | Input | Outcome |
 |---|---|
 | no MODEL, ≥1 running chat launch (state launching/loading/ready) | the one with the highest launch number (`L<n>`); wait for Ready if not Ready yet |
-| no MODEL, none running | exit `66` (`MODEL_NOT_FOUND`): no chat model is running, start one or pass MODEL |
+| no MODEL, none running, interactive TTY and no `--json` | the `start` model picker over the catalog's chat models; start the pick with its default preset and wait for Ready, as `start` with no model does |
+| no MODEL, none running, non-interactive or `--json` | exit `66` (`MODEL_NOT_FOUND`): no chat model is running, start one or pass MODEL |
 | MODEL matches a `proxy.aliases` name and no catalog model | replace it with the alias target, then continue below (same precedence as the proxy) |
 | MODEL resolves (`resolve_model_or_launch`) and a matching launch is running | reuse that launch. A `<model>@<name>` ref needs a launch with that name. A plain ref prefers an unnamed launch of that model, else its latest launch |
 | MODEL resolves, nothing running | start it (`@<name>` → preset `<name>`, else the model's default preset, same as plain `start`), wait for Ready |
@@ -295,6 +296,33 @@ U1 → U2 → U3 run in one lane, in that order. U4 is docs only and can run in 
 **Test expectation:** none, docs only.
 
 **Verification:** every flag, exit code and JSON key in the docs matches the CLI contract above.
+
+- [ ] **Unit 5: tool and model pickers**
+
+**Goal:** `llamastash session` with no TOOL opens a picker over the supported tools. With no MODEL and no running chat launch it opens the same model picker `start` uses, then starts the pick and launches the tool.
+
+**Requirements:** user request after review round 1 (2026-10-18)
+
+**Dependencies:** Units 1-3
+
+**Decisions:**
+- Pickers only on an interactive TTY without `--json`, through the existing `picker::ensure_interactive` check. Otherwise: no TOOL is a usage error (exit 64) listing the tools; no MODEL with nothing running keeps exit 66.
+- A running chat launch still wins when MODEL is omitted (latest started); the model picker appears only when none is running.
+- The tool picker lists one entry per tool (`claude`, `codex`, `opencode`, `pi`, `aider`; `claude-code` stays a CLI alias, not a second entry).
+- The model picker lists only chat models (embedding and rerank rows filtered out with the same gate `session` already applies).
+- DRY: one generic cliclack select helper in `src/cli/picker.rs` that `pick_catalog_row`, `pick_running_target` and the new tool picker all use; the command name in prompts and errors is a parameter, not hardcoded to `start`/`stop`. The chosen model then goes through the same start-and-wait path a MODEL argument takes. `start` and `stop` picker behavior and text stay the same.
+
+**Files:**
+- Modify: `src/cli/picker.rs`, `src/cli/session.rs`, `src/cli/cli_args.rs` (TOOL becomes optional), `tests/session_cli.rs`
+- Modify: `docs/usage.md` (session synopsis, model selection table, the two pickers), `CHANGELOG.md` only if the existing session bullet no longer covers it
+
+**Test scenarios:**
+- No TOOL, non-interactive: exit 64, the message lists the supported tools.
+- No MODEL, nothing running, non-interactive or `--json`: exit 66, nothing started (existing test stays green).
+- Chat-only filter for the model picker list (unit test on the filtering function).
+- `start` and `stop` picker tests and output unchanged.
+
+**Verification:** `cargo nextest run --features test-fixtures --lib picker --lib session`, `--test session_cli`. The orchestrator drives both pickers in a pty for the E2E.
 
 ## System-Wide Impact
 
