@@ -1,8 +1,8 @@
 //! Generalized model identity at the backend seam.
 //!
 //! [`crate::gguf::identity::ModelId`] is `(canonical path, BLAKE3 of header)`
-//! — it assumes a **local GGUF file**. A managed-multiplexer backend names
-//! models from a remote registry that have no local path or header.
+//! — it assumes a **local GGUF file**. A backend that names models from a
+//! remote registry has rows with no local path or header.
 //! [`ModelIdentity`] is the seam-level union that lets both coexist.
 //!
 //! # Why a wrapper enum, not "make `ModelId` an enum"
@@ -33,7 +33,7 @@ pub struct BackendModelId {
   pub name: String,
 }
 
-/// A model's identity, generalized across backend lifecycle shapes.
+/// A model's identity, generalized across the shapes a backend serves.
 ///
 /// Serialized `#[serde(untagged)]` so the [`Gguf`](ModelIdentity::Gguf)
 /// variant is wire-identical to today's bare `ModelId`

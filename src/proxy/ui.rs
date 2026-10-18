@@ -205,8 +205,7 @@ fn resolve_target(headers: &HeaderMap, mut running: Vec<RunningEntry>) -> UiTarg
 /// rows come from [`metrics::live_launches`], the registry walk shared with
 /// `/metrics`, so the walk happens in one place. Names mirror `/v1/models`
 /// (display label wins, else file stem) so the chooser shows the same
-/// identifier the API surfaces. The managed-multiplexer umbrella is skipped
-/// there — it's a multiplexer process, not a web UI.
+/// identifier the API surfaces.
 async fn collect_running(state: &Arc<ProxyState>) -> Vec<RunningEntry> {
   let mut out = Vec::new();
   for launch in metrics::live_launches(state).await {
@@ -314,7 +313,6 @@ async fn forward_to_launch(
       port: entry.port,
       served_model_id: &entry.name,
       served_model_key: &entry.model_id,
-      upstream_path_prefix: None,
       fallback: false,
       fallback_reason: None,
     },

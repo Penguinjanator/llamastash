@@ -36,19 +36,6 @@ pub struct ProxyState {
   /// the per-connection clone is a refcount bump rather than
   /// rebuilding the pool.
   pub http_client: Arc<reqwest::Client>,
-  /// Client for managed-multiplexer upstreams. Identical to
-  /// [`Self::http_client`] except the idle pool is disabled, so every
-  /// forwarded request closes its connection client-side when done.
-  /// Keep-alive connections into the umbrella are what wedge its port
-  /// across restarts: when the umbrella dies first, its half of each
-  /// pooled connection lingers in FIN-WAIT-2 *bound to the umbrella
-  /// port* for the kernel's fin-timeout (~60 s), and those orphans
-  /// (no `SO_REUSEADDR`) block every rebind — so a quick
-  /// a quick daemon restart refused. Closing
-  /// client-side parks the remnants on our ephemeral ports instead.
-  /// llama.cpp upstreams keep the pooled client: their child owns a
-  /// fresh per-launch port, so remnants there never block anything.
-  pub umbrella_client: Arc<reqwest::Client>,
   /// Single-flight coalesce map for the auto-start path. Keyed on
   /// [`crate::gguf::identity::ModelId`] so two concurrent requests
   /// with different fuzzy spellings of the same model share one
@@ -156,7 +143,6 @@ impl ProxyState {
   ) -> Arc<Self> {
     Arc::new(Self {
       http_client: Arc::new(build_http_client()),
-      umbrella_client: Arc::new(build_umbrella_client()),
       coalesce: Coalesce::new(),
       mru: MruTracker::new(),
       failures: Arc::new(FailureTracker::new()),
@@ -186,18 +172,5 @@ fn build_http_client() -> reqwest::Client {
     // missing certificate root. Loopback HTTP has none of those — we
     // never hit a network. If this ever panics in production the
     // build is broken, not the runtime.
-    .expect("reqwest client must build on a healthy runtime")
-}
-
-/// Build the umbrella-upstream client: same posture as
-/// [`build_http_client`] minus the idle pool (see
-/// [`ProxyState::umbrella_client`] for why keep-alive into the umbrella
-/// port is harmful). The per-request reconnect is a loopback TCP
-/// handshake — microseconds against inference latencies.
-fn build_umbrella_client() -> reqwest::Client {
-  reqwest::Client::builder()
-    .connect_timeout(Duration::from_secs(5))
-    .pool_max_idle_per_host(0)
-    .build()
     .expect("reqwest client must build on a healthy runtime")
 }

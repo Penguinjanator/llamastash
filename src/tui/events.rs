@@ -2669,24 +2669,13 @@ fn writer_error_toast(method: &str, message: &str) -> String {
 /// stderr cadence; we just need them visibly fresh.
 const TAB_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// The scope the Requests tab is showing, which is the focused row's own
-/// launch, or its model when the row has no launch of its own to scope by —
-/// a model resident in a managed multiplexer, whose requests the proxy files
-/// under the model. `None` while the tab is closed or has no launch.
+/// The scope the Requests tab is showing: the focused row's own launch.
+/// `None` while the tab is closed or has no launch.
 fn requests_poll_target(app: &App) -> Option<RequestsScope> {
   if app.right_tab != RightTab::Requests {
     return None;
   }
   let managed = app.focused_managed()?;
-  if managed
-    .backend
-    .as_deref()
-    .is_some_and(crate::backend::is_managed_multiplexer)
-  {
-    return Some(RequestsScope::Model(
-      managed.path.to_string_lossy().into_owned(),
-    ));
-  }
   Some(RequestsScope::Launch(managed.launch_id.clone()))
 }
 
@@ -5289,8 +5278,6 @@ mod tests {
     assert_eq!(app.requests.rows.len(), 2);
   }
 
-  /// A backend whose models are delegated to a shared umbrella, taken from
-  /// the registry so the test names no backend of its own.
   #[test]
   fn moving_focus_or_closing_the_tab_drops_the_other_launches_rows() {
     let mut app = app_on_requests_tab();

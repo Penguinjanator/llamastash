@@ -25,8 +25,7 @@ pub use config::{GenericConfig, GenericServer, KnobDecl, KnobSpec};
 
 use super::identity::{BackendModelId, ModelIdentity};
 use super::{
-  AcceleratorSupport, Backend, KnobResolution, LaunchPlan, Lifecycle, ProcessLaunchSpec, Readiness,
-  CREDENTIAL_ENV_STRIP,
+  AcceleratorSupport, Backend, KnobResolution, ProcessLaunchSpec, Readiness, CREDENTIAL_ENV_STRIP,
 };
 use crate::daemon::context::MethodContext;
 use crate::daemon::probe::ProbeOptions;
@@ -246,10 +245,6 @@ impl GenericBackend {
 impl Backend for GenericBackend {
   fn id(&self) -> &'static str {
     GENERIC_BACKEND_ID
-  }
-
-  fn lifecycle(&self) -> Lifecycle {
-    Lifecycle::ProcessPerModel
   }
 
   /// None compiled in: every knob is declared per entry, in a runtime table
@@ -538,8 +533,8 @@ impl Backend for GenericBackend {
     port: u16,
     binary: PathBuf,
     probe: ProbeOptions,
-  ) -> LaunchPlan {
-    LaunchPlan::SpawnProcess(self.process_spec(params, port, binary, probe))
+  ) -> ProcessLaunchSpec {
+    self.process_spec(params, port, binary, probe)
   }
 
   /// The default process-per-model start, plus the one input it lacks: the

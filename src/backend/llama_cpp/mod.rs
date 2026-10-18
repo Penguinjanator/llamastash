@@ -27,9 +27,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::identity::ModelIdentity;
-use super::{
-  Accelerator, AcceleratorSupport, Backend, LaunchPlan, Lifecycle, ProcessLaunchSpec, Readiness,
-};
+use super::{Accelerator, AcceleratorSupport, Backend, ProcessLaunchSpec, Readiness};
 use crate::daemon::context::MethodContext;
 use crate::daemon::probe::ProbeOptions;
 use crate::launch::params::LaunchParams;
@@ -222,10 +220,9 @@ impl Default for LlamaCppBackend {
 impl LlamaCppBackend {
   /// Build the process-per-model launch spec directly.
   ///
-  /// [`Backend::prepare_launch`] wraps this in a [`LaunchPlan`] so the
-  /// orchestrator can branch on lifecycle shape. Call sites that have
-  /// already committed to a process spawn (and tests) can skip the enum
-  /// and build the spec straight away.
+  /// [`Backend::prepare_launch`] is this method; it exists so call sites that
+  /// already committed to a process spawn (and tests) can reach the spec
+  /// without going through the seam.
   pub fn process_spec(
     &self,
     params: &LaunchParams,
@@ -274,10 +271,6 @@ impl Backend for LlamaCppBackend {
     effort::rewrite_request_body(endpoint, body)
   }
 
-  fn lifecycle(&self) -> Lifecycle {
-    Lifecycle::ProcessPerModel
-  }
-
   fn accelerators(&self) -> AcceleratorSupport {
     // CPU is the always-available floor; which GPU backend a given build
     // can drive is host-/variant-specific and surfaced via the live device
@@ -297,8 +290,8 @@ impl Backend for LlamaCppBackend {
     port: u16,
     binary: PathBuf,
     probe: ProbeOptions,
-  ) -> LaunchPlan {
-    LaunchPlan::SpawnProcess(self.process_spec(params, port, binary, probe))
+  ) -> ProcessLaunchSpec {
+    self.process_spec(params, port, binary, probe)
   }
 
   fn available(&self, ctx: &MethodContext) -> bool {
@@ -656,13 +649,6 @@ mod tests {
     assert!(!b.gpu_resident(&with(crate::knobset! {}, &["--device=none"]), layers));
   }
 
-  fn spec_of(plan: LaunchPlan) -> ProcessLaunchSpec {
-    match plan {
-      LaunchPlan::SpawnProcess(s) => s,
-      LaunchPlan::DelegateToManager(_) => panic!("llama.cpp must produce a SpawnProcess plan"),
-    }
-  }
-
   fn full_knobs() -> crate::launch::knobs::KnobSet {
     // Mirror the canonical-order fixture in params.rs so the parity
     // assertion exercises every emitted flag.
@@ -711,12 +697,12 @@ mod tests {
   #[test]
   fn argv_prepends_serve_for_the_unified_binary_only() {
     let p = LaunchParams::new(PathBuf::from("/m/model.gguf"), LaunchMode::Chat);
-    let unified = spec_of(LlamaCppBackend::new().prepare_launch(
+    let unified = LlamaCppBackend::new().prepare_launch(
       &p,
       41100,
       PathBuf::from("/home/u/.local/bin/llama"),
       ProbeOptions::default(),
-    ));
+    );
     let expected: Vec<OsString> = std::iter::once(OsString::from("serve"))
       .chain(compose(&p, 41100))
       .collect();
@@ -786,12 +772,12 @@ mod tests {
   #[test]
   fn argv_matches_compose_for_minimal_chat_params() {
     let p = LaunchParams::new(PathBuf::from("/m/model.gguf"), LaunchMode::Chat);
-    let spec = spec_of(LlamaCppBackend::new().prepare_launch(
+    let spec = LlamaCppBackend::new().prepare_launch(
       &p,
       41100,
       PathBuf::from("/bin/llama-server"),
       ProbeOptions::default(),
-    ));
+    );
     assert_eq!(spec.argv, compose(&p, 41100));
   }
 
@@ -802,12 +788,12 @@ mod tests {
     p.reasoning = true;
     p.knobs = full_knobs();
     p.extras = vec![OsString::from("--threads-batch"), OsString::from("16")];
-    let spec = spec_of(LlamaCppBackend::new().prepare_launch(
+    let spec = LlamaCppBackend::new().prepare_launch(
       &p,
       55555,
       PathBuf::from("/bin/llama-server"),
       ProbeOptions::default(),
-    ));
+    );
     // The whole point: identical to the canonical emitter, not a reimpl.
     assert_eq!(spec.argv, compose(&p, 55555));
   }
@@ -816,12 +802,12 @@ mod tests {
   fn argv_matches_compose_for_embedding_and_rerank_modes() {
     for mode in [LaunchMode::Embedding, LaunchMode::Rerank] {
       let p = LaunchParams::new(PathBuf::from("/m/model.gguf"), mode);
-      let spec = spec_of(LlamaCppBackend::new().prepare_launch(
+      let spec = LlamaCppBackend::new().prepare_launch(
         &p,
         41100,
         PathBuf::from("/bin/llama-server"),
         ProbeOptions::default(),
-      ));
+      );
       assert_eq!(
         spec.argv,
         compose(&p, 41100),
@@ -836,12 +822,12 @@ mod tests {
     // A loopback-bypass attempt in extras must be stripped identically
     // to compose — the security contract survives the seam.
     p.extras = vec![OsString::from("--host"), OsString::from("0.0.0.0")];
-    let spec = spec_of(LlamaCppBackend::new().prepare_launch(
+    let spec = LlamaCppBackend::new().prepare_launch(
       &p,
       41100,
       PathBuf::from("/bin/llama-server"),
       ProbeOptions::default(),
-    ));
+    );
     assert_eq!(spec.argv, compose(&p, 41100));
     // And the dangerous binding is gone (compose already guarantees this;
     // assert it explicitly so the intent is legible).
@@ -856,12 +842,12 @@ mod tests {
     // such default (factory-on, suppressed under bench parity); with no
     // `jinja` key seeded in `backend_knobs`, `compose` emits no `--jinja`.
     let p = LaunchParams::new(PathBuf::from("/m/model.gguf"), LaunchMode::Chat);
-    let spec = spec_of(LlamaCppBackend::new().prepare_launch(
+    let spec = LlamaCppBackend::new().prepare_launch(
       &p,
       41100,
       PathBuf::from("/bin/llama-server"),
       ProbeOptions::default(),
-    ));
+    );
     let argv: Vec<String> = spec
       .argv
       .iter()
@@ -885,12 +871,12 @@ mod tests {
   #[test]
   fn env_remove_is_exactly_the_supervisors_strip_set() {
     let p = LaunchParams::new(PathBuf::from("/m/model.gguf"), LaunchMode::Chat);
-    let spec = spec_of(LlamaCppBackend::new().prepare_launch(
+    let spec = LlamaCppBackend::new().prepare_launch(
       &p,
       41100,
       PathBuf::from("/bin/llama-server"),
       ProbeOptions::default(),
-    ));
+    );
     assert_eq!(
       spec.env_remove,
       vec![
@@ -912,12 +898,12 @@ mod tests {
   #[test]
   fn readiness_is_health_two_hundred() {
     let p = LaunchParams::new(PathBuf::from("/m/model.gguf"), LaunchMode::Chat);
-    let spec = spec_of(LlamaCppBackend::new().prepare_launch(
+    let spec = LlamaCppBackend::new().prepare_launch(
       &p,
       41100,
       PathBuf::from("/bin/llama-server"),
       ProbeOptions::default(),
-    ));
+    );
     assert_eq!(
       spec.readiness,
       Readiness::HttpPoll {
@@ -930,22 +916,21 @@ mod tests {
   #[test]
   fn binary_is_passed_through_verbatim() {
     let p = LaunchParams::new(PathBuf::from("/m/model.gguf"), LaunchMode::Chat);
-    let spec = spec_of(LlamaCppBackend::new().prepare_launch(
+    let spec = LlamaCppBackend::new().prepare_launch(
       &p,
       41100,
       PathBuf::from("/opt/cuda/llama-server"),
       ProbeOptions::default(),
-    ));
+    );
     assert_eq!(spec.binary, PathBuf::from("/opt/cuda/llama-server"));
   }
 
-  // ---- id / lifecycle / capabilities / identify ----
+  // ---- id / capabilities / identify ----
 
   #[test]
-  fn id_and_lifecycle_are_stable() {
+  fn id_is_stable() {
     let b = LlamaCppBackend::new();
     assert_eq!(b.id(), "llamacpp");
-    assert_eq!(b.lifecycle(), Lifecycle::ProcessPerModel);
   }
 
   #[test]

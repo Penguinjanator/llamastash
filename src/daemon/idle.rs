@@ -76,18 +76,11 @@ impl Default for Activity {
 /// stopped leaves a terminal-state entry in the registry, and treating
 /// that as work would pin the daemon awake forever — the opposite of
 /// what a walk-away timeout is for.
-///
-/// Infra launches — a managed multiplexer's shared umbrella, which the
-/// daemon brings up itself at boot — never count: they'd otherwise pin
-/// every host running one.
 async fn is_busy(supervisors: &SupervisorRegistry, connections: &AtomicUsize) -> bool {
   if connections.load(Ordering::Relaxed) > 0 {
     return true;
   }
-  for (id, model) in supervisors.snapshot().await {
-    if crate::backend::is_infra_launch(&id) {
-      continue;
-    }
+  for (_id, model) in supervisors.snapshot().await {
     if !matches!(
       model.state().await,
       ManagedState::Stopped | ManagedState::Error { .. }

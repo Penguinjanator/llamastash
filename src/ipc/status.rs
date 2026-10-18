@@ -1,7 +1,7 @@
 //! Assembly of the daemon's `status` IPC document.
 //!
 //! `status_response` is the read-only snapshot the `status` method
-//! returns: managed + delegated + external model rows, the host/GPU
+//! returns: managed and external model rows, the host/GPU
 //! samplers, the backend matrix, and the proxy block. The wire shape is
 //! an agent-facing contract — every top-level key and field name here is
 //! pinned by `status_top_level_key_set_is_stable` and the surrounding
@@ -61,19 +61,8 @@ pub(crate) async fn status_response(ctx: &MethodContext) -> Value {
     // The backend this launch *resolved* to, stamped on the running snapshot
     // at spawn — the honest signal (respects an explicit backend override on a
     // compatible file), not the routing prediction.
-    // A managed-multiplexer umbrella row keys deterministically on its own
-    // backend id: the umbrella shares its port with every delegated model's
-    // snapshot, so matching by port would pick an arbitrary snapshot (or the
-    // default-backend fallback when none is resident) and the reported backend
-    // would flip-flop between calls. Resolved via the registry so no backend is
-    // named here.
-    let owner = crate::backend::Backends::all()
-      .into_iter()
-      .find(|b| b.umbrella_launch_id().as_ref() == Some(&launch_id))
-      .or_else(|| {
-        let id = running_snap.map(|r| r.resolved_backend.as_str())?;
-        crate::backend::Backends::from_id(id)
-      })
+    let owner = running_snap
+      .and_then(|r| crate::backend::Backends::from_id(&r.resolved_backend))
       .unwrap_or_else(crate::backend::default_backend);
     let resolved_backend = owner.id().to_string();
     // MTP telemetry comes from the owning backend: whether it dispatched with
@@ -314,8 +303,7 @@ async fn backends_status(ctx: &MethodContext) -> Value {
 
   // Live GPU classes the host exposes (from each configured binary's
   // `--list-devices`). The default `status_accelerators` unions these into a
-  // backend's static floor; a backend that probes its own installed
-  // accelerators live (a managed multiplexer) overrides and ignores them.
+  // backend's static floor.
   let catalog: Vec<crate::backend::Server> = match ctx.launch.as_ref() {
     Some(env) => env.servers.current().await.to_vec(),
     None => Vec::new(),
@@ -327,7 +315,7 @@ async fn backends_status(ctx: &MethodContext) -> Value {
     .collect();
 
   // One row per registered backend, assembled generically from the backend's
-  // status hooks (installed / enabled / accelerators / binary / extra). This
+  // status hooks (installed / enabled / accelerators / binary). This
   // names no backend, so a new backend surfaces in `status` from its
   // registration alone — no edit here.
   let mut rows = Vec::new();
@@ -335,19 +323,11 @@ async fn backends_status(ctx: &MethodContext) -> Value {
     let accelerators = b.status_accelerators(ctx, &device_accels).await;
     let mut labels = server_labels(b.id(), &catalog, &accelerators);
     labels.extend(b.status_server_labels());
-    let mut row = backend_row(
-      b.id(),
-      b.lifecycle().label(),
-      b.installed(ctx),
-      accelerators,
-    );
+    let mut row = backend_row(b.id(), b.installed(ctx), accelerators);
     if let Some(obj) = row.as_object_mut() {
       obj.insert("server_labels".into(), json!(labels));
       if let Some(enabled) = b.status_enabled(ctx) {
         obj.insert("enabled".into(), json!(enabled));
-      }
-      for (k, v) in b.status_extra(ctx).await {
-        obj.insert(k, v);
       }
     }
     set_backend_binary(&mut row, b.binary_path(ctx));
@@ -387,10 +367,9 @@ fn set_backend_binary(row: &mut Value, binary: Option<String>) {
   }
 }
 
-fn backend_row(id: &str, lifecycle: &str, installed: bool, accelerators: Vec<String>) -> Value {
+fn backend_row(id: &str, installed: bool, accelerators: Vec<String>) -> Value {
   json!({
     "id": id,
-    "lifecycle": lifecycle,
     "installed": installed,
     "accelerators": accelerators,
   })
@@ -600,14 +579,17 @@ mod tests {
       ids.contains(&"llamacpp"),
       "backends must list llamacpp: {ids:?}"
     );
-    // Each row carries the installed/lifecycle/accelerator fields;
-    // llama.cpp always offers CPU.
+    // Each row carries the installed/accelerator fields; llama.cpp always
+    // offers CPU.
     let llama = backends
       .iter()
       .find(|b| b["id"] == "llamacpp")
       .expect("llamacpp row");
     assert!(llama["installed"].is_boolean());
-    assert_eq!(llama["lifecycle"], json!("process_per_model"));
+    assert!(
+      llama.get("lifecycle").is_none(),
+      "backend rows carry no lifecycle field"
+    );
     let accel: Vec<&str> = llama["accelerators"]
       .as_array()
       .unwrap()

@@ -39,7 +39,6 @@ use std::time::{Duration, Instant};
 
 use crate::daemon::registry::LaunchId;
 use crate::daemon::shutdown::ShutdownToken;
-use crate::daemon::state_store::RunningSnapshot;
 use crate::daemon::supervisor::{LaunchOrigin, ManagedModel, ManagedState};
 use crate::proxy::ProxyState;
 
@@ -150,31 +149,6 @@ pub async fn sweep_once(state: &Arc<ProxyState>, default_ttl: Duration) {
   let snap = state.ctx.supervisors.snapshot().await;
   for (launch_id, model) in snap {
     let ttl = ttls.get(&launch_id).copied().unwrap_or(default_ttl);
-    // An infrastructure launch (a managed-multiplexer umbrella) gets
-    // lifecycle-aware eviction: never SIGTERM the shared process — free its
-    // idle loaded model via the backend's unload API instead (the umbrella
-    // stays Ready and autoloads on the next request). This is the `model.stop`
-    // vs API-unload branch.
-    if crate::backend::umbrella_owner(&launch_id).is_some() {
-      // The umbrella's own TTL is not consulted: idleness is shared inside the
-      // multiplexer, but which rows are due is decided per row, and a global TTL
-      // of `0` ("presets only") must not blind the pass to a row that pins one.
-      let targets = umbrella_idle_rows(state, &ttls, default_ttl, &model).await;
-      if targets.is_empty() {
-        continue;
-      }
-      let ctx = state.ctx.clone();
-      tokio::spawn(async move {
-        for target in &targets {
-          log::info!(
-            "proxy eviction: unloading idle {} (umbrella stays up)",
-            target.as_str()
-          );
-          stop_launch(&ctx, target).await;
-        }
-      });
-      continue;
-    }
     if ttl.is_zero() {
       continue;
     }
@@ -220,79 +194,13 @@ pub async fn sweep_once(state: &Arc<ProxyState>, default_ttl: Duration) {
 
 /// Stop one launch through its own backend — the path `stop_model` uses, so the
 /// supervisor and its `state.running` row go with it and a backend that
-/// overrides `stop` is dispatched rather than defaulted. For a delegated
-/// (multiplexer) row that `stop` is the umbrella-unload call, which is why the
-/// sweep and make-room need only one stop helper.
+/// overrides `stop` is dispatched rather than defaulted.
 async fn stop_launch(ctx: &crate::daemon::context::MethodContext, launch_id: &LaunchId) {
   use crate::backend::Backend;
   let backend = crate::daemon::launch_service::backend_for_launch(ctx, launch_id).await;
   let _ = backend
     .stop(ctx, launch_id, EVICT_STOP_GRACE.as_secs())
     .await;
-}
-
-/// The rows living inside a managed multiplexer: a delegated launch shares the
-/// umbrella's port and carries a delegated backend id.
-fn delegated_rows(
-  running: &[crate::daemon::state_store::RunningSnapshot],
-  port: u16,
-) -> impl Iterator<Item = &crate::daemon::state_store::RunningSnapshot> {
-  running
-    .iter()
-    .filter(move |r| r.port == port && r.delegated_backend_id().is_some())
-}
-
-/// Whether a multiplexer row may be given back. A delegated row has no
-/// supervisor of its own, so its origin and its preset's `idle_ttl_secs` are read
-/// off the row: a manually started or preloaded model is durable user intent, and
-/// an adopted row (no origin) is never a candidate.
-fn row_evictable(row: &RunningSnapshot, ttls: &HashMap<LaunchId, Duration>) -> bool {
-  if !matches!(row.origin, Some(LaunchOrigin::AutoStart)) {
-    return false;
-  }
-  !row
-    .launch_id
-    .as_ref()
-    .is_some_and(|id| ttls.get(id).is_some_and(Duration::is_zero))
-}
-
-/// The rows inside `umbrella` that are due to be freed: the umbrella is `Ready`
-/// and quiet, and each row is auto-started, not pinned to `idle_ttl_secs: 0`, and
-/// idle for at least its own TTL.
-///
-/// Idleness is umbrella-granular — every delegated request touches the umbrella's
-/// inflight guard and MRU stamp — but the TTL and the origin exemptions are the
-/// row's own, so one never-unload model does not hold its neighbours resident and
-/// a manual launch inside a multiplexer is never given up.
-async fn umbrella_idle_rows(
-  state: &Arc<ProxyState>,
-  ttls: &HashMap<LaunchId, Duration>,
-  default_ttl: Duration,
-  umbrella: &ManagedModel,
-) -> Vec<LaunchId> {
-  if !matches!(umbrella.state().await, ManagedState::Ready) || umbrella.inflight() > 0 {
-    return Vec::new();
-  }
-  let Some(touched) = state.mru.last_request_at(umbrella.id()).await else {
-    return Vec::new();
-  };
-  let idle = touched.elapsed();
-  let snapshot = state.ctx.state.snapshot().await;
-  delegated_rows(&snapshot.running, umbrella.port())
-    .filter(|row| row_evictable(row, ttls))
-    .filter(|row| {
-      let row_ttl = row
-        .launch_id
-        .as_ref()
-        .and_then(|id| ttls.get(id))
-        .copied()
-        .unwrap_or(default_ttl);
-      // `0` is never-unload for that row, and with the global TTL at `0` a row
-      // that pins nothing is `0` too: it waits for a preset, not for nothing.
-      !row_ttl.is_zero() && idle >= row_ttl
-    })
-    .filter_map(|row| row.launch_id.clone())
-    .collect()
 }
 
 /// The idle-TTL each running launch is held to, keyed by launch id — its
@@ -340,17 +248,15 @@ pub(crate) async fn launch_ttls(state: &Arc<ProxyState>) -> HashMap<LaunchId, Du
 
 /// One unload make-room may buy with, and what it is worth in bytes.
 struct RoomCandidate {
-  /// Bytes this unload is credited for freeing — the demand each row was
-  /// admitted at, the same projection the refused launch is priced with. For a
-  /// managed multiplexer it is the sum over the rows given up.
+  /// Bytes this unload is credited for freeing — the demand the row was
+  /// admitted at, the same projection the refused launch is priced with.
   bytes: u64,
   last_request_at: Option<Instant>,
-  /// The supervisor whose idle gates this candidate: the launch itself, or the
-  /// umbrella whose rows are unloaded. Re-checked immediately before the stop,
-  /// because selection and stopping are separated by up to the stop grace.
+  /// The supervisor whose idle gates this candidate. Re-checked immediately
+  /// before the stop, because selection and stopping are separated by up to the
+  /// stop grace.
   guard: ManagedModel,
-  /// The launches to stop: one for a process launch, or the rows resident inside
-  /// a multiplexer (the shared process itself is never stopped).
+  /// The launch to stop.
   targets: Vec<LaunchId>,
 }
 
@@ -371,9 +277,8 @@ struct RoomCandidate {
 ///
 /// Eligible: `Ready`, zero in-flight, `LaunchOrigin::AutoStart` (manual and
 /// preloaded launches are durable user intent, the same exemption the sweep
-/// applies) and not pinned to `idle_ttl_secs: 0`. Inside a managed multiplexer
-/// those two gates are read off each resident row, because a delegated row has
-/// no supervisor of its own. Credit and refusal are one figure: each row is
+/// applies) and not pinned to `idle_ttl_secs: 0`. Credit and refusal are one
+/// figure: each row is
 /// worth the demand the gate admitted it at, or `launch_resident_bytes` when
 /// it carries no stamp.
 pub async fn make_room(
@@ -445,8 +350,7 @@ pub async fn make_room(
   let unloaded = targets.len();
   // Candidates stop together, the way the sweep unloads: the re-check above is
   // only honest if nothing else runs before the stops, and stopping one after
-  // another would stretch the request's wait to N x the stop grace. The models
-  // inside one multiplexer still go one at a time, as the sweep sends them.
+  // another would stretch the request's wait to N x the stop grace.
   futures::future::join_all(go.iter().map(|candidate| async move {
     for target in &candidate.targets {
       stop_launch(ctx, target).await;
@@ -475,36 +379,6 @@ async fn room_candidates(
       continue;
     }
     let last_request_at = state.mru.last_request_at(model.id()).await;
-    // A managed multiplexer holds its models inside the shared process, so its
-    // credit is what its *eligible* rows are worth and freeing them is an unload
-    // call rather than a SIGTERM. Row-level gates are read off the rows here: a
-    // delegated row has no supervisor, so this is the only place its origin and
-    // its preset's `idle_ttl_secs` can be honoured.
-    if crate::backend::umbrella_owner(&launch_id).is_some() {
-      let mut bytes = 0u64;
-      let mut targets: Vec<LaunchId> = Vec::new();
-      for row in delegated_rows(&running.running, model.port()) {
-        if !row_evictable(row, ttls) {
-          continue;
-        }
-        let Some(size) = resident_estimate(&state.ctx, row).await else {
-          continue;
-        };
-        bytes = bytes.saturating_add(size);
-        if let Some(id) = row.launch_id.clone() {
-          targets.push(id);
-        }
-      }
-      if bytes > 0 && !targets.is_empty() {
-        out.push(RoomCandidate {
-          bytes,
-          last_request_at,
-          guard: model,
-          targets,
-        });
-      }
-      continue;
-    }
     if model.origin() != LaunchOrigin::AutoStart {
       continue;
     }
@@ -749,36 +623,6 @@ mod tests {
     )
   }
 
-  /// The two row-level exemptions, read off the row itself because a delegated
-  /// row inside a multiplexer has no supervisor to consult: only a proxy
-  /// auto-start is ever given up, and a preset pinned to `idle_ttl_secs: 0` keeps
-  /// its own row resident without touching its neighbours.
-  #[test]
-  fn row_evictable_requires_an_auto_start_and_a_nonzero_ttl() {
-    let mut ttls = HashMap::new();
-    ttls.insert(LaunchId("L1".to_string()), Duration::from_secs(60));
-    ttls.insert(LaunchId("L2".to_string()), Duration::ZERO);
-
-    let auto = crate::test_support::running_row("/m.gguf")
-      .origin(LaunchOrigin::AutoStart)
-      .build();
-    assert!(row_evictable(&auto, &ttls));
-
-    let manual = crate::test_support::running_row("/m.gguf")
-      .origin(LaunchOrigin::Manual)
-      .build();
-    assert!(!row_evictable(&manual, &ttls));
-
-    let adopted = crate::test_support::running_row("/m.gguf").build();
-    assert!(!row_evictable(&adopted, &ttls));
-
-    let pinned = crate::test_support::running_row("/m.gguf")
-      .launch_id("L2")
-      .origin(LaunchOrigin::AutoStart)
-      .build();
-    assert!(!row_evictable(&pinned, &ttls));
-  }
-
   /// Make-room credits a launch with the figure admission priced it at, so the
   /// credit and the refused demand are in one unit — that stamp wins over every
   /// other size available.
@@ -791,7 +635,7 @@ mod tests {
     assert_eq!(resident_estimate(&empty_ctx(), &row).await, Some(4096));
   }
 
-  /// A row the gate never budgeted (adopted, or delegated inside a multiplexer)
+  /// A row the gate never budgeted (an adopted row)
   /// falls back to the figure a launch is measured with at admission: catalog
   /// metadata when the catalog knows the model, else the size on disk across
   /// every shard of a split file.

@@ -155,8 +155,8 @@ pub async fn handle(args: StopArgs, cli: &Cli, config: &Config) -> CliResult {
     params["grace_secs"] = serde_json::Value::from(g);
   }
   // The daemon-side stop waits up to `grace` for SIGTERM before SIGKILL, then
-  // does its own teardown bookkeeping — a slow child (e.g. an umbrella unloading
-  // a resident model) can run the full grace window. Size the IPC budget around
+  // does its own teardown bookkeeping — a slow child can run the full grace
+  // window. Size the IPC budget around
   // `grace + slop` so the client doesn't time out mid-stop and cancel the
   // handler, leaving a half-cleaned row (matches `stop_all` above).
   let grace_for_timeout = grace.unwrap_or(5).max(row.stop_grace_secs);

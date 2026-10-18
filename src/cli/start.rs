@@ -502,12 +502,6 @@ fn resolve_mode(
   if let Some(m) = override_mode {
     return Ok(Some(m.as_label()));
   }
-  // A managed-multiplexer row is served by an umbrella that picks the recipe
-  // from the model name; llama.cpp launch modes don't apply, so don't force
-  // `--mode` and don't refuse a row whose hint we cannot read.
-  if crate::backend::is_managed_multiplexer(crate::cli::output::backend_for_source(&row.source)) {
-    return Ok(None);
-  }
   // A preset's pin outranks the hint. `chat` is not a pin -- see
   // `PartialParams::mode`.
   if let Some(m) = preset_mode.filter(|m| *m != "chat").and_then(mode_label) {

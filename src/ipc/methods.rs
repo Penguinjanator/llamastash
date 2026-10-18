@@ -191,35 +191,11 @@ async fn stop_model_handler(
 ) -> Result<Value, ErrorObject> {
   let parsed: StopParams = parse_params(params)?;
   check_grace_secs(parsed.grace_secs)?;
-  // Hand the launch to its owning backend and ask it to stop — the backend
-  // decides *how* (SIGTERM a supervised child, or unload from its umbrella). The
-  // caller resolves the owner (registry lookup by recorded backend id) but never
-  // branches on process-vs-umbrella lifecycle.
+  // Hand the launch to its owning backend and ask it to stop. The caller
+  // resolves the owner (registry lookup by recorded backend id) and names no
+  // backend.
   let backend = crate::daemon::launch_service::backend_for_launch(ctx, &parsed.launch_id).await;
   crate::backend::Backend::stop(&backend, ctx, &parsed.launch_id, parsed.grace_secs).await
-}
-
-/// The `(owning backend, umbrella model name)` behind a delegated launch id, or
-/// `None` when `launch_id` isn't a delegated row. Delegated models have no
-/// supervisor of their own, so the `L#` → (backend, name) binding is read off
-/// the running snapshot stamped at launch; `logs_tail` reverse-maps through here
-/// to find the umbrella whose log a delegated model shares. Names no backend —
-/// the backend is resolved from the row's identity.
-async fn delegated_target(
-  ctx: &MethodContext,
-  launch_id: &LaunchId,
-) -> Option<(crate::backend::Backends, String)> {
-  ctx
-    .state
-    .snapshot()
-    .await
-    .running
-    .into_iter()
-    .find(|r| r.launch_id.as_ref() == Some(launch_id))
-    .and_then(|r| {
-      r.delegated_backend_id()
-        .map(|b| (crate::backend::backend_for_identity(&r.id), b.name.clone()))
-    })
 }
 
 /// Flatten `ManagedState` to a JSON object whose `state` field is a
@@ -467,20 +443,16 @@ async fn logs_tail_handler(
   params: Option<Value>,
 ) -> Result<Value, ErrorObject> {
   let parsed: LogsTailParams = parse_params(params)?;
-  // A delegated (managed-multiplexer) model has no process of its own — its log
-  // *is* the shared umbrella's log, so tail that one (the owning backend's infra
-  // launch).
-  let lookup_id = match delegated_target(ctx, &parsed.launch_id).await {
-    Some((backend, _)) => crate::backend::Backend::umbrella_launch_id(&backend)
-      .unwrap_or_else(|| parsed.launch_id.clone()),
-    None => parsed.launch_id.clone(),
-  };
-  let model = ctx.supervisors.get(&lookup_id).await.ok_or_else(|| {
-    ErrorObject::new(
-      ErrorCode::InvalidParams,
-      format!("unknown launch_id: {}", parsed.launch_id.as_str()),
-    )
-  })?;
+  let model = ctx
+    .supervisors
+    .get(&parsed.launch_id)
+    .await
+    .ok_or_else(|| {
+      ErrorObject::new(
+        ErrorCode::InvalidParams,
+        format!("unknown launch_id: {}", parsed.launch_id.as_str()),
+      )
+    })?;
   let tail = model.tail(parsed.lines).await;
   Ok(json!({
     "launch_id": parsed.launch_id,

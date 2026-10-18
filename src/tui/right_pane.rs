@@ -759,12 +759,6 @@ fn wrap_path_chunks(s: &str, width: usize, max_lines: usize) -> Vec<String> {
   out
 }
 
-/// Suffix marking a value shared across every model of one umbrella process
-/// process — its port, RAM, and CPU are the umbrella's, not per-model. Same `*`
-/// the Host pane uses for shared/aggregate pools (`MEM*` / `GPU*`); explained in
-/// the help overlay's Legend.
-pub(crate) const SHARED_UMBRELLA_MARKER: &str = "*";
-
 /// Render line 2 of the header: `:port  state  RAM  CPU` for a
 /// running model, `not launched` when the focused model has no
 /// supervisor row, blank when nothing is focused.
@@ -780,17 +774,6 @@ fn render_header_stats(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &P
           palette.muted_style(),
         )
       };
-      // Managed-multiplexer delegated rows share the umbrella's port/RAM/CPU —
-      // mark them. Keyed on the backend's lifecycle shape, not a specific id.
-      let mark = if m
-        .backend
-        .as_deref()
-        .is_some_and(crate::backend::is_managed_multiplexer)
-      {
-        SHARED_UMBRELLA_MARKER
-      } else {
-        ""
-      };
       let mut spans = vec![
         // `ID:L9` prefix surfaces the launch id alongside the port so
         // it's visible without diving into the Settings tab. The
@@ -799,7 +782,7 @@ fn render_header_stats(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &P
         Span::styled("ID:", label_style),
         Span::styled(m.launch_id.clone(), value_style),
         Span::styled("  ", Style::default()),
-        Span::styled(format!(":{}{}  ", m.port, mark), palette.muted_style()),
+        Span::styled(format!(":{}  ", m.port), palette.muted_style()),
         Span::styled(
           format!("{} ", glyph_for(m.state)),
           Style::default().fg(crate::tui::status_icons::colour_for(m.state, palette)),
@@ -827,10 +810,10 @@ fn render_header_stats(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &P
       // labels matching the in-pane convention (Host / Daemon panes) instead of
       // disappearing into the same muted tone as the value digits.
       spans.push(middot());
-      spans.push(Span::styled(format!("{rss}{mark}"), value_style));
+      spans.push(Span::styled(rss, value_style));
       spans.push(Span::styled(" RAM", label_style));
       spans.push(middot());
-      spans.push(Span::styled(format!("{cpu}{mark}"), value_style));
+      spans.push(Span::styled(cpu, value_style));
       spans.push(Span::styled(" CPU", label_style));
       Line::from(spans)
     }
@@ -1095,10 +1078,6 @@ mod tests {
     app.managed[0].backend = Some("llamacpp".into());
     let s = render_stats_text(&app);
     assert!(s.contains("32k") && s.contains("ctx"), "ctx missing: {s:?}");
-    assert!(
-      !s.contains('*'),
-      "llama.cpp must not carry the shared marker: {s:?}"
-    );
   }
 
   #[test]

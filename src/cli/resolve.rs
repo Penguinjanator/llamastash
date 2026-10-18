@@ -293,7 +293,7 @@ pub struct StatusSnapshot {
   /// when talking to a daemon that omits the field.
   pub proxy: Value,
   /// Backends block — array of
-  /// `{id, lifecycle, installed, accelerators, server_labels}`.
+  /// `{id, installed, accelerators, server_labels}`.
   /// Verbatim copy of the daemon's wire shape; `Value::Null`
   /// against a daemon that predates the field.
   pub backends: Value,

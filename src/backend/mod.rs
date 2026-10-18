@@ -19,20 +19,13 @@
 //! and the origin brainstorm
 //! `docs/brainstorms/2026-06-08-multi-backend-abstraction-requirements.md`.
 //!
-//! # Two lifecycle shapes
+//! # One process per model
 //!
-//! The contract does not assume **one process per model**. Two shapes
-//! exist, one per [`Lifecycle`]:
-//!
-//! - **Process-per-model** ([`llama_cpp`]): llamastash spawns one
-//!   `llama-server` per model and owns its full lifecycle. The launch
-//!   produces a [`LaunchPlan::SpawnProcess`].
-//! - **Managed-multiplexer**: a backend supervises one long-lived umbrella
-//!   process and delegates per-model start/list to its API. The launch
-//!   produces a [`LaunchPlan::DelegateToManager`] carrying the umbrella
-//!   [`ProcessLaunchSpec`] + the model to serve. [`Backend::prepare_launch`]
-//!   stays synchronous for both shapes — the async API call happens when the
-//!   plan is *executed*. No backend produces the delegate shape today.
+//! Every backend runs one supervised child process per model ([`llama_cpp`] is
+//! the reference): llamastash spawns it, probes it, and owns its full
+//! lifecycle. [`Backend::prepare_launch`] is the synchronous translation to the
+//! [`ProcessLaunchSpec`] the supervisor consumes; the heavy work (the spawn and
+//! the readiness probe) happens when that spec is executed.
 //!
 //! # Generalized identity
 //!
@@ -103,28 +96,6 @@ pub struct DeclaredEffort {
   pub default: Option<String>,
 }
 
-/// How a backend manages the lifecycle of the models it runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Lifecycle {
-  /// One supervised child process per model; llamastash owns the full
-  /// lifecycle (spawn, probe, evict-by-kill). llama.cpp.
-  ProcessPerModel,
-  /// One long-lived supervised umbrella process; per-model start/stop
-  /// /list delegated to the backend's own API. Used by managed-multiplexer
-  /// backends (e.g. an NPU server).
-  ManagedMultiplexer,
-}
-
-impl Lifecycle {
-  /// Stable lowercase label for logs / future JSON projection.
-  pub fn label(self) -> &'static str {
-    match self {
-      Lifecycle::ProcessPerModel => "process_per_model",
-      Lifecycle::ManagedMultiplexer => "managed_multiplexer",
-    }
-  }
-}
-
 /// How to tell that a launched model is ready to serve.
 ///
 /// Currently only the HTTP-poll shape (llama.cpp's `/health`). The
@@ -189,46 +160,6 @@ pub struct ProcessLaunchSpec {
   /// child. A GPU server killed mid-kernel can hang the device, so a slow
   /// stopper declares its own floor and no caller's shorter grace undercuts it.
   pub min_stop_grace: std::time::Duration,
-}
-
-/// The result of translating the resolved knob IR into "how to start
-/// this model" for a given backend.
-///
-/// The two arms mirror the two lifecycle shapes: process-per-model
-/// (llama.cpp) and managed-multiplexer. Adding the second arm
-/// is additive — it does not change [`Backend::prepare_launch`]'s
-/// signature, which stays synchronous and infallible (the async work
-/// happens when the plan is *executed*).
-#[derive(Debug, Clone)]
-pub enum LaunchPlan {
-  /// Spawn and supervise a child process (process-per-model shape).
-  SpawnProcess(ProcessLaunchSpec),
-  /// Ensure a long-lived umbrella process is up, then delegate the
-  /// per-model start to its API (managed-multiplexer shape).
-  DelegateToManager(ManagerLaunchSpec),
-}
-
-/// How to start one model on a **managed-multiplexer** backend: make sure
-/// the umbrella process is running, then ask it (via its API) to serve a
-/// named model. The umbrella is supervised by the same generic
-/// [`crate::daemon::supervisor`] that runs process-per-model children — it
-/// is just one long-lived child whose readiness is the backend's liveness
-/// endpoint (e.g. a `/live` probe).
-#[derive(Debug, Clone)]
-pub struct ManagerLaunchSpec {
-  /// How to ensure the umbrella process is up (spawn it once if not).
-  pub umbrella: ProcessLaunchSpec,
-  /// The model the umbrella should serve.
-  pub model: ManagerModelRef,
-}
-
-/// A reference to a model the umbrella backend serves from its own
-/// registry. Kept minimal (just the registry name) for now;
-/// room to grow as the API surface is wired.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ManagerModelRef {
-  /// The model name as the backend's API knows it.
-  pub name: String,
 }
 
 /// A hardware accelerator class a backend can run models on.
@@ -319,18 +250,14 @@ pub struct KnobResolution {
 /// lint's auto-trait-bound concern doesn't apply.
 ///
 /// Most methods are synchronous (pure translation / cheap config reads). The
-/// few `async` ones do I/O a live backend needs at query time — a managed
-/// multiplexer probing its umbrella for `status`, say — and the heavy async
-/// work (spawning a process, calling a multiplexer's API) still happens when a
-/// [`LaunchPlan`] is *executed*, not when it is built.
+/// few `async` ones do I/O a live backend needs at query time, and the heavy
+/// async work (spawning a process) still happens when a [`ProcessLaunchSpec`]
+/// is executed, not when it is built.
 #[allow(async_fn_in_trait)]
 pub trait Backend {
   /// Stable backend identifier (`"llamacpp"`). Used by the registry and
   /// any backend-aware surface.
   fn id(&self) -> &'static str;
-
-  /// The lifecycle shape this backend uses.
-  fn lifecycle(&self) -> Lifecycle;
 
   /// The knobs this backend declares — the single source every surface reads.
   ///
@@ -634,9 +561,8 @@ pub trait Backend {
   /// Resolve the executable + port this launch spawns on, given the
   /// orchestrator's default (device-owning) binary and the reserved pool port.
   ///
-  /// Default returns them unchanged — a process-per-model backend that uses the
-  /// device binary on the pool port. A backend with its own server binary (or a
-  /// managed multiplexer whose umbrella binds a configured port) overrides.
+  /// Default returns them unchanged — a backend that uses the device binary on
+  /// the pool port. A backend with its own server binary overrides.
   /// `Err(msg)` is a user-facing "binary not found" message; the launch is
   /// refused and the reserved port released. Keeps the orchestrator's spawn arm
   /// backend-agnostic.
@@ -752,13 +678,6 @@ pub trait Backend {
     Vec::new()
   }
 
-  /// Extra `status` row fields beyond id / lifecycle / installed / enabled /
-  /// accelerators / binary — e.g. a managed-multiplexer's umbrella state.
-  /// Default none.
-  async fn status_extra(&self, _ctx: &MethodContext) -> Vec<(String, serde_json::Value)> {
-    Vec::new()
-  }
-
   /// The `doctor` advisories this backend contributes, given the resolved
   /// [`Config`](crate::config::Config). Default: none. `doctor` collects across
   /// [`Backends::all`] so its check flow names no backend; each finding carries
@@ -773,45 +692,6 @@ pub trait Backend {
     _config: &crate::config::Config,
   ) -> Vec<crate::init::doctor::Finding> {
     Vec::new()
-  }
-
-  /// The [`LaunchId`](crate::daemon::registry::LaunchId) of this backend's
-  /// long-lived infrastructure process (a managed-multiplexer umbrella), or
-  /// `None` for a process-per-model backend. Generic walkers that iterate
-  /// running launches (proxy routing, `/ui`, eviction, `status`) skip infra
-  /// launches via [`is_infra_launch`] rather than hard-coding the umbrella id.
-  fn umbrella_launch_id(&self) -> Option<crate::daemon::registry::LaunchId> {
-    None
-  }
-
-  /// The OpenAI path prefix a managed-multiplexer umbrella serves its `/v1/...`
-  /// surface behind (e.g. `Some("/api")` → the umbrella answers `/api/v1/...`),
-  /// or `None` for a backend that serves `/v1/...` directly. Read by the proxy's
-  /// umbrella-routing arm so it forwards under the right prefix without naming a
-  /// backend. Default `None`.
-  fn umbrella_openai_prefix(&self) -> Option<&'static str> {
-    None
-  }
-
-  /// Bring up any always-on infrastructure this backend supervises at daemon
-  /// **boot** — a managed multiplexer's shared umbrella process, so discovery
-  /// and proxy routing work before the user issues an explicit `start`. Called
-  /// once per registered backend after the dispatch context is wired, before
-  /// the proxy listener binds. Default: nothing (a process-per-model backend
-  /// supervises only per `start_model`).
-  ///
-  /// The backend **self-gates** on its own [`available`](Self::available)
-  /// predicate and must return promptly: bring the process up in a detached
-  /// background task rather than blocking boot on a readiness probe (the
-  /// detached-start parent only waits a few seconds for `runtime.json`).
-  /// `log_dir` is the daemon's per-launch log directory; `probe_timeout` is the
-  /// configured readiness deadline (`None` = the backend's default).
-  fn supervise_at_boot(
-    &self,
-    _ctx: &MethodContext,
-    _log_dir: &Path,
-    _probe_timeout: Option<std::time::Duration>,
-  ) {
   }
 
   /// Mint this backend's synthetic [`ModelIdentity`] for a **file-less** catalog
@@ -886,9 +766,7 @@ pub trait Backend {
   /// `$PATH` locator searches for and the orphan sweep recognises an
   /// *unmanaged* instance by. The **first** entry is the primary marker (the
   /// name used in messages and for an adopted child); the rest are alternate
-  /// distributions of the same server. Empty for a backend with no standalone
-  /// per-model server process (a managed multiplexer's umbrella is supervised,
-  /// not swept). Default empty.
+  /// distributions of the same server. Default empty.
   fn process_markers(&self) -> &'static [&'static str] {
     &[]
   }
@@ -928,7 +806,7 @@ pub trait Backend {
   ///
   /// A *static, backend-intrinsic* floor — llama.cpp always runs CPU (GPU
   /// targets are build-/host-specific and surfaced separately via the live
-  /// device catalog); a managed-multiplexer backend might declare CPU + NPU.
+  /// device catalog).
   /// The `status` backends view unions this with host-derived signals (e.g.
   /// the llama.cpp device catalog) for the full per-host picture.
   fn accelerators(&self) -> AcceleratorSupport;
@@ -944,7 +822,7 @@ pub trait Backend {
   /// [`identity`]).
   fn identify(&self, path: &Path, header_bytes: &[u8]) -> ModelIdentity;
 
-  /// Translate a fully-resolved [`LaunchParams`] into a [`LaunchPlan`]
+  /// Translate a fully-resolved [`LaunchParams`] into a [`ProcessLaunchSpec`].
   /// Pure and infallible for llama.cpp — `compose` cannot fail.
   ///
   /// `binary` is the device-owning executable the orchestrator already
@@ -955,15 +833,13 @@ pub trait Backend {
     port: u16,
     binary: PathBuf,
     probe: ProbeOptions,
-  ) -> LaunchPlan;
+  ) -> ProcessLaunchSpec;
 
   /// Execute a launch, returning the observable `StartedLaunch` handle (or a
   /// JSON-RPC error). **The backend owns the lifecycle**: the default spawns a
-  /// supervised child process (admission-gated) via `spawn_supervised`; a
-  /// managed-multiplexer backend overrides this to ensure its umbrella +
-  /// delegate the model. The caller (`compose_and_spawn`) hands over the prepared
-  /// [`LaunchExec`](crate::daemon::launch_service::LaunchExec) and never branches
-  /// on lifecycle.
+  /// supervised child process (admission-gated) via `spawn_supervised`. The
+  /// caller (`compose_and_spawn`) hands over the prepared
+  /// [`LaunchExec`](crate::daemon::launch_service::LaunchExec).
   async fn start(
     &self,
     ctx: &MethodContext,
@@ -986,12 +862,7 @@ pub trait Backend {
           ));
         }
       };
-    let spec = match self.prepare_launch(&exec.params, port, binary, exec.probe) {
-      LaunchPlan::SpawnProcess(s) => s,
-      LaunchPlan::DelegateToManager(_) => {
-        unreachable!("a managed-multiplexer backend must override start()")
-      }
-    };
+    let spec = self.prepare_launch(&exec.params, port, binary, exec.probe);
     // Backend-owned launch inputs the generic supervised spawn needs but must
     // not derive itself: the admission ctx floor and the strict-fit readiness
     // gate. Both default to `None` (a backend with no such concept), so the
@@ -1005,10 +876,8 @@ pub trait Backend {
   /// Stop a launch this backend owns, returning the `{launch_id, state}` response
   /// (or a JSON-RPC error). **The backend owns the lifecycle**, mirroring
   /// [`start`](Backend::start): the default SIGTERMs the supervised child
-  /// (`stop_supervised`, `spawn_supervised`'s counterpart); a managed multiplexer
-  /// overrides this to unload the model from its umbrella (or tear the umbrella
-  /// down). The caller resolves the owning backend (`backend_for_launch`) and
-  /// calls `stop`; it never branches on process-vs-umbrella.
+  /// (`stop_supervised`, `spawn_supervised`'s counterpart). The caller resolves
+  /// the owning backend (`backend_for_launch`) and calls `stop`.
   async fn stop(
     &self,
     ctx: &MethodContext,
@@ -1132,10 +1001,6 @@ pub fn supported_backends_for(header: &GgufHeader) -> Vec<String> {
 impl Backend for Backends {
   fn id(&self) -> &'static str {
     for_each_backend!(self, b => b.id())
-  }
-
-  fn lifecycle(&self) -> Lifecycle {
-    for_each_backend!(self, b => b.lifecycle())
   }
 
   fn knobs(&self) -> &'static [crate::launch::knobs::KnobDef] {
@@ -1326,32 +1191,11 @@ impl Backend for Backends {
     for_each_backend!(self, b => b.status_server_labels())
   }
 
-  async fn status_extra(&self, ctx: &MethodContext) -> Vec<(String, serde_json::Value)> {
-    for_each_backend!(self, b => b.status_extra(ctx).await)
-  }
-
   async fn doctor_findings(
     &self,
     config: &crate::config::Config,
   ) -> Vec<crate::init::doctor::Finding> {
     for_each_backend!(self, b => b.doctor_findings(config).await)
-  }
-
-  fn umbrella_launch_id(&self) -> Option<crate::daemon::registry::LaunchId> {
-    for_each_backend!(self, b => b.umbrella_launch_id())
-  }
-
-  fn umbrella_openai_prefix(&self) -> Option<&'static str> {
-    for_each_backend!(self, b => b.umbrella_openai_prefix())
-  }
-
-  fn supervise_at_boot(
-    &self,
-    ctx: &MethodContext,
-    log_dir: &Path,
-    probe_timeout: Option<std::time::Duration>,
-  ) {
-    for_each_backend!(self, b => b.supervise_at_boot(ctx, log_dir, probe_timeout))
   }
 
   fn synthetic_identity(&self, path: &Path) -> Option<ModelIdentity> {
@@ -1420,7 +1264,7 @@ impl Backend for Backends {
     port: u16,
     binary: PathBuf,
     probe: ProbeOptions,
-  ) -> LaunchPlan {
+  ) -> ProcessLaunchSpec {
     for_each_backend!(self, b => b.prepare_launch(params, port, binary, probe))
   }
 
@@ -1559,27 +1403,6 @@ pub fn refusal_for_auto_launch(arch: Option<&str>, path: &Path) -> Option<String
   Backends::all()
     .into_iter()
     .find_map(|b| b.refuses(arch, path))
-}
-
-/// Whether `id` is a backend's long-lived **infrastructure** launch (a
-/// managed-multiplexer umbrella), not a servable model.
-///
-/// The generic replacement for the hard-coded `if launch_id == umbrella_id`
-/// skip that every running-launch walker (proxy routing, `/ui`, eviction,
-/// `status`) applies: an umbrella process is supervised like any child but
-/// isn't itself a model a client can attach to. Names no backend.
-pub fn is_infra_launch(id: &crate::daemon::registry::LaunchId) -> bool {
-  umbrella_owner(id).is_some()
-}
-
-/// The managed-multiplexer backend that owns the umbrella at `id`, or `None`
-/// when `id` isn't an umbrella. Idle eviction resolves the owner this way to
-/// `stop` the delegated models it serves (which unloads them from the umbrella),
-/// without naming a backend.
-pub fn umbrella_owner(id: &crate::daemon::registry::LaunchId) -> Option<Backends> {
-  Backends::all()
-    .into_iter()
-    .find(|b| b.umbrella_launch_id().as_ref() == Some(id))
 }
 
 /// Mint the synthetic [`ModelIdentity`] for a **file-less** catalog `path`, plus
@@ -1860,16 +1683,6 @@ pub fn default_backend() -> Backends {
   Backends::LlamaCpp(LlamaCppBackend::new())
 }
 
-/// Whether the backend with `id` is a managed multiplexer (its models are
-/// delegated to a shared umbrella, so they share the umbrella's port / RAM /
-/// CPU). Lets a client key on the lifecycle shape from just an id, without
-/// naming a backend. Unknown id → `false`.
-pub fn is_managed_multiplexer(id: &str) -> bool {
-  Backends::all()
-    .iter()
-    .any(|b| b.id() == id && b.lifecycle() == Lifecycle::ManagedMultiplexer)
-}
-
 /// The process name for an adopted child recorded under `backend_id`, or the
 /// default backend's own marker when the id is unknown / marker-less. Names no
 /// backend — the marker comes from the backend's own `process_markers`.
@@ -1998,21 +1811,16 @@ mod tests {
       },
       probe: ProbeOptions::default(),
     };
-    match LaunchPlan::SpawnProcess(spec) {
-      LaunchPlan::SpawnProcess(s) => {
-        assert_eq!(s.binary, PathBuf::from("/usr/bin/llama-server"));
-        assert_eq!(s.argv.len(), 2);
-        assert_eq!(s.env_remove, vec!["LLAMA_ARG_HOST"]);
-        assert!(matches!(
-          s.readiness,
-          Readiness::HttpPoll {
-            ready_status: 200,
-            ..
-          }
-        ));
+    assert_eq!(spec.binary, PathBuf::from("/usr/bin/llama-server"));
+    assert_eq!(spec.argv.len(), 2);
+    assert_eq!(spec.env_remove, vec!["LLAMA_ARG_HOST"]);
+    assert!(matches!(
+      spec.readiness,
+      Readiness::HttpPoll {
+        ready_status: 200,
+        ..
       }
-      LaunchPlan::DelegateToManager(_) => unreachable!("constructed a SpawnProcess"),
-    }
+    ));
   }
 
   #[test]
@@ -2053,14 +1861,7 @@ mod tests {
     let gguf = ModelIdentity::Gguf(compute("/m/anything.gguf", b"hdr"));
     let b = resolve_backend(&gguf, BackendChoice::Auto);
     assert_eq!(b.id(), DEFAULT_BACKEND_ID);
-    assert_eq!(b.lifecycle(), Lifecycle::ProcessPerModel);
     assert!(!b.knobs().is_empty());
-  }
-
-  #[test]
-  fn lifecycle_labels_are_stable() {
-    assert_eq!(Lifecycle::ProcessPerModel.label(), "process_per_model");
-    assert_eq!(Lifecycle::ManagedMultiplexer.label(), "managed_multiplexer");
   }
 
   #[test]
@@ -2071,10 +1872,6 @@ mod tests {
     // GGUF always binds to the direct llama.cpp backend.
     let gguf = ModelIdentity::Gguf(compute("/m/model.gguf", b"hdr"));
     assert_eq!(backend_for_identity(&gguf).id(), "llamacpp");
-    assert_eq!(
-      backend_for_identity(&gguf).lifecycle(),
-      Lifecycle::ProcessPerModel
-    );
 
     // A backend-registry identity for an unknown backend falls back to the
     // safe direct path.
@@ -2089,64 +1886,17 @@ mod tests {
   fn backends_enum_forwards_to_each_variant() {
     let llama = Backends::LlamaCpp(LlamaCppBackend::new());
     assert_eq!(llama.id(), "llamacpp");
-    assert_eq!(llama.lifecycle(), Lifecycle::ProcessPerModel);
 
-    // The dispatch enum routes prepare_launch to the process-per-model plan.
+    // The dispatch enum routes prepare_launch to the backend's own spec.
     use crate::launch::mode::LaunchMode;
     let p = LaunchParams::new(PathBuf::from("/m/model.gguf"), LaunchMode::Chat);
-    assert!(matches!(
-      llama.prepare_launch(
-        &p,
-        41100,
-        PathBuf::from("/bin/llama-server"),
-        ProbeOptions::default()
-      ),
-      LaunchPlan::SpawnProcess(_)
-    ));
-  }
-
-  #[test]
-  fn delegate_to_manager_carries_umbrella_and_model() {
-    // The managed-multiplexer arm: an umbrella ProcessLaunchSpec (probed
-    // via a liveness endpoint) plus the model the umbrella should serve.
-    let umbrella = ProcessLaunchSpec {
-      binary: PathBuf::from("/opt/example/server"),
-      argv: vec![
-        OsString::from("--host"),
-        OsString::from("127.0.0.1"),
-        OsString::from("--port"),
-        OsString::from("13305"),
-      ],
-      env_remove: vec![],
-      env: Vec::new(),
-      min_stop_grace: std::time::Duration::ZERO,
-      readiness: Readiness::HttpPoll {
-        path: "/live".to_string(),
-        ready_status: 200,
-      },
-      probe: ProbeOptions::default(),
-    };
-    let plan = LaunchPlan::DelegateToManager(ManagerLaunchSpec {
-      umbrella,
-      model: ManagerModelRef {
-        name: "Qwen2.5-7B-Instruct-GGUF".to_string(),
-      },
-    });
-    match plan {
-      LaunchPlan::DelegateToManager(spec) => {
-        assert_eq!(spec.model.name, "Qwen2.5-7B-Instruct-GGUF");
-        assert!(matches!(
-          spec.umbrella.readiness,
-          Readiness::HttpPoll {
-            ready_status: 200,
-            ..
-          }
-        ));
-        // Readiness path is a probe target, not a launch arg.
-        assert!(!spec.umbrella.argv.iter().any(|a| a == "/live"));
-      }
-      LaunchPlan::SpawnProcess(_) => panic!("expected DelegateToManager"),
-    }
+    let spec = llama.prepare_launch(
+      &p,
+      41100,
+      PathBuf::from("/bin/llama-server"),
+      ProbeOptions::default(),
+    );
+    assert_eq!(spec.binary, PathBuf::from("/bin/llama-server"));
   }
 
   #[test]
@@ -2157,14 +1907,6 @@ mod tests {
     // `status` / `doctor` / `--backend` without editing those sites.
     let ids: Vec<&str> = Backends::all().iter().map(|b| b.id()).collect();
     assert_eq!(ids, vec!["llamacpp", "vllm", "sglang", "generic"]);
-    // Forwarding through the macro reaches each variant's real lifecycle.
-    let by_id: std::collections::BTreeMap<&str, Lifecycle> = Backends::all()
-      .iter()
-      .map(|b| (b.id(), b.lifecycle()))
-      .collect();
-    assert_eq!(by_id["llamacpp"], Lifecycle::ProcessPerModel);
-    assert_eq!(by_id["vllm"], Lifecycle::ProcessPerModel);
-    assert_eq!(by_id["sglang"], Lifecycle::ProcessPerModel);
   }
 
   /// Routing order is priority, not registration order. Two engines claim a

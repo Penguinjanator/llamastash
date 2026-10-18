@@ -2270,36 +2270,9 @@ impl App {
       Some(m) => m,
       None => return vec![RightTab::Settings],
     };
-    // A managed-multiplexer umbrella row is infrastructure, not a model: it has
-    // no launch params to edit and chatting with the bare umbrella is
-    // meaningless. Its log tail is the one useful surface.
-    if crate::backend::is_infra_launch(&crate::daemon::registry::LaunchId(
-      managed.launch_id.clone(),
-    )) {
-      return vec![RightTab::Logs];
-    }
-    // A delegated multiplexer model (resident in the umbrella): the umbrella
-    // honors no launch knobs, so Settings is dropped; the mode surface
-    // (Chat / Embed / Rerank) stays — requests ride the umbrella's
-    // OpenAI-compat port directly — and Logs tails the shared umbrella log. A
-    // model with no mode surface (hint `Unknown`), or one that is not Ready,
+    // A model with no mode surface (hint `Unknown`), or one that is not Ready,
     // gets Logs and Requests: the 503s of a failed load are filed under the
-    // model, and Requests is where they show. Keys on the
-    // resolved `backend`'s lifecycle (the umbrella row is already dropped at
-    // ingest), since the launch id is a plain `L#` shared with every backend.
-    if managed
-      .backend
-      .as_deref()
-      .is_some_and(crate::backend::is_managed_multiplexer)
-    {
-      if managed.state != SurfaceState::Ready {
-        return vec![RightTab::Logs, RightTab::Requests];
-      }
-      return tabs_for_mode(self.mode_hint_for(&managed.path))
-        .into_iter()
-        .filter(|t| *t != RightTab::Settings)
-        .collect();
-    }
+    // model, and Requests is where they show.
     match managed.state {
       SurfaceState::Ready => tabs_for_mode(self.mode_hint_for(&managed.path)),
       // Process alive but not yet serving — Settings stays the
@@ -2618,14 +2591,6 @@ fn parse_proxy_info(v: &Value) -> Option<ProxyInfo> {
 
 fn parse_status_row(row: &Value) -> Option<ManagedRow> {
   let launch_id = row.get("launch_id")?.as_str()?.to_string();
-  // A managed-multiplexer umbrella is the multiplexer *process*, not a model:
-  // the daemon tracks it as a managed launch, but its path is the umbrella
-  // binary, so it would render as a bogus running row and yank an invalid model
-  // id. Drop it from the TUI — delegated model launches still surface as their
-  // own rows. (The daemon `status` / CLI keep it; this is TUI-only.)
-  if crate::backend::is_infra_launch(&crate::daemon::registry::LaunchId(launch_id.clone())) {
-    return None;
-  }
   let port = row.get("port")?.as_u64()? as u16;
   let name = row.get("name").and_then(Value::as_str).map(String::from);
   // The preset this launch resolved, present only when one was in play.

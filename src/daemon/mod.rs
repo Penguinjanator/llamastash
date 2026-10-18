@@ -472,18 +472,6 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
   // row whose process exited never leaves. Same slot `status` reads.
   orphans::spawn_resweep(token.clone(), ctx.external.clone());
 
-  // 8a. Per-backend boot infrastructure supervision (opt-in). A managed
-  // multiplexer brings up its one shared umbrella here so discovery (which
-  // probes its port) and proxy routing (which forwards to the registered
-  // umbrella) both work before the user issues an explicit `start`. Each
-  // backend self-gates on its own availability and runs the bring-up in its own
-  // detached task, so boot never blocks on a readiness probe; a
-  // process-per-model backend does nothing. Names no backend.
-  let boot_probe_timeout = opts.probe_timeout_secs.map(std::time::Duration::from_secs);
-  for backend in crate::backend::Backends::all() {
-    crate::backend::Backend::supervise_at_boot(&backend, &ctx, &opts.log_dir, boot_probe_timeout);
-  }
-
   // 8a-ii. Idle auto-shutdown (opt-in via `daemon.idle_timeout_secs`).
   if let Some(timeout) = opts.idle_timeout {
     idle::spawn(

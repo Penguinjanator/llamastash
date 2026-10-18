@@ -15,8 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::identity::{BackendModelId, ModelIdentity};
 use super::{
-  Accelerator, AcceleratorSupport, Backend, LaunchPlan, Lifecycle, ProcessLaunchSpec, Readiness,
-  CREDENTIAL_ENV_STRIP,
+  Accelerator, AcceleratorSupport, Backend, ProcessLaunchSpec, Readiness, CREDENTIAL_ENV_STRIP,
 };
 use crate::daemon::context::MethodContext;
 use crate::daemon::probe::ProbeOptions;
@@ -178,10 +177,6 @@ impl Backend for VllmBackend {
   }
   fn id(&self) -> &'static str {
     VLLM_BACKEND_ID
-  }
-
-  fn lifecycle(&self) -> Lifecycle {
-    Lifecycle::ProcessPerModel
   }
 
   fn enabled_in_config(
@@ -387,8 +382,8 @@ impl Backend for VllmBackend {
     port: u16,
     binary: PathBuf,
     probe: ProbeOptions,
-  ) -> LaunchPlan {
-    LaunchPlan::SpawnProcess(self.process_spec(params, port, binary, probe))
+  ) -> ProcessLaunchSpec {
+    self.process_spec(params, port, binary, probe)
   }
 
   fn seed_launch_knobs(&self, ctx: &MethodContext, params: &mut LaunchParams) {
@@ -737,10 +732,9 @@ mod tests {
   }
 
   #[test]
-  fn id_and_lifecycle() {
+  fn id_is_stable() {
     let b = VllmBackend::new();
     assert_eq!(b.id(), "vllm");
-    assert_eq!(b.lifecycle(), Lifecycle::ProcessPerModel);
   }
 
   #[test]

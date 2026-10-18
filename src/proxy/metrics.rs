@@ -386,18 +386,14 @@ pub(crate) struct LiveLaunch {
 
 /// Every live launch that is a model, with its display name, identity and port,
 /// sorted by launch order. The one registry walk, shared by `/metrics` and
-/// `/ui`'s chooser; infrastructure launches (a managed multiplexer's umbrella)
-/// serve no model of their own and are left out. A launch that is not Ready is
-/// still listed, with `ready: false`.
+/// `/ui`'s chooser. A launch that is not Ready is still listed, with
+/// `ready: false`.
 pub(crate) async fn live_launches(state: &ProxyState) -> Vec<LiveLaunch> {
   let sup_snap = state.ctx.supervisors.snapshot().await;
   let cat_snap = state.ctx.catalog.shared_view().await;
   let by_path = route::index_catalog_by_path(&cat_snap);
   let mut out = Vec::new();
   for (launch_id, model) in sup_snap {
-    if crate::backend::is_infra_launch(&launch_id) {
-      continue;
-    }
     let id = model.id().clone();
     let path = id.path.to_string_lossy().into_owned();
     let name = route::served_name_for_model(by_path.get(&path).copied(), &id.path);

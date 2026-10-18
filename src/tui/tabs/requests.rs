@@ -156,9 +156,8 @@ pub struct RequestsTabState {
 
 /// What the tab asks the daemon for. Normally one launch, because a running
 /// model row is one launch and its numbers must not come from another one.
-/// A managed multiplexer is the exception: its models run inside a shared
-/// umbrella and their requests are filed under the model, so that row polls
-/// its model and shows the whole-model aggregate.
+/// A `Model` scope is the whole-model aggregate, used when a row has no launch
+/// of its own to scope by.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestsScope {
   Launch(String),

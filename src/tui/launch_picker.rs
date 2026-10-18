@@ -687,14 +687,11 @@ impl LaunchPickerState {
   /// backend (a non-default backend the daemon picks by header) is downgraded to
   /// `Auto` so the daemon re-derives the route — it still lands there for a
   /// compatible file, but the daemon's Auto-only pre-spawn guards fire instead
-  /// of a doomed load. The default backend and a managed-multiplexer
-  /// (identity-bound) scope pass through unchanged. Names no backend.
+  /// of a doomed load. The default backend's scope passes through unchanged.
+  /// Names no backend.
   pub fn launch_backend(&self) -> BackendChoice {
     match &self.model_backend {
-      BackendChoice::Explicit(id)
-        if id != crate::backend::DEFAULT_BACKEND_ID
-          && !crate::backend::is_managed_multiplexer(id) =>
-      {
+      BackendChoice::Explicit(id) if id != crate::backend::DEFAULT_BACKEND_ID => {
         BackendChoice::Auto
       }
       other => other.clone(),
