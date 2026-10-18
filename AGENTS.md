@@ -13,7 +13,7 @@ Read the relevant doc before non-trivial work in that area; don't re-derive from
 | What's actually in the binary — modules, lifecycle, IPC, `status` shape, backend internals, servers, MTP | `docs/architecture.md` |
 | CLI subcommands, flags, JSON shapes, config keys, exit codes, keybindings | `docs/usage.md` |
 | Failure modes an end user hits | `docs/troubleshooting.md` |
-| Tested `config.yaml` blocks per engine and model (generic entries, wrappers, presets) | `RECIPES.md` |
+| Tested `config.yaml` blocks per engine and model (generic entries, wrappers, presets); `tests/recipes_load.rs` loads every block | `RECIPES.md` |
 | Design intent + tradeoffs, per feature | `docs/plans/*.md` (dated, one per feature) |
 | Origin requirements (R1–R46 v1, R48–R80 v2) | `docs/brainstorms/*requirements*.md` |
 | Pre-implementation findings | `docs/spikes/*.md` |
