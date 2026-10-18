@@ -118,6 +118,11 @@ servers:
     args: [--port, "{{port}}", --health-delay-ms, "60000"]
     ready: /health
     ready_timeout_secs: 2
+  - name: gen-rw
+    binary: {bin}
+    args: [--port, "{{port}}", -m, "{{name}}", --print-argv]
+    ready: /health
+    rewrite_model: true
 "#,
       bin = fake()
     );
@@ -487,6 +492,57 @@ servers:
         .iter()
         .any(|m| m["id"]["path"] == "generic://gen-a" && state_of(m) == "ready"),
       "auto-started the entry: {status}"
+    );
+    shutdown(client, daemon).await;
+  }
+
+  /// `rewrite_model` forwards the name the engine was launched with, so a named
+  /// launch is told `gen-rw@coder` on the wire as well as in `{name}`.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn rewrite_model_forwards_the_named_launch_s_own_name() {
+    let proxy_port = std::net::TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .port();
+    let (mut client, daemon) = boot(opts(unique_temp("rw"), Some(proxy_port))).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !client
+      .call("list_models", None)
+      .await
+      .unwrap()
+      .to_string()
+      .contains("generic://gen-rw")
+    {
+      assert!(Instant::now() < deadline, "entry never listed");
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let id = start(
+      &mut client,
+      json!({"model_path": "generic://gen-rw", "name": "coder"}),
+    )
+    .await;
+    wait_state(&mut client, &id, "ready").await;
+    let argv = log_lines(&mut client, &id, "argv ").await;
+    assert!(argv[0].contains("-m gen-rw@coder "), "{argv:?}");
+
+    let resp = reqwest::Client::new()
+      .post(format!("http://127.0.0.1:{proxy_port}/v1/chat/completions"))
+      .json(&json!({
+        "model": "gen-rw@coder",
+        "messages": [{"role": "user", "content": "hi"}],
+      }))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("proxy request");
+    let status = resp.status();
+    // The fixture echoes the `model` it was sent.
+    let text = resp.text().await.unwrap();
+    assert!(status.is_success(), "status {status}: {text}");
+    assert!(
+      text.contains(r#""model":"gen-rw@coder""#),
+      "the engine is told the name it serves: {text}"
     );
     shutdown(client, daemon).await;
   }
