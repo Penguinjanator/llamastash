@@ -70,11 +70,11 @@ impl ToolPatcher for Aider {
     }
     obj
   }
-  /// Every key it would write to `~/.aider.conf.yml`, set as the same-named env
-  /// var instead so that file stays untouched.
   fn session_program(&self) -> Option<&'static str> {
     Some(PROGRAM)
   }
+  /// Every key it would write to `~/.aider.conf.yml`, set as the same-named env
+  /// var instead so that file stays untouched.
   fn session(&self, ctx: &PatchContext, _files_dir: &Path) -> Option<SessionLaunch> {
     ctx.primary().filter(|m| !m.is_embed)?;
     let env = self

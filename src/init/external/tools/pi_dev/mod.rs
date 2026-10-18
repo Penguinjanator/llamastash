@@ -138,13 +138,13 @@ impl ToolPatcher for PiDev {
   fn companions(&self) -> Vec<Box<dyn ToolPatcher>> {
     vec![Box::new(settings::PiSettings)]
   }
+  fn session_program(&self) -> Option<&'static str> {
+    Some(PROGRAM)
+  }
   /// pi takes a provider from an extension file loaded with `-e`, so a session
   /// writes one under `files_dir` instead of touching `models.json`. The name
   /// is a hash of the body, so two sessions on different models (or against
   /// different proxies) never overwrite each other's file.
-  fn session_program(&self) -> Option<&'static str> {
-    Some(PROGRAM)
-  }
   fn session(&self, ctx: &PatchContext, files_dir: &Path) -> Option<SessionLaunch> {
     let m = ctx.primary().filter(|m| !m.is_embed)?;
     let mut provider = self.build_additions(ctx)["providers"][PROVIDER].clone();

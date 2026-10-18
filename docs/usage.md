@@ -1773,7 +1773,7 @@ The id handed to the tool is the one `/v1/models` publishes, plus `@<name>` when
 | `claude`, `claude-code` | `claude`   | Env only: `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, the same lines `claude-code.sh` exports. `ANTHROPIC_API_KEY` is removed from the child's env, since a real key there competes with the token and brings back Claude Code's custom-key approval prompt. |
 | `codex`          | `codex`    | `-c` overrides: `model_provider="llamastash"`, the `model_providers.llamastash` inline table (`name`, `base_url`, `wire_api="responses"`, `env_key="LLAMASTASH_API_KEY"`), `model`, `model_context_window`, and `model_reasoning_effort` for a model whose chat template lists effort levels (its default level). Env: `LLAMASTASH_API_KEY`. The key comes from the env var here, not from the profile's `auth.command`, because the `llamastash` on PATH may not be the binary running the session. |
 | `opencode`       | `opencode` | Env only: `OPENCODE_CONFIG_CONTENT`, the patcher's `provider.llamastash` block for the one model plus `"model"` and `"small_model"` set to `llamastash/<id>`; and `LLAMASTASH_API_KEY`, which that block resolves as `{env:LLAMASTASH_API_KEY}`. OpenCode merges that content after its global and project config, and does not seed its global config file while it is set. |
-| `pi`             | `pi`       | Args `-e <file> --provider llamastash-session --model <id>`, env `LLAMASTASH_API_KEY`. `<file>` is a generated extension at `<cache dir>/sessions/pi-<hash>.ts` whose default export calls `pi.registerProvider("llamastash-session", …)` with the patcher's provider block and `apiKey: "$LLAMASTASH_API_KEY"`. The provider name is kept apart from the `llamastash` one `integrations` may have written to `models.json`. The name is a hash of the content, so concurrent sessions never overwrite each other's file. |
+| `pi`             | `pi`       | Args `-e <file> --provider llamastash-session --model <id>`, env `LLAMASTASH_API_KEY`. `<file>` is a generated extension at `<cache dir>/sessions/pi-<hash>.ts` whose default export calls `pi.registerProvider("llamastash-session", ...)` with the patcher's provider block and `apiKey: "$LLAMASTASH_API_KEY"`. The provider name is kept apart from the `llamastash` one `integrations` may have written to `models.json`. The name is a hash of the content, so concurrent sessions never overwrite each other's file. |
 | `aider`          | `aider`    | Env only: `AIDER_MODEL=openai/<id>`, `AIDER_OPENAI_API_BASE`, `AIDER_OPENAI_API_KEY` (Aider's env form of configargparse precedence: CLI beats env beats config file).                                                                                        |
 
 The API key travels in the child's env only: never as a CLI argument visible in `ps`, never in a written file. The pi extension file holds no secret.
@@ -1784,7 +1784,7 @@ Verified against Claude Code 2.1.302, Codex 0.163.0, OpenCode 1.19.3, pi 1.3.0 a
 
 ```console
 $ llamastash session claude Qwen3.8-27B-UD-Q6_K --dry-run
-ANTHROPIC_BASE_URL='http://127.0.0.1:11435' ANTHROPIC_AUTH_TOKEN='***' ANTHROPIC_MODEL='Qwen3.8-27B-UD-Q6_K' … claude
+ANTHROPIC_BASE_URL='http://127.0.0.1:11435' ANTHROPIC_AUTH_TOKEN='***' ANTHROPIC_MODEL='Qwen3.8-27B-UD-Q6_K' ... claude
 ```
 
 `--dry-run --json` prints the same launch as an object:

@@ -134,12 +134,12 @@ impl ToolPatcher for OpenCode {
       }
     })
   }
-  /// OpenCode reads `OPENCODE_CONFIG_CONTENT` after its global and project
-  /// config, so the whole run's configuration is one env var and nothing of
-  /// the user's `opencode.json` is touched.
   fn session_program(&self) -> Option<&'static str> {
     Some(PROGRAM)
   }
+  /// OpenCode reads `OPENCODE_CONFIG_CONTENT` after its global and project
+  /// config, so the whole run's configuration is one env var and nothing of
+  /// the user's `opencode.json` is touched.
   fn session(&self, ctx: &PatchContext, _files_dir: &Path) -> Option<SessionLaunch> {
     let m = ctx.primary().filter(|m| !m.is_embed)?;
     let mut config = self.build_additions(ctx);
