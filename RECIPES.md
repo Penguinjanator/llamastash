@@ -36,7 +36,38 @@ llamastash status                                  # the servers it probed
 llamastash start <model> --server llamacpp-vulkan  # one launch on the Vulkan build
 ```
 
-A preset pins a build with `server: llamacpp-vulkan`, so the model always launches on it. The CPU build is handy for a small helper model next to a big GPU model, since it leaves GPU memory alone.
+A preset's `server:` line picks the build. With `default:` that build also runs on a plain `start` and on proxy auto-starts. An explicit `--server` still wins over it.
+
+```yaml
+presets:
+  Qwen3-0.6B-Q8_0.gguf:             # a small helper model, kept off the GPU
+    default: cpu
+    entries:
+      cpu:
+        server: llamacpp-cpu
+        knobs:
+          threads: 8
+          parallel: 1
+          ctx-size: 4096
+  "Qwen3-30B-A3B-*":                # every quant of one model
+    default: rocm
+    entries:
+      rocm:
+        server: llamacpp-rocm
+        knobs:
+          ctx-size: 32768
+      vulkan:                       # the same settings on the other build, to compare
+        server: llamacpp-vulkan
+        knobs:
+          ctx-size: 32768
+```
+
+```bash
+llamastash start Qwen3-0.6B-Q8_0.gguf                         # runs on llamacpp-cpu
+llamastash start Qwen3-30B-A3B-Q4_K_M.gguf --preset vulkan    # runs on llamacpp-vulkan
+```
+
+The CPU build suits a small helper model next to a big GPU model, since it leaves GPU memory alone.
 
 A Vulkan build on a host that probes as AMD or NVIDIA works. It changes the binary, not the detected host, so `init`, host metrics and UAT preflight still report `amd` / `nvidia` while the launch runs the Vulkan build.
 
