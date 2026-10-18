@@ -134,7 +134,7 @@ llamastash completions zsh > ~/.zsh/completions/_llamastash
 llamastash completions fish > ~/.config/fish/completions/llamastash.fish
 ```
 
-Full subcommand reference: [`docs/usage.md`](docs/usage.md). Proxy client setup (including an OpenCode example): [`docs/usage.md#opencode-setup`](docs/usage.md#opencode-setup). Prefer a Vulkan `llama-server` build on AMD/NVIDIA hosts: [`docs/usage.md#preferring-a-vulkan-llama-server-build`](docs/usage.md#preferring-a-vulkan-llama-server-build). Architecture and IPC contract: [`docs/architecture.md`](docs/architecture.md). When things go wrong: [`docs/troubleshooting.md`](docs/troubleshooting.md).
+Full subcommand reference: [`docs/usage.md`](docs/usage.md). Proxy client setup (including an OpenCode example): [`docs/usage.md#opencode-setup`](docs/usage.md#opencode-setup). Tested configs for llama.cpp builds, vLLM, SGLang, gufo, Halogen, ds4, Lemonade, FastFlowLM and whisper.cpp, with model presets: [`RECIPES.md`](RECIPES.md). Architecture and IPC contract: [`docs/architecture.md`](docs/architecture.md). When things go wrong: [`docs/troubleshooting.md`](docs/troubleshooting.md).
 
 ## Agent Skills
 
@@ -228,7 +228,7 @@ Full detail per feature in [`FEATURES.md`](FEATURES.md) — including trade-offs
 ### [Other engines (NPU, ASR, anything) through the generic backend](docs/usage.md#generic-backend)
 
 - **A `backend.generic.servers` entry runs any OpenAI-compatible server you declare**: its argv, its readiness path, its knobs, its stop grace. Supervised, admission-gated, proxy-routed like llama.cpp.
-- **NPU inference works here.** [Lemonade](https://github.com/lemonade-sdk/lemonade) (`lemond`) runs behind one entry plus one `proxy.aliases` line per model — measured 1.9 s cold at 103 t/s on a Strix Halo. [FastFlowLM](https://github.com/FastFlowLM/FastFlowLM) (`flm`) runs on AMD XDNA2 as its own entry at 82.9 t/s, no umbrella needed. Recipes: [Lemonade](docs/usage.md#running-lemonade-as-a-generic-server), [FastFlowLM](docs/usage.md#running-an-amd-npu-engine-fastflowlm-as-a-generic-server), [whisper.cpp](docs/usage.md#running-whispercpp-as-a-generic-server).
+- **NPU inference works here.** [Lemonade](https://github.com/lemonade-sdk/lemonade) (`lemond`) runs behind one entry plus one `proxy.aliases` line per model — measured 1.9 s cold at 103 t/s on a Strix Halo. [FastFlowLM](https://github.com/FastFlowLM/FastFlowLM) (`flm`) runs on AMD XDNA2 as its own entry at 82.9 t/s, no umbrella needed. Recipes: [Lemonade](RECIPES.md#lemonade), [FastFlowLM](RECIPES.md#fastflowlm-amd-npu), [whisper.cpp](RECIPES.md#whispercpp).
 - **You install the engine; LlamaStash drives it.** No auto-install anywhere — LlamaStash launches the binary you point at, polls readiness, routes requests, and stops it on your grace period. The dedicated Lemonade backend that shipped through 0.8.0 is gone; a generic entry does the same job ([why](docs/plans/2026-10-17-002-refactor-drop-lemonade-backend-plan.md)).
 
 ### [vLLM — safetensors HuggingFace repos (experimental)](docs/vllm-setup.md)
@@ -249,7 +249,7 @@ Full detail per feature in [`FEATURES.md`](FEATURES.md) — including trade-offs
 
 - **Engines LlamaStash has no backend for.** Declare a binary (or a wrapper script around `docker run`), its args with `{port}` / `{model}` placeholders, its readiness path and its own knobs in `config.yaml`. LlamaStash reserves the port, waits for ready, routes the proxy and stops it with a per-entry grace floor. Validated with gufo, Halogen (Docker) and CIRU on a Strix Halo box.
 - **Run a GGUF through another engine.** An entry with `model: "<glob>"` becomes a server option on the matching catalog rows, next to llama.cpp, in the TUI Server row, `--server`, and presets. Its knobs show up in the launch editor, presets and last-used like any other.
-- **ds4 for DeepSeek-V4.** antirez's [ds4](https://github.com/antirez/ds4) (`ds4-server`) runs as a generic entry with its MTP, DSpark, SSD-streaming and disk KV cache flags as knobs. Same argv and speed as the dedicated backend it replaces. See **[Running ds4 as a generic server](docs/usage.md#running-ds4-as-a-generic-server)**.
+- **ds4 for DeepSeek-V4.** antirez's [ds4](https://github.com/antirez/ds4) (`ds4-server`) runs as a generic entry with its MTP, DSpark, SSD-streaming and disk KV cache flags as knobs. Same argv and speed as the dedicated backend it replaces. See **[Running ds4 as a generic server](RECIPES.md#deepseek-v4)**.
 
 ### [Built to be safe to run](FEATURES.md#built-to-be-safe-to-run)
 

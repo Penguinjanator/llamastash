@@ -74,7 +74,7 @@ Run as many models as your hardware can hold. Each launch gets its own port, aut
 
 ### DeepSeek-V4 via ds4 as a generic server
 
-antirez's [`ds4-server`](https://github.com/antirez/ds4) runs the DeepSeek-V4 Flash/PRO GGUFs as a `backend.generic` entry. Its flags (`--ctx`, `--power`, `--kv-disk-dir`, `--ssd-streaming`, `--mtp`, `--dspark`, and the rest) are declared as knobs, so they show in the TUI launch editor and presets, and a preset pins the `generic-ds4` server and the MTP or DSpark head file. llama.cpp (**b9840+**) runs these GGUFs too and is the default server. See [`docs/usage.md` § Running ds4 as a generic server](docs/usage.md#running-ds4-as-a-generic-server).
+antirez's [`ds4-server`](https://github.com/antirez/ds4) runs the DeepSeek-V4 Flash/PRO GGUFs as a `backend.generic` entry. Its flags (`--ctx`, `--power`, `--kv-disk-dir`, `--ssd-streaming`, `--mtp`, `--dspark`, and the rest) are declared as knobs, so they show in the TUI launch editor and presets, and a preset pins the `generic-ds4` server and the MTP or DSpark head file. llama.cpp (**b9840+**) runs these GGUFs too and is the default server. See [`RECIPES.md` § DeepSeek V4](RECIPES.md#deepseek-v4).
 
 ### GPU-aware built-in arch defaults
 
@@ -245,15 +245,15 @@ Measured on a Strix Halo on 2026-10-17:
 - **[Lemonade](https://github.com/lemonade-sdk/lemonade) (`lemond`)** — one
   long-lived umbrella for NPU / ROCm / ONNX engines, behind one entry plus one
   `proxy.aliases` line per model. 1.9 s cold through the alias at 103 t/s.
-  Recipe: [Running Lemonade as a generic server](docs/usage.md#running-lemonade-as-a-generic-server);
+  Recipe: [Running Lemonade as a generic server](RECIPES.md#lemonade);
   install notes: [Lemonade setup](docs/lemonade-setup.md).
 - **[FastFlowLM (`flm`)](https://github.com/FastFlowLM/FastFlowLM)** — AMD
   XDNA2 NPU, one process per model type, no umbrella. 82.9 decode t/s on
   `qwen3:0.6b`; `flm serve --asr 1` answers `POST /v1/audio/transcriptions`.
-  Recipe: [FastFlowLM on an AMD NPU](docs/usage.md#running-an-amd-npu-engine-fastflowlm-as-a-generic-server).
+  Recipe: [FastFlowLM on an AMD NPU](RECIPES.md#fastflowlm-amd-npu).
 - **whisper.cpp** — supervised and ready-polled, but its API (`POST /inference`)
   is not an OpenAI route, so it is launch-managed only.
-  Recipe: [whisper.cpp](docs/usage.md#running-whispercpp-as-a-generic-server).
+  Recipe: [whisper.cpp](RECIPES.md#whispercpp).
 
 **You install the engine yourself** (including AMD's NPU system stack — XRT /
 firmware / `flm`); LlamaStash never downloads or installs anything.

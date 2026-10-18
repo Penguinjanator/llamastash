@@ -231,7 +231,7 @@ Once the underlying launch issue is fixed, the fallback path stops firing. To tu
 
 **Cause:** ds4 was a dedicated backend up to 0.4.0. It now runs as a `backend.generic` entry, and the old `backend.ds4:` block no longer parses.
 
-**Fix:** follow the migration steps in [Running ds4 as a generic server](usage.md#running-ds4-as-a-generic-server): replace the block with the generic entry, add `server: generic-ds4` to your ds4 presets, and restart the daemon.
+**Fix:** follow the migration steps in [Running ds4 as a generic server](../RECIPES.md#deepseek-v4): replace the block with the generic entry, add `server: generic-ds4` to your ds4 presets, and restart the daemon.
 
 ## My DeepSeek-V4 model launched on llama.cpp, not ds4
 
@@ -250,7 +250,7 @@ llamastash status --json | jq -r '.daemon.server_path'
 "$(llamastash status --json | jq -r '.daemon.server_path')" --version   # want: version >= 9840
 ```
 
-Or run the file on ds4 instead, through a [generic server entry](usage.md#running-ds4-as-a-generic-server). (On a b9840+ llama.cpp, Flash Attention is currently auto-disabled for the deepseek4 graph — the model still loads and runs.)
+Or run the file on ds4 instead, through a [generic server entry](../RECIPES.md#deepseek-v4). (On a b9840+ llama.cpp, Flash Attention is currently auto-disabled for the deepseek4 graph — the model still loads and runs.)
 
 ## A model shows `error: process exited unexpectedly`
 

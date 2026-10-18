@@ -580,16 +580,11 @@ backend:
     # leaving both memory knobs unset lets llamastash cap the KV cache from
     # live free memory. That guard exists because vLLM sizes its cache
     # against the whole pool rather than the model, which has exhausted RAM
-    # and frozen a 121 GB machine. Set either knob and the cap steps aside:
-    #
-    #   presets:
-    #     big-ctx:
-    #       knobs:
-    #         kv-cache-memory-bytes: 16G   # absolute cap; wins outright
-    #         gpu-memory-utilization: 0.5  # fraction of the pool
-    #
-    # Neither is remembered: both are marked volatile, so a preset run
-    # applies the value without every later bare `start` inheriting it.
+    # and frozen a 121 GB machine. Set `kv-cache-memory-bytes` or
+    # `gpu-memory-utilization` in a preset and the cap steps aside (example
+    # in RECIPES.md § vLLM and SGLang). Neither is remembered: both are
+    # marked volatile, so a preset run applies the value without every later
+    # bare `start` inheriting it.
 
     # Let browser pages reach this backend cross-origin. `true` is vLLM's
     # own default (it allows any origin, unconditionally), so llamastash
@@ -626,24 +621,20 @@ backend:
     # On a unified-memory host, leaving both memory knobs unset lets
     # llamastash cap the KV pool — in tokens, because SGLang has no byte
     # cap: `--max-total-tokens` is derived from the shared byte budget and
-    # the model's KV bytes per token (read from its config.json). Set either
-    # knob and the cap steps aside:
-    #
-    #   presets:
-    #     big-ctx:
-    #       knobs:
-    #         max-total-tokens: 131072      # absolute cap in tokens; wins
-    #         mem-fraction-static: 0.5      # fraction of the whole pool
-    #
-    # Both are volatile, so a preset run applies the value without every
-    # later bare `start` inheriting it. There is no `cors` key: SGLang
-    # allows every origin and exposes no flag to narrow it.
+    # the model's KV bytes per token (read from its config.json). Set
+    # `max-total-tokens` or `mem-fraction-static` in a preset and the cap
+    # steps aside (example in RECIPES.md § vLLM and SGLang). Both are
+    # volatile, so a preset run applies the value without every later bare
+    # `start` inheriting it. There is no `cors` key: SGLang allows every
+    # origin and exposes no flag to narrow it.
 
   # Generic — run any OpenAI-compatible server llamastash has no dedicated
   # backend for. llamastash picks the port, polls `ready`, routes the proxy
   # and stops the process; everything engine-specific lives in the entry or
   # in a wrapper script. Read once at start: `daemon restart` after editing.
-  # See docs/usage.md § Generic backend for the rules and a Docker wrapper.
+  # See docs/usage.md § Generic backend for the rules, and RECIPES.md for
+  # tested entries (gufo, Halogen, CIRU, ds4, Lemonade, FastFlowLM,
+  # whisper.cpp) with their wrapper scripts and presets.
   #
   # Sources — CLI: (none) · Env: (none). Config-only: `binary` runs as you.
   generic:
@@ -651,64 +642,45 @@ backend:
       # With `model`, the entry is a server option (`generic-<name>`) on every
       # catalog GGUF the value matches: a preset-key glob, a path, or a model
       # id. llama.cpp stays the default; pick this server in the TUI Server
-      # row, with `start <model> --server generic-gufo`, or in a preset.
-      - name: gufo
-        model: "Qwen3.8-Flash-Next-UD-Q4_K_XL*"
-        binary: /opt/gufo/build/release/gufo
+      # row, with `start <model> --server generic-my-engine`, or in a preset.
+      - name: my-engine
+        model: "Qwen3-8B-*"
+        binary: /opt/my-engine/bin/my-engine
         # Placeholders: {port} (llamastash reserves it), {host} (always
         # 127.0.0.1), {name} (the id /v1/models publishes, `id@launch` when named),
         # {model} (the chosen GGUF path, required with `model`) and
         # {<knob id>}. Knobs, then `start -- …` extras, follow.
-        args: [serve, --host, "{host}", --port, "{port}", llm,
-               --served-model-name, "{name}", --model, "{model}",
-               --mtp-model, /models/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf]
+        args: [serve, --host, "{host}", --port, "{port}",
+               --served-model-name, "{name}", --model, "{model}"]
         knobs:
           # Emitted as `<flag> <value>`. `ctx: true` (at most one) makes the
           # knob the context window: `--ctx`, the TUI Context row, `status`.
           - flag: --context
             ctx: true
             default: "65536"
-          - flag: --speculative
-            default: mtp
-          - flag: --temperature
-            default: "1.0"
-          - --seed                         # no default: sent only when set
-        ready: /ready                      # HTTP path that returns 200 when loaded
-        stop_grace_secs: 60                # SIGTERM→SIGKILL floor for every stop
-      # ds4 (DwarfStar, https://github.com/antirez/ds4) for the DeepSeek-V4
-      # GGUFs. See docs/usage.md#running-ds4-as-a-generic-server.
-      - name: ds4
-        model: "DeepSeek-V4-*"
-        binary: /opt/ds4/ds4-server
-        args: [-m, "{model}", --host, "{host}", --port, "{port}"]
-        ready: /v1/models                  # ds4-server binds only after loading
-        knobs:
-          - {flag: --ctx, id: ds4-ctx, ctx: true}
-          - --power
-          - --kv-disk-dir
           # `switch: true` sends the bare flag when on, nothing when off.
-          - {flag: --ssd-streaming, switch: true}
-          - {flag: --mtp, id: mtp-model}   # a draft head path; set it in a preset
-          - {flag: --dspark, switch: true}
+          - {flag: --low-memory, switch: true}
+          - --seed                         # no default: sent only when set
+        ready: /health                     # HTTP path that returns 200 when loaded
+        stop_grace_secs: 60                # SIGTERM→SIGKILL floor for every stop
+        # rewrite_model: true              # proxy sets body.model to {name}
       # Without `model`, the entry is its own row, published as `name`. For
       # engines whose weights are not a catalog GGUF.
-      - name: flash-next-halogen
-        binary: ~/bin/halogen-serve.sh     # wrapper around `docker run`
+      - name: my-wrapped-engine
+        binary: ~/bin/my-engine-serve.sh   # e.g. a wrapper around `docker run`
         args: ["{port}"]
         knobs:
-          - flag: --ctx-window             # referenced in env, so never a flag
-            id: halogen-ctx
+          - flag: --engine-ctx             # referenced in env, so never a flag
+            id: engine-ctx
             ctx: true
             default: "65536"
         env:
-          HALOGEN_MODEL_ID: "{name}"
-          HALOGEN_CTX: "{halogen-ctx}"
-          HALOGEN_KV_POOL_POSITIONS: "{halogen-ctx}"
+          ENGINE_MODEL_ID: "{name}"
+          ENGINE_CTX: "{engine-ctx}"
         ready: /v1/models
         memory_gib: 80                     # admission demand; unset = no gating
         stop_grace_secs: 90
         ready_timeout_secs: 600
-        # rewrite_model: true              # proxy sets body.model to {name}
         # modes: [chat]                    # refuse /v1/embeddings and /v1/rerank
         # Row info for the Arch / Params / Quant / Ctx columns. Only
         # without `model`. Ctx defaults to the `ctx: true`
@@ -729,12 +701,12 @@ backend:
       # `{path: label, contains: audio}` / `{path: details.family, equals: qwen3}`.
       # Missing, failing or non-JSON output mints nothing. See docs/usage.md §
       # Minting rows from an engine's own listing.
-      # - name: flm
-      #   binary: ~/.local/opt/fastflowlm/flm
+      # - name: my-store
+      #   binary: /opt/my-store/bin/serve
       #   args: [serve, "{name}", --port, "{port}"]
-      #   ready: /v1/version
+      #   ready: /health
       #   rows_from:
-      #     command: [~/.local/opt/fastflowlm/flm, list, --filter, installed, --json]
+      #     command: [/opt/my-store/bin/serve, list, --json]
       #     items: models            # omit when the body is the array itself
       #     name: model
       #     when: installed
