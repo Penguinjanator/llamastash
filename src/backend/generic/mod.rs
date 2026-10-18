@@ -76,6 +76,21 @@ fn minted_name_from_path(path: &Path) -> Option<&str> {
   tail.split_once('/').map(|(_, model)| model)
 }
 
+/// The name the engine is told about itself. A minted row always reports its bare
+/// tag: its published id is qualified (`tag@coder`) or escalated (`entry/tag`)
+/// exactly when the engine would reject it. Everything else reports the published
+/// id stamped at start, falling back to the entry name.
+fn engine_name(params: &LaunchParams, entry_name: &str) -> String {
+  match minted_name_from_path(&params.model_path) {
+    Some(tag) => tag.to_string(),
+    None => params
+      .launch_config
+      .get(PUBLISHED_NAME_KEY)
+      .cloned()
+      .unwrap_or_else(|| entry_name.to_string()),
+  }
+}
+
 fn entry_for_path(path: &Path) -> Option<Arc<Entry>> {
   entry_named(entry_name_from_path(path)?)
 }
@@ -171,17 +186,7 @@ impl GenericBackend {
     let (argv, env, ready, probe, grace) = match &entry {
       Some(e) => {
         let s = &e.server;
-        // A minted row always launches with its bare tag: the published id is
-        // qualified (`tag@coder`) or escalated (`entry/tag`) exactly when the
-        // engine would reject it, and the engine picks the model from the tag.
-        let published = match minted_name_from_path(&params.model_path) {
-          Some(tag) => tag.to_string(),
-          None => params
-            .launch_config
-            .get(PUBLISHED_NAME_KEY)
-            .cloned()
-            .unwrap_or_else(|| s.name.clone()),
-        };
+        let published = engine_name(params, &s.name);
         // `resolve_knobs` already refused a placeholder knob with no value, so
         // an error here means the params changed under us; spawn nothing
         // useful rather than panic.
@@ -592,9 +597,11 @@ impl Backend for GenericBackend {
       None => model_id,
     };
     if entry.server.rewrite_model {
+      // The forwarded `body.model` is what the engine reads, so it carries the
+      // engine's own name for the model, not the catalog's published id.
       exec.params.launch_config.insert(
         crate::backend::REQUEST_MODEL_KEY.to_string(),
-        published.clone(),
+        engine_name(&exec.params, &entry.server.name),
       );
     }
     exec

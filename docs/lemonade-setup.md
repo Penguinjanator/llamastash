@@ -29,8 +29,9 @@ lemond            # starts the umbrella (default port 13305)
 curl http://127.0.0.1:13305/api/v1/models
 ```
 
-Then **stop that manual `lemond`** — the generic entry launches its own copy on
-the port LlamaStash reserves, and a second listener on the same port blocks it.
+Then **stop that manual `lemond`** — the generic entry launches its own copy on a
+port LlamaStash reserves, so nothing is blocked by leaving it up, but it holds its
+models in memory and on the device.
 
 ## 2. Declare it as a generic entry
 
@@ -52,11 +53,11 @@ proxy:
 Full recipe with the measured numbers and the limits:
 [usage.md](usage.md#running-lemonade-as-a-generic-server). Model names come
 from the running entry's own port, which `llamastash status` shows:
-`curl http://127.0.0.1:<launch-port>/api/v1/models?show_all=true`. Write the
-alias key in exactly the case `lemond` uses (`Qwen3-0.6B-GGUF`, not
-`qwen3-0.6b-gguf`): `lemond` matches names case-sensitively, while
-`/v1/models` lists an alias lowercased, so a client that copies the listed id
-gets a 404.
+`curl "http://127.0.0.1:<launch-port>/api/v1/models?show_all=true"` (quote the
+URL or zsh eats the `?`). Names are case-sensitive at `lemond` and alias keys are
+lowercased when the config loads, so a model whose name has capitals is only
+reachable by a request that spells it exactly as `lemond` does; the lowercased id
+`/v1/models` publishes for an alias answers 404 at `lemond`.
 
 ## 3. Verify
 
@@ -68,8 +69,10 @@ llamastash requests Qwen3-0.6B-GGUF     # after a chat through the alias
 
 ## 4. Troubleshooting
 
-- **`404 model_not_found` naming no alias** — the entry is not up. `llamastash
-  start lemonade`, then check `llamastash logs lemonade`.
+- **`404 model_not_found` naming an alias** — the alias names no entry; check
+  the key against `proxy.aliases`. A stopped entry is not a 404: the proxy starts
+  it on the first request, and if that start fails while another model runs the
+  request falls through to it with a `launch_failed` note.
 - **A model name 404s through the alias** — `lemond` only answers names it
   has; check the `show_all=true` list and add the exact name to
   `proxy.aliases`.

@@ -216,14 +216,9 @@ fn keeps(when: Option<&super::config::When>, item: &Value) -> bool {
       };
       match (equals, contains) {
         (Some(want), None) => v.as_str().is_some_and(|s| s == want),
-        (None, Some(want)) => match v {
-          // A list matches on a member, a string on a substring, so an engine
-          // that reports `["reasoning"]` and one that reports `"reasoning"`
-          // both work.
-          Value::Array(arr) => arr.iter().any(|e| e.as_str() == Some(want.as_str())),
-          Value::String(s) => s.contains(want.as_str()),
-          _ => false,
-        },
+        (None, Some(want)) => v
+          .as_array()
+          .is_some_and(|arr| arr.iter().any(|e| e.as_str() == Some(want.as_str()))),
         (Some(_), Some(_)) | (None, None) => false,
       }
     }
@@ -420,27 +415,6 @@ servers:
         "`{bad}` must not mint a row"
       );
     }
-  }
-
-  /// A string label matches on a substring; a missing path or a non-string
-  /// against `equals` fails closed.
-  #[test]
-  fn contains_matches_a_substring_and_equals_fails_closed() {
-    let server = recipe("{path: label, contains: reason}");
-    let spec = server.rows_from.clone().unwrap();
-    let body = r#"{"models":[{"model":"a","label":"vision-reasoning"},
-                          {"model":"b","label":"audio"},
-                          {"model":"c"},{"model":"d","label":7}]}"#;
-    assert_eq!(
-      rows_from_json(&server, &spec, body)
-        .into_iter()
-        .map(|m| m.display_label.unwrap())
-        .collect::<Vec<_>>(),
-      ["a"]
-    );
-    let eq = recipe(r#"{path: n, equals: "2"}"#);
-    let eq_spec = eq.rows_from.clone().unwrap();
-    assert!(rows_from_json(&eq, &eq_spec, r#"{"models":[{"model":"d","n":2}]}"#).is_empty());
   }
 
   #[tokio::test]

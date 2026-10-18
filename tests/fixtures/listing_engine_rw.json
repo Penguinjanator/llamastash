@@ -1,0 +1,1 @@
+{"models": [{"model": "solo:one", "installed": true, "details": {"family": "solo", "parameter_size": "1B"}, "default_context_length": 4096, "footprint": 0.4}]}

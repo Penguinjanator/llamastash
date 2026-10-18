@@ -23,6 +23,13 @@ fn listing() -> String {
     .into_owned()
 }
 
+fn listing_rw() -> String {
+  PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    .join("tests/fixtures/listing_engine_rw.json")
+    .to_string_lossy()
+    .into_owned()
+}
+
 fn unique_temp(label: &str) -> PathBuf {
   llamastash::test_support::unique_temp_dir("ls-rows", label)
 }
@@ -46,6 +53,17 @@ servers:
       quant: details.quantization_level
       ctx: default_context_length
       memory_gib: footprint
+  - name: rw
+    binary: {bin}
+    args: [--port, "{{port}}", -m, "{{name}}", --print-argv]
+    ready: /health
+    memory_gib: 1
+    rewrite_model: true
+    rows_from:
+      command: [{bin}, --print-listing, {listing_rw}]
+      items: models
+      name: model
+      when: installed
   - name: listed-broken
     binary: {bin}
     args: [--port, "{{port}}"]
@@ -56,7 +74,8 @@ servers:
       name: model
 "#,
     bin = fake(),
-    listing = listing()
+    listing = listing(),
+    listing_rw = listing_rw()
   );
   BackendConfig {
     generic: yaml_serde::from_str(&yaml).unwrap(),
@@ -160,59 +179,47 @@ async fn a_minted_row_carries_the_item_s_own_context_and_size() {
   shutdown(client, daemon).await;
 }
 
+/// Start a model over IPC and wait until its launch reports ready.
+async fn start_ready(client: &mut Client, params: Value) -> String {
+  let resp = client
+    .call("start_model", Some(params))
+    .await
+    .expect("start_model");
+  let id = resp["launch_id"].as_str().unwrap().to_string();
+  let deadline = Instant::now() + Duration::from_secs(30);
+  loop {
+    let status = client.call("status", None).await.unwrap();
+    if status["models"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .any(|m| m["launch_id"] == json!(id) && m["state"]["state"] == "ready")
+    {
+      return id;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "launch `{id}` never came up: {status}"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+  }
+}
+
 /// The point of minting rows instead of aliasing one: `{name}` is the minted
 /// tag, so the same entry launches whichever model the row names.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_minted_row_launches_with_its_tag_as_the_name() {
   let (mut client, daemon) = boot(opts(unique_temp("launch"), None)).await;
   assert!(!minted_rows(&mut client).await.is_empty());
-  let resp = client
-    .call(
-      "start_model",
-      Some(json!({"model": "listed:three", "model_path": "generic://listed/listed:three"})),
-    )
-    .await
-    .expect("start_model");
-  let id = resp["launch_id"].as_str().unwrap();
-  let deadline = Instant::now() + Duration::from_secs(30);
-  loop {
-    let status = client.call("status", None).await.unwrap();
-    let row = status["models"]
-      .as_array()
-      .unwrap()
-      .iter()
-      .find(|m| m["launch_id"] == json!(id))
-      .cloned()
-      .unwrap_or(Value::Null);
-    if row["state"]["state"] == "ready" {
-      break;
-    }
-    assert!(Instant::now() < deadline, "minted row never came up: {row}");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-  }
-  let deadline = Instant::now() + Duration::from_secs(5);
-  let argv = loop {
-    let body = client
-      .call("logs_tail", Some(json!({"launch_id": id, "lines": 200})))
-      .await
-      .unwrap();
-    let lines: Vec<String> = body["lines"]
-      .as_array()
-      .unwrap()
-      .iter()
-      .filter_map(|l| l.as_str())
-      .filter(|l| l.contains("argv --port"))
-      .map(str::to_string)
-      .collect();
-    if !lines.is_empty() || Instant::now() >= deadline {
-      break (lines, body);
-    }
-    tokio::time::sleep(Duration::from_millis(50)).await;
-  };
-  let (argv, body) = argv;
+  let id = start_ready(
+    &mut client,
+    json!({"model": "listed:three", "model_path": "generic://listed/listed:three"}),
+  )
+  .await;
+  let argv = log_lines(&mut client, &id).await;
   assert!(
     argv.iter().any(|l| l.contains("-m listed:three")),
-    "`{{name}}` must be the minted tag: {argv:?} / {body}"
+    "`{{name}}` must be the minted tag: {argv:?}"
   );
   shutdown(client, daemon).await;
 }
@@ -222,39 +229,60 @@ async fn a_minted_row_launches_with_its_tag_as_the_name() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_named_minted_launch_still_sends_the_bare_tag() {
   let (mut client, daemon) = boot(opts(unique_temp("named"), None)).await;
-  assert!(!minted_rows(&mut client).await.is_empty());
-  let resp = client
-    .call(
-      "start_model",
-      Some(json!({
-        "model": "listed:three",
-        "model_path": "generic://listed/listed:three",
-        "name": "coder",
-      })),
-    )
-    .await
-    .expect("start_model");
-  let id = resp["launch_id"].as_str().unwrap();
-  let deadline = Instant::now() + Duration::from_secs(30);
-  let argv = loop {
-    let status = client.call("status", None).await.unwrap();
-    let ready = status["models"]
-      .as_array()
-      .unwrap()
-      .iter()
-      .any(|m| m["launch_id"] == json!(id) && m["state"]["state"] == "ready");
-    if ready {
-      break log_lines(&mut client, id).await;
-    }
-    assert!(
-      Instant::now() < deadline,
-      "named minted row never came up: {status}"
-    );
-    tokio::time::sleep(Duration::from_millis(50)).await;
-  };
+  let id = start_ready(
+    &mut client,
+    json!({
+      "model": "listed:three",
+      "model_path": "generic://listed/listed:three",
+      "name": "coder",
+    }),
+  )
+  .await;
+  let argv = log_lines(&mut client, &id).await;
   assert!(
-    argv.iter().any(|l| l.contains("-m listed:three ")),
+    argv.iter().any(|l| l.contains("-m listed:three "))
+      && !argv.iter().any(|l| l.contains("@coder")),
     "the tag is sent bare, not `listed:three@coder`: {argv:?}"
+  );
+  shutdown(client, daemon).await;
+}
+
+/// `rewrite_model` replaces `body.model` for an engine that cannot resolve the
+/// catalog id. On a named minted launch the catalog id is `tag@coder`, so the
+/// forwarded name has to be the engine's own tag or the engine cannot load it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rewrite_model_on_a_named_minted_launch_forwards_the_tag() {
+  let proxy_port = std::net::TcpListener::bind("127.0.0.1:0")
+    .unwrap()
+    .local_addr()
+    .unwrap()
+    .port();
+  let (mut client, daemon) = boot(opts(unique_temp("rw"), Some(proxy_port))).await;
+  start_ready(
+    &mut client,
+    json!({"model": "solo:one", "model_path": "generic://rw/solo:one", "name": "coder"}),
+  )
+  .await;
+  let resp = reqwest::Client::new()
+    .post(format!("http://127.0.0.1:{proxy_port}/v1/chat/completions"))
+    .json(&json!({
+      "model": "solo:one",
+      "messages": [{"role": "user", "content": "hi"}],
+    }))
+    .timeout(Duration::from_secs(60))
+    .send()
+    .await
+    .expect("proxy request");
+  assert!(resp.status().is_success(), "status {}", resp.status());
+  // The fixture echoes the `model` it was sent, and replies as SSE.
+  let text = resp.text().await.unwrap();
+  assert!(
+    text.contains(r#""model":"solo:one""#),
+    "the engine is told its own tag: {text}"
+  );
+  assert!(
+    !text.contains("@coder"),
+    "the published id leaked into the forwarded body: {text}"
   );
   shutdown(client, daemon).await;
 }
