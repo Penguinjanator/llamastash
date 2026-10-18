@@ -512,17 +512,22 @@ pub async fn pick_install_method(
     return Ok(default);
   }
   let (initial_idx, items) = build_install_items(&default, existing, brew_offer_available(), cuda);
-  let items_for_thread = items.clone();
-  let chosen_idx = tokio::task::spawn_blocking(move || {
-    let mut select = cliclack::select::<usize>("Install method").initial_value(initial_idx);
-    for (i, (_pick, label, hint)) in items_for_thread.iter().enumerate() {
-      select = select.item(i, label.clone(), hint.clone());
-    }
-    select.interact()
-  })
+  let chosen_idx = crate::cli::picker::select_one(
+    "Install method".to_string(),
+    initial_idx,
+    items
+      .iter()
+      .map(|(_pick, label, hint)| (label.clone(), hint.clone()))
+      .collect(),
+  )
   .await
-  .map_err(|e| CliExit::new(INIT_ABORTED, format!("init: prompt join failed: {e}")))?
-  .map_err(|e| CliExit::new(INIT_ABORTED, format!("init: install prompt: {e}")))?;
+  .map_err(|e| {
+    e.into_exit(
+      INIT_ABORTED,
+      "init: prompt join failed",
+      "init: install prompt",
+    )
+  })?;
   let (pick, _, _) = items
     .into_iter()
     .nth(chosen_idx)
@@ -669,40 +674,36 @@ async fn show_model_menu(
   let n = recs.len();
   let search_idx = online.then_some(n);
   let skip_idx = if online { n + 1 } else { n };
-  tokio::task::spawn_blocking(move || {
-    let mut select = cliclack::select("Pick a model").initial_value(initial_idx);
-    for (i, r) in recs.iter().enumerate() {
-      let (label, hint) = render_recommendation(r);
-      select = select.item(i, label, hint);
+  let mut items: Vec<(String, String)> = recs.iter().map(render_recommendation).collect();
+  if online {
+    items.push((
+      "Search HuggingFace by name…".to_string(),
+      "type a query, pick from results".to_string(),
+    ));
+  }
+  items.push((
+    "Skip — don't download a model".to_string(),
+    "use `llamastash pull` later".to_string(),
+  ));
+  let idx = crate::cli::picker::select_one("Pick a model".to_string(), initial_idx, items)
+    .await
+    .map_err(|e| {
+      e.into_exit(
+        INIT_ABORTED,
+        "init: prompt join failed",
+        "init: model prompt",
+      )
+    })?;
+  Ok(if Some(idx) == search_idx {
+    ModelMenuOutcome::Search
+  } else if idx == skip_idx {
+    ModelMenuOutcome::Skip
+  } else {
+    match recs.into_iter().nth(idx) {
+      Some(r) => ModelMenuOutcome::Pick(r.kind),
+      None => ModelMenuOutcome::Skip,
     }
-    if let Some(si) = search_idx {
-      select = select.item(
-        si,
-        "Search HuggingFace by name…".to_string(),
-        "type a query, pick from results".to_string(),
-      );
-    }
-    select = select.item(
-      skip_idx,
-      "Skip — don't download a model".to_string(),
-      "use `llamastash pull` later".to_string(),
-    );
-    let idx = select.interact()?;
-    let outcome = if Some(idx) == search_idx {
-      ModelMenuOutcome::Search
-    } else if idx == skip_idx {
-      ModelMenuOutcome::Skip
-    } else {
-      match recs.into_iter().nth(idx) {
-        Some(r) => ModelMenuOutcome::Pick(r.kind),
-        None => ModelMenuOutcome::Skip,
-      }
-    };
-    Ok::<_, std::io::Error>(outcome)
   })
-  .await
-  .map_err(|e| CliExit::new(INIT_ABORTED, format!("init: prompt join failed: {e}")))?
-  .map_err(|e| CliExit::new(INIT_ABORTED, format!("init: model prompt: {e}")))
 }
 
 /// The existing "paste an owner/repo slug" prompt. Shared by the
@@ -808,38 +809,39 @@ async fn pick_search_result(
   query: &str,
   results: Vec<HfSearchResult>,
 ) -> Result<SearchPick, CliExit> {
-  let query = query.to_string();
-  tokio::task::spawn_blocking(move || {
-    let n = results.len();
-    let again_idx = n;
-    let back_idx = n + 1;
-    let title = if results.is_empty() {
-      format!("No GGUF matches for `{query}`")
-    } else {
-      format!("Results for `{query}`")
-    };
-    let mut select = cliclack::select(title);
-    for (i, r) in results.iter().enumerate() {
-      select = select.item(i, r.repo_id.clone(), search_result_hint(r));
+  let n = results.len();
+  let again_idx = n;
+  let back_idx = n + 1;
+  let title = if results.is_empty() {
+    format!("No GGUF matches for `{query}`")
+  } else {
+    format!("Results for `{query}`")
+  };
+  let mut items: Vec<(String, String)> = results
+    .iter()
+    .map(|r| (r.repo_id.clone(), search_result_hint(r)))
+    .collect();
+  items.push(("↻ Search again".to_string(), String::new()));
+  items.push(("← Back to model list".to_string(), String::new()));
+  let idx = crate::cli::picker::select_one(title, 0, items)
+    .await
+    .map_err(|e| {
+      e.into_exit(
+        INIT_ABORTED,
+        "init: prompt join failed",
+        "init: results prompt",
+      )
+    })?;
+  Ok(if idx == again_idx {
+    SearchPick::Again
+  } else if idx == back_idx {
+    SearchPick::Back
+  } else {
+    match results.into_iter().nth(idx) {
+      Some(r) => SearchPick::Repo(r.repo_id),
+      None => SearchPick::Back,
     }
-    select = select.item(again_idx, "↻ Search again".to_string(), String::new());
-    select = select.item(back_idx, "← Back to model list".to_string(), String::new());
-    let idx = select.interact()?;
-    let pick = if idx == again_idx {
-      SearchPick::Again
-    } else if idx == back_idx {
-      SearchPick::Back
-    } else {
-      match results.into_iter().nth(idx) {
-        Some(r) => SearchPick::Repo(r.repo_id),
-        None => SearchPick::Back,
-      }
-    };
-    Ok::<_, std::io::Error>(pick)
   })
-  .await
-  .map_err(|e| CliExit::new(INIT_ABORTED, format!("init: prompt join failed: {e}")))?
-  .map_err(|e| CliExit::new(INIT_ABORTED, format!("init: results prompt: {e}")))
 }
 
 /// One-line metadata hint for a search result row: params, approximate

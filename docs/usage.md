@@ -1728,19 +1728,19 @@ The tools in the last two rows have no reference syntax to use, so the value goe
 
 When the run patches a tool that reads the variable **and** the proxy has auth on, the summary says so and gives the line to add to your shell rc — pointing at the `env.sh` it just wrote when you picked that integration, and at `export LLAMASTASH_API_KEY="$(llamastash api-key)"` when you did not. `--json` carries the same under `integrations.env_requirement` (`{var, tools, source_file}`); the field is absent when nothing needs it. Nothing is said on the keyless loopback default, where the value is ignored.
 
-### `llamastash session <tool> [model]`
+### `llamastash session [tool] [model]`
 
 Point a coding tool at one model the proxy serves, for that one run. The tool's own config is never written: its per-run settings go in as env vars, CLI flags, or a file only that run loads, then the process is replaced by the tool. `llamastash integrations` is the other path: it patches each tool's global config, which changes what the tool does in every later run.
 
 ```
-llamastash session <TOOL> [MODEL] [--dry-run] [--json] [-- <TOOL_ARG>...]
+llamastash session [TOOL] [MODEL] [--dry-run] [--json] [-- <TOOL_ARG>...]
 TOOL: claude | claude-code | codex | opencode | pi | aider
 ```
 
 | Flag / arg              | Effect                                                                                                                                             |
 | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `[TOOL]`                | `claude` (or `claude-code`), `codex`, `opencode`, `pi`, `aider`. Continue and Zed have no per-run hook, so they are not targets.                       |
-| `[MODEL]`               | A `proxy.aliases` name, a model reference, or `<model>@<preset>`. Omit to use the most recently started chat launch.                                  |
+| `[TOOL]`                | `claude` (or `claude-code`), `codex`, `opencode`, `pi`, `aider`. Continue and Zed have no per-run hook, so they are not targets. Omit to pick one.      |
+| `[MODEL]`               | A `proxy.aliases` name, a model reference, or `<model>@<preset>`. Omit to use the most recently started chat launch, or to pick one when none is running. |
 | `--dry-run`             | Resolve everything and print the launch. Starts no model, writes no file, runs no tool.                                                               |
 | `--json`                | The resolved launch as JSON. Requires `--dry-run`, the only case with no side effects to hide.                                                        |
 | `-- <TOOL_ARG>...`      | Everything after `--` reaches the tool unchanged, after the args `session` builds for it.                                                             |
@@ -1752,7 +1752,8 @@ The global `--quiet` drops the one-line note on stderr before the tool takes the
 | Input                                                        | Outcome                                                                                                                                        |
 | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | no MODEL, a chat launch is live (`launching` / `loading` / `ready`) | The one with the highest launch number (`L<n>`), which is the newest start; waits for Ready unless `--dry-run` was given.                                              |
-| no MODEL, no chat launch live                                | Exit `66`: no chat model is running, start one or pass MODEL.                                                                                     |
+| no MODEL, no chat launch live, on a terminal       | A picker over the catalog's chat models, the same list `start` shows without a model. What you pick is started, then handed to the tool.                    |
+| no MODEL, no chat launch live, not on a terminal   | Exit `66`: no chat model is running, start one or pass MODEL. With `--json` the picker is off too.                                                    |
 | MODEL is a `proxy.aliases` name and no catalog model has it   | The alias target resolves instead, the proxy's own precedence. A model that owns the name wins.                                                    |
 | MODEL resolves and a matching launch is live                   | That launch is reused. `<model>@<name>` needs a launch with that name; a plain ref prefers an unnamed launch of the model, else its latest.        |
 | MODEL resolves, nothing live                                 | Start it (`@<name>` uses preset `<name>`, otherwise the model's default preset, as plain `start` does) and wait for Ready.                         |
@@ -1762,6 +1763,8 @@ The global `--quiet` drops the one-line note on stderr before the tool takes the
 | The tool binary is not on PATH                                 | Exit `70`, before any model is started, so a missing tool costs no load. Every check happens before the handover, so nothing fails after the tool has the process. A `--dry-run` still prints. |
 
 The id handed to the tool is the one `/v1/models` publishes, plus `@<name>` when the chosen launch is named. Without the suffix the proxy would auto-start a second, unnamed copy of the same model. The context window the tool is told about is the launch's settled `ctx`, else the `ctx` it asked for, else the preset `start` would launch with, else the model's trained context.
+
+**Pickers.** Two, and both are the same single-select as the `start` and `stop` pickers: `session` with no TOOL asks which tool to run, and `session <tool>` with no MODEL while nothing is running asks which model to start. The model picker lists chat models only, so a pick cannot turn into the refusal below. Neither appears with `--json` or without a terminal: no TOOL is then exit `64` naming the tools, and no MODEL is exit `66`.
 
 **Per-tool launch.** Each one reuses what that tool's `init` patcher already builds, so the two cannot drift apart.
 
@@ -1808,7 +1811,7 @@ The tool's binary is looked up on `PATH` before a model is started, so a tool yo
 
 **What is written.** Nothing in any tool's config directory. The only file `session` writes is the pi extension above, mode `0600`, in the cache dir. Those files accumulate, one per distinct model, context and proxy address, and are small. Files the tools write themselves are their own behavior and `session` neither prevents nor reads them: Claude Code records the model and its approvals in `~/.claude.json`, OpenCode keeps its recent-model state, Codex adds project trust entries.
 
-Examples: `llamastash session claude` (whatever is loaded right now), `llamastash session pi qwen@coder -- -p "hi"`, `llamastash session codex -- exec "hi"`, `llamastash session claude Qwen3.8-27B-UD-Q6_K --dry-run --json`.
+Examples: `llamastash session` (pick a tool, then a model if nothing is loaded), `llamastash session claude` (whatever is loaded right now), `llamastash session pi qwen@coder -- -p "hi"`, `llamastash session codex -- exec "hi"`, `llamastash session claude Qwen3.8-27B-UD-Q6_K --dry-run --json`.
 
 ### `llamastash api-key`
 
@@ -1868,7 +1871,7 @@ Source of truth: `src/cli/exit_codes.rs`. Codes are part of the public CLI contr
 | Code | Constant               | Meaning                                                                                                                                                |
 | ---- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `0`  | `SUCCESS`              | Success                                                                                                                                                |
-| `64` | `USAGE`                | Bad CLI usage — missing required arg, invalid flag combination, or config-load error. Clap also emits this on its own. `session` uses it for a MODEL that is an embedding or rerank model. |
+| `64` | `USAGE`                | Bad CLI usage — missing required arg, invalid flag combination, or config-load error. Clap also emits this on its own. `session` uses it for a MODEL that is an embedding or rerank model, and for no TOOL where a picker cannot run. |
 | `65` | `DAEMON_UNREACHABLE`   | Daemon socket missing, peer hung up, or call timed out. `session` also uses it when the daemon is up but its proxy is not listening, since the tool's traffic has to reach it. |
 | `66` | `MODEL_NOT_FOUND`      | Model reference matched zero or multiple catalog rows; stderr carries a disambiguation hint. `session` also uses it when no chat model is running and none was named. |
 | `67` | `LAUNCH_FAILED`        | Daemon accepted `start_model` but the supervisor failed (probe timeout, port allocation, etc.). `session` also uses it when the launch it waited on settled in `error` or `stopped`, or never settled. |

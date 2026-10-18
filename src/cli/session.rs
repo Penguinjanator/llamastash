@@ -12,6 +12,8 @@
 //! the tool opens.
 
 use std::borrow::Cow;
+
+use clap::ValueEnum;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
@@ -65,9 +67,13 @@ pub async fn handle(args: SessionArgs, cli: &Cli, config: &Config) -> CliResult 
   let secret = config.proxy.effective_api_key();
   let api_key = secret.clone().unwrap_or_else(|| KEYLESS_STUB.to_string());
 
-  let mut target = resolve_target(&catalog, &status.models, &args, config)?;
+  let tool = match args.tool {
+    Some(tool) => tool,
+    None => pick_tool(args.json).await?,
+  };
+  let mut target = resolve_target(&catalog, &status.models, &args, config).await?;
   let mut launch = describe(
-    args.tool,
+    tool,
     &target,
     &proxy_base_url,
     &api_key,
@@ -82,7 +88,7 @@ pub async fn handle(args: SessionArgs, cli: &Cli, config: &Config) -> CliResult 
     PathBuf::from(NO_FILES_DIR)
   } else {
     let dir = session_files_dir()?;
-    launch = describe(args.tool, &target, &proxy_base_url, &api_key, &dir)?;
+    launch = describe(tool, &target, &proxy_base_url, &api_key, &dir)?;
     dir
   };
   // The tool binary is looked up before a model is started: a tool that is not
@@ -90,7 +96,7 @@ pub async fn handle(args: SessionArgs, cli: &Cli, config: &Config) -> CliResult 
   // A dry run still prints: it describes a command, it does not need to run one.
   let found = which::which(launch.program);
   if args.dry_run {
-    return emit_dry_run(&args, &target, &launch, secret.as_deref());
+    return emit_dry_run(&args, tool, &target, &launch, secret.as_deref());
   }
   let program = found.map_err(|_| {
     CliExit::new(
@@ -101,10 +107,10 @@ pub async fn handle(args: SessionArgs, cli: &Cli, config: &Config) -> CliResult 
   // Everything that can fail is checked before the process is handed over: once
   // the tool is exec'd there is nothing of ours left to report a late failure.
   settle(&mut client, &catalog, config, &mut target).await?;
-  launch = describe(args.tool, &target, &proxy_base_url, &api_key, &files_dir)?;
+  launch = describe(tool, &target, &proxy_base_url, &api_key, &files_dir)?;
   write_session_files(&launch)?;
   if !cli.quiet {
-    eprintln!("{}", target.note(args.tool.as_str()));
+    eprintln!("{}", target.note(tool.as_str()));
   }
   run(program, launch, &args.tool_args)
 }
@@ -178,23 +184,21 @@ impl Target {
 
 /// Resolve what to run. Reads only: nothing is started here, and nothing is
 /// written.
-fn resolve_target(
+async fn resolve_target(
   catalog: &[CatalogRow],
   running: &[RunningRow],
   args: &SessionArgs,
   config: &Config,
 ) -> Result<Target, CliExit> {
   let (row, name, launch) = match args.model.as_deref() {
-    None => {
-      let found = latest_chat_launch(running).ok_or_else(|| {
-        CliExit::new(
-          MODEL_NOT_FOUND,
-          "no chat model is running; start one or pass a MODEL",
-        )
-      })?;
-      let name = found.name.clone();
-      (catalog_row(catalog, &found.model_path)?, name, Some(found))
-    }
+    None => match latest_chat_launch(running) {
+      Some(found) => {
+        let name = found.name.clone();
+        (catalog_row(catalog, &found.model_path)?, name, Some(found))
+      }
+      // Nothing live to point at, so ask for a model to start.
+      None => (pick_model_to_start(catalog, args.json).await?, None, None),
+    },
     Some(reference) => {
       let aliases = AliasTable::from_config(&config.proxy.aliases);
       let reference = alias_target(&aliases, catalog, reference);
@@ -415,10 +419,16 @@ fn launch_by_identity(running: &[RunningRow], reference: &str, path: &str) -> Op
 /// all), so a target that passes this gate is one they will take. The rerank
 /// hint is checked here because `is_embed` says nothing about rerank models.
 fn non_chat_mode(target: &Target) -> Option<&'static str> {
-  if target.patch_model().is_embed {
+  not_chat(&target.row, &target.patch_model().id)
+}
+
+/// The same rule for a row on its own, before a launch or preset is known, which
+/// is all the model picker has to judge. `id` is the id the tool will be handed.
+fn not_chat(row: &CatalogRow, id: &str) -> Option<&'static str> {
+  if PatchModel::from_catalog_row(row, id.to_string()).is_embed {
     return Some("an embedding");
   }
-  match target.row.mode_hint.as_deref() {
+  match row.mode_hint.as_deref() {
     Some("rerank") => Some("a rerank"),
     _ => None,
   }
@@ -458,6 +468,63 @@ fn declared_ctx(launch: Option<&RunningRow>, row: &CatalogRow, preset: Option<u6
 fn patcher_for(tool: SessionTool) -> Option<Box<dyn ToolPatcher>> {
   let id = tool.patcher_id();
   all_patchers().into_iter().find(|p| p.id() == id)
+}
+
+/// The tool when none was typed. A caller that cannot answer a prompt gets the
+/// choices spelled out instead of a prompt it cannot see.
+async fn pick_tool(json: bool) -> Result<SessionTool, CliExit> {
+  if !crate::cli::picker::interactive(json) {
+    let tools: Vec<&str> = SessionTool::value_variants()
+      .iter()
+      .map(|t| t.as_str())
+      .collect();
+    return Err(CliExit::new(
+      USAGE,
+      format!("no tool given; pass one of: {}", tools.join(", ")),
+    ));
+  }
+  let tools: &[SessionTool] = SessionTool::value_variants();
+  let items = tools
+    .iter()
+    .map(|t| {
+      let hint = patcher_for(*t)
+        .map(|p| p.display_name().to_string())
+        .unwrap_or_default();
+      (t.as_str().to_string(), hint)
+    })
+    .collect();
+  let idx = crate::cli::picker::select_one("Pick a tool".to_string(), 0, items)
+    .await
+    .map_err(|e| e.into_exit(USAGE, "session picker join", "session picker"))?;
+  Ok(*tools.get(idx).expect("select returns an index it offered"))
+}
+
+/// The model picker for a session with no MODEL and nothing running.
+async fn pick_model_to_start(catalog: &[CatalogRow], json: bool) -> Result<CatalogRow, CliExit> {
+  if !crate::cli::picker::interactive(json) {
+    return Err(CliExit::new(
+      MODEL_NOT_FOUND,
+      "no chat model is running; start one or pass a MODEL",
+    ));
+  }
+  let rows = chat_rows(catalog);
+  if rows.is_empty() {
+    return Err(CliExit::new(
+      MODEL_NOT_FOUND,
+      "no chat model is running and the catalog has none to start",
+    ));
+  }
+  crate::cli::picker::pick_catalog_row(&rows, json, "session", "Pick a model to start").await
+}
+
+/// Catalog rows a session can use. Without this the picker would offer rows the
+/// gate refuses as soon as one is picked.
+fn chat_rows(catalog: &[CatalogRow]) -> Vec<CatalogRow> {
+  catalog
+    .iter()
+    .filter(|r| not_chat(r, &published_id(catalog, r)).is_none())
+    .cloned()
+    .collect()
 }
 
 /// Where a tool's generated per-run files go. One file per distinct content, so
@@ -502,6 +569,7 @@ fn shown_value(secret: Option<&str>, value: &str) -> String {
 /// `--dry-run` output: one shell-quoted line, or the contract's JSON object.
 fn emit_dry_run(
   args: &SessionArgs,
+  tool: SessionTool,
   target: &Target,
   launch: &SessionLaunch,
   secret: Option<&str>,
@@ -512,7 +580,7 @@ fn emit_dry_run(
       env.insert(name.clone(), json!(shown_value(secret, value)));
     }
     crate::cli::output::pretty_json(&json!({
-      "tool": args.tool.as_str(),
+      "tool": tool.as_str(),
       "model": target.id,
       "launch_id": target.launch.as_ref().map(|l| l.launch_id.clone()),
       "running": target.launch.is_some(),
@@ -813,6 +881,27 @@ mod tests {
     named.name = None;
     fill(&mut named, &catalog, &presets_config(None));
     assert_eq!(named.context_window, Some(8192));
+  }
+
+  #[test]
+  fn the_model_picker_offers_only_chat_rows() {
+    let mut embed = chat("/m/e.gguf");
+    embed.mode_hint = Some("embedding".into());
+    let mut rerank = chat("/m/r.gguf");
+    rerank.mode_hint = Some("rerank".into());
+    // No hint at all, named like an embedder: the picker uses the same rule the
+    // gate does, so it never offers a row that would be refused after the pick.
+    let mut hintless = chat("/m/nomic-embed.gguf");
+    hintless.mode_hint = None;
+    let catalog = vec![chat("/m/chat.gguf"), embed, rerank, hintless];
+    assert_eq!(
+      chat_rows(&catalog)
+        .iter()
+        .map(|r| r.name())
+        .collect::<Vec<_>>(),
+      vec!["chat.gguf"],
+      "an embedding or rerank row is not a session target"
+    );
   }
 
   #[test]

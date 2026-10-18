@@ -297,7 +297,7 @@ U1 → U2 → U3 run in one lane, in that order. U4 is docs only and can run in 
 
 **Verification:** every flag, exit code and JSON key in the docs matches the CLI contract above.
 
-- [ ] **Unit 5: tool and model pickers**
+- [x] **Unit 5: tool and model pickers**
 
 **Goal:** `llamastash session` with no TOOL opens a picker over the supported tools. With no MODEL and no running chat launch it opens the same model picker `start` uses, then starts the pick and launches the tool.
 

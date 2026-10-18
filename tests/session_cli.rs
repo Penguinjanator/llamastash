@@ -467,6 +467,41 @@ fn a_tool_that_writes_no_file_needs_no_cache_dir() {
 }
 
 #[test]
+fn no_tool_named_is_a_usage_error_that_lists_the_tools() {
+  let daemon = Daemon::start(None);
+  daemon.start_model();
+  let json = daemon
+    .cmd()
+    .args(["session", "--dry-run", "--json"])
+    .output()
+    .expect("run session");
+  assert_eq!(
+    json.status.code(),
+    Some(64),
+    "{}{}",
+    String::from_utf8_lossy(&json.stdout),
+    String::from_utf8_lossy(&json.stderr)
+  );
+  let message = stdout_json(&json)["error"]["message"]
+    .as_str()
+    .unwrap_or_default()
+    .to_string();
+  for tool in ["claude", "codex", "opencode", "pi", "aider"] {
+    assert!(
+      message.contains(tool),
+      "the message names {tool}: {message}"
+    );
+  }
+  // Without `--json` the same refusal is the plain error line.
+  let plain = daemon
+    .cmd()
+    .args(["session"])
+    .output()
+    .expect("run session");
+  assert_eq!(plain.status.code(), Some(64));
+}
+
+#[test]
 fn nothing_running_and_no_model_named_is_a_model_not_found() {
   let daemon = Daemon::start(None);
   let out = daemon

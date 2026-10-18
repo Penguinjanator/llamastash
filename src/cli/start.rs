@@ -49,7 +49,10 @@ pub async fn handle(args: StartArgs, cli: &Cli, config: &Config) -> CliResult {
   let row = match (&from_file, args.model.as_deref()) {
     (Some(sel), _) => select_start_row(&rows, &args, &sel.model_key)?,
     (None, Some(m)) => select_start_row(&rows, &args, m)?,
-    (None, None) => crate::cli::picker::pick_catalog_row(&rows, args.json).await?,
+    (None, None) => {
+      crate::cli::picker::pick_catalog_row(&rows, args.json, "start", "Pick a model to start")
+        .await?
+    }
   };
 
   // The preset that actually applied. A launch file's `default:` picks one

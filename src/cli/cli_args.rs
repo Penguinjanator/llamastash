@@ -263,9 +263,10 @@ pub enum Command {
   /// Point a coding tool (Claude Code, Codex, OpenCode, pi, Aider) at a model
   /// the proxy serves, for that one run. The tool's own config is never
   /// written: its per-run settings go in as env vars, flags, or a file only
-  /// that run loads, then the tool is exec'd. Omit MODEL to use the most
-  /// recently started chat launch; a MODEL that is not running is started
-  /// first. Extra args after `--` reach the tool unchanged.
+  /// that run loads, then the tool is exec'd. Omit TOOL to pick one, and MODEL
+  /// to use the most recently started chat launch or pick one when none is
+  /// running; a MODEL that is not running is started first. Extra args after
+  /// `--` reach the tool unchanged.
   Session(SessionArgs),
   /// Print the proxy's bearer key on stdout. For client configs that
   /// resolve a credential by shelling out (pi.dev's
@@ -1305,12 +1306,12 @@ impl SessionTool {
 
 #[derive(Args, Debug)]
 pub struct SessionArgs {
-  /// The tool to launch.
+  /// The tool to launch. Omit to pick one.
   #[arg(value_name = "TOOL")]
-  pub tool: SessionTool,
+  pub tool: Option<SessionTool>,
   /// Model to point it at: a `proxy.aliases` name, a model reference, or
   /// `<model>@<launch-name>`. Omit to use the most recently started chat
-  /// launch.
+  /// launch, or pick one when none is running.
   pub model: Option<String>,
   /// Resolve everything and print the launch without starting a model,
   /// writing a file, or running the tool.
@@ -1606,18 +1607,21 @@ mod tests {
       other => panic!("expected session, got {other:?}"),
     };
     let plain = session(&["session", "claude"]);
-    assert_eq!(plain.tool, SessionTool::Claude);
+    assert_eq!(plain.tool, Some(SessionTool::Claude));
     assert_eq!(plain.model, None);
     assert!(plain.tool_args.is_empty());
     assert!(!plain.dry_run && !plain.json);
+    // With no tool at all there is nothing to run yet: the command picks one.
+    let bare = session(&["session"]);
+    assert_eq!(bare.tool, None, "TOOL is optional");
     // `claude-code` is the same tool under the patcher's own id.
     let alias = session(&["session", "claude-code", "qwen"]);
     assert_eq!(
       (alias.tool, alias.model.as_deref()),
-      (SessionTool::Claude, Some("qwen"))
+      (Some(SessionTool::Claude), Some("qwen"))
     );
     let with_tail = session(&["session", "pi", "qwen@coder", "--", "-p", "hi"]);
-    assert_eq!(with_tail.tool, SessionTool::Pi);
+    assert_eq!(with_tail.tool, Some(SessionTool::Pi));
     assert_eq!(with_tail.model.as_deref(), Some("qwen@coder"));
     assert_eq!(with_tail.tool_args, ["-p", "hi"]);
   }
