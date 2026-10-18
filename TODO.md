@@ -516,7 +516,7 @@ _Shared context: `kv_label_width` in `src/tui/fmt.rs` and the Settings tab rows 
 
 _Shared context: `src/cli/` and `src/ipc/methods.rs` for the start and wait-for-ready round trip, the per-tool env scripts in `src/init/external/tools/` (`claude_code.rs`, `codex.rs`, `opencode.rs`, `pi_dev/`), and `api_key` plus `daemon.status` for the proxy URL, auth and the active model._
 
-- [ ] `llamastash session claude|pi|codex|opencode` should launch the harness with active model or with an optional model arg (an alias or model name or model name@preset)
+- [x] ~~`llamastash session claude|pi|codex|opencode` should launch the harness with active model or with an optional model arg (an alias or model name or model name@preset)~~ — done: `llamastash session <tool> [model]` covers `claude`, `codex`, `opencode`, `pi` and `aider`. With no MODEL it takes the newest live chat launch; a MODEL (alias, reference, or `model@preset`) is started and waited for if it is not up. Each tool's settings go in per-run (env, `-c` overrides, `OPENCODE_CONFIG_CONTENT`, a generated pi extension, Aider env), so no tool config is written, and `--` passes args through. Plan: [`docs/plans/2026-10-18-002-feat-session-launcher-plan.md`](docs/plans/2026-10-18-002-feat-session-launcher-plan.md).
 
 ## Next
 
