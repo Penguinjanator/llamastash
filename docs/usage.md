@@ -1756,12 +1756,12 @@ The global `--quiet` drops the one-line note on stderr before the tool takes the
 | MODEL is a `proxy.aliases` name and no catalog model has it   | The alias target resolves instead, the proxy's own precedence. A model that owns the name wins.                                                    |
 | MODEL resolves and a matching launch is live                   | That launch is reused. `<model>@<name>` needs a launch with that name; a plain ref prefers an unnamed launch of the model, else its latest.        |
 | MODEL resolves, nothing live                                 | Start it (`@<name>` uses preset `<name>`, otherwise the model's default preset, as plain `start` does) and wait for Ready.                         |
-| MODEL is an embedding or rerank model                          | Exit `64`: session tools need a chat model.                                                                                                       |
+| MODEL is an embedding or rerank model                          | Exit `64`: session tools need a chat model. Checked against the mode hint, or an `embed`-like id when the model carries no hint, before anything is started. |
 | MODEL matches no catalog row                                 | The usual `model_miss` error, exit `66`.                                                                                                          |
 | The launch settles in `error` or `stopped`, or the wait times out | Exit `67` with the cause.                                                                                                                        |
-| The tool binary is not on PATH                                 | Exit `70`. Every check happens before the handover, so nothing fails after the tool has the process.                                               |
+| The tool binary is not on PATH                                 | Exit `70`, before any model is started, so a missing tool costs no load. Every check happens before the handover, so nothing fails after the tool has the process. A `--dry-run` still prints. |
 
-The id handed to the tool is the one `/v1/models` publishes, plus `@<name>` when the chosen launch is named. Without the suffix the proxy would auto-start a second, unnamed copy of the same model. The context window the tool is told about is the launch's settled `ctx`, else the `ctx` it asked for, else the model's trained context.
+The id handed to the tool is the one `/v1/models` publishes, plus `@<name>` when the chosen launch is named. Without the suffix the proxy would auto-start a second, unnamed copy of the same model. The context window the tool is told about is the launch's settled `ctx`, else the `ctx` it asked for, else the preset `start` would launch with, else the model's trained context.
 
 **Per-tool launch.** Each one reuses what that tool's `init` patcher already builds, so the two cannot drift apart.
 
@@ -1802,7 +1802,9 @@ ANTHROPIC_BASE_URL='http://127.0.0.1:11435' ANTHROPIC_AUTH_TOKEN='***' ANTHROPIC
 }
 ```
 
-`launch_id` is `null` and `running` is `false` when the model is not up; a dry run never starts one, and `context_window` then comes from the catalog. `args` are the tool's own args and excludes your `--` pass-through, which is listed as `tool_args`. A real bearer key prints as `***`; the `llamastash` stub a keyless proxy ignores prints as is. `files` carries `{path, content}` for the pi extension and is empty for every other tool. The vars removed from the child's env appear only in the JSON form.
+`launch_id` is `null` and `running` is `false` when the model is not up; a dry run never starts one. It still prints what the real run would use: the `@<name>` suffix from your reference, and a `context_window` taken from the preset `start` would launch with (your `@<name>` preset, else the model's `default:`), falling back to the trained window. `args` are the tool's own args and excludes your `--` pass-through, which is listed as `tool_args`. Only the bearer key is masked, and only when `proxy.api_key` is set: a real key prints as `***` and everything else prints as the child receives it, so the line stays runnable. The `llamastash` stub a keyless proxy ignores is not a secret and prints as is. `files` carries `{path, content}` for the pi extension and is empty for every other tool. The vars removed from the child's env appear only in the JSON form.
+
+The tool's binary is looked up on `PATH` before a model is started, so a tool you have not installed exits `70` without paying for a load. A dry run prints even then: it describes a command rather than running one.
 
 **What is written.** Nothing in any tool's config directory. The only file `session` writes is the pi extension above, mode `0600`, in the cache dir. Those files accumulate, one per distinct model, context and proxy address, and are small. Files the tools write themselves are their own behavior and `session` neither prevents nor reads them: Claude Code records the model and its approvals in `~/.claude.json`, OpenCode keeps its recent-model state, Codex adds project trust entries.
 
