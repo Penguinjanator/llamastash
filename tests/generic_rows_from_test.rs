@@ -117,27 +117,45 @@ async fn boot(
   }
 }
 
-async fn shutdown(
-  mut client: Client,
-  daemon: tokio::task::JoinHandle<anyhow::Result<llamastash::daemon::StartOutcome>>,
-) {
-  let _ = client.call("shutdown", None).await;
+/// Boot a daemon, run `body` against it, and shut the daemon down even when
+/// `body` panics. A panic that skipped the shutdown left the engines running,
+/// and on Windows the runtime then blocked on their pipes until the nextest
+/// timeout.
+async fn with_daemon<F, Fut>(label: &str, proxy_port: Option<u16>, body: F)
+where
+  F: FnOnce(Client) -> Fut,
+  Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+  let state = unique_temp(label);
+  let (client, daemon) = boot(opts(state.clone(), proxy_port)).await;
+  let outcome = tokio::spawn(body(client)).await;
+  if let Ok(mut c) = Client::connect(&state).await {
+    let _ = c.call("shutdown", None).await;
+  }
   let _ = daemon.await;
+  if let Err(e) = outcome {
+    std::panic::resume_unwind(e.into_panic());
+  }
 }
 
-/// The minted rows, by display name, as `list_models` publishes them.
-async fn minted_rows(client: &mut Client) -> Vec<Value> {
+fn free_port() -> u16 {
+  std::net::TcpListener::bind("127.0.0.1:0")
+    .unwrap()
+    .local_addr()
+    .unwrap()
+    .port()
+}
+
+/// The rows `entry` minted, as `list_models` publishes them.
+async fn minted_rows(client: &mut Client, entry: &str) -> Vec<Value> {
+  let prefix = format!("generic://{entry}/");
   let deadline = Instant::now() + Duration::from_secs(15);
   loop {
     let rows: Vec<Value> = client.call("list_models", None).await.unwrap()["models"]
       .as_array()
       .unwrap()
       .iter()
-      .filter(|r| {
-        r["path"]
-          .as_str()
-          .is_some_and(|p| p.starts_with("generic://listed/"))
-      })
+      .filter(|r| r["path"].as_str().is_some_and(|p| p.starts_with(&prefix)))
       .cloned()
       .collect();
     if !rows.is_empty() || Instant::now() >= deadline {
@@ -149,34 +167,36 @@ async fn minted_rows(client: &mut Client) -> Vec<Value> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rows_from_mints_one_row_per_reported_model() {
-  let (mut client, daemon) = boot(opts(unique_temp("mint"), None)).await;
-  let rows = minted_rows(&mut client).await;
-  let names: Vec<&str> = rows
-    .iter()
-    .map(|r| r["display_label"].as_str().unwrap_or(""))
-    .collect();
-  assert_eq!(names, ["listed:one", "listed:three"], "{rows:?}");
-  for row in &rows {
-    assert_eq!(row["backend"], "generic", "a minted row runs generically");
-    assert_eq!(row["source"], "config");
-  }
-  shutdown(client, daemon).await;
+  with_daemon("mint", None, |mut client| async move {
+    let rows = minted_rows(&mut client, "listed").await;
+    let names: Vec<&str> = rows
+      .iter()
+      .map(|r| r["display_label"].as_str().unwrap_or(""))
+      .collect();
+    assert_eq!(names, ["listed:one", "listed:three"], "{rows:?}");
+    for row in &rows {
+      assert_eq!(row["backend"], "generic", "a minted row runs generically");
+      assert_eq!(row["source"], "config");
+    }
+  })
+  .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_minted_row_carries_the_item_s_own_context_and_size() {
-  let (mut client, daemon) = boot(opts(unique_temp("info"), None)).await;
-  let rows = minted_rows(&mut client).await;
-  let one = &rows[0]["metadata"];
-  assert_eq!(one["native_ctx"], json!(32768), "{one}");
-  assert_eq!(one["arch"], json!("fam-one"));
-  assert_eq!(one["parameter_label"], json!("0.6B"));
-  assert_eq!(one["quant"], json!("Q4_1"));
-  assert_eq!(one["weights_bytes"], json!((0.7 * 1024f64.powi(3)) as u64));
-  let three = &rows[1]["metadata"];
-  assert_eq!(three["native_ctx"], json!(448), "{three}");
-  assert_eq!(three["arch"], json!("fam-three"));
-  shutdown(client, daemon).await;
+  with_daemon("info", None, |mut client| async move {
+    let rows = minted_rows(&mut client, "listed").await;
+    let one = &rows[0]["metadata"];
+    assert_eq!(one["native_ctx"], json!(32768), "{one}");
+    assert_eq!(one["arch"], json!("fam-one"));
+    assert_eq!(one["parameter_label"], json!("0.6B"));
+    assert_eq!(one["quant"], json!("Q4_1"));
+    assert_eq!(one["weights_bytes"], json!((0.7 * 1024f64.powi(3)) as u64));
+    let three = &rows[1]["metadata"];
+    assert_eq!(three["native_ctx"], json!(448), "{three}");
+    assert_eq!(three["arch"], json!("fam-three"));
+  })
+  .await;
 }
 
 /// Start a model over IPC and wait until its launch reports ready.
@@ -209,42 +229,44 @@ async fn start_ready(client: &mut Client, params: Value) -> String {
 /// tag, so the same entry launches whichever model the row names.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_minted_row_launches_with_its_tag_as_the_name() {
-  let (mut client, daemon) = boot(opts(unique_temp("launch"), None)).await;
-  assert!(!minted_rows(&mut client).await.is_empty());
-  let id = start_ready(
-    &mut client,
-    json!({"model": "listed:three", "model_path": "generic://listed/listed:three"}),
-  )
+  with_daemon("launch", None, |mut client| async move {
+    assert!(!minted_rows(&mut client, "listed").await.is_empty());
+    let id = start_ready(
+      &mut client,
+      json!({"model": "listed:three", "model_path": "generic://listed/listed:three"}),
+    )
+    .await;
+    let argv = log_lines(&mut client, &id).await;
+    assert!(
+      argv.iter().any(|l| l.contains("-m listed:three")),
+      "`{{name}}` must be the minted tag: {argv:?}"
+    );
+  })
   .await;
-  let argv = log_lines(&mut client, &id).await;
-  assert!(
-    argv.iter().any(|l| l.contains("-m listed:three")),
-    "`{{name}}` must be the minted tag: {argv:?}"
-  );
-  shutdown(client, daemon).await;
 }
 
 /// A named launch qualifies the published id (`tag@coder`) so two launches of
 /// one model stay addressable, but the engine only knows the bare tag.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_named_minted_launch_still_sends_the_bare_tag() {
-  let (mut client, daemon) = boot(opts(unique_temp("named"), None)).await;
-  let id = start_ready(
-    &mut client,
-    json!({
-      "model": "listed:three",
-      "model_path": "generic://listed/listed:three",
-      "name": "coder",
-    }),
-  )
+  with_daemon("named", None, |mut client| async move {
+    let id = start_ready(
+      &mut client,
+      json!({
+        "model": "listed:three",
+        "model_path": "generic://listed/listed:three",
+        "name": "coder",
+      }),
+    )
+    .await;
+    let argv = log_lines(&mut client, &id).await;
+    assert!(
+      argv.iter().any(|l| l.contains("-m listed:three "))
+        && !argv.iter().any(|l| l.contains("@coder")),
+      "the tag is sent bare, not `listed:three@coder`: {argv:?}"
+    );
+  })
   .await;
-  let argv = log_lines(&mut client, &id).await;
-  assert!(
-    argv.iter().any(|l| l.contains("-m listed:three "))
-      && !argv.iter().any(|l| l.contains("@coder")),
-    "the tag is sent bare, not `listed:three@coder`: {argv:?}"
-  );
-  shutdown(client, daemon).await;
 }
 
 /// `rewrite_model` replaces `body.model` for an engine that cannot resolve the
@@ -252,39 +274,40 @@ async fn a_named_minted_launch_still_sends_the_bare_tag() {
 /// forwarded name has to be the engine's own tag or the engine cannot load it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rewrite_model_on_a_named_minted_launch_forwards_the_tag() {
-  let proxy_port = std::net::TcpListener::bind("127.0.0.1:0")
-    .unwrap()
-    .local_addr()
-    .unwrap()
-    .port();
-  let (mut client, daemon) = boot(opts(unique_temp("rw"), Some(proxy_port))).await;
-  start_ready(
-    &mut client,
-    json!({"model": "solo:one", "model_path": "generic://rw/solo:one", "name": "coder"}),
-  )
+  let proxy_port = free_port();
+  with_daemon("rw", Some(proxy_port), |mut client| async move {
+    // The proxy resolves `solo:one` against the catalog, which an IPC start by
+    // path does not wait for.
+    assert!(!minted_rows(&mut client, "rw").await.is_empty());
+    start_ready(
+      &mut client,
+      json!({"model": "solo:one", "model_path": "generic://rw/solo:one", "name": "coder"}),
+    )
+    .await;
+    let resp = reqwest::Client::new()
+      .post(format!("http://127.0.0.1:{proxy_port}/v1/chat/completions"))
+      .json(&json!({
+        "model": "solo:one",
+        "messages": [{"role": "user", "content": "hi"}],
+      }))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("proxy request");
+    let status = resp.status();
+    // The fixture echoes the `model` it was sent, and replies as SSE.
+    let text = resp.text().await.unwrap();
+    assert!(status.is_success(), "status {status}: {text}");
+    assert!(
+      text.contains(r#""model":"solo:one""#),
+      "the engine is told its own tag: {text}"
+    );
+    assert!(
+      !text.contains("@coder"),
+      "the published id leaked into the forwarded body: {text}"
+    );
+  })
   .await;
-  let resp = reqwest::Client::new()
-    .post(format!("http://127.0.0.1:{proxy_port}/v1/chat/completions"))
-    .json(&json!({
-      "model": "solo:one",
-      "messages": [{"role": "user", "content": "hi"}],
-    }))
-    .timeout(Duration::from_secs(60))
-    .send()
-    .await
-    .expect("proxy request");
-  assert!(resp.status().is_success(), "status {}", resp.status());
-  // The fixture echoes the `model` it was sent, and replies as SSE.
-  let text = resp.text().await.unwrap();
-  assert!(
-    text.contains(r#""model":"solo:one""#),
-    "the engine is told its own tag: {text}"
-  );
-  assert!(
-    !text.contains("@coder"),
-    "the published id leaked into the forwarded body: {text}"
-  );
-  shutdown(client, daemon).await;
 }
 
 /// The log tail of a launch, one helper for both launch tests.
@@ -315,50 +338,48 @@ async fn log_lines(client: &mut Client, launch_id: &str) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_broken_listing_mints_nothing_and_keeps_the_rest() {
-  let (mut client, daemon) = boot(opts(unique_temp("broken"), None)).await;
-  let rows = minted_rows(&mut client).await;
-  assert!(!rows.is_empty(), "the working entry still mints");
-  let all = client.call("list_models", None).await.unwrap().to_string();
-  assert!(
-    !all.contains("listed-broken/"),
-    "a listing that cannot be read mints no rows: {all}"
-  );
-  shutdown(client, daemon).await;
+  with_daemon("broken", None, |mut client| async move {
+    let rows = minted_rows(&mut client, "listed").await;
+    assert!(!rows.is_empty(), "the working entry still mints");
+    let all = client.call("list_models", None).await.unwrap().to_string();
+    assert!(
+      !all.contains("listed-broken/"),
+      "a listing that cannot be read mints no rows: {all}"
+    );
+  })
+  .await;
 }
 
 /// No `proxy.aliases` entry: the minted row's name is the engine's tag, and the
 /// proxy resolves the request to it like any other row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_proxy_routes_a_minted_row_without_an_alias() {
-  let proxy_port = std::net::TcpListener::bind("127.0.0.1:0")
-    .unwrap()
-    .local_addr()
-    .unwrap()
-    .port();
-  let (mut client, daemon) = boot(opts(unique_temp("proxy"), Some(proxy_port))).await;
-  assert!(!minted_rows(&mut client).await.is_empty());
+  let proxy_port = free_port();
+  with_daemon("proxy", Some(proxy_port), |mut client| async move {
+    assert!(!minted_rows(&mut client, "listed").await.is_empty());
 
-  let http = reqwest::Client::new();
-  let resp = http
-    .post(format!("http://127.0.0.1:{proxy_port}/v1/chat/completions"))
-    .json(&json!({
-      "model": "listed:one",
-      "messages": [{"role": "user", "content": "hi"}],
-    }))
-    .timeout(Duration::from_secs(60))
-    .send()
-    .await
-    .expect("proxy request");
-  assert!(resp.status().is_success(), "status {}", resp.status());
+    let http = reqwest::Client::new();
+    let resp = http
+      .post(format!("http://127.0.0.1:{proxy_port}/v1/chat/completions"))
+      .json(&json!({
+        "model": "listed:one",
+        "messages": [{"role": "user", "content": "hi"}],
+      }))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("proxy request");
+    assert!(resp.status().is_success(), "status {}", resp.status());
 
-  let status = client.call("status", None).await.unwrap();
-  assert!(
-    status["models"]
-      .as_array()
-      .unwrap()
-      .iter()
-      .any(|m| m["id"]["path"] == "generic://listed/listed:one"),
-    "auto-started the minted row: {status}"
-  );
-  shutdown(client, daemon).await;
+    let status = client.call("status", None).await.unwrap();
+    assert!(
+      status["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["id"]["path"] == "generic://listed/listed:one"),
+      "auto-started the minted row: {status}"
+    );
+  })
+  .await;
 }

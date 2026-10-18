@@ -596,18 +596,18 @@ impl Backend for GenericBackend {
       Some(n) => crate::launch::resolve::join_named_reference(&model_id, n),
       None => model_id,
     };
+    exec
+      .params
+      .launch_config
+      .insert(PUBLISHED_NAME_KEY.to_string(), published);
     if entry.server.rewrite_model {
       // The forwarded `body.model` is what the engine reads, so it carries the
-      // engine's own name for the model, not the catalog's published id.
+      // same name `{name}` gave the engine. `engine_name` reads the stamp above.
       exec.params.launch_config.insert(
         crate::backend::REQUEST_MODEL_KEY.to_string(),
         engine_name(&exec.params, &entry.server.name),
       );
     }
-    exec
-      .params
-      .launch_config
-      .insert(PUBLISHED_NAME_KEY.to_string(), published);
     let spec = self.process_spec(&exec.params, exec.reserved_port, binary, exec.probe);
     crate::daemon::launch_service::spawn_supervised(ctx, exec, spec, None, None).await
   }
