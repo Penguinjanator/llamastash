@@ -516,7 +516,7 @@ _Shared context: `kv_label_width` in `src/tui/fmt.rs` and the Settings tab rows 
 
 _Shared context: `src/cli/` and `src/ipc/methods.rs` for the start and wait-for-ready round trip, the per-tool env scripts in `src/init/external/tools/` (`claude_code.rs`, `codex.rs`, `opencode.rs`, `pi_dev/`), and `api_key` plus `daemon.status` for the proxy URL, auth and the active model._
 
-- [ ] `llamastash session claude|pi|codex|opencode` should launch the harness with active model or start a default model if none is active (configurable, with an alias or model name or model name@preset)
+- [ ] `llamastash session claude|pi|codex|opencode` should launch the harness with active model or with an optional model arg (an alias or model name or model name@preset)
 
 ## Next
 
