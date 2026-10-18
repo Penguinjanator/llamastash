@@ -241,9 +241,33 @@ The three `LLAMASTASH_*_DIR` overrides make it possible to run side-by-side daem
 
 `llamastash init --recommended --model owner/repo --revision <SHA-or-branch>` threads the `--revision` value into hf-hub's `Repo::with_revision` so the byte-stream resolves at the supplied commit. Empty values are rejected at parse time. Use this when you need a reproducible model download — agents pinning environments should always pass a SHA rather than relying on the repo's default branch.
 
-### Several `llama-server` builds
+### Preferring a Vulkan `llama-server` build
 
-List each build under `backend.llamacpp.servers` and pick one per launch with `--server`, or pin it in a preset. A ROCm + Vulkan + CPU setup, and what a Vulkan build on an AMD or NVIDIA host reports, are in [RECIPES.md § llama.cpp builds](../RECIPES.md#llamacpp-builds).
+LlamaStash does **not** block you from using a Vulkan-built
+`llama-server` on hardware that normally probes as another backend
+(for example an AMD ROCm machine). If `init` already installed a model
+or pulled one into the cache, you can point launches at a Vulkan build
+by overriding the binary path:
+
+```bash
+# One-off run
+LLAMASTASH_LLAMA_SERVER=/path/to/llama.cpp/build-vulkan/bin/llama-server \
+  llamastash start qwen
+
+# Or set it once in config.yaml
+backend:
+  llamacpp:
+    servers:
+      - binary: /path/to/llama.cpp/build-vulkan/bin/llama-server
+```
+
+This changes the **runtime binary**, not the detected host backend. So
+`init`, host metrics, and UAT preflight may still report the machine as
+`amd` / `nvidia` while the actual launched server is the Vulkan build.
+That combination already works as long as the Vulkan binary itself can
+load the model on your system.
+
+Several builds side by side, picked per launch or per preset: [RECIPES.md § llama.cpp builds](../RECIPES.md#llamacpp-builds).
 
 ## Top-level flags
 
@@ -786,7 +810,18 @@ Under the hood, each backend maps this onto its own flags — the serving backen
 
 #### DSpark speculative decoding
 
-DSpark is ds4's second speculative engine for DeepSeek-V4 Flash: a support model that reads the target's hidden states and proposes up to five tokens per step, which the Flash model then verifies. It replaces the one-stage MTP head for that run rather than stacking with it, and it takes the same `--mtp` slot: `mtp-model` points at the support GGUF, and `dspark` turns the runtime on. The `ds4-dspark` preset in [RECIPES.md § DeepSeek V4](../RECIPES.md#deepseek-v4) sets both.
+DSpark is ds4's second speculative engine for DeepSeek-V4 Flash: a support model that reads the target's hidden states and proposes up to five tokens per step, which the Flash model then verifies. It replaces the one-stage MTP head for that run rather than stacking with it, and it takes the same `--mtp` slot: `mtp-model` points at the support GGUF, and `dspark` turns the runtime on. With the ds4 generic entry from [RECIPES.md § DeepSeek V4](../RECIPES.md#deepseek-v4):
+
+```yaml
+presets:
+  DeepSeek-V4-Flash-*-0731.gguf:
+    entries:
+      ds4-dspark:
+        server: generic-ds4
+        knobs:
+          dspark: true
+          mtp-model: /path/to/DeepSeek-V4-Flash-DSpark-support-0731.gguf
+```
 
 `ds4-server` refuses `--dspark` without an `--mtp` file, and only after the full weight load, so always set both.
 
@@ -888,7 +923,27 @@ Two shapes:
 
 ### Minting rows from an engine's own listing
 
-An engine that owns its model store knows which models are installed, what context each one wants and what it costs to keep. `rows_from` asks it, once per rescan, and mints a row per model, so `config.yaml` carries the launch and nothing else. The FastFlowLM entry in [RECIPES.md](../RECIPES.md#fastflowlm-amd-npu) uses it.
+An engine that owns its model store knows which models are installed, what context each one wants and what it costs to keep. `rows_from` asks it, once per rescan, and mints a row per model, so `config.yaml` carries the launch and nothing else:
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: flm
+        binary: ~/.local/opt/fastflowlm/flm
+        args: [serve, "{name}", --host, "{host}", -p, "{port}", --cors, "0"]
+        ready: /v1/version
+        rows_from:
+          command: [~/.local/opt/fastflowlm/flm, list, --filter, installed, --json]
+          items: models
+          name: model
+          when: installed
+          arch: details.family
+          params: details.parameter_size
+          quant: details.quantization_level
+          ctx: default_context_length
+          memory_gib: footprint
+```
 
 | Field | Required | Meaning |
 |---|---|---|
@@ -909,8 +964,8 @@ Two limits follow from the shape. A listing command that is missing, fails or pr
 ```bash
 llamastash list                                            # entries and matching GGUFs
 llamastash knobs --backend generic                         # each entry's knobs
-llamastash start <model> --server generic-<name> --ctx 32768   # an entry with `model`
-llamastash start <name> --ctx 65536                             # an entry without `model`
+llamastash start Qwen3.8-Flash-Next-UD-Q4_K_XL --server generic-gufo --ctx 32768
+llamastash start flash-next-halogen --ctx 65536
 ```
 
 ### Rules the backend does not enforce

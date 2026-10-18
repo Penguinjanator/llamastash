@@ -35,9 +35,23 @@ models in memory and on the device.
 
 ## 2. Declare it as a generic entry
 
-Copy the entry and the `proxy.aliases` line from
-[RECIPES.md § Lemonade](../RECIPES.md#lemonade), which also lists the
-limits. Model names come
+```yaml
+backend:
+  generic:
+    servers:
+      - name: lemonade
+        binary: /usr/bin/lemond            # absolute path, or on PATH
+        args: ["--port", "{port}", "--host", "{host}", "--no-broadcast", "--log-file", "disabled"]
+        ready: /live                       # 200 once the umbrella answers
+        ready_timeout_secs: 90
+        stop_grace_secs: 20                # lemond takes ~6 s to exit
+proxy:
+  aliases:
+    Qwen3-0.6B-GGUF: lemonade             # one line per model clients name
+```
+
+Full recipe with the limits:
+[RECIPES.md § Lemonade](../RECIPES.md#lemonade). Model names come
 from the running entry's own port, which `llamastash status` shows:
 `curl "http://127.0.0.1:<launch-port>/api/v1/models?show_all=true"` (quote the
 URL or zsh eats the `?`). Names are case-sensitive at `lemond` and alias keys are
