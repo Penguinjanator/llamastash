@@ -102,6 +102,8 @@ fn codex_override(key: &str, value: &str) -> Vec<String> {
   vec!["-c".to_string(), format!("{key}={value}")]
 }
 
+/// The program `llamastash session codex` execs.
+const PROGRAM: &str = "codex";
 impl ToolPatcher for Codex {
   fn id(&self) -> &'static str {
     "codex"
@@ -167,6 +169,9 @@ impl ToolPatcher for Codex {
     );
     Some(body)
   }
+  fn session_program(&self) -> Option<&'static str> {
+    Some(PROGRAM)
+  }
   fn session(&self, ctx: &PatchContext, _files_dir: &Path) -> Option<SessionLaunch> {
     let m = ctx.primary().filter(|m| !m.is_embed)?;
     let provider = provider_fields(&ctx.proxy_base_url)
@@ -191,7 +196,7 @@ impl ToolPatcher for Codex {
       }
     }
     Some(SessionLaunch {
-      program: "codex",
+      program: PROGRAM,
       args,
       env: vec![(super::env_sh::API_KEY_VAR.to_string(), ctx.api_key.clone())],
       env_remove: Vec::new(),

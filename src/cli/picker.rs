@@ -39,9 +39,10 @@ pub fn interactive(json: bool) -> bool {
   !json && std::io::stdin().is_terminal()
 }
 
-/// Refuse the picker up front when the caller can't drive it. Returns
-/// `Ok(())` when an interactive picker is allowed.
-fn ensure_interactive(json: bool, command: &str) -> Result<(), CliExit> {
+/// Refuse the picker up front when the caller can't drive it. `session` words
+/// its own refusal because a missing model there is a model problem, not a
+/// usage one.
+pub fn ensure_interactive(json: bool, command: &str) -> Result<(), CliExit> {
   if json {
     return Err(CliExit::new(
       USAGE,
@@ -81,14 +82,13 @@ pub async fn select_one(
 
 /// Open a picker over the catalog and return the chosen row. Wired into `start`
 /// when the user omits the model reference, and into `session` when it has no
-/// MODEL and nothing is running. `command` names the caller in the refusal text.
+/// MODEL and nothing is running. The caller guards interactivity itself when it
+/// has a refusal of its own to print; `command` names it in this one's text.
 pub async fn pick_catalog_row(
   rows: &[CatalogRow],
-  json: bool,
   command: &str,
   title: &str,
 ) -> Result<CatalogRow, CliExit> {
-  ensure_interactive(json, command)?;
   if rows.is_empty() {
     return Err(CliExit::new(MODEL_NOT_FOUND, "no models discovered"));
   }

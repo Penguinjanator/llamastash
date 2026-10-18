@@ -50,8 +50,8 @@ pub async fn handle(args: StartArgs, cli: &Cli, config: &Config) -> CliResult {
     (Some(sel), _) => select_start_row(&rows, &args, &sel.model_key)?,
     (None, Some(m)) => select_start_row(&rows, &args, m)?,
     (None, None) => {
-      crate::cli::picker::pick_catalog_row(&rows, args.json, "start", "Pick a model to start")
-        .await?
+      crate::cli::picker::ensure_interactive(args.json, "start")?;
+      crate::cli::picker::pick_catalog_row(&rows, "start", "Pick a model to start").await?
     }
   };
 

@@ -444,6 +444,48 @@ fn a_pi_session_writes_its_extension_under_the_cache_dir() {
 }
 
 #[test]
+fn a_pi_dry_run_names_the_file_its_extension_argument_points_at() {
+  let daemon = Daemon::start(None);
+  daemon.start_model();
+  let out = daemon
+    .cmd()
+    .args(["session", "pi", "chat", "--dry-run", "--json"])
+    .output()
+    .expect("run session");
+  assert!(
+    out.status.success(),
+    "{}{}",
+    String::from_utf8_lossy(&out.stdout),
+    String::from_utf8_lossy(&out.stderr)
+  );
+  let body = stdout_json(&out);
+  let path = body["files"][0]["path"]
+    .as_str()
+    .unwrap_or_default()
+    .to_string();
+  let args: Vec<&str> = body["args"]
+    .as_array()
+    .map(|a| a.iter().filter_map(Value::as_str).collect())
+    .unwrap_or_default();
+  let at = args
+    .iter()
+    .position(|a| *a == "-e")
+    .expect("an -e argument");
+  assert_eq!(
+    args.get(at + 1).copied().unwrap_or_default(),
+    path,
+    "the argument loads the very file the session writes"
+  );
+  let path = Path::new(&path);
+  assert!(path.is_absolute(), "{path:?} is not absolute");
+  assert_eq!(
+    path.parent(),
+    Some(daemon.sessions_dir().as_path()),
+    "the extension sits in the cache dir"
+  );
+}
+
+#[test]
 fn a_tool_that_writes_no_file_needs_no_cache_dir() {
   let daemon = Daemon::start(None);
   daemon.start_model();
@@ -499,6 +541,10 @@ fn no_tool_named_is_a_usage_error_that_lists_the_tools() {
     .output()
     .expect("run session");
   assert_eq!(plain.status.code(), Some(64));
+  let err = String::from_utf8_lossy(&plain.stderr);
+  for tool in ["claude", "codex", "opencode", "pi", "aider"] {
+    assert!(err.contains(tool), "the error line names {tool}: {err}");
+  }
 }
 
 #[test]

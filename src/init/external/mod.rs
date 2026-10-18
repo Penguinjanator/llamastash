@@ -148,8 +148,10 @@ impl PatchModel {
   /// `public_id()` can be a string that always 400s.
   pub fn from_catalog_row(row: &crate::launch::resolve::CatalogRow, id: String) -> Self {
     let is_embed = match row.mode_hint.as_deref() {
-      Some(hint) => hint == "embedding",
-      None => Self::from_id(id.clone()).is_embed,
+      // `unknown` is the daemon's "the header said nothing", not a mode, so the
+      // id decides. `start`'s mode resolution already reads it that way.
+      Some(hint) if hint != "unknown" => hint == "embedding",
+      _ => Self::from_id(id.clone()).is_embed,
     };
     let path = std::path::Path::new(&row.path);
     let levels = if row.has_reasoning_hint {
@@ -288,6 +290,13 @@ pub trait ToolPatcher: Send + Sync {
   /// is no file). Defaults to [`Self::raw_body`].
   fn raw_body_from(&self, ctx: &PatchContext, _current: Option<&str>) -> Option<String> {
     self.raw_body(ctx)
+  }
+  /// The program [`Self::session`] execs, named without needing a model in the
+  /// way: a caller that wants to turn away a tool that is not installed before
+  /// asking any questions needs the name on its own. Default `None`, as is
+  /// [`Self::session`].
+  fn session_program(&self) -> Option<&'static str> {
+    None
   }
   /// The per-run launch for `llamastash session <tool>`: this tool pointed at
   /// the one model in `ctx`, configured through env/argv/`files_dir` instead
@@ -516,6 +525,21 @@ mod tests {
     assert!(PatchModel::from_catalog_row(&row, row.public_id()).is_embed);
     row.mode_hint = Some("chat".into());
     assert!(!PatchModel::from_catalog_row(&row, row.public_id()).is_embed);
+  }
+
+  #[test]
+  fn an_unknown_mode_hint_is_no_hint_at_all() {
+    // A GGUF with nothing in the header gets `Some("unknown")` from the daemon,
+    // which is not a mode: the id has to decide, or an `*-embed.gguf` file is
+    // taken for a chat model by everything that reads this.
+    let mut row =
+      crate::launch::resolve::CatalogRow::for_resolution("/models/mystery.gguf".into(), None, None);
+    row.mode_hint = Some("unknown".into());
+    assert!(
+      PatchModel::from_catalog_row(&row, "nomic-embed-text".into()).is_embed,
+      "an embed-like id is an embedder with nothing to say otherwise"
+    );
+    assert!(!PatchModel::from_catalog_row(&row, "qwen3-coder".into()).is_embed);
   }
 
   #[test]

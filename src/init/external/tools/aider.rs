@@ -33,6 +33,8 @@ fn env_name(config_key: &str) -> String {
   format!("AIDER_{}", config_key.replace('-', "_").to_uppercase())
 }
 
+/// The program `llamastash session aider` execs.
+const PROGRAM: &str = "aider";
 impl ToolPatcher for Aider {
   fn id(&self) -> &'static str {
     "aider"
@@ -70,6 +72,9 @@ impl ToolPatcher for Aider {
   }
   /// Every key it would write to `~/.aider.conf.yml`, set as the same-named env
   /// var instead so that file stays untouched.
+  fn session_program(&self) -> Option<&'static str> {
+    Some(PROGRAM)
+  }
   fn session(&self, ctx: &PatchContext, _files_dir: &Path) -> Option<SessionLaunch> {
     ctx.primary().filter(|m| !m.is_embed)?;
     let env = self
@@ -80,7 +85,7 @@ impl ToolPatcher for Aider {
       .filter_map(|(key, value)| value.as_str().map(|v| (env_name(key), v.to_string())))
       .collect();
     Some(SessionLaunch {
-      program: "aider",
+      program: PROGRAM,
       args: Vec::new(),
       env,
       env_remove: Vec::new(),

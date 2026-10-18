@@ -66,6 +66,8 @@ fn model_entry(m: &PatchModel) -> serde_json::Value {
   entry
 }
 
+/// The program `llamastash session opencode` execs.
+const PROGRAM: &str = "opencode";
 impl ToolPatcher for OpenCode {
   fn id(&self) -> &'static str {
     "opencode"
@@ -135,6 +137,9 @@ impl ToolPatcher for OpenCode {
   /// OpenCode reads `OPENCODE_CONFIG_CONTENT` after its global and project
   /// config, so the whole run's configuration is one env var and nothing of
   /// the user's `opencode.json` is touched.
+  fn session_program(&self) -> Option<&'static str> {
+    Some(PROGRAM)
+  }
   fn session(&self, ctx: &PatchContext, _files_dir: &Path) -> Option<SessionLaunch> {
     let m = ctx.primary().filter(|m| !m.is_embed)?;
     let mut config = self.build_additions(ctx);
@@ -142,7 +147,7 @@ impl ToolPatcher for OpenCode {
     config["model"] = json!(&address);
     config["small_model"] = json!(&address);
     Some(SessionLaunch {
-      program: "opencode",
+      program: PROGRAM,
       args: Vec::new(),
       env: vec![
         ("OPENCODE_CONFIG_CONTENT".to_string(), config.to_string()),

@@ -71,6 +71,11 @@ pub async fn handle(args: SessionArgs, cli: &Cli, config: &Config) -> CliResult 
     Some(tool) => tool,
     None => pick_tool(args.json).await?,
   };
+  // The tool binary is looked up before a model is picked or started: a tool
+  // that is not installed should cost no question and no load, and the program
+  // depends only on the tool. The failure is carried, not raised, because a dry
+  // run describes a command it does not need to run.
+  let program = lookup_program(tool);
   let mut target = resolve_target(&catalog, &status.models, &args, config).await?;
   let mut launch = describe(
     tool,
@@ -91,19 +96,10 @@ pub async fn handle(args: SessionArgs, cli: &Cli, config: &Config) -> CliResult 
     launch = describe(tool, &target, &proxy_base_url, &api_key, &dir)?;
     dir
   };
-  // The tool binary is looked up before a model is started: a tool that is not
-  // installed should cost nothing, and the program does not depend on the model.
-  // A dry run still prints: it describes a command, it does not need to run one.
-  let found = which::which(launch.program);
   if args.dry_run {
     return emit_dry_run(&args, tool, &target, &launch, secret.as_deref());
   }
-  let program = found.map_err(|_| {
-    CliExit::new(
-      BINARY_NOT_FOUND,
-      format!("`{}` not found on PATH", launch.program),
-    )
-  })?;
+  let program = program?;
   // Everything that can fail is checked before the process is handed over: once
   // the tool is exec'd there is nothing of ours left to report a late failure.
   settle(&mut client, &catalog, config, &mut target).await?;
@@ -118,6 +114,16 @@ pub async fn handle(args: SessionArgs, cli: &Cli, config: &Config) -> CliResult 
 /// Stand-in for a launch that writes no file. Only a tool that generates one
 /// (pi) ever has its real path read, and by then the real dir is in hand.
 const NO_FILES_DIR: &str = "";
+
+/// The tool's binary on `PATH`. The patcher names the program without a model in
+/// the way, so this can run before the pickers and before anything is started.
+fn lookup_program(tool: SessionTool) -> Result<PathBuf, CliExit> {
+  let program = patcher_for(tool)
+    .and_then(|p| p.session_program())
+    .ok_or_else(|| no_launch(tool))?;
+  which::which(program)
+    .map_err(|_| CliExit::new(BINARY_NOT_FOUND, format!("`{program}` not found on PATH")))
+}
 
 /// The tool's launch for this target: what to exec, with what.
 fn describe(
@@ -514,7 +520,7 @@ async fn pick_model_to_start(catalog: &[CatalogRow], json: bool) -> Result<Catal
       "no chat model is running and the catalog has none to start",
     ));
   }
-  crate::cli::picker::pick_catalog_row(&rows, json, "session", "Pick a model to start").await
+  crate::cli::picker::pick_catalog_row(&rows, "session", "Pick a model to start").await
 }
 
 /// Catalog rows a session can use. Without this the picker would offer rows the
@@ -928,6 +934,16 @@ mod tests {
       non_chat_mode(&gated(None, Some("embed-test"))),
       Some("an embedding"),
       "the same id the patcher refuses is the id the gate refuses"
+    );
+    assert_eq!(
+      non_chat_mode(&gated(Some("unknown"), Some("embed-test"))),
+      Some("an embedding"),
+      "an `unknown` hint is no hint, so the id still decides"
+    );
+    assert_eq!(
+      non_chat_mode(&gated(Some("unknown"), None)),
+      None,
+      "and does not make a plain model an embedder"
     );
     assert_eq!(
       non_chat_mode(&gated(None, Some("coder"))),

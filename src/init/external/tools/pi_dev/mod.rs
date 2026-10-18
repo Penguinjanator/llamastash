@@ -84,6 +84,8 @@ const SESSION_PROVIDER: &str = "llamastash-session";
 /// re-patching anything.
 const API_KEY_COMMAND: &str = "!llamastash api-key";
 
+/// The program `llamastash session pi` execs.
+const PROGRAM: &str = "pi";
 impl ToolPatcher for PiDev {
   fn id(&self) -> &'static str {
     "pi"
@@ -140,6 +142,9 @@ impl ToolPatcher for PiDev {
   /// writes one under `files_dir` instead of touching `models.json`. The name
   /// is a hash of the body, so two sessions on different models (or against
   /// different proxies) never overwrite each other's file.
+  fn session_program(&self) -> Option<&'static str> {
+    Some(PROGRAM)
+  }
   fn session(&self, ctx: &PatchContext, files_dir: &Path) -> Option<SessionLaunch> {
     let m = ctx.primary().filter(|m| !m.is_embed)?;
     let mut provider = self.build_additions(ctx)["providers"][PROVIDER].clone();
@@ -171,7 +176,7 @@ impl ToolPatcher for PiDev {
     let hash = blake3::hash(body.as_bytes()).to_hex()[..8].to_string();
     let path = files_dir.join(format!("pi-{hash}.ts"));
     Some(SessionLaunch {
-      program: "pi",
+      program: PROGRAM,
       args: vec![
         "-e".to_string(),
         path.display().to_string(),

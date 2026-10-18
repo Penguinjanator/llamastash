@@ -1741,7 +1741,7 @@ TOOL: claude | claude-code | codex | opencode | pi | aider
 | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `[TOOL]`                | `claude` (or `claude-code`), `codex`, `opencode`, `pi`, `aider`. Continue and Zed have no per-run hook, so they are not targets. Omit to pick one.      |
 | `[MODEL]`               | A `proxy.aliases` name, a model reference, or `<model>@<preset>`. Omit to use the most recently started chat launch, or to pick one when none is running. |
-| `--dry-run`             | Resolve everything and print the launch. Starts no model, writes no file, runs no tool.                                                               |
+| `--dry-run`             | Resolve everything and print the launch. Starts no model, writes no file, runs no tool. On a terminal it still asks what a run would ask: a missing TOOL or MODEL is picked before the line prints.                                                               |
 | `--json`                | The resolved launch as JSON. Requires `--dry-run`, the only case with no side effects to hide.                                                        |
 | `-- <TOOL_ARG>...`      | Everything after `--` reaches the tool unchanged, after the args `session` builds for it.                                                             |
 
@@ -1757,14 +1757,14 @@ The global `--quiet` drops the one-line note on stderr before the tool takes the
 | MODEL is a `proxy.aliases` name and no catalog model has it   | The alias target resolves instead, the proxy's own precedence. A model that owns the name wins.                                                    |
 | MODEL resolves and a matching launch is live                   | That launch is reused. `<model>@<name>` needs a launch with that name; a plain ref prefers an unnamed launch of the model, else its latest.        |
 | MODEL resolves, nothing live                                 | Start it (`@<name>` uses preset `<name>`, otherwise the model's default preset, as plain `start` does) and wait for Ready.                         |
-| MODEL is an embedding or rerank model                          | Exit `64`: session tools need a chat model. Checked against the mode hint, or an `embed`-like id when the model carries no hint, before anything is started. |
+| MODEL is an embedding or rerank model                          | Exit `64`: session tools need a chat model. Checked against the mode hint, or an `embed`-like id when the model carries no hint or an `unknown` one, before anything is started. |
 | MODEL matches no catalog row                                 | The usual `model_miss` error, exit `66`.                                                                                                          |
 | The launch settles in `error` or `stopped`, or the wait times out | Exit `67` with the cause.                                                                                                                        |
-| The tool binary is not on PATH                                 | Exit `70`, before any model is started, so a missing tool costs no load. Every check happens before the handover, so nothing fails after the tool has the process. A `--dry-run` still prints. |
+| The tool binary is not on PATH                                 | Exit `70`, before a model is picked or started, so a missing tool costs no question and no load. Every check happens before the handover, so nothing fails after the tool has the process. A `--dry-run` still prints. |
 
 The id handed to the tool is the one `/v1/models` publishes, plus `@<name>` when the chosen launch is named. Without the suffix the proxy would auto-start a second, unnamed copy of the same model. The context window the tool is told about is the launch's settled `ctx`, else the `ctx` it asked for, else the preset `start` would launch with, else the model's trained context.
 
-**Pickers.** Two, and both are the same single-select as the `start` and `stop` pickers: `session` with no TOOL asks which tool to run, and `session <tool>` with no MODEL while nothing is running asks which model to start. The model picker lists chat models only, so a pick cannot turn into the refusal below. Neither appears with `--json` or without a terminal: no TOOL is then exit `64` naming the tools, and no MODEL is exit `66`.
+**Pickers.** Two, and both are the same single-select as the `start` and `stop` pickers: `session` with no TOOL asks which tool to run, and `session <tool>` with no MODEL while nothing is running asks which model to start. A `--dry-run` asks them too, on a terminal: picking is how you see the command it prints. The model picker lists chat models only, so a pick cannot turn into the refusal below. Neither appears with `--json` or without a terminal: no TOOL is then exit `64` naming the tools, and no MODEL is exit `66`.
 
 **Per-tool launch.** Each one reuses what that tool's `init` patcher already builds, so the two cannot drift apart.
 

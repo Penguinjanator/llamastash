@@ -55,6 +55,8 @@ fn declared_window(context: u64, output: u64) -> u64 {
   context.saturating_sub(output.saturating_sub(20_000))
 }
 
+/// The program `llamastash session claude` execs.
+const PROGRAM: &str = "claude";
 impl ToolPatcher for ClaudeCode {
   fn id(&self) -> &'static str {
     "claude-code"
@@ -90,10 +92,13 @@ impl ToolPatcher for ClaudeCode {
     }
     Some(body)
   }
+  fn session_program(&self) -> Option<&'static str> {
+    Some(PROGRAM)
+  }
   fn session(&self, ctx: &PatchContext, _files_dir: &Path) -> Option<SessionLaunch> {
     ctx.primary().filter(|m| !m.is_embed)?;
     Some(SessionLaunch {
-      program: "claude",
+      program: PROGRAM,
       args: Vec::new(),
       env: env_pairs(ctx),
       // `ANTHROPIC_AUTH_TOKEN` is what keeps Claude Code from showing its
