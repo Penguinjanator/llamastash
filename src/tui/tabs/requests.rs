@@ -154,23 +154,19 @@ pub struct RequestsTabState {
   page_rows: std::cell::Cell<usize>,
 }
 
-/// What the tab asks the daemon for. Normally one launch, because a running
-/// model row is one launch and its numbers must not come from another one.
-/// A `Model` scope is the whole-model aggregate, used when a row has no launch
-/// of its own to scope by.
+/// What the tab asks the daemon for: one launch, because a running model row
+/// is one launch and its numbers must not come from another one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RequestsScope {
-  Launch(String),
-  Model(String),
-}
+pub struct RequestsScope(String);
 
 impl RequestsScope {
+  pub fn new(launch_id: impl Into<String>) -> Self {
+    Self(launch_id.into())
+  }
+
   /// The `requests_tail` params that ask for this scope.
   pub fn params(&self, limit: usize) -> serde_json::Value {
-    match self {
-      Self::Launch(id) => serde_json::json!({ "launch_id": id, "limit": limit }),
-      Self::Model(path) => serde_json::json!({ "model_path": path, "limit": limit }),
-    }
+    serde_json::json!({ "launch_id": &self.0, "limit": limit })
   }
 }
 
@@ -392,6 +388,14 @@ mod tests {
   use ratatui::backend::TestBackend;
   use ratatui::Terminal;
 
+  #[test]
+  fn the_poll_params_name_exactly_one_launch() {
+    assert_eq!(
+      RequestsScope::new("L7").params(50),
+      serde_json::json!({ "launch_id": "L7", "limit": 50 })
+    );
+  }
+
   fn row(seq: u64) -> RequestRow {
     RequestRow {
       seq,
@@ -580,7 +584,7 @@ mod tests {
     // instead of pushing the fixed columns.
     let mut state = RequestsTabState::default();
     state.set(
-      RequestsScope::Model("/m/a.gguf".to_string()),
+      RequestsScope::new("L-1"),
       RequestSummary::default(),
       vec![RequestRow {
         requested_model: Some("asked-7b".to_string()),
@@ -636,7 +640,7 @@ mod tests {
     let whole = "n".repeat(24);
     let mut state = RequestsTabState::default();
     state.set(
-      RequestsScope::Model("/m/a.gguf".to_string()),
+      RequestsScope::new("L-1"),
       RequestSummary::default(),
       vec![
         RequestRow {
@@ -690,7 +694,7 @@ mod tests {
   fn renders_the_summary_then_the_table_newest_first() {
     let mut state = RequestsTabState::default();
     state.set(
-      RequestsScope::Model("/m/a.gguf".to_string()),
+      RequestsScope::new("L-1"),
       RequestSummary {
         requests: 2,
         ..RequestSummary::default()
@@ -732,7 +736,7 @@ mod tests {
   fn a_long_note_keeps_its_first_words() {
     let mut state = RequestsTabState::default();
     state.set(
-      RequestsScope::Model("/m/a.gguf".to_string()),
+      RequestsScope::new("L-1"),
       RequestSummary::default(),
       vec![RequestRow {
         seq: 1,
@@ -765,7 +769,7 @@ mod tests {
   fn an_empty_log_says_so_under_the_summary() {
     let mut state = RequestsTabState::default();
     state.set(
-      RequestsScope::Model("/m/a.gguf".to_string()),
+      RequestsScope::new("L-1"),
       RequestSummary::default(),
       Vec::new(),
     );
@@ -790,11 +794,7 @@ mod tests {
   fn scroll_moves_toward_older_rows_and_stops_at_the_last_page() {
     let mut state = RequestsTabState::default();
     let rows: Vec<RequestRow> = (1..=10).rev().map(row).collect();
-    state.set(
-      RequestsScope::Model("/m/a.gguf".to_string()),
-      RequestSummary::default(),
-      rows,
-    );
+    state.set(RequestsScope::new("L-1"), RequestSummary::default(), rows);
     state.scroll_up();
     assert_eq!(state.scroll_offset, 0);
     for _ in 0..50 {
@@ -822,11 +822,7 @@ mod tests {
       })
       .collect();
     let mut state = RequestsTabState::default();
-    state.set(
-      RequestsScope::Model("/m/a.gguf".to_string()),
-      RequestSummary::default(),
-      rows,
-    );
+    state.set(RequestsScope::new("L-1"), RequestSummary::default(), rows);
     for _ in 0..50 {
       state.scroll_down();
     }
@@ -854,13 +850,13 @@ mod tests {
   fn set_clamps_the_scroll_and_clear_resets_it() {
     let mut state = RequestsTabState::default();
     state.set(
-      RequestsScope::Model("/m/a.gguf".to_string()),
+      RequestsScope::new("L-1"),
       RequestSummary::default(),
       (1..=10).rev().map(row).collect(),
     );
     state.scroll_offset = 8;
     state.set(
-      RequestsScope::Model("/m/a.gguf".to_string()),
+      RequestsScope::new("L-1"),
       RequestSummary::default(),
       (1..=4).rev().map(row).collect(),
     );
@@ -868,7 +864,7 @@ mod tests {
     assert_eq!(state.scroll_offset, 2);
     state.scroll_offset = 3;
     state.set(
-      RequestsScope::Model("/m/a.gguf".to_string()),
+      RequestsScope::new("L-1"),
       RequestSummary::default(),
       vec![row(9)],
     );
@@ -880,7 +876,7 @@ mod tests {
 
   #[test]
   fn an_evicted_anchor_parks_on_the_last_page_not_past_it() {
-    let scope = || RequestsScope::Model("/m/a.gguf".to_string());
+    let scope = || RequestsScope::new("L-1");
     let mut state = RequestsTabState::default();
     state.set(
       scope(),
@@ -909,7 +905,7 @@ mod tests {
 
   #[test]
   fn a_page_that_grew_does_not_park_the_scroll_past_itself() {
-    let scope = || RequestsScope::Model("/m/a.gguf".to_string());
+    let scope = || RequestsScope::new("L-1");
     let mut state = RequestsTabState::default();
     state.set(
       scope(),
@@ -931,7 +927,7 @@ mod tests {
 
   #[test]
   fn a_poll_holds_the_top_row_and_follows_the_newest_only_at_the_top() {
-    let scope = || RequestsScope::Model("/m/a.gguf".to_string());
+    let scope = || RequestsScope::new("L-1");
     let mut state = RequestsTabState::default();
     state.set(
       scope(),

@@ -467,12 +467,12 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
     });
   }
 
-  // 8a-i. Periodic external resweep. Step 6 ran the sweep once, so without this
+  // 8a. Periodic external resweep. Step 6 ran the sweep once, so without this
   // the list is frozen at boot: a server started afterwards never appears and a
   // row whose process exited never leaves. Same slot `status` reads.
   orphans::spawn_resweep(token.clone(), ctx.external.clone());
 
-  // 8a-ii. Idle auto-shutdown (opt-in via `daemon.idle_timeout_secs`).
+  // 8b. Idle auto-shutdown (opt-in via `daemon.idle_timeout_secs`).
   if let Some(timeout) = opts.idle_timeout {
     idle::spawn(
       ctx.supervisors.clone(),
@@ -483,7 +483,7 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
     );
   }
 
-  // 8b. OpenAI-compat proxy listener. Spawned between the
+  // 8c. OpenAI-compat proxy listener. Spawned between the
   // host-metrics sampler (which the proxy doesn't depend on but
   // which is the canonical "background sampler" anchor) and the
   // unix-socket accept loop so the IPC ctx is fully populated
@@ -592,7 +592,7 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
     }
   }
 
-  // 8c. Control-plane HTTP listener — the daemon's only RPC surface.
+  // 8d. Control-plane HTTP listener — the daemon's only RPC surface.
   // Binds a loopback TCP port; auth is bearer-token; the token + URL
   // are written to `runtime.json` under `state_dir` so attaching CLI
   // / TUI clients can pick them up. Bind failure is fatal here (the
@@ -655,7 +655,7 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
     }
   });
 
-  // 8d. Boot preload: `daemon.preload:` entries plus any preset pinning
+  // 8e. Boot preload: `daemon.preload:` entries plus any preset pinning
   // `preload: true`. Spawned last so the catalog, the proxy and the control
   // plane all exist before the first launch — entries resolve against the
   // catalog, and a preloaded model should be routable the moment it is Ready.

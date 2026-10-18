@@ -25,10 +25,12 @@
 //! launches are unloaded least-recently-used first until the refused demand fits,
 //! instead of answering 503. See [`make_room`].
 //!
-//! A preset's `idle_ttl_secs` is read off the live preset store on every pass,
-//! so a `presets save --idle-ttl` moves a running launch's deadline without a
-//! relaunch (a hand edit to `config.yaml` still needs a daemon restart, like
-//! every other hand edit). `0` there means never unload that launch.
+//! Each launch's TTL comes from `launch_ttls`: its preset's `idle_ttl_secs`
+//! when that preset pins one, else the global `proxy.idle_ttl_secs`. The preset
+//! side is read off the live store on every pass, so a `presets save
+//! --idle-ttl` moves a running launch's deadline without a relaunch (a hand
+//! edit to `config.yaml` still needs a daemon restart, like every other hand
+//! edit). `0` on either side means never unload that launch.
 //!
 //! A global `proxy.idle_ttl_secs = 0` disables the sweep unless some
 //! preset pins its own TTL; per-launch `0` always means "never unload".
@@ -257,7 +259,7 @@ struct RoomCandidate {
   /// stop grace.
   guard: ManagedModel,
   /// The launch to stop.
-  targets: Vec<LaunchId>,
+  target: LaunchId,
 }
 
 /// Unload idle launches so a refused auto-start can fit, least-recently-used
@@ -329,7 +331,7 @@ pub async fn make_room(
     {
       log::info!(
         "proxy make-room: {} is busy again — left it running",
-        candidate.targets[0].as_str(),
+        candidate.target.as_str(),
       );
       continue;
     }
@@ -345,17 +347,16 @@ pub async fn make_room(
     return false;
   }
   let ctx = &state.ctx;
-  let targets: Vec<LaunchId> = go.iter().flat_map(|c| c.targets.iter().cloned()).collect();
+  let targets: Vec<LaunchId> = go.iter().map(|c| c.target.clone()).collect();
   unloading(&targets);
   let unloaded = targets.len();
   // Candidates stop together, the way the sweep unloads: the re-check above is
   // only honest if nothing else runs before the stops, and stopping one after
   // another would stretch the request's wait to N x the stop grace.
-  futures::future::join_all(go.iter().map(|candidate| async move {
-    for target in &candidate.targets {
-      stop_launch(ctx, target).await;
-    }
-  }))
+  futures::future::join_all(
+    go.iter()
+      .map(|candidate| stop_launch(ctx, &candidate.target)),
+  )
   .await;
   log::info!(
     "proxy make-room: unloaded {} launch(es) ({}), waiting for the memory to land",
@@ -397,7 +398,7 @@ async fn room_candidates(
         bytes,
         last_request_at,
         guard: model,
-        targets: vec![launch_id],
+        target: launch_id,
       }),
       _ => log::debug!(
         "proxy make-room: {} has no size to credit — not a candidate",

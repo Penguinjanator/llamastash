@@ -552,7 +552,7 @@ fn seeded_requests_view_app() -> App {
     row(1),
   ];
   app.requests.set(
-    RequestsScope::Launch("L1".into()),
+    RequestsScope::new("L1"),
     RequestSummary {
       requests: 6,
       errors: 1,

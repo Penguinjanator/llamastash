@@ -2676,7 +2676,7 @@ fn requests_poll_target(app: &App) -> Option<RequestsScope> {
     return None;
   }
   let managed = app.focused_managed()?;
-  Some(RequestsScope::Launch(managed.launch_id.clone()))
+  Some(RequestsScope::new(managed.launch_id.clone()))
 }
 
 /// Drop the Requests tab's data when it is for another row or the tab
@@ -5243,7 +5243,7 @@ mod tests {
   }
 
   fn launch_scope(id: &str) -> RequestsScope {
-    RequestsScope::Launch(id.to_string())
+    RequestsScope::new(id)
   }
 
   #[test]

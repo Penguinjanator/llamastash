@@ -31,7 +31,7 @@ impl LaunchId {
     &self.0
   }
 
-  /// The counter behind an `L<n>` id; `None` for a reserved id.
+  /// The counter behind an `L<n>` id, or `None` when the id is not that shape.
   pub fn counter(&self) -> Option<u64> {
     self.0.strip_prefix('L')?.parse().ok()
   }
