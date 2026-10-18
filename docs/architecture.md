@@ -513,7 +513,7 @@ Filtered out before classification: software adapters (`DXGI_ADAPTER_FLAG_SOFTWA
 
 The source of truth is `App::available_right_tabs` (`src/tui/app.rs`) and `tabs_for_mode` (`src/tui/tabs/mod.rs`).
 
-The Requests tab reads `requests_tail` for the focused model's path through its own poller (`spawn_requests_poller` in `src/tui/events.rs`), and only while the tab is open. Its table columns carry a rank and drop out as the pane narrows; the picker is `tui::columns::fit`, shared with the Models list.
+The Requests tab reads `requests_tail` for the focused launch's id through its own poller (`spawn_requests_poller` in `src/tui/events.rs`), and only while the tab is open. Its table columns carry a rank and drop out as the pane narrows; the picker is `tui::columns::fit`, shared with the Models list.
 
 The Chat / Embed / Rerank tabs hit the same OpenAI-compatible endpoints any external client would use (`/v1/chat/completions`, `/v1/embeddings`, `/v1/rerank`). This is deliberate: it proves the model is consumable by anything, not just LlamaStash's own smoke test.
 

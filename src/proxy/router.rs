@@ -546,9 +546,9 @@ fn alias_rows<'a>(
 /// then 400s `ambiguous_model` on the model half — a listed id that cannot be
 /// reached.
 ///
-/// Every named row published here routes: the daemon refuses `--name` on a
-/// launch it cannot route, so this list never publishes an address `decide`
-/// has no target for.
+/// Every named row published here routes: each one is built from a running
+/// supervised launch, which `decide` walks, so this list never publishes an
+/// address `decide` has no target for.
 fn named_launch_ids<'a>(
   running: &'a [RunningSnapshot],
   ids: &HashMap<String, String>,

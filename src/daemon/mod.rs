@@ -286,7 +286,7 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
 
   // 2. State directory: created lazily by the lockfile / state-store /
   // runtime-file writers. No socket file to clear — the control plane
-  // binds a TCP listener (§8c) and writes its URL+token into
+  // binds a TCP listener (§8d) and writes its URL+token into
   // `runtime.json` instead.
 
   // Config load installs this too; repeating it here covers a daemon built
@@ -402,7 +402,7 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
   // `status` handler and the proxy listener task share the same
   // handle. The cell surfaces via `status.proxy`; it is seeded with
   // the `Disabled` variant so a daemon with
-  // `proxy.enabled: false` reads as disabled even before §8b runs.
+  // `proxy.enabled: false` reads as disabled even before §8c runs.
   let proxy_status_cell = proxy::server::new_status_cell();
   // Aggregate backend config + per-backend force-enable map, both already
   // post-env-override (`build_options` applied `LLAMASTASH_FIT_CTX_FLOOR` /

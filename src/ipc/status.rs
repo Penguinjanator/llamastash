@@ -590,6 +590,10 @@ mod tests {
       llama.get("lifecycle").is_none(),
       "backend rows carry no lifecycle field"
     );
+    assert!(
+      llama.get("umbrella").is_none(),
+      "backend rows carry no umbrella field"
+    );
     let accel: Vec<&str> = llama["accelerators"]
       .as_array()
       .unwrap()

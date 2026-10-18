@@ -7,7 +7,7 @@
 
 ### Removed
 
-- **Breaking: the `lifecycle` field of `status --json` backend rows, and the umbrella columns that came with it.** Every backend runs one process per model, so there is nothing left to distinguish.
+- **Breaking: the `lifecycle` field of `status --json` backend rows, and the umbrella columns that came with it.** Every backend runs one process per model, so there is nothing left to distinguish ([#116](https://github.com/llamastash/llamastash/pull/116)).
 - **Breaking: the dedicated Lemonade backend.** Run `lemond` as a `backend.generic` server: one declared entry plus one `proxy.aliases` line per model, and the same models answer on the proxy at the same speeds. A config with a `backend.lemonade:` block is rejected with a pointer to the steps, and `--lemonade` / `LLAMASTASH_LEMONADE` are gone. See [Running Lemonade as a generic server](docs/usage.md#running-lemonade-as-a-generic-server).
 
 ### Fixed
