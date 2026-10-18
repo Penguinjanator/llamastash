@@ -277,7 +277,7 @@ U1 → U2 → U3 run in one lane, in that order. U4 is docs only and can run in 
 
 **Verification:** unit, parse and `--test session_cli` pass; `make lint` clean.
 
-- [ ] **Unit 4: docs**
+- [x] **Unit 4: docs**
 
 **Goal:** Users and agents can find and use `session`.
 
