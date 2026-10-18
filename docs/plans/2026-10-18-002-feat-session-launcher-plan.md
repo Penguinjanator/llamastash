@@ -310,19 +310,19 @@ U1 → U2 → U3 run in one lane, in that order. U4 is docs only and can run in 
 - A running chat launch still wins when MODEL is omitted (latest started); the model picker appears only when none is running.
 - The tool picker lists one entry per tool (`claude`, `codex`, `opencode`, `pi`, `aider`; `claude-code` stays a CLI alias, not a second entry).
 - The model picker lists only chat models (embedding and rerank rows filtered out with the same gate `session` already applies).
-- DRY: one generic cliclack select helper in `src/cli/picker.rs` that `pick_catalog_row`, `pick_running_target` and the new tool picker all use; the command name in prompts and errors is a parameter, not hardcoded to `start`/`stop`. The chosen model then goes through the same start-and-wait path a MODEL argument takes. `start` and `stop` picker behavior and text stay the same.
+- DRY: one generic single-select helper in `src/cli/picker.rs` (title, initial index, `(label, hint)` items; runs cliclack on a blocking thread; returns the chosen index or the error for the caller to map to its own exit code). Every single-select uses it: `pick_catalog_row`, `pick_running_target`, the new tool picker, and the three in `src/init/prompts.rs` (install method, model menu, HF search results). The command name in picker prompts and errors is a parameter, not hardcoded to `start`/`stop`. `pick_integrations` keeps its own `cliclack::multiselect`: it is the only multiselect. The chosen model then goes through the same start-and-wait path a MODEL argument takes. `start` and `stop` picker behavior and text stay the same.
 
 **Files:**
-- Modify: `src/cli/picker.rs`, `src/cli/session.rs`, `src/cli/cli_args.rs` (TOOL becomes optional), `tests/session_cli.rs`
+- Modify: `src/cli/picker.rs`, `src/init/prompts.rs`, `src/cli/session.rs`, `src/cli/cli_args.rs` (TOOL becomes optional), `tests/session_cli.rs`
 - Modify: `docs/usage.md` (session synopsis, model selection table, the two pickers), `CHANGELOG.md` only if the existing session bullet no longer covers it
 
 **Test scenarios:**
 - No TOOL, non-interactive: exit 64, the message lists the supported tools.
 - No MODEL, nothing running, non-interactive or `--json`: exit 66, nothing started (existing test stays green).
 - Chat-only filter for the model picker list (unit test on the filtering function).
-- `start` and `stop` picker tests and output unchanged.
+- `start`, `stop` and init prompt tests and output unchanged (init's exit code stays `INIT_ABORTED` on a prompt error).
 
-**Verification:** `cargo nextest run --features test-fixtures --lib picker --lib session`, `--test session_cli`. The orchestrator drives both pickers in a pty for the E2E.
+**Verification:** `cargo nextest run --features test-fixtures --lib picker`, `--lib session`, `--lib init::prompts`, `--test session_cli`. The orchestrator drives both pickers in a pty for the E2E.
 
 ## System-Wide Impact
 
