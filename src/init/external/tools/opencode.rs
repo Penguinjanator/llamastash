@@ -28,13 +28,17 @@
 //!   template accepts. `@ai-sdk/openai-compatible` sends `reasoningEffort`
 //!   as `reasoning_effort`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use crate::init::external::{Format, PatchContext, PatchModel, ToolPatcher};
+use crate::init::external::{Format, PatchContext, PatchModel, SessionLaunch, ToolPatcher};
 
 pub struct OpenCode;
+
+/// The provider id our block registers under, and the prefix of a model
+/// address (`llamastash/<id>`) in `model` / `small_model`.
+pub const PROVIDER: &str = "llamastash";
 
 fn model_entry(m: &PatchModel) -> serde_json::Value {
   // opencode compacts at `context - output`.
@@ -102,7 +106,7 @@ impl ToolPatcher for OpenCode {
     ctx: &PatchContext,
   ) -> serde_json::Value {
     // Null in place keeps the key where it was; the merge then replaces it.
-    if let Some(models) = current.pointer_mut("/provider/llamastash/models") {
+    if let Some(models) = current.pointer_mut(&format!("/provider/{PROVIDER}/models")) {
       *models = serde_json::Value::Null;
     }
     crate::init::external::merge::merge(current, self.build_additions(ctx))
@@ -116,7 +120,7 @@ impl ToolPatcher for OpenCode {
     json!({
       "$schema": "https://opencode.ai/config.json",
       "provider": {
-        "llamastash": {
+        (PROVIDER): {
           "npm": "@ai-sdk/openai-compatible",
           "name": "LlamaStash",
           "options": {
@@ -126,6 +130,27 @@ impl ToolPatcher for OpenCode {
           "models": models,
         }
       }
+    })
+  }
+  /// OpenCode reads `OPENCODE_CONFIG_CONTENT` after its global and project
+  /// config, so the whole run's configuration is one env var and nothing of
+  /// the user's `opencode.json` is touched.
+  fn session(&self, ctx: &PatchContext, _files_dir: &Path) -> Option<SessionLaunch> {
+    let m = ctx.primary().filter(|m| !m.is_embed)?;
+    let mut config = self.build_additions(ctx);
+    let address = format!("{PROVIDER}/{}", m.id);
+    config["model"] = json!(&address);
+    config["small_model"] = json!(&address);
+    Some(SessionLaunch {
+      program: "opencode",
+      args: Vec::new(),
+      env: vec![
+        ("OPENCODE_CONFIG_CONTENT".to_string(), config.to_string()),
+        // The provider block resolves its key as `{env:LLAMASTASH_API_KEY}`.
+        (super::env_sh::API_KEY_VAR.to_string(), ctx.api_key.clone()),
+      ],
+      env_remove: Vec::new(),
+      files: Vec::new(),
     })
   }
 }
@@ -356,5 +381,43 @@ mod tests {
       .expect("baseURL leaf");
     assert_eq!(leaf.kind, "changed");
     std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn session_content_is_the_patcher_block_plus_the_model_choice() {
+    let mut ctx = ctx();
+    ctx.models[0].context_window = Some(131_072);
+    let launch = OpenCode.session(&ctx, Path::new(".")).expect("launch");
+    assert_eq!(launch.program, "opencode");
+    assert!(launch.args.is_empty());
+    assert!(launch.files.is_empty());
+    let content = launch
+      .env
+      .iter()
+      .find(|(k, _)| k == "OPENCODE_CONFIG_CONTENT")
+      .expect("config content")
+      .1
+      .clone();
+    let cfg: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
+    // Byte-for-byte the provider the patcher would write to disk for this model.
+    assert_eq!(
+      cfg["provider"]["llamastash"],
+      OpenCode.build_additions(&ctx)["provider"]["llamastash"]
+    );
+    assert_eq!(
+      cfg["provider"]["llamastash"]["models"]["qwen3-coder-30b"]["limit"],
+      json!({ "context": 131_072, "output": 32_000 })
+    );
+    assert_eq!(cfg["model"], "llamastash/qwen3-coder-30b");
+    assert_eq!(cfg["small_model"], "llamastash/qwen3-coder-30b");
+    // The block resolves its key from the env, so the launch has to set it.
+    assert_eq!(
+      cfg["provider"]["llamastash"]["options"]["apiKey"],
+      "{env:LLAMASTASH_API_KEY}"
+    );
+    assert!(launch
+      .env
+      .iter()
+      .any(|(k, v)| k == "LLAMASTASH_API_KEY" && v == "llamastash"));
   }
 }

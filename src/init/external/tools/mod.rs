@@ -32,3 +32,64 @@ pub fn registered() -> Vec<Box<dyn ToolPatcher>> {
     Box::new(claude_code::ClaudeCode),
   ]
 }
+
+#[cfg(test)]
+mod tests {
+  use super::super::{PatchContext, SessionLaunch};
+  use super::registered;
+
+  /// A key that would be a real bearer token if the proxy enforced auth.
+  const SECRET: &str = "s3cr3t-bearer-token";
+  const SESSION_TOOLS: &[&str] = &["claude-code", "codex", "opencode", "pi", "aider"];
+
+  fn ctx() -> PatchContext {
+    let mut ctx = PatchContext::fixture(&["qwen3-coder-30b"]);
+    ctx.api_key = SECRET.to_string();
+    ctx
+  }
+
+  fn session(id: &str) -> Option<SessionLaunch> {
+    let patcher = registered()
+      .into_iter()
+      .find(|p| p.id() == id)
+      .expect("registered patcher");
+    // Nothing is written: the session hook only describes files.
+    patcher.session(&ctx(), std::path::Path::new("/sessions"))
+  }
+
+  #[test]
+  fn the_five_coding_tools_describe_a_per_run_launch() {
+    for id in SESSION_TOOLS {
+      assert!(session(id).is_some(), "{id} offers no per-run launch");
+    }
+  }
+
+  #[test]
+  fn an_editor_or_shell_target_declines_to_launch() {
+    // Continue is an IDE extension, Zed an editor, and env-sh is not a tool.
+    for id in ["continue", "zed", "env-sh"] {
+      assert!(session(id).is_none(), "{id} must not offer a session");
+    }
+  }
+
+  #[test]
+  fn the_key_reaches_only_the_child_env() {
+    for id in SESSION_TOOLS {
+      let launch = session(id).unwrap_or_else(|| panic!("{id} offers no per-run launch"));
+      assert!(
+        launch.env.iter().any(|(_, v)| v == SECRET),
+        "{id} must pass the key through env"
+      );
+      for arg in &launch.args {
+        assert!(!arg.contains(SECRET), "{id} puts the key in argv");
+      }
+      for file in &launch.files {
+        assert!(
+          !file.content.contains(SECRET),
+          "{id} puts the key in {}",
+          file.path.display()
+        );
+      }
+    }
+  }
+}

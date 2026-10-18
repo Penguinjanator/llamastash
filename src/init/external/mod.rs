@@ -25,7 +25,7 @@ pub mod tool_targets;
 pub mod tools;
 pub mod write;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -185,6 +185,32 @@ impl PatchContext {
   }
 }
 
+/// One file a [`SessionLaunch`] writes before the tool starts. Never a
+/// secret: the proxy key travels in the child's env only, so these bodies are
+/// safe to world-read and to keep after the run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionFile {
+  pub path: PathBuf,
+  pub content: String,
+}
+
+/// How to start one tool against one model for a single run, which is what
+/// `llamastash session <tool>` execs. Nothing here touches the tool's own
+/// config: the run's configuration is env, argv, and generated files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionLaunch {
+  /// Program to run, resolved on `PATH` by the caller.
+  pub program: &'static str,
+  /// The tool's own args, ahead of anything the user passed after `--`.
+  pub args: Vec<String>,
+  /// Env to set on the child, in declaration order.
+  pub env: Vec<(String, String)>,
+  /// Env names to drop from the child's inherited env.
+  pub env_remove: Vec<String>,
+  /// Files to write before the tool starts.
+  pub files: Vec<SessionFile>,
+}
+
 /// One supported external-tool patcher. Implementors declare where
 /// the tool's config lives, what format it uses, and the JSON
 /// additions to merge in.
@@ -262,6 +288,13 @@ pub trait ToolPatcher: Send + Sync {
   /// is no file). Defaults to [`Self::raw_body`].
   fn raw_body_from(&self, ctx: &PatchContext, _current: Option<&str>) -> Option<String> {
     self.raw_body(ctx)
+  }
+  /// The per-run launch for `llamastash session <tool>`: this tool pointed at
+  /// the one model in `ctx`, configured through env/argv/`files_dir` instead
+  /// of the tool's global config. `None` for a tool with no per-run hook, or
+  /// when `ctx` names no usable model. Default impl is `None`.
+  fn session(&self, _ctx: &PatchContext, _files_dir: &Path) -> Option<SessionLaunch> {
+    None
   }
   /// Unix mode for the on-disk file. Defaults to `0o600` — these
   /// files may carry the proxy's real bearer token (embedded literally,

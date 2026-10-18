@@ -180,7 +180,7 @@ graph LR
 
 U1 → U2 → U3 run in one lane, in that order. U4 is docs only and can run in parallel from this plan's CLI contract. It shares no files with U1–U3.
 
-- [ ] **Unit 1: `ToolPatcher::session` and the five tool launches**
+- [x] **Unit 1: `ToolPatcher::session` and the five tool launches**
 
 **Goal:** Each supported patcher can describe a per-run launch for one model.
 

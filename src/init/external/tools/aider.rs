@@ -18,13 +18,20 @@
 //! model id (`configure_model_settings` in `aider/models.py`), so it is
 //! not written.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use crate::init::external::{Format, PatchContext, ToolPatcher};
+use crate::init::external::{Format, PatchContext, SessionLaunch, ToolPatcher};
 
 pub struct Aider;
+
+/// Aider reads every config key from `AIDER_<UPPER_SNAKE>`; `--help` lists
+/// `AIDER_MODEL`, `AIDER_OPENAI_API_BASE`, `AIDER_OPENAI_API_KEY`. Its
+/// precedence is CLI > env > config file, so these win over the conf file.
+fn env_name(config_key: &str) -> String {
+  format!("AIDER_{}", config_key.replace('-', "_").to_uppercase())
+}
 
 impl ToolPatcher for Aider {
   fn id(&self) -> &'static str {
@@ -60,6 +67,25 @@ impl ToolPatcher for Aider {
         .insert("model".into(), json!(format!("openai/{}", m.id)));
     }
     obj
+  }
+  /// Every key it would write to `~/.aider.conf.yml`, set as the same-named env
+  /// var instead so that file stays untouched.
+  fn session(&self, ctx: &PatchContext, _files_dir: &Path) -> Option<SessionLaunch> {
+    ctx.primary().filter(|m| !m.is_embed)?;
+    let env = self
+      .build_additions(ctx)
+      .as_object()
+      .into_iter()
+      .flat_map(|map| map.iter())
+      .filter_map(|(key, value)| value.as_str().map(|v| (env_name(key), v.to_string())))
+      .collect();
+    Some(SessionLaunch {
+      program: "aider",
+      args: Vec::new(),
+      env,
+      env_remove: Vec::new(),
+      files: Vec::new(),
+    })
   }
 }
 
@@ -103,5 +129,29 @@ mod tests {
     assert!(body.contains("stream: true"));
     assert!(body.contains("openai-api-base"));
     std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[test]
+  fn session_sets_its_three_keys_as_env() {
+    let launch = Aider.session(&ctx(), Path::new(".")).expect("launch");
+    assert_eq!(launch.program, "aider");
+    assert!(launch.args.is_empty());
+    assert!(launch.files.is_empty());
+    let mut env = launch.env.clone();
+    env.sort();
+    assert_eq!(
+      env,
+      vec![
+        (
+          "AIDER_MODEL".to_string(),
+          "openai/qwen3-coder-30b".to_string()
+        ),
+        (
+          "AIDER_OPENAI_API_BASE".to_string(),
+          "http://127.0.0.1:11435/v1".to_string()
+        ),
+        ("AIDER_OPENAI_API_KEY".to_string(), "llamastash".to_string()),
+      ]
+    );
   }
 }

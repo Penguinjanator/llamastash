@@ -23,10 +23,10 @@
 //! the template's default written here. The file is rewritten on each
 //! run, but a level the user set in it is kept when the model accepts it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::init::external::effort::EffortLevels;
-use crate::init::external::{Format, PatchContext, ToolPatcher};
+use crate::init::external::{Format, PatchContext, SessionLaunch, ToolPatcher};
 
 pub struct Codex;
 
@@ -83,6 +83,25 @@ fn effort_to_write(effort: &EffortLevels, current: Option<&str>) -> Option<Strin
     .or_else(|| effort.preferred().map(str::to_string))
 }
 
+/// The provider table's fields, as TOML values. The profile writes these
+/// under `[model_providers.llamastash]` and adds an `auth` command beside
+/// them; [`ToolPatcher::session`] passes them inline with `env_key` instead,
+/// because the `llamastash` on `PATH` may not be the binary running the
+/// session. One source so the two cannot drift.
+fn provider_fields(base_url: &str) -> Vec<(&'static str, String)> {
+  vec![
+    ("name", toml_str("LlamaStash")),
+    ("base_url", toml_str(base_url)),
+    ("wire_api", toml_str("responses")),
+  ]
+}
+
+/// One `-c key=value` override: two argv entries, since the child is execd and
+/// never sees a shell. The value stays a TOML literal, quotes included.
+fn codex_override(key: &str, value: &str) -> Vec<String> {
+  vec!["-c".to_string(), format!("{key}={value}")]
+}
+
 impl ToolPatcher for Codex {
   fn id(&self) -> &'static str {
     "codex"
@@ -135,17 +154,49 @@ impl ToolPatcher for Codex {
     }
     body.push_str(&format!(
       "model_provider = {}\n\n\
-       [model_providers.{PROFILE}]\n\
-       name = \"LlamaStash\"\n\
-       base_url = {}\n\
-       wire_api = \"responses\"\n\n\
-       [model_providers.{PROFILE}.auth]\n\
+       [model_providers.{PROFILE}]\n",
+      toml_str(PROFILE),
+    ));
+    for (key, value) in provider_fields(&ctx.proxy_base_url) {
+      body.push_str(&format!("{key} = {value}\n"));
+    }
+    body.push_str(
+      "\n[model_providers.{PROFILE}.auth]\n\
        command = \"llamastash\"\n\
        args = [\"api-key\"]\n",
-      toml_str(PROFILE),
-      toml_str(&ctx.proxy_base_url),
-    ));
+    );
     Some(body)
+  }
+  fn session(&self, ctx: &PatchContext, _files_dir: &Path) -> Option<SessionLaunch> {
+    let m = ctx.primary().filter(|m| !m.is_embed)?;
+    let provider = provider_fields(&ctx.proxy_base_url)
+      .into_iter()
+      .chain([("env_key", toml_str(super::env_sh::API_KEY_VAR))])
+      .map(|(k, v)| format!("{k}={v}"))
+      .collect::<Vec<_>>()
+      .join(", ");
+    let mut args = codex_override("model_provider", &toml_str(PROFILE));
+    args.extend(codex_override(
+      &format!("model_providers.{PROFILE}"),
+      &format!("{{{provider}}}"),
+    ));
+    args.extend(codex_override("model", &toml_str(&m.id)));
+    args.extend(codex_override(
+      "model_context_window",
+      &m.declared_context().to_string(),
+    ));
+    if let Some(effort) = &m.effort {
+      if let Some(level) = effort_to_write(effort, None) {
+        args.extend(codex_override("model_reasoning_effort", &toml_str(&level)));
+      }
+    }
+    Some(SessionLaunch {
+      program: "codex",
+      args,
+      env: vec![(super::env_sh::API_KEY_VAR.to_string(), ctx.api_key.clone())],
+      env_remove: Vec::new(),
+      files: Vec::new(),
+    })
   }
 }
 
@@ -271,5 +322,75 @@ mod tests {
     let second = apply(&Codex, &ctx, Some(path.clone())).expect("second");
     assert!(second.diff_json.is_empty());
     std::fs::remove_dir_all(&dir).ok();
+  }
+
+  /// The `-c key=value` pairs of a session launch, in order.
+  fn overrides(launch: &SessionLaunch) -> Vec<(String, String)> {
+    launch
+      .args
+      .chunks(2)
+      .map(|pair| {
+        assert_eq!(pair[0], "-c", "every codex arg is a -c override");
+        let (key, value) = pair[1].split_once('=').expect("key=value");
+        (key.to_string(), value.to_string())
+      })
+      .collect()
+  }
+
+  #[test]
+  fn session_overrides_carry_the_provider_and_the_model() {
+    let mut ctx = PatchContext::fixture(&["nomic-embed-text-v1.5", "Qwen3.8-27B-UD-Q6_K"]);
+    ctx.models[1].context_window = Some(262_144);
+    let launch = Codex.session(&ctx, Path::new(".")).expect("launch");
+    assert_eq!(launch.program, "codex");
+    assert!(launch.files.is_empty());
+    assert_eq!(
+      launch.env,
+      vec![("LLAMASTASH_API_KEY".to_string(), "llamastash".to_string())]
+    );
+    let o = overrides(&launch);
+    assert_eq!(o[0], ("model_provider".into(), "\"llamastash\"".into()));
+    assert_eq!(
+      o[1],
+      (
+        "model_providers.llamastash".into(),
+        "{name=\"LlamaStash\", base_url=\"http://127.0.0.1:11435/v1\", \
+         wire_api=\"responses\", env_key=\"LLAMASTASH_API_KEY\"}"
+          .into()
+      ),
+      "the same provider fields the profile writes, plus env_key"
+    );
+    assert!(o.contains(&("model".into(), "\"Qwen3.8-27B-UD-Q6_K\"".into())));
+    assert!(o.contains(&("model_context_window".into(), "262144".into())));
+    assert!(
+      !o.iter().any(|(k, _)| k == "model_reasoning_effort"),
+      "no levels, nothing to pin"
+    );
+  }
+
+  #[test]
+  fn session_pins_the_template_default_effort_for_an_effort_model() {
+    let launch = Codex.session(&qwen38(), Path::new(".")).expect("launch");
+    assert!(
+      overrides(&launch).contains(&("model_reasoning_effort".into(), "\"xhigh\"".into())),
+      "the same level the profile writer picks"
+    );
+  }
+
+  #[test]
+  fn session_escapes_an_id_as_a_toml_string() {
+    let ctx = PatchContext::fixture(&["we\"ird\\name"]);
+    let launch = Codex.session(&ctx, Path::new(".")).expect("launch");
+    assert!(overrides(&launch).contains(&("model".into(), "\"we\\\"ird\\\\name\"".into())));
+  }
+
+  #[test]
+  fn session_needs_a_chat_model() {
+    assert!(Codex
+      .session(
+        &PatchContext::fixture(&["nomic-embed-text-v1.5"]),
+        Path::new(".")
+      )
+      .is_none());
   }
 }
