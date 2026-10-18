@@ -241,7 +241,7 @@ U1 → U2 → U3 run in one lane, in that order. U4 is docs only and can run in 
 
 **Verification:** `cargo nextest run --features test-fixtures --lib start` and `--test cli_integration_test` pass.
 
-- [ ] **Unit 3: the `session` command**
+- [x] **Unit 3: the `session` command**
 
 **Goal:** `llamastash session <tool> [MODEL] [--dry-run] [--json] [-- args]` as specified in the CLI contract.
 

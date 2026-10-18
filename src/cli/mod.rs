@@ -30,6 +30,7 @@ pub mod presets;
 pub mod pull;
 pub mod requests;
 pub mod resolve;
+pub mod session;
 pub mod show;
 pub mod start;
 pub mod status;
@@ -143,6 +144,7 @@ pub async fn dispatch(mut cli: Cli, config: LoadedConfig) -> Result<i32> {
       )
       .await
     }
+    Some(Command::Session(args)) => session::handle(args, &cli, resolved_config).await,
     Some(Command::ApiKey(args)) => api_key::handle(args, &cli, resolved_config).await,
     Some(Command::Doctor(args)) => doctor::handle(args, &cli, resolved_config).await,
     #[cfg(feature = "uat")]
