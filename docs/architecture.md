@@ -104,8 +104,8 @@ YAML key. No surface hand-wires a knob, so none can be missing one.
 This replaced a two-channel model: a llama.cpp-keyed `TypedKnobs` IR plus a
 stringly-typed `native_knobs` map for everything else. The IR gave three of the
 four backends one usable slot out of nineteen while their real tunables sat in
-the parallel channel with no layering, no arch defaults and no CLI surface. A
-2026-08-25 audit found the split was exact: every setting on the generated path
+the parallel channel with no layering, no arch defaults and no CLI surface. An
+audit found the split was exact: every setting on the generated path
 reached all three surfaces, and every setting off it was missing from at least
 one.
 

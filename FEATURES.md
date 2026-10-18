@@ -240,11 +240,11 @@ HTTP path that answers 200 when loaded, its knobs and its stop grace, and
 LlamaStash supervises it exactly the way it supervises `llama-server` —
 admission, readiness, proxy routing, logs, request stats.
 
-Measured on a Strix Halo on 2026-10-17:
+Engines with a recipe:
 
 - **[Lemonade](https://github.com/lemonade-sdk/lemonade) (`lemond`)** — one
   long-lived umbrella for NPU / ROCm / ONNX engines, behind one entry plus one
-  `proxy.aliases` line per model. 1.9 s cold through the alias at 103 t/s.
+  `proxy.aliases` line per model.
   Recipe: [Running Lemonade as a generic server](RECIPES.md#lemonade);
   install notes: [Lemonade setup](docs/lemonade-setup.md).
 - **[FastFlowLM (`flm`)](https://github.com/FastFlowLM/FastFlowLM)** — AMD

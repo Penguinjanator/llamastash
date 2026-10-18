@@ -36,8 +36,8 @@ models in memory and on the device.
 ## 2. Declare it as a generic entry
 
 Copy the entry and the `proxy.aliases` line from
-[RECIPES.md § Lemonade](../RECIPES.md#lemonade), which also has the measured
-numbers and the limits. Model names come
+[RECIPES.md § Lemonade](../RECIPES.md#lemonade), which also lists the
+limits. Model names come
 from the running entry's own port, which `llamastash status` shows:
 `curl "http://127.0.0.1:<launch-port>/api/v1/models?show_all=true"` (quote the
 URL or zsh eats the `?`). Names are case-sensitive at `lemond` and alias keys are

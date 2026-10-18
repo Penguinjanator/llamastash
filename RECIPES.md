@@ -1,6 +1,6 @@
 # Recipes
 
-Working `config.yaml` blocks for engines and models. Each one says what it was tested with and when. Replace the `/path/to/...` parts with your own paths, then run `llamastash daemon restart`: the daemon reads `config.yaml` at start.
+Working `config.yaml` blocks for engines and models. Each one names the engine version it was written for. Replace the `/path/to/...` parts with your own paths, then run `llamastash daemon restart`: the daemon reads `config.yaml` at start.
 
 What each field means is in [`docs/usage.md`](docs/usage.md): § [Generic backend](docs/usage.md#generic-backend) for `backend.generic.servers`, § [`presets`](docs/usage.md#llamastash-presets-model-ref-action) for preset keys and precedence. [`config.example.yaml`](config.example.yaml) has every key with a comment.
 
@@ -68,7 +68,7 @@ llamastash start Qwen/Qwen2.5-0.5B-Instruct --preset vllm-16g
 
 ## Qwen3.8 Flash-Next
 
-Three engines besides llama.cpp, tested on a Strix Halo box with gufo `d9a84f1` and CIRU `3cf984c` on 2026-09-26, and Halogen `0.17.0` (Docker image) on 2026-10-07. Each takes 80-100 GB, so run one at a time.
+Three engines besides llama.cpp: gufo (commit `d9a84f1`), Halogen (`0.17.0` Docker image) and CIRU (commit `3cf984c`). Each takes 80-100 GB, so run one at a time.
 
 ### gufo
 
@@ -216,15 +216,15 @@ kill "$fwd" 2>/dev/null
 ```
 
 - `docker run -d` plus `docker wait` keeps the wrapper in the foreground while the container never sees the process-group SIGTERM directly, so the engine gets exactly one signal. Keep `docker stop -t` above the image's 30 s and `stop_grace_secs` above `-t`.
-- The loop after `docker rm -f` covers a relaunch on the same port right after a stop. A stopped `--rm` container keeps its name until Docker finishes removing it, which took 33 s here. `docker rm -f` returns at once during that time (`removal of container ... is already in progress`), and `docker run` then fails with `Conflict. The container name ... is already in use`.
-- The `--internal` network gives the container no outbound access. Docker does not publish ports for a container on an internal network (checked on Docker 29.8.2), so `socat` forwards `127.0.0.1:$port` to it. The host needs `socat`, `setpriv` and `curl`. Without the isolation, publish the port instead (`-p "127.0.0.1:$port:8080"`, no `socat`), as this example did for 0.14.0. The API binds `0.0.0.0:8080` inside the container, so keep it off `--network host`.
+- The loop after `docker rm -f` covers a relaunch on the same port right after a stop. A stopped `--rm` container keeps its name until Docker finishes removing it, which can take over 30 s. `docker rm -f` returns at once during that time (`removal of container ... is already in progress`), and `docker run` then fails with `Conflict. The container name ... is already in use`.
+- The `--internal` network gives the container no outbound access. Docker does not publish ports for a container on an internal network, so `socat` forwards `127.0.0.1:$port` to it. The host needs `socat`, `setpriv` and `curl`. Without the isolation, publish the port instead (`-p "127.0.0.1:$port:8080"`, no `socat`), as this example did for 0.14.0. The API binds `0.0.0.0:8080` inside the container, so keep it off `--network host`.
 - 0.17.0 serves the v2 checkpoint, `qwen38-flash-next-v2.hgn` (62.1 GiB), and finds its lookup table `qwen38-flash-next-ngram.hgn` (47.7 GiB) beside it. The draft head is inside the checkpoint, so there is no `HALOGEN_MTP_HEAD`. The older w4b checkpoint still loads but is deprecated.
 - It does not check the request's `model` field. The engine was listening 88 s after start when it read the checkpoint from disk, and after 6 to 8 s with the weights still in page cache.
 - `HALOGEN_REASONING_EFFORT` sets the default thinking effort: `minimal`, `low`, `medium`, `high` or `xhigh`, mapped to the template's `low`, `medium` and `xhigh`. Unset, the template's own default applies, which is `xhigh`. A request that sends `reasoning_effort` still wins. The wrapper has to pass the variable through (`-e HALOGEN_REASONING_EFFORT`), or the preset has no effect.
 
 #### Halogen for agent harnesses (several conversations at once)
 
-A harness that fans out subagents keeps a parent conversation and several child conversations alive at once. Newer Halogen images have variables for that. These were checked against Halogen's [FLAGS.md](https://github.com/peonist-ai/halogen-flash-server/blob/main/docs/FLAGS.md) at 0.18.10 (2026-10-18) and were not part of the 0.17.0 test run, so bump the image tag in the wrapper. Add the knobs and env lines to the entry above, and the same `-e HALOGEN_...` names to the wrapper's `docker run`:
+A harness that fans out subagents keeps a parent conversation and several child conversations alive at once. Newer Halogen images have variables for that. The names below match Halogen's [FLAGS.md](https://github.com/peonist-ai/halogen-flash-server/blob/main/docs/FLAGS.md) at 0.18.10, newer than the 0.17.0 image above, so bump the image tag in the wrapper. Add the knobs and env lines to the entry above, and the same `-e HALOGEN_...` names to the wrapper's `docker run`:
 
 ```yaml
         knobs:
@@ -312,7 +312,7 @@ exec /path/to/ciru/scripts/ciru/run-server.sh "$@"
 
 ## Qwen3.8 27B
 
-gufo runs the 27B GGUF with z-lab's DFlash2 draft model. This entry comes from a working Strix Halo config (gufo built for ROCm) and was not part of the 2026-09-26 test run. Without `default:` in the preset, llama.cpp stays the default server for this GGUF.
+A ROCm build of gufo runs the 27B GGUF with z-lab's DFlash2 draft model. Without `default:` in the preset, llama.cpp stays the default server for this GGUF.
 
 ```yaml
 backend:
@@ -345,7 +345,7 @@ presets:
 
 ## DeepSeek V4
 
-[ds4](https://github.com/antirez/ds4) (antirez's DwarfStar) runs the DeepSeek-V4 Flash/PRO GGUFs from [huggingface.co/antirez/deepseek-v4-gguf](https://huggingface.co/antirez/deepseek-v4-gguf) through its `ds4-server` binary. It was a dedicated backend up to 0.4.0. It's now a generic server entry, which gives the same argv, readiness and speed (tested on 2026-09-28 with ds4 `0aaea5a` and the Flash IQ2_XXS `0731` GGUF: 13.2 t/s either way). You build `ds4-server` yourself (`git clone https://github.com/antirez/ds4 && cd ds4 && make`). llama.cpp runs these GGUFs too, from **b9840** on, and stays their default server.
+[ds4](https://github.com/antirez/ds4) (antirez's DwarfStar) runs the DeepSeek-V4 Flash/PRO GGUFs from [huggingface.co/antirez/deepseek-v4-gguf](https://huggingface.co/antirez/deepseek-v4-gguf) through its `ds4-server` binary. It was a dedicated backend up to 0.4.0. It's now a generic server entry, which gives the same argv, readiness and speed (13.2 t/s both ways with ds4 `0aaea5a` and the Flash IQ2_XXS `0731` GGUF). You build `ds4-server` yourself (`git clone https://github.com/antirez/ds4 && cd ds4 && make`). llama.cpp runs these GGUFs too, from **b9840** on, and stays their default server.
 
 ```yaml
 backend:
@@ -443,11 +443,11 @@ presets:
 llamastash start <gemma-4-31B model> --preset no-mtp
 ```
 
-A key that names no model is read as a GGUF architecture id, so `glm4moe` covers every GGUF converted from a `Glm4MoeForCausalLM` checkpoint (the arch id comes from llama.cpp's converter, `conversion/glm.py`, checked 2026-10-16). The `Arch` column of `llamastash list` shows the id for your files. The GLM block was not run on a GLM model for this page.
+A key that names no model is read as a GGUF architecture id, so `glm4moe` covers every GGUF converted from a `Glm4MoeForCausalLM` checkpoint (the arch id comes from llama.cpp's converter, `conversion/glm.py`). The `Arch` column of `llamastash list` shows the id for your files. The GLM block has not been run on a GLM model yet.
 
 ## Small GPU: Qwen3.5 4B vision
 
-Screenshot reading on a 4 GB laptop GPU (RTX 3050 Ti Laptop, CUDA build of llama.cpp). The knob values come from measurements on that card.
+Screenshot reading on a 4 GB laptop GPU (RTX 3050 Ti Laptop, CUDA build of llama.cpp). The knob values are tuned for that card.
 
 ```yaml
 presets:
@@ -469,7 +469,7 @@ presets:
 
 ### Lemonade
 
-[Lemonade](https://github.com/lemonade-sdk/lemonade) runs one long-lived `lemond` that serves every model it has downloaded and loads each one on the first request that names it. Tested on a Strix Halo host on 2026-10-17 with `lemond` 2026.42.1 (the upstream release of that date), its `llamacpp:rocm` backend at b11395, and `unsloth/Qwen3-0.6B-GGUF`. Full write-up: [`docs/testing/2026-10-17-batch1-lemonade-flm-whisper.md`](docs/testing/2026-10-17-batch1-lemonade-flm-whisper.md).
+[Lemonade](https://github.com/lemonade-sdk/lemonade) runs one long-lived `lemond` that serves every model it has downloaded and loads each one on the first request that names it. Written for `lemond` 2026.42.1 with its `llamacpp:rocm` backend (b11395) and `unsloth/Qwen3-0.6B-GGUF`.
 
 ```yaml
 backend:
@@ -489,18 +489,18 @@ proxy:
     Qwen3-0.6B-GGUF: lemonade                      # one alias per Lemonade model you name
 ```
 
-`lemond` picks its own port for nothing and takes the one llamastash reserves, so it publishes one row (`lemonade`) no client can send as `body.model`. The alias is what clients use, and the alias string survives into the forwarded body, which is how `lemond` finds the model: `curl :11435/v1/chat/completions -d '{"model":"Qwen3-0.6B-GGUF",...}'` came back in 1.9 s (cold, including Lemonade's own model load) at 103 t/s, and auto-start through the alias works. `GET http://127.0.0.1:13305/api/v1/models?show_all=true` lists every name the engine will accept (179 on that build). `stop_grace_secs` is not decoration: `lemond` takes about 6 s to exit, over the 5 s default grace.
+`lemond` picks its own port for nothing and takes the one llamastash reserves, so it publishes one row (`lemonade`) no client can send as `body.model`. The alias is what clients use, and the alias string survives into the forwarded body, which is how `lemond` finds the model: `curl :11435/v1/chat/completions -d '{"model":"Qwen3-0.6B-GGUF",...}'` came back in 1.9 s (cold, including Lemonade's own model load) at 103 t/s, and auto-start through the alias works. `GET http://127.0.0.1:13305/api/v1/models?show_all=true` lists every name the engine will accept (179 on 2026.42.1). `stop_grace_secs` is not decoration: `lemond` takes about 6 s to exit, over the 5 s default grace.
 
 What one entry does not do:
 
 - **The model list is not the catalog.** LlamaStash shows one `lemonade` row, not Lemonade's models. Each name a client should use needs its own `proxy.aliases` line, and nothing warns you when an alias names a model Lemonade does not have.
-- **One launch, one umbrella, every model inside it.** `stop` takes the umbrella down (measured 4.7 s), not one model. Two launched models means two `lemond` processes at about 38 MB each idle, and no shared residency.
+- **One launch, one umbrella, every model inside it.** `stop` takes the umbrella down (about 4.7 s), not one model. Two launched models means two `lemond` processes at about 38 MB each idle, and no shared residency.
 - **No context control.** `lemond` takes context as the `ctx_size` field of its `POST /api/v1/load`, which argv cannot reach. You get whatever `~/.config/lemonade/config.json` says, and `--ctx` on a generic entry does nothing here.
 - **`lemond`'s own children show up as `external`.** The `llama-server` it spawns appears in `status` as an unmanaged row.
 
 ### FastFlowLM (AMD NPU)
 
-[FastFlowLM](https://github.com/ROCm/FastFlowLM) (`flm`) runs LLMs, Whisper ASR and embedding models on AMD XDNA2 NPUs. It speaks the OpenAI shape, so it needs no dedicated backend. Tested 2026-10-17 with `flm` v1.0.9 (portable `fastflowlm_1.0.9_linux.tar.gz`) on kernel 7.2.10 with the in-tree `amdxdna`, firmware 1.1.2.65, `xrt` + `xrt-plugin-amdxdna`, and `flm validate` passing.
+[FastFlowLM](https://github.com/ROCm/FastFlowLM) (`flm`) runs LLMs, Whisper ASR and embedding models on AMD XDNA2 NPUs. It speaks the OpenAI shape, so it needs no dedicated backend. Written for `flm` v1.0.9 (portable `fastflowlm_1.0.9_linux.tar.gz`) on Linux 7.2.10 with the in-tree `amdxdna` driver, NPU firmware 1.1.2.65 and `xrt` + `xrt-plugin-amdxdna`. `flm validate` should pass before you add the entry.
 
 ```yaml
 backend:
@@ -561,7 +561,7 @@ Three FLM notes: `/v1/models` lists FLM's whole model list, not what you downloa
 
 ### whisper.cpp
 
-`whisper-server` (whisper.cpp v1.8.4 tested 2026-10-17, from `lemonade backends install whispercpp:cpu`) serves two routes: `GET /health` and `POST /inference` (multipart `file=@clip.wav`, replies `{"text": ...}`). It has no `/v1/models`. Two flags rename its own routes onto the OpenAI transcription shape, measured on v1.8.4: `--request-path /v1/audio --inference-path /transcriptions` answers `POST /v1/audio/transcriptions` with 200 and `{"text": ...}`, and the plain `/inference` then 404s. The llamastash proxy does not forward that route yet (see [Proxy routes](docs/usage.md#proxy-openai-compatible-listener)), so an ASR client posts to the launch port from `llamastash status`.
+`whisper-server` (whisper.cpp v1.8.4, from `lemonade backends install whispercpp:cpu`) serves two routes: `GET /health` and `POST /inference` (multipart `file=@clip.wav`, replies `{"text": ...}`). It has no `/v1/models`. Two flags rename its own routes onto the OpenAI transcription shape: `--request-path /v1/audio --inference-path /transcriptions` answers `POST /v1/audio/transcriptions` with 200 and `{"text": ...}`, and the plain `/inference` then 404s. The llamastash proxy does not forward that route yet (see [Proxy routes](docs/usage.md#proxy-openai-compatible-listener)), so an ASR client posts to the launch port from `llamastash status`.
 
 ```yaml
 backend:
@@ -578,4 +578,4 @@ backend:
         memory_gib: 1
 ```
 
-`ready` moves with the request path: `--request-path /v1/audio` puts health at `/v1/audio/health` and `/health` answers 404 (measured on v1.8.4). Two gotchas: the binary needs `LD_LIBRARY_PATH` set to its own directory or it dies with `libwhisper.so.1: cannot open shared object file` (exit 127), and a leading `~/` in an `env` value resolves to your home directory the way `binary` does (the rest of the value is passed through, so a `~` in the middle of a path list is literal). Its weights are `ggml-*.bin`, which the model scanner does not list, so the path lives in the entry.
+`ready` moves with the request path: `--request-path /v1/audio` puts health at `/v1/audio/health` and `/health` answers 404. Two gotchas: the binary needs `LD_LIBRARY_PATH` set to its own directory or it dies with `libwhisper.so.1: cannot open shared object file` (exit 127), and a leading `~/` in an `env` value resolves to your home directory the way `binary` does (the rest of the value is passed through, so a `~` in the middle of a path list is literal). Its weights are `ggml-*.bin`, which the model scanner does not list, so the path lives in the entry.

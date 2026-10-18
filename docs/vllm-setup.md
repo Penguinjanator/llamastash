@@ -7,8 +7,7 @@ GGUF still binds llama.cpp, and a safetensors repo binds vLLM.
 LlamaStash never installs vLLM. You supply the launcher; the backend is on by
 default whenever a `vllm` is found, and contributes nothing when it isn't.
 
-> **Experimental.** Validated against vLLM `0.27.1` on one Strix Halo / ROCm
-> host. Behaviour and config may change.
+> **Experimental.** Tested with vLLM `0.27.1`. Behaviour and config may change.
 
 ## Install
 
@@ -170,7 +169,7 @@ channel where it is labelled for what it is.
   from. On an APU (Strix Halo / Ryzen AI Max and friends) there is no separate
   VRAM pool — the GPU allocates out of the same DRAM your OS is using. vLLM
   sizes its KV cache to fill whatever `gpu_memory_utilization` allows, and that
-  is a fraction of the **pool**, not of your model. Measured on a 121 GB box:
+  is a fraction of the **pool**, not of your model. On a 121 GB host
   even `0.15` on a 0.5B model reserved 15.1 GiB of KV cache (1.3M tokens, 644x
   concurrency for a 2048-token model) and cost 21.2 GB of RAM. The `0.92`
   default projects to roughly 106 GB and has frozen the machine outright.
@@ -183,9 +182,9 @@ channel where it is labelled for what it is.
   budget from live free memory: 8 GiB, or less if weights plus the host
   reserve leave less. The reserve is what has to stay free after weights and
   cache: an OS floor (2 GiB) plus the engine's own footprint (7 GiB — CUDA
-  context, workspace, CUDA graphs and the API server, measured at 5.4–6.7 GiB
-  on a DGX Spark with vLLM 0.28) plus the compute band the admission gate
-  prices, or 15% of the pool if that is more (18.3 GiB on a 121.69 GiB box).
+  context, workspace, CUDA graphs and the API server, 5.4–6.7 GiB with
+  vLLM 0.28) plus the compute band the admission gate
+  prices, or 15% of the pool if that is more (18.3 GiB of a 121.69 GiB pool).
   The refusal message quotes the figure it used.
 
   The launcher also passes `--gpu-memory-utilization` next to the cap, sized
@@ -207,8 +206,8 @@ channel where it is labelled for what it is.
   answers to that name only, and the proxy forwards the `model` a client sent,
   so a `proxy.aliases` name for a vLLM model gets vLLM's own `404`
   (`NotFoundError`).
-- **The request log gets less from vLLM than from llama.cpp.** Measured on vLLM
-  0.27.1 with Qwen2.5-0.5B-Instruct:
+- **The request log gets less from vLLM than from llama.cpp.** On vLLM
+  0.27.1:
   - vLLM sends no speed of its own, so every `TOK/S` is the proxy's `~`
     estimate, and a response that arrives whole never gets a `PP/S`.
   - By default only `/v1/responses` reports a cached count. Chat and

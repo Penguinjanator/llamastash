@@ -8,12 +8,7 @@ llama.cpp, and a safetensors repo binds a safetensors engine.
 LlamaStash never installs SGLang. You supply the launcher; the backend is on by
 default whenever a `sglang` is found, and contributes nothing when it isn't.
 
-> **Experimental.** Validated against SGLang `0.5.18` on one DGX Spark (GB10,
-> unified memory): the flag surface from `sglang serve --help`, and a real
-> launch through `scripts/sglang/uat.sh` — the token cap the guard passed came
-> back as the server's resolved pool, with host memory peaking at 22 GiB of
-> 121 GiB where the fraction default would have claimed ~107 GiB. Behaviour
-> and config may change.
+> **Experimental.** Tested with SGLang `0.5.18`. Behaviour and config may change.
 
 ## Install
 
@@ -193,7 +188,7 @@ for a name the server never advertises.
 - **The model name is the repo id.** LlamaStash passes `--served-model-name`,
   so `/v1/models` advertises `owner/name`, not the cache path. SGLang takes
   one served name and does not validate the `model` field of a request
-  (verified on 0.5.18: an unregistered name is served), so no aliases are
+  (on 0.5.18 an unregistered name is served), so no aliases are
   registered and any name the proxy resolves reaches the model.
 - **No GGUF on SGLang.** A GGUF binds llama.cpp. SGLang claims
   safetensors repos only.

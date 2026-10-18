@@ -715,8 +715,6 @@ Check linger took with `loginctl show-user $USER -p Linger` (`Linger=yes`). With
 - **Keep the default `KillMode` (`control-group`).** On `systemctl --user stop` the daemon's SIGTERM handler stops every launch — each gets a 5 s grace, raised to whatever floor that backend declares (a `backend.generic` entry can ask for more) — and anything still in the unit's cgroup goes with the unit, so no `llama-server` is orphaned. `TimeoutStopSec=90` is systemd's own default and leaves room for the slowest child; raise it only if a generic entry declares a longer stop grace.
 - **`Restart=on-failure`** brings a crashed daemon back (and a `kill -9`'d one). A clean `systemctl --user stop` is not a failure, so it stays down.
 
-Checked on systemd 262 with an isolated `LLAMASTASH_STATE_DIR` and `--proxy-port 11599`: the unit came up with its preloaded model `ready` and the model's server as a child inside the unit's cgroup; `systemctl --user stop` returned in well under a second with that child gone and `runtime.json` / `daemon.pid` removed; `kill -9` on the main PID was restarted (`NRestarts=1`).
-
 **macOS: a launchd agent.** Untested — it has not been run on a Mac, so treat it as a starting point, not a verified recipe. Write `~/Library/LaunchAgents/com.llamastash.daemon.plist`:
 
 ```xml
@@ -864,8 +862,6 @@ With vLLM installed too, a repo lists both engines in `supported_backends` and a
 ## Generic backend
 
 Runs any OpenAI-compatible server llamastash has no dedicated backend for, declared under `backend.generic.servers` in `config.yaml`. llamastash reserves the port, polls the readiness path, routes the proxy, and stops the process. It knows nothing else about the engine: flags, env and weights live in the entry or in a wrapper script you write. Config-only on purpose, since `binary` runs as you; no CLI flag or IPC method sets one. Entries are read at process start, so run `llamastash daemon restart` (and reopen the TUI) after editing them.
-
-Tested on a Strix Halo host: gufo `d9a84f1` and CIRU `3cf984c` on 2026-09-26, Halogen `0.17.0` (Docker image) on 2026-10-07. Full configs for those and the other engines are in [RECIPES.md](../RECIPES.md).
 
 Two shapes:
 
@@ -1034,7 +1030,14 @@ A chat you send from this page is a request like any other: it lands in [`llamas
 - llama.cpp-only features have nothing behind them and are off: the slots view, stream resume, and server-side tools. llamastash answers those routes itself so the page reports each one as unavailable instead of logging a failing request: `/slots` and the stream-resume route get `404`, the resume lookup gets an empty list (what an engine answers when it has no stream for those ids), and `/tools` gets `403` (what an engine started without tools answers, and what the page reads as "tools are disabled").
 - The page is cached by a service worker. After switching between a llama.cpp model and an embedded-UI model, one reload can show the other version of the page.
 
-Checked live on 2026-10-15 with the bundled UI `b11642` against a generic entry running `llama-server` `b11658` started with `--no-ui`, so nothing else served the page: the UI loaded, `/ui/props` reported the launch's ctx, and answers streamed token by token with the page's built-in tools off (with them on, this 1B model's plain-text reply fails the engine's tool parser and the stream dies mid-answer). Re-checked the same day on a CUDA host against the real engines: **Halogen 0.18.5** worked with the page's defaults, including a reasoning block, a `get_datetime` tool call and an image read back correctly; **gufo f711612** (0.15.1) worked the same once the request named a model (the page names none, so llamastash fills in the launch's name); **vLLM 0.27.1** streamed answers with the page's tools off and showed no reasoning block, as documented above. `/ui/props` reported the right ctx on each (32768, 32768 and 16384) and image support where the model had it. All three accepted the extra fields this page sends (`return_progress`, `sse_ping_interval`, `reasoning_format`), and gufo and Halogen answered with `prompt_progress`. SGLang is not exercised yet (see [`TODO.md`](../TODO.md)).
+Engines that work with the page:
+
+- **`llama-server`** (b11658) as a generic entry started with `--no-ui`. Turn the page's built-in tools off for small models: a 1B model's plain-text reply fails the engine's tool parser and the stream stops mid-answer.
+- **Halogen 0.18.5** with the page's defaults, including reasoning, tool calls and images.
+- **gufo `f711612`** (0.15.1). The page sends no model name, so llamastash fills in the launch's name.
+- **vLLM 0.27.1** with the page's tools off. It shows no reasoning block, as described above.
+
+`/ui/props` reports the launch's ctx and image support on each, and all of them accept the extra fields the page sends (`return_progress`, `sse_ping_interval`, `reasoning_format`). gufo and Halogen also send `prompt_progress`. SGLang is not checked yet (see [`TODO.md`](../TODO.md)).
 
 `/ui` is reachable over [LAN](#lan-access-opt-in-behind-a-key) too. A browser can't send a bearer header by navigating, so when a key is configured the proxy answers `/ui` with `WWW-Authenticate: Basic`: the browser prompts once, you paste the proxy key as the **password** (any username), and it's remembered per-origin. Same key as the API path, no login page, no key-in-URL. On the keyless loopback default there's no prompt. As with the API, LAN mode is plaintext HTTP (no TLS yet), so the key crosses the wire as base64 — keep it on a trusted network.
 
