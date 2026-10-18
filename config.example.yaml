@@ -583,10 +583,12 @@ backend:
     # and frozen a 121 GB machine. Set either knob and the cap steps aside:
     #
     #   presets:
-    #     big-ctx:
-    #       knobs:
-    #         kv-cache-memory-bytes: 16G   # absolute cap; wins outright
-    #         gpu-memory-utilization: 0.5  # fraction of the pool
+    #     owner/repo:
+    #       entries:
+    #         big-ctx:
+    #           knobs:
+    #             kv-cache-memory-bytes: 16G   # absolute cap; wins outright
+    #             gpu-memory-utilization: 0.5  # fraction of the pool
     #
     # Neither is remembered: both are marked volatile, so a preset run
     # applies the value without every later bare `start` inheriting it.
@@ -630,10 +632,12 @@ backend:
     # knob and the cap steps aside:
     #
     #   presets:
-    #     big-ctx:
-    #       knobs:
-    #         max-total-tokens: 131072      # absolute cap in tokens; wins
-    #         mem-fraction-static: 0.5      # fraction of the whole pool
+    #     owner/repo:
+    #       entries:
+    #         big-ctx:
+    #           knobs:
+    #             max-total-tokens: 131072      # absolute cap in tokens; wins
+    #             mem-fraction-static: 0.5      # fraction of the whole pool
     #
     # Both are volatile, so a preset run applies the value without every
     # later bare `start` inheriting it. There is no `cors` key: SGLang
@@ -643,7 +647,9 @@ backend:
   # backend for. llamastash picks the port, polls `ready`, routes the proxy
   # and stops the process; everything engine-specific lives in the entry or
   # in a wrapper script. Read once at start: `daemon restart` after editing.
-  # See docs/usage.md § Generic backend for the rules and a Docker wrapper.
+  # See docs/usage.md § Generic backend for the rules, and RECIPES.md for
+  # tested entries (gufo, Halogen, CIRU, ds4, Lemonade, FastFlowLM,
+  # whisper.cpp) with their wrapper scripts and presets.
   #
   # Sources — CLI: (none) · Env: (none). Config-only: `binary` runs as you.
   generic:
@@ -676,7 +682,7 @@ backend:
         ready: /ready                      # HTTP path that returns 200 when loaded
         stop_grace_secs: 60                # SIGTERM→SIGKILL floor for every stop
       # ds4 (DwarfStar, https://github.com/antirez/ds4) for the DeepSeek-V4
-      # GGUFs. See docs/usage.md#running-ds4-as-a-generic-server.
+      # GGUFs. See RECIPES.md#deepseek-v4.
       - name: ds4
         model: "DeepSeek-V4-*"
         binary: /opt/ds4/ds4-server

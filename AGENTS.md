@@ -13,6 +13,7 @@ Read the relevant doc before non-trivial work in that area; don't re-derive from
 | What's actually in the binary — modules, lifecycle, IPC, `status` shape, backend internals, servers, MTP | `docs/architecture.md` |
 | CLI subcommands, flags, JSON shapes, config keys, exit codes, keybindings | `docs/usage.md` |
 | Failure modes an end user hits | `docs/troubleshooting.md` |
+| Tested `config.yaml` blocks per engine and model (generic entries, wrappers, presets) | `RECIPES.md` |
 | Design intent + tradeoffs, per feature | `docs/plans/*.md` (dated, one per feature) |
 | Origin requirements (R1–R46 v1, R48–R80 v2) | `docs/brainstorms/*requirements*.md` |
 | Pre-implementation findings | `docs/spikes/*.md` |
@@ -22,7 +23,7 @@ Read the relevant doc before non-trivial work in that area; don't re-derive from
 
 ## Rules
 
-**Docs ship with code.** Any change to user-visible behavior, the CLI/IPC surface, config shape, install paths, exit codes, dependencies, scope, or architecture updates the affected docs in the **same commit**. Check for drift in: `README.md`, this file, `INSTALL.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, `config.example.yaml`, `Cargo.toml`, `TODO.md`, and the `docs/` files in the table above. Tick the matching `- [ ]` → `- [x]` in the feature's plan. If a change makes a doc statement wrong, fix or delete it — don't leave the contradiction. New user-facing concept: add a section to the closest existing doc, don't spawn a file.
+**Docs ship with code.** Any change to user-visible behavior, the CLI/IPC surface, config shape, install paths, exit codes, dependencies, scope, or architecture updates the affected docs in the **same commit**. Check for drift in: `README.md`, this file, `INSTALL.md`, `RECIPES.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, `config.example.yaml`, `Cargo.toml`, `TODO.md`, and the `docs/` files in the table above. Tick the matching `- [ ]` → `- [x]` in the feature's plan. If a change makes a doc statement wrong, fix or delete it — don't leave the contradiction. New user-facing concept: add a section to the closest existing doc, don't spawn a file.
 
 **CHANGELOG entries are short one-liners** under `[Unreleased]`. Not every change earns a bullet; no implementation detail. Bundle related changes and link the PR/commit (`(#123)`).
 

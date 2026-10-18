@@ -4,7 +4,7 @@ LlamaStash has no dedicated Lemonade backend. Run
 [Lemonade](https://github.com/lemonade-sdk/lemonade)'s `lemond` as a
 **generic server entry** — one `backend.generic.servers` block plus one
 `proxy.aliases` line per model you want to name. Recipe:
-**[Running Lemonade as a generic server](usage.md#running-lemonade-as-a-generic-server)**.
+**[RECIPES.md § Lemonade](../RECIPES.md#lemonade)**.
 
 A dedicated backend existed up to 0.8.0 and was removed: measured against
 `lemond` 2026.42.1 it had four reproducible defects, and the generic entry
@@ -50,8 +50,8 @@ proxy:
     Qwen3-0.6B-GGUF: lemonade             # one line per model clients name
 ```
 
-Full recipe with the measured numbers and the limits:
-[usage.md](usage.md#running-lemonade-as-a-generic-server). Model names come
+Full recipe with the limits:
+[RECIPES.md § Lemonade](../RECIPES.md#lemonade). Model names come
 from the running entry's own port, which `llamastash status` shows:
 `curl "http://127.0.0.1:<launch-port>/api/v1/models?show_all=true"` (quote the
 URL or zsh eats the `?`). Names are case-sensitive at `lemond` and alias keys are
@@ -87,4 +87,4 @@ llamastash requests Qwen3-0.6B-GGUF     # after a chat through the alias
   login shell, or raise `DefaultLimitMEMLOCK` for `user@.service`.
 - **Running an AMD NPU engine without Lemonade** — `flm` also works as its own
   generic entry, one process per model:
-  [FastFlowLM on an AMD NPU](usage.md#running-an-amd-npu-engine-fastflowlm-as-a-generic-server).
+  [FastFlowLM on an AMD NPU](../RECIPES.md#fastflowlm-amd-npu).

@@ -1031,10 +1031,10 @@ fn parse_config(contents: &str, path: &Path) -> LoadedConfig {
       // leaving the raw unknown-field error.
       let hint = if error.contains("unknown field `ds4`") {
         " (the ds4 backend was removed: run ds4-server as a `backend.generic` server, \
-         see docs/usage.md#running-ds4-as-a-generic-server)"
+         see RECIPES.md#deepseek-v4)"
       } else if error.contains("unknown field `lemonade") {
         " (the lemonade backend was removed: run lemond as a `backend.generic` server, \
-         see docs/usage.md#running-lemonade-as-a-generic-server)"
+         see RECIPES.md#lemonade)"
       } else {
         ""
       };

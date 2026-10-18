@@ -3,12 +3,12 @@
 ### Added
 
 - `rows_from` on a `backend.generic` entry mints one row per model an engine's own listing reports, with that model's arch, params, quant, context and size, so `llamastash start qwen3:0.6b` and a proxy request naming it work with no `proxy.aliases` lines ([#115](https://github.com/llamastash/llamastash/pull/115)).
-- Verified generic-entry recipes for Lemonade, FastFlowLM on an AMD NPU, and whisper.cpp in `docs/usage.md`, with the limits each one hits.
+- [`RECIPES.md`](RECIPES.md): tested configs for llama.cpp builds, vLLM/SGLang, gufo, Halogen, CIRU, ds4, Lemonade, FastFlowLM on an AMD NPU and whisper.cpp, with presets for Qwen3.8 Flash-Next, DeepSeek V4, GLM and Gemma 4. The engine examples moved there from `docs/usage.md`.
 
 ### Removed
 
 - **Breaking: the `lifecycle` field of `status --json` backend rows, and the umbrella columns that came with it.** Every backend runs one process per model, so there is nothing left to distinguish ([#116](https://github.com/llamastash/llamastash/pull/116)).
-- **Breaking: the dedicated Lemonade backend.** Run `lemond` as a `backend.generic` server: one declared entry plus one `proxy.aliases` line per model, and the same models answer on the proxy at the same speeds. A config with a `backend.lemonade:` block is rejected with a pointer to the steps, and `--lemonade` / `LLAMASTASH_LEMONADE` are gone. See [Running Lemonade as a generic server](docs/usage.md#running-lemonade-as-a-generic-server).
+- **Breaking: the dedicated Lemonade backend.** Run `lemond` as a `backend.generic` server: one declared entry plus one `proxy.aliases` line per model, and the same models answer on the proxy at the same speeds. A config with a `backend.lemonade:` block is rejected with a pointer to the steps, and `--lemonade` / `LLAMASTASH_LEMONADE` are gone. See [Running Lemonade as a generic server](RECIPES.md#lemonade).
 
 ### Fixed
 
@@ -183,7 +183,7 @@ This release adds the **generic backend**: any OpenAI-compatible server you decl
 
 ### Removed
 
-- **Breaking: the ds4 backend.** Run `ds4-server` as a `backend.generic` entry instead; it gives the same argv, readiness and speed. A config with a `backend.ds4:` block is rejected with a pointer to the migration steps, and `--ds4` / `LLAMASTASH_DS4` are gone. See [Running ds4 as a generic server](docs/usage.md#running-ds4-as-a-generic-server).
+- **Breaking: the ds4 backend.** Run `ds4-server` as a `backend.generic` entry instead; it gives the same argv, readiness and speed. A config with a `backend.ds4:` block is rejected with a pointer to the migration steps, and `--ds4` / `LLAMASTASH_DS4` are gone. See [Running ds4 as a generic server](RECIPES.md#deepseek-v4).
 
 ### Fixed
 
