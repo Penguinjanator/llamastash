@@ -21,6 +21,7 @@
 - A `backend.generic` `env` value that starts with `~/` resolves against the home directory like `binary` does, so an engine that needs `LD_LIBRARY_PATH` beside its binary no longer dies with `exit code 127` and a loader error that does not name the path ([#115](https://github.com/llamastash/llamastash/pull/115)).
 - Request rows carry the speed an engine reports under `usage` as `decoding_speed_tps` and `prefill_speed_tps`, so FastFlowLM rows show its measured rate instead of one estimated from the proxy's clock ([#115](https://github.com/llamastash/llamastash/pull/115)).
 - `Agg PP tok/s` places a streamed prompt where it actually ran, ending its window at the first token rather than the first response byte. An engine that opens a stream with a status event before computing the prompt read an aggregate 2 to 2.5 times its own average with a single client.
+- The Settings label column is sized from the keys the view renders, so a long `backend.generic` knob name like `halogen-cache-entries` no longer renders its value flush against the label.
 
 ## [0.8.0] — 2026-10-17
 

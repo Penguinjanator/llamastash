@@ -219,26 +219,24 @@ pub(crate) fn take_tail_by_width(s: &str, budget: usize) -> String {
   s[start..].to_string()
 }
 
-/// Label column width for every knob row, derived from the labels backends
-/// actually register rather than hand-maintained.
+/// Label column width for one rendered view: the longest key that view puts
+/// in the first column, floored so short-label views keep the historical
+/// alignment, plus one column of gap between label and value.
 ///
-/// Two hand-set copies of this used to exist, both `18`, both documenting the
-/// same two 17-char labels, with nothing linking them — so the next backend to
-/// register a longer label would need both bumped, and bumping one reproduced
-/// the `Trust remote codeinherited` collision in whichever pane was missed.
-pub fn kv_label_width() -> usize {
-  static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-  *W.get_or_init(|| {
-    crate::backend::Backends::all()
-      .iter()
-      .flat_map(|b| crate::backend::Backend::knobs(b).iter())
-      .map(|d| d.label.chars().count())
-      .chain(std::iter::once(MIN_KV_LABEL_W))
-      .max()
-      .unwrap_or(MIN_KV_LABEL_W)
-      // One column of gap between label and value.
-      + 1
-  })
+/// This used to be one build-wide constant derived from the labels statically
+/// registered backends (after two hand-set copies of it drifted — the
+/// `Trust remote codeinherited` collision). A build-wide value was still blind
+/// to knobs declared in a generic entry's `config.yaml`, so
+/// `halogen-cache-entries` rendered flush against its value; the column has
+/// to be sized from the rows actually being drawn.
+pub(crate) fn kv_label_width<'a>(labels: impl IntoIterator<Item = &'a str>) -> usize {
+  labels
+    .into_iter()
+    .map(|l| l.chars().count())
+    .chain(std::iter::once(MIN_KV_LABEL_W))
+    .max()
+    .unwrap_or(MIN_KV_LABEL_W)
+    + 1
 }
 
 /// Floor, so the shared (non-native) rows keep their historical alignment even
@@ -264,13 +262,19 @@ fn kv_value_style(value: &str, palette: &Palette) -> Style {
 }
 
 /// `  label            value` row used by the Settings running-launch
-/// view. Label padded to [`kv_label_width`] in the label tone; value muted
-/// when it reads as a layered default.
-pub(crate) fn kv_row(label: &str, value: String, palette: &Palette) -> Line<'static> {
+/// view. Label padded to `label_w` (one [`kv_label_width`] call shared by
+/// every row in the view) in the label tone; value muted when it reads as a
+/// layered default.
+pub(crate) fn kv_row(
+  label: &str,
+  value: String,
+  palette: &Palette,
+  label_w: usize,
+) -> Line<'static> {
   let style = kv_value_style(&value, palette);
   Line::from(vec![
     Span::styled(
-      format!("  {label:<width$}", width = kv_label_width()),
+      format!("  {label:<width$}", width = label_w),
       palette.label_style(),
     ),
     Span::styled(value, style),
@@ -290,6 +294,7 @@ pub(crate) fn kv_row_focused(
   cyclable: bool,
   palette: &Palette,
   show_source: bool,
+  label_w: usize,
 ) -> Line<'static> {
   kv_row_focused_muted(
     label,
@@ -300,6 +305,7 @@ pub(crate) fn kv_row_focused(
     palette,
     show_source,
     false,
+    label_w,
   )
 }
 
@@ -316,6 +322,7 @@ pub(crate) fn kv_row_focused_muted(
   palette: &Palette,
   show_source: bool,
   muted: bool,
+  label_w: usize,
 ) -> Line<'static> {
   let marker = if focused {
     crate::tui::glyphs::active().focus_marker()
@@ -331,7 +338,7 @@ pub(crate) fn kv_row_focused_muted(
   };
   let mut spans: Vec<Span<'static>> = Vec::with_capacity(6);
   spans.push(Span::styled(
-    format!("{marker}{label:<width$}", width = kv_label_width()),
+    format!("{marker}{label:<width$}", width = label_w),
     label_style,
   ));
   let v_style = if muted {
@@ -410,25 +417,33 @@ pub(crate) fn clip_line(line: Line<'static>, max_width: usize, palette: &Palette
 #[cfg(test)]
 mod tests {
 
-  /// The label column is a cross-module contract: the strings live in backend
-  /// modules, the renderer is generic, and no golden exercises a long one — a
-  /// backend registering an 18-char label used to produce
-  /// `KV cache dtype sizeinherited` with every test still green.
+  /// The label column is sized per view from the keys it renders, so even a
+  /// config-declared generic knob gets its gap. Hand-sized columns broke this
+  /// twice (`Trust remote codeinherited`, `KV cache dtype sizeinherited`),
+  /// and the build-wide derivation still missed config-declared knobs
+  /// (`halogen-cache-entries88`).
   #[test]
-  fn every_registered_knob_label_keeps_a_gap_before_its_value() {
-    let width = kv_label_width();
-    for b in crate::backend::Backends::all() {
-      for d in crate::backend::Backend::knobs(&b) {
-        let rendered = format!("{:<width$}", d.label, width = width);
-        assert!(
-          rendered.len() > d.label.chars().count(),
-          "`{}` ({} chars) fills the {width}-wide column with no separating \
-           space, so its value renders flush against it",
-          d.label,
-          d.label.chars().count()
-        );
-      }
-    }
+  fn kv_label_width_floors_then_extends_to_the_longest_key() {
+    assert_eq!(kv_label_width(["ctx", "extras"]), MIN_KV_LABEL_W + 1);
+    let long = "halogen-cache-entries";
+    assert_eq!(
+      kv_label_width(["ctx", long, "extras"]),
+      long.chars().count() + 1
+    );
+  }
+
+  #[test]
+  fn kv_row_keeps_a_gap_between_longest_label_and_value() {
+    let p = demo_palette();
+    let long = "halogen-cache-branches";
+    let w = kv_label_width(["launch", long]);
+    let row = kv_row(long, "3".to_string(), p, w);
+    let label_span = &row.spans[0];
+    assert!(
+      label_span.content.width() > 2 + long.chars().count(),
+      "value renders flush against `{long}`: {label_span:?}"
+    );
+    assert!(label_span.content.ends_with(' '));
   }
   use super::*;
 

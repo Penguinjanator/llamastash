@@ -14,17 +14,17 @@
 │ ★ mistral-7b                             llama       Q4_K    8.0k    4.0G  ││ ID:L1  :41100  ● ready · 4.2G RAM · 31 │
 │────────────────────────────────────────────────────────────────────────────││ ────────────────────────────────────── │
 │m/x                                                                         ││ Running launch                         │
-│ ★ mistral-7b                             llama       Q4_K    8.0k    4.0G  ││   launch            L1                 │
-│m/y                                                                         ││   name              coder              │
+│ ★ mistral-7b                             llama       Q4_K    8.0k    4.0G  ││   launch          L1                   │
+│m/y                                                                         ││   name            coder                │
 │   phi-3                                  phi         Q4_K    8.0k    3.9G  ││   ── Context                           │
-│                                                                            ││   ctx-size          inherited          │
-│                                                                            ││   reasoning         inherited          │
-│                                                                            ││   mode              inherited          │
+│                                                                            ││   ctx-size        inherited            │
+│                                                                            ││   reasoning       inherited            │
+│                                                                            ││   mode            inherited            │
 │                                                                            ││   ── GPU / CPU offload                 │
-│                                                                            ││   n-gpu-layers      inherited          │
-│                                                                            ││   n-cpu-moe         inherited          │
+│                                                                            ││   n-gpu-layers    inherited            │
+│                                                                            ││   n-cpu-moe       inherited            │
 │                                                                            ││   ── Attention & KV cache              │
-│                                                                            ││   cache-type-k      inherited          │
-│                                                                            ││   cache-type-v      inherited          │
-│                                                                            ││   flash-attn        inherited          │
+│                                                                            ││   cache-type-k    inherited            │
+│                                                                            ││   cache-type-v    inherited            │
+│                                                                            ││   flash-attn      inherited            │
 └ ◌ launching · ◐ loading · ● ready · ▲ error · ○ stopped · ⇪ external ──────┘└ e:edit for launch · s:stop · p:path ───┘

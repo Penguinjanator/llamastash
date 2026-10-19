@@ -24,7 +24,7 @@
 │       │                                                                                                      │       │
 │       │                                                                                                      │       │
 │       └──────────────────────────────────────────────────────────────────────────────────────────────────────┘       │
-│                                                                            ││   cache-type-v      inherited          │
-│                                                                            ││   flash-attn        inherited          │
+│                                                                            ││   cache-type-v    inherited            │
+│                                                                            ││   flash-attn      inherited            │
 │                                                                            ││   ── Throughput                        │
 └ ◌ launching · ◐ loading · ● ready · ▲ error · ○ stopped · ⇪ external ──────┘└ e:edit for launch · s:stop · p:path ───┘

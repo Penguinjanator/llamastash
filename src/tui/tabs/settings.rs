@@ -57,118 +57,6 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &Palette) {
   // with a margin; the read-only view leaves this `None` and scrolls free.
   let mut focused_line: Option<u16> = None;
 
-  let mut lines: Vec<Line<'static>> = Vec::new();
-  lines.push(heading(
-    if !editable {
-      "Running launch"
-    } else if no_focus {
-      "No model focused"
-    } else {
-      "Launch settings"
-    },
-    palette,
-  ));
-
-  if let Some(m) = managed {
-    // Read-only: name the launch (port / state / rss live in the header).
-    lines.push(crate::tui::fmt::kv_row(
-      "launch",
-      m.launch_id.clone(),
-      palette,
-    ));
-    // User-chosen launch name (from `--name`), when set — the distinguishing
-    // identifier for a named launch, addressable as `<model-id>@<name>`.
-    if let Some(n) = m.name.as_deref() {
-      lines.push(crate::tui::fmt::kv_row("name", n.to_string(), palette));
-    }
-    // The preset this launch resolved, when one was in play — the answer to
-    // "what launched this", above the server row with the other identity
-    // rows. Absent for a plain launch, matching the status wire shape.
-    if let Some(p) = m.preset.as_deref() {
-      lines.push(crate::tui::fmt::kv_row("preset", p.to_string(), palette));
-    }
-    // Server (build/binary) the launch ran on — mirrors the editable picker's
-    // server row so the operator can see which build served the model. Shown
-    // only when the model has more than one compatible server (a real choice);
-    // a single-server model has nothing to disambiguate.
-    if let Some(label) = running_server_label(app, m) {
-      lines.push(crate::tui::fmt::kv_row("server", label, palette));
-    }
-  } else if let Some(pv) = picker_view {
-    // Editable: duplicate-launch heads-up, then the preset cycle row.
-    if pv.active_instances > 0 {
-      lines.push(
-        Span::styled(
-          format!(
-            "⚠ {n} instance{plural} already running — Enter launches a new one on a fresh port",
-            n = pv.active_instances,
-            plural = if pv.active_instances == 1 { "" } else { "s" }
-          ),
-          Style::default()
-            .fg(palette.warning)
-            .add_modifier(Modifier::BOLD),
-        )
-        .into(),
-      );
-    }
-    // Preset cycle row leads the form. No source chip: it's a selector,
-    // not an inherited value. The label carries the count of named presets
-    // available for this model (`preset (0)` when none).
-    let focused = pv.field == PickerField::Preset;
-    if focused {
-      focused_line = Some(lines.len() as u16);
-    }
-    let preset_label = format!("preset ({})", pv.presets.len());
-    lines.push(crate::tui::fmt::kv_row_focused(
-      &preset_label,
-      pv.preset_value_label(),
-      None,
-      focused,
-      true,
-      palette,
-      show_source,
-    ));
-    // Server (build/binary) cycle row, just under the preset row — shown only
-    // when the model has more than one compatible server (a real choice). No
-    // source chip: it's a selector, not an inherited value.
-    if pv.field_visible(PickerField::Server) {
-      let server_focused = pv.field == PickerField::Server;
-      if server_focused {
-        focused_line = Some(lines.len() as u16);
-      }
-      lines.push(crate::tui::fmt::kv_row_focused(
-        "server",
-        pv.server_value_label(),
-        None,
-        server_focused,
-        true,
-        palette,
-        show_source,
-      ));
-    }
-  }
-
-  // Every knob flows through the same `value (chip)` row shape in both views.
-  // The read-only view shows the *dispatched* values (`auto` for a fit-delegated
-  // row), with ctx overlaid by the `--fit`-resolved window read from `/props`;
-  // no chip, since a live value has no inheritance layer to name.
-  let resolved_ctx = managed.map(|m| {
-    m.resolved_ctx.or_else(|| {
-      let id = crate::backend::knob_scope_by_id(
-        m.backend
-          .as_deref()
-          .unwrap_or(crate::backend::DEFAULT_BACKEND_ID),
-        &m.path,
-        m.server.as_deref(),
-      );
-      crate::launch::knobs::def_for_backend_concept(
-        id,
-        crate::launch::knobs::Concept::ContextLength,
-      )
-      .and_then(|d| m.knobs.u32(d.knob_id()))
-    })
-  });
-
   // Rows are generated from whichever backend is in scope: the picker's active
   // one while editing, the launch's *actual* backend when read-only (not the
   // routing prediction, so a compatible file launched with `--backend llamacpp`
@@ -201,6 +89,157 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &Palette) {
     }
   };
 
+  // The preset row's label carries the named-preset count; hoisted so the
+  // label-column sizing and the row itself cannot disagree.
+  let preset_label = picker_view
+    .map(|pv| format!("preset ({})", pv.presets.len()))
+    .unwrap_or_default();
+  // One label column for every row in this view, sized to the longest key it
+  // renders (plus the gap `kv_label_width` adds). Derived from the rows, not a
+  // build-wide constant, because knob ids here include the ones a generic
+  // entry declares in its `config.yaml` — those never appear in the
+  // statically registered set.
+  let label_w = crate::tui::fmt::kv_label_width(
+    [
+      "launch",
+      "name",
+      "preset",
+      "server",
+      "extras",
+      &preset_label,
+    ]
+    .into_iter()
+    .chain(
+      groups
+        .iter()
+        .flat_map(|(_, defs)| defs.iter().map(|d| d.id)),
+    ),
+  );
+
+  let mut lines: Vec<Line<'static>> = Vec::new();
+  lines.push(heading(
+    if !editable {
+      "Running launch"
+    } else if no_focus {
+      "No model focused"
+    } else {
+      "Launch settings"
+    },
+    palette,
+  ));
+
+  if let Some(m) = managed {
+    // Read-only: name the launch (port / state / rss live in the header).
+    lines.push(crate::tui::fmt::kv_row(
+      "launch",
+      m.launch_id.clone(),
+      palette,
+      label_w,
+    ));
+    // User-chosen launch name (from `--name`), when set — the distinguishing
+    // identifier for a named launch, addressable as `<model-id>@<name>`.
+    if let Some(n) = m.name.as_deref() {
+      lines.push(crate::tui::fmt::kv_row(
+        "name",
+        n.to_string(),
+        palette,
+        label_w,
+      ));
+    }
+    // The preset this launch resolved, when one was in play — the answer to
+    // "what launched this", above the server row with the other identity
+    // rows. Absent for a plain launch, matching the status wire shape.
+    if let Some(p) = m.preset.as_deref() {
+      lines.push(crate::tui::fmt::kv_row(
+        "preset",
+        p.to_string(),
+        palette,
+        label_w,
+      ));
+    }
+    // Server (build/binary) the launch ran on — mirrors the editable picker's
+    // server row so the operator can see which build served the model. Shown
+    // only when the model has more than one compatible server (a real choice);
+    // a single-server model has nothing to disambiguate.
+    if let Some(label) = running_server_label(app, m) {
+      lines.push(crate::tui::fmt::kv_row("server", label, palette, label_w));
+    }
+  } else if let Some(pv) = picker_view {
+    // Editable: duplicate-launch heads-up, then the preset cycle row.
+    if pv.active_instances > 0 {
+      lines.push(
+        Span::styled(
+          format!(
+            "⚠ {n} instance{plural} already running — Enter launches a new one on a fresh port",
+            n = pv.active_instances,
+            plural = if pv.active_instances == 1 { "" } else { "s" }
+          ),
+          Style::default()
+            .fg(palette.warning)
+            .add_modifier(Modifier::BOLD),
+        )
+        .into(),
+      );
+    }
+    // Preset cycle row leads the form. No source chip: it's a selector,
+    // not an inherited value. The label carries the count of named presets
+    // available for this model (`preset (0)` when none).
+    let focused = pv.field == PickerField::Preset;
+    if focused {
+      focused_line = Some(lines.len() as u16);
+    }
+    lines.push(crate::tui::fmt::kv_row_focused(
+      &preset_label,
+      pv.preset_value_label(),
+      None,
+      focused,
+      true,
+      palette,
+      show_source,
+      label_w,
+    ));
+    // Server (build/binary) cycle row, just under the preset row — shown only
+    // when the model has more than one compatible server (a real choice). No
+    // source chip: it's a selector, not an inherited value.
+    if pv.field_visible(PickerField::Server) {
+      let server_focused = pv.field == PickerField::Server;
+      if server_focused {
+        focused_line = Some(lines.len() as u16);
+      }
+      lines.push(crate::tui::fmt::kv_row_focused(
+        "server",
+        pv.server_value_label(),
+        None,
+        server_focused,
+        true,
+        palette,
+        show_source,
+        label_w,
+      ));
+    }
+  }
+
+  // Every knob flows through the same `value (chip)` row shape in both views.
+  // The read-only view shows the *dispatched* values (`auto` for a fit-delegated
+  // row), with ctx overlaid by the `--fit`-resolved window read from `/props`;
+  // no chip, since a live value has no inheritance layer to name.
+  let resolved_ctx = managed.map(|m| {
+    m.resolved_ctx.or_else(|| {
+      let id = crate::backend::knob_scope_by_id(
+        m.backend
+          .as_deref()
+          .unwrap_or(crate::backend::DEFAULT_BACKEND_ID),
+        &m.path,
+        m.server.as_deref(),
+      );
+      crate::launch::knobs::def_for_backend_concept(
+        id,
+        crate::launch::knobs::Concept::ContextLength,
+      )
+      .and_then(|d| m.knobs.u32(d.knob_id()))
+    })
+  });
+
   for (group, defs) in groups {
     lines.push(group_header(group.title(), palette));
     for def in defs {
@@ -218,6 +257,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &Palette) {
               pv.inline_edit.input.buffer(),
               focused,
               palette,
+              label_w,
             ));
             if let Some(err) = &pv.inline_edit.error {
               lines.push(inline_warning_row(err, palette));
@@ -234,6 +274,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &Palette) {
               palette,
               show_source,
               pv.shows_config_default(id),
+              label_w,
             ));
           }
         }
@@ -257,6 +298,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &Palette) {
             false,
             palette,
             show_source,
+            label_w,
           ));
         }
       }
@@ -277,6 +319,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &Palette) {
           pv.extras_input.buffer(),
           extras_focused,
           palette,
+          label_w,
         ));
       } else {
         let extras_text = if pv.extras.is_empty() {
@@ -296,6 +339,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &Palette) {
           false,
           palette,
           show_source,
+          label_w,
         ));
       }
       // Forbidden-flag warning under the extras row.
@@ -323,6 +367,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &Palette) {
         false,
         palette,
         show_source,
+        label_w,
       ));
     }
   }
@@ -483,7 +528,13 @@ fn chip_label(chip: &str) -> &str {
   chip.split(':').next().unwrap_or(chip)
 }
 
-fn inline_edit_row(label: &str, buffer: &str, focused: bool, palette: &Palette) -> Line<'static> {
+fn inline_edit_row(
+  label: &str,
+  buffer: &str,
+  focused: bool,
+  palette: &Palette,
+  label_w: usize,
+) -> Line<'static> {
   let marker = if focused {
     crate::tui::glyphs::active().focus_marker()
   } else {
@@ -494,10 +545,7 @@ fn inline_edit_row(label: &str, buffer: &str, focused: bool, palette: &Palette) 
     .add_modifier(Modifier::BOLD);
   Line::from(vec![
     Span::styled(
-      format!(
-        "{marker}{label:<width$}",
-        width = crate::tui::fmt::kv_label_width()
-      ),
+      format!("{marker}{label:<width$}", width = label_w),
       label_style,
     ),
     Span::styled("[ ".to_string(), palette.muted_style()),

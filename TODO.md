@@ -511,7 +511,7 @@ _Shared context: The generic backend's declared entries, the Lemonade umbrella, 
 
 _Shared context: `kv_label_width` in `src/tui/fmt.rs` and the Settings tab rows in `src/tui/tabs/settings.rs`._
 
-- [ ] launch settings key col width should accomodate longer keys, make dynamic
+- [x] ~~launch settings key col width should accomodate longer keys, make dynamic~~ — the Settings label column is sized per view from the keys that view renders, so config-declared generic-entry knobs keep a gap (2026-10-19)
 
 ### Batch 11: `llamastash session` launcher
 
