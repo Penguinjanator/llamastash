@@ -107,7 +107,34 @@ impl Daemon {
       "daemon start failed: {}",
       String::from_utf8_lossy(&out.stderr)
     );
+    daemon.wait_for_catalog();
     daemon
+  }
+
+  /// Wait until the daemon's first scan has listed the fixture models.
+  ///
+  /// `daemon start` answers as soon as the control plane binds, and the scan
+  /// runs after that. The daemon inherits the host's `HF_HOME`, so on a
+  /// developer's machine it walks a real model cache first and can take seconds
+  /// to publish a catalog; a `start` in that window exits 66 (`no model
+  /// matches`, 0 known). Empty CI caches never hit this.
+  fn wait_for_catalog(&self) {
+    for _ in 0..150 {
+      let out = self
+        .cmd()
+        .args(["list", "--json"])
+        .output()
+        .expect("list catalog");
+      let body = String::from_utf8_lossy(&out.stdout).into_owned();
+      if ["chat.gguf", "nohint.gguf", "embed.gguf"]
+        .iter()
+        .all(|name| body.contains(name))
+      {
+        return;
+      }
+      std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("the catalog never listed the fixture models");
   }
 
   /// `llamastash` wired to this daemon: isolated state, cache, and config, and
