@@ -490,6 +490,7 @@ _Shared context: `src/init/external/tools/`, the `doctor` findings, and what `--
 
 ## R16 (v0.9.0 checklist)
 
+- [ ] Agg tok/sec also seems wrong when running Claude code sessions (Avg tok/s 44.3 Agg tok/s 30.6 over 1m39s Avg PP tok/s 1231 Agg PP tok/s 134k over 503ms Avg total 14.8s Avg TTFB 45ms Tokens in 634.1k Cached 566.6k (89.4%) Tokens out 3050 )
 - [ ] Agg PP tok/s seems wrong. Shows 3055 over 37.1s when there is only one connection and avg is 1211.
 - [ ] Consider making Requests the first tab for running launches, followed by Logs, Settings, Chat\*
 - [x] ~~Add a recipes page with config for different engines and popular models like Qwen 3.8, Deepseek, GLM etc~~ — done: [`RECIPES.md`](RECIPES.md) holds the llama.cpp, vLLM/SGLang and generic-engine configs (gufo, Halogen, CIRU, ds4, Lemonade, FastFlowLM, whisper.cpp) with presets for Qwen3.8 Flash-Next, Qwen3.8 27B, DeepSeek V4, GLM and Gemma 4; the engine examples moved there from `docs/usage.md`, `config.example.yaml` and `docs/lemonade-setup.md`.
