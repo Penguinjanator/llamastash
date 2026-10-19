@@ -1,9 +1,19 @@
 ## [Unreleased]
 
+
+## [0.9.1] — 2026-10-19
+
+A patch release with two TUI fixes. The right pane now follows the row you move to, opening on that row's first tab, and the request summary stops printing an aggregate that only repeats its own average.
+
 ### Fixed
 
-- Moving the list cursor re-opens the right pane on the focused row's first tab: `Requests` for a launch in any state, `Settings` for a model with no launch. It kept the tab the previous row was on, so a running launch selected from Settings stayed on its read-only launch parameters.
+- Moving the list cursor re-opens the right pane on the focused row's first tab: `Requests` for a launch in any state, `Settings` for a model with no launch. It kept the tab the previous row was on, so a running launch selected from Settings stayed on its read-only launch parameters. Stepping between two named launches of one model counts as a row change.
 - The `llamastash requests` summary and the TUI Requests strip drop `Agg tok/s` and `Agg PP tok/s` when the figure lands within 5% of the average beside it, or prints the same number as it. One stream makes the two the same number, so printing both wasted the cells.
+
+### Contributors
+
+- [@deepu105](https://github.com/deepu105): everything
+
 
 ## [0.9.0] — 2026-10-19
 
