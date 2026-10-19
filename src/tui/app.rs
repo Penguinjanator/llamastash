@@ -1396,7 +1396,7 @@ impl App {
       } => id == launch_id,
       _ => false,
     }) {
-      let before = self.focused_path();
+      let before = self.focused_row_key();
       self.list_cursor = idx;
       self.sync_pane_to_focus(before);
     }
@@ -1453,33 +1453,51 @@ impl App {
   /// Move cursor down to the next selectable (model) row.
   pub fn move_down(&mut self) {
     let rows = self.rendered_rows();
-    let before = self.focused_path();
+    let before = self.focused_row_key();
     self.move_down_in(&rows);
     self.sync_pane_to_focus(before);
   }
 
   pub fn move_up(&mut self) {
     let rows = self.rendered_rows();
-    let before = self.focused_path();
+    let before = self.focused_row_key();
     self.move_up_in(&rows);
     self.sync_pane_to_focus(before);
   }
 
-  /// Follow the cursor when it lands on a different path. The right
-  /// pane belongs to the focused row, with no sticky fallback: a picker
-  /// staged for model A must not linger while the user scrolls to
-  /// model B, and the active tab re-opens at the new row's first one,
-  /// so a launch opens on Requests and a model with no launch on
-  /// Settings. Caller passes the focused path *before* the move so we
-  /// can compare against the path *after*.
-  fn sync_pane_to_focus(&mut self, before: Option<PathBuf>) {
-    let after = self.focused_path();
-    if before != after {
-      // Scroll offset is per-focused-model; clear it on cursor moves
-      // so the new model's running-launch view opens at the top.
-      self.running_view_scroll.set(0);
+  /// Follow the cursor when it lands on a different row. The right pane
+  /// belongs to the focused row, with no sticky fallback: a picker staged
+  /// for model A must not linger while the user scrolls to model B, and
+  /// the active tab re-opens at the new row's first one, so a launch
+  /// opens on Requests and a model with no launch on Settings. Caller
+  /// passes the focused key *before* the move to compare against the one
+  /// *after*.
+  fn sync_pane_to_focus(&mut self, before: Option<(PathBuf, Option<String>)>) {
+    let after = self.focused_row_key();
+    if before == after {
+      return;
+    }
+    // Scroll offset is per-focused-row; clear it on cursor moves so the
+    // new row's running-launch view opens at the top.
+    self.running_view_scroll.set(0);
+    self.right_tab = self.first_right_tab();
+    // The picker belongs to a model, so two launches of one path share a
+    // staged one and only a path change drops it.
+    let path = |key: &(PathBuf, Option<String>)| key.0.clone();
+    if before.as_ref().map(path) != after.as_ref().map(path) {
       self.launch_picker = None;
-      self.right_tab = self.first_right_tab();
+    }
+  }
+
+  /// The row under the cursor, keyed as finely as the list differentiates
+  /// it: the launch id when the row carries one, so two named launches of
+  /// one model are two rows, else the path.
+  fn focused_row_key(&self) -> Option<(PathBuf, Option<String>)> {
+    match self.rendered_rows().get(self.list_cursor) {
+      Some(ListRow::Model {
+        path, launch_id, ..
+      }) => Some((path.clone(), launch_id.clone())),
+      _ => None,
     }
   }
 
@@ -1516,7 +1534,7 @@ impl App {
   /// single keypress doesn't rebuild rows 10×.
   pub fn move_by(&mut self, delta: i32) {
     let rows = self.rendered_rows();
-    let before = self.focused_path();
+    let before = self.focused_row_key();
     if delta >= 0 {
       for _ in 0..delta {
         self.move_down_in(&rows);
@@ -1531,7 +1549,7 @@ impl App {
 
   pub fn go_top(&mut self) {
     let rows = self.rendered_rows();
-    let before = self.focused_path();
+    let before = self.focused_row_key();
     for (i, r) in rows.iter().enumerate() {
       if r.is_selectable() {
         self.list_cursor = i;
@@ -1543,7 +1561,7 @@ impl App {
 
   pub fn go_bottom(&mut self) {
     let rows = self.rendered_rows();
-    let before = self.focused_path();
+    let before = self.focused_row_key();
     for (i, r) in rows.iter().enumerate().rev() {
       if r.is_selectable() {
         self.list_cursor = i;
@@ -4346,6 +4364,35 @@ mod tests {
       app.right_tab,
       RightTab::Requests,
       "a launch opens on Requests, not on the tab the row before used"
+    );
+  }
+
+  #[test]
+  fn stepping_between_two_launches_of_one_model_reopens_the_pane() {
+    // Two named launches of one GGUF are two rows on one path, so a
+    // follow keyed on the path alone would leave the second one on
+    // whatever tab the first was on.
+    let mut app = App::new(AppOptions::default());
+    app.models = vec![fake("/m/qwen.gguf", "/m")];
+    app.managed = vec![
+      ready_managed("/m/qwen.gguf", 41100, SurfaceState::Ready),
+      ready_managed("/m/qwen.gguf", 41101, SurfaceState::Ready),
+    ];
+    app.list_cursor = 2;
+    assert_eq!(
+      app.focused_managed().map(|m| m.launch_id.as_str()),
+      Some("L-41100")
+    );
+    app.right_tab = RightTab::Chat;
+    app.move_down();
+    assert_eq!(
+      app.focused_managed().map(|m| m.launch_id.as_str()),
+      Some("L-41101")
+    );
+    assert_eq!(
+      app.right_tab,
+      RightTab::Requests,
+      "the second launch opens on its own first tab"
     );
   }
 
