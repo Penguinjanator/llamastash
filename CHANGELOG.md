@@ -2,6 +2,7 @@
 
 ### Added
 
+- `llamastash session [tool] [model]` launches Claude Code, Codex, OpenCode, pi or Aider pointed at one model the proxy serves, for that run only. On a terminal, leaving the tool or the model out picks one from a menu. Its per-run settings arrive as env vars, flags or a file only that run loads, so no tool config is written; a model that is not running is started first, and `--dry-run` prints the launch with no side effects.
 - `rows_from` on a `backend.generic` entry mints one row per model an engine's own listing reports, with that model's arch, params, quant, context and size, so `llamastash start qwen3:0.6b` and a proxy request naming it work with no `proxy.aliases` lines ([#115](https://github.com/llamastash/llamastash/pull/115)).
 - [`RECIPES.md`](RECIPES.md): tested configs for llama.cpp builds, vLLM/SGLang, gufo, Halogen, CIRU, ds4, Lemonade, FastFlowLM on an AMD NPU and whisper.cpp, with presets for Qwen3.8 Flash-Next, DeepSeek V4, GLM and Gemma 4. The engine examples moved there from `docs/usage.md`.
 
@@ -12,6 +13,7 @@
 
 ### Fixed
 
+- A GGUF whose header carries no mode is judged by its name: an `*-embed*` file with an `unknown` mode hint is an embedding model to `session` and to `integrations`, not a chat model.
 - A `backend.generic` `env` value that starts with `~/` resolves against the home directory like `binary` does, so an engine that needs `LD_LIBRARY_PATH` beside its binary no longer dies with `exit code 127` and a loader error that does not name the path ([#115](https://github.com/llamastash/llamastash/pull/115)).
 - Request rows carry the speed an engine reports under `usage` as `decoding_speed_tps` and `prefill_speed_tps`, so FastFlowLM rows show its measured rate instead of one estimated from the proxy's clock ([#115](https://github.com/llamastash/llamastash/pull/115)).
 

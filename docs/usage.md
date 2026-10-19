@@ -1053,7 +1053,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:11435 \
 ```
 
 - **Set both model vars** to a discovered model name (not a `claude-*` name) so Claude Code's main and background calls both resolve through the proxy.
-- **`llamastash init` writes these for you.** Its **Claude Code** integration drops a sourceable `~/.config/llamastash/claude-code.sh` with the `ANTHROPIC_*` exports (separate from the OpenAI `env.sh`); `source ~/.config/llamastash/claude-code.sh && claude` opts Claude Code into the proxy **for that shell only**. It deliberately does *not* write Claude Code's global `~/.claude/settings.json` (whose `env` block applies to every session) — so bare `claude` keeps using your real Anthropic models.
+- **`llamastash init` writes these for you.** Its **Claude Code** integration drops a sourceable `~/.config/llamastash/claude-code.sh` with the `ANTHROPIC_*` exports (separate from the OpenAI `env.sh`); `source ~/.config/llamastash/claude-code.sh && claude` opts Claude Code into the proxy **for that shell only**. It deliberately does *not* write Claude Code's global `~/.claude/settings.json` (whose `env` block applies to every session) — so bare `claude` keeps using your real Anthropic models. [`llamastash session claude`](#llamastash-session-tool-model) does the same for one run, with the exports set on the child process instead of a file you source.
 - **`CLAUDE_CODE_MAX_CONTEXT_TOKENS` is exported alongside them.** That is the context window Claude Code assumes for the active model, and for a name it does not recognise (every model name `init` writes) it assumes 200,000 — then compacts at window − 33,000 and refuses to send at window − 23,000, so a long session starts compacting while the proxy still has room. `init` writes the launch window minus the output room Claude Code does not already keep for itself, so the declared ceiling stays inside what the engine accepts at that window; a model with no known context gets its own small figure unchanged. Declaring more than 200,000 makes Claude Code print its "the 200K limit isn't enforced" notice at startup — that is the point, not a warning to act on.
 - **Auth.** Anthropic clients send the key in the `x-api-key` header; the proxy accepts it alongside `Authorization: Bearer` and browser `Basic`. On the keyless loopback default no key is needed (the token value is ignored, but Claude Code still wants one set). When you set `proxy.api_key` (or `LLAMASTASH_PROXY_API_KEY`), auth is enforced and `init`'s generated `env.sh` / `claude-code.sh` carry that real key (mode `0o600`) — so a client only authenticates once the script is sourced into its environment.
 - **Tool calling** needs the backend launched with `--jinja`, which is on by default (`backend.llamacpp.jinja: true` in `config.yaml`; the reasoning toggle also forces it). Set `backend.llamacpp.jinja: false` only if you don't need tool use. Basic chat / streaming work either way. Some model templates (e.g. certain Qwen GGUFs) fail llama-server's tool-parser generation with `System message must be at the beginning`; override with `start <model> -- --chat-template-file <tool-compatible.jinja>` (or the crude `--chat-template chatml`), or use a GGUF whose template is tool-compatible.
@@ -1667,7 +1667,7 @@ llamastash recommend [--json] [--offline] [--model <CHOICE>] [--revision <SHA>]
 
 ### `llamastash integrations [tools...]`
 
-Shortcut for `init --only integrations` that points your AI dev tools at the local proxy without walking the wizard. Patches each selected tool's config with the proxy URL and every model you have **favorited**, and writes the sourceable env snippets.
+Shortcut for `init --only integrations` that points your AI dev tools at the local proxy without walking the wizard. Patches each selected tool's config with the proxy URL and every model you have **favorited**, and writes the sourceable env snippets. To point a tool at one model for a single run instead of patching its config, use [`llamastash session <tool>`](#llamastash-session-tool-model).
 
 ```
 llamastash integrations [TOOLS] [--integrations <TOOLS>] [--json]
@@ -1728,6 +1728,91 @@ The tools in the last two rows have no reference syntax to use, so the value goe
 
 When the run patches a tool that reads the variable **and** the proxy has auth on, the summary says so and gives the line to add to your shell rc — pointing at the `env.sh` it just wrote when you picked that integration, and at `export LLAMASTASH_API_KEY="$(llamastash api-key)"` when you did not. `--json` carries the same under `integrations.env_requirement` (`{var, tools, source_file}`); the field is absent when nothing needs it. Nothing is said on the keyless loopback default, where the value is ignored.
 
+### `llamastash session [tool] [model]`
+
+Point a coding tool at one model the proxy serves, for that one run. The tool's own config is never written: its per-run settings go in as env vars, CLI flags, or a file only that run loads, then the process is replaced by the tool. `llamastash integrations` is the other path: it patches each tool's global config, which changes what the tool does in every later run.
+
+```
+llamastash session [TOOL] [MODEL] [--dry-run] [--json] [-- <TOOL_ARG>...]
+TOOL: claude | claude-code | codex | opencode | pi | aider
+```
+
+| Flag / arg              | Effect                                                                                                                                             |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `[TOOL]`                | `claude` (or `claude-code`), `codex`, `opencode`, `pi`, `aider`. Continue and Zed have no per-run hook, so they are not targets. Omit to pick one.      |
+| `[MODEL]`               | A `proxy.aliases` name, a model reference, or `<model>@<preset>`. Omit to use the most recently started chat launch, or to pick one when none is running. |
+| `--dry-run`             | Resolve everything and print the launch. Starts no model, writes no file, runs no tool. On a terminal it still asks what a run would ask: a missing TOOL or MODEL is picked before the line prints.                                                               |
+| `--json`                | The resolved launch as JSON. Requires `--dry-run`, the only case with no side effects to hide.                                                        |
+| `-- <TOOL_ARG>...`      | Everything after `--` reaches the tool unchanged, after the args `session` builds for it.                                                             |
+
+The global `--quiet` drops the one-line note on stderr before the tool takes the process over (`claude → Qwen3.8-27B-UD-Q6_K (L3, ctx 262144)`). `--no-spawn` applies as on other commands: no daemon is started when none is up. On Unix the process is replaced by the tool, so the tool's signals, terminal and exit code are its own; on Windows it is spawned, waited for, and its exit code becomes the process's.
+
+**Model selection.**
+
+| Input                                                        | Outcome                                                                                                                                        |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| no MODEL, a chat launch is live (`launching` / `loading` / `ready`) | The one with the highest launch number (`L<n>`), which is the newest start; waits for Ready unless `--dry-run` was given.                                              |
+| no MODEL, no chat launch live, on a terminal       | A picker over the catalog's chat models, the same list `start` shows without a model. What you pick is started, then handed to the tool.                    |
+| no MODEL, no chat launch live, not on a terminal   | Exit `66`: no chat model is running, start one or pass MODEL. With `--json` the picker is off too.                                                    |
+| MODEL is a `proxy.aliases` name and no catalog model has it   | The alias target resolves instead, the proxy's own precedence. A model that owns the name wins.                                                    |
+| MODEL resolves and a matching launch is live                   | That launch is reused. `<model>@<name>` needs a launch with that name; a plain ref prefers an unnamed launch of the model, else its latest.        |
+| MODEL resolves, nothing live                                 | Start it (`@<name>` uses preset `<name>`, otherwise the model's default preset, as plain `start` does) and wait for Ready.                         |
+| MODEL is an embedding or rerank model                          | Exit `64`: session tools need a chat model. Checked against the mode hint, or an `embed`-like id when the model carries no hint or an `unknown` one, before anything is started. |
+| MODEL matches no catalog row                                 | The usual `model_miss` error, exit `66`.                                                                                                          |
+| The launch settles in `error` or `stopped`, or the wait times out | Exit `67` with the cause.                                                                                                                        |
+| The tool binary is not on PATH                                 | Exit `70`, before a model is picked or started, so a missing tool costs no question and no load. Every check happens before the handover, so nothing fails after the tool has the process. A `--dry-run` still prints. |
+
+The id handed to the tool is the one `/v1/models` publishes, plus `@<name>` when the chosen launch is named. Without the suffix the proxy would auto-start a second, unnamed copy of the same model. The context window the tool is told about is the launch's settled `ctx`, else the `ctx` it asked for, else the preset `start` would launch with, else the model's trained context.
+
+**Pickers.** Two, and both are the same single-select as the `start` and `stop` pickers: `session` with no TOOL asks which tool to run, and `session <tool>` with no MODEL while nothing is running asks which model to start. A `--dry-run` asks them too, on a terminal: picking is how you see the command it prints. The model picker lists chat models only, so a pick cannot turn into the refusal below. Neither appears with `--json` or without a terminal: no TOOL is then exit `64` naming the tools, and no MODEL is exit `66`.
+
+**Per-tool launch.** Each one reuses what that tool's `init` patcher already builds, so the two cannot drift apart.
+
+| Tool             | Program    | How the model is passed                                                                                                                                                                                                                                |
+| ---------------- | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `claude`, `claude-code` | `claude`   | Env only: `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, the same lines `claude-code.sh` exports. `ANTHROPIC_API_KEY` is removed from the child's env, since a real key there competes with the token and brings back Claude Code's custom-key approval prompt. |
+| `codex`          | `codex`    | `-c` overrides: `model_provider="llamastash"`, the `model_providers.llamastash` inline table (`name`, `base_url`, `wire_api="responses"`, `env_key="LLAMASTASH_API_KEY"`), `model`, `model_context_window`, and `model_reasoning_effort` for a model whose chat template lists effort levels (its default level). Env: `LLAMASTASH_API_KEY`. The key comes from the env var here, not from the profile's `auth.command`, because the `llamastash` on PATH may not be the binary running the session. |
+| `opencode`       | `opencode` | Env only: `OPENCODE_CONFIG_CONTENT`, the patcher's `provider.llamastash` block for the one model plus `"model"` and `"small_model"` set to `llamastash/<id>`; and `LLAMASTASH_API_KEY`, which that block resolves as `{env:LLAMASTASH_API_KEY}`. OpenCode merges that content after its global and project config, and does not seed its global config file while it is set. |
+| `pi`             | `pi`       | Args `-e <file> --provider llamastash-session --model <id>`, env `LLAMASTASH_API_KEY`. `<file>` is a generated extension at `<cache dir>/sessions/pi-<hash>.ts` whose default export calls `pi.registerProvider("llamastash-session", ...)` with the patcher's provider block and `apiKey: "$LLAMASTASH_API_KEY"`. The provider name is kept apart from the `llamastash` one `integrations` may have written to `models.json`. The name is a hash of the content, so concurrent sessions never overwrite each other's file. |
+| `aider`          | `aider`    | Env only: `AIDER_MODEL=openai/<id>`, `AIDER_OPENAI_API_BASE`, `AIDER_OPENAI_API_KEY` (Aider's env form of configargparse precedence: CLI beats env beats config file).                                                                                        |
+
+The API key travels in the child's env only: never as a CLI argument visible in `ps`, never in a written file. The pi extension file holds no secret.
+
+Verified against Claude Code 2.1.302, Codex 0.163.0, OpenCode 1.19.3, pi 1.3.0 and Aider 0.86.2 (2026-10-18).
+
+**`--dry-run`** prints one shell-quoted line you can paste back:
+
+```console
+$ llamastash session claude Qwen3.8-27B-UD-Q6_K --dry-run
+env -u ANTHROPIC_API_KEY ANTHROPIC_BASE_URL='http://127.0.0.1:11435' ANTHROPIC_AUTH_TOKEN='***' ANTHROPIC_MODEL='Qwen3.8-27B-UD-Q6_K' ... claude
+```
+
+`--dry-run --json` prints the same launch as an object:
+
+```json
+{
+  "tool": "claude",
+  "model": "Qwen3.8-27B-UD-Q6_K@coder",
+  "launch_id": "L3",
+  "running": true,
+  "context_window": 262144,
+  "program": "claude",
+  "args": [],
+  "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:11435", "ANTHROPIC_AUTH_TOKEN": "***" },
+  "env_remove": ["ANTHROPIC_API_KEY"],
+  "files": [],
+  "tool_args": ["-p", "hi"]
+}
+```
+
+`launch_id` is `null` and `running` is `false` when the model is not up; a dry run never starts one. It still prints what the real run would use: the `@<name>` suffix from your reference, and a `context_window` taken from the preset `start` would launch with (your `@<name>` preset, else the model's `default:`), falling back to the trained window. `args` are the tool's own args and excludes your `--` pass-through, which is listed as `tool_args`. Only the bearer key is masked, and only when `proxy.api_key` is set: a real key prints as `***` and everything else prints as the child receives it, so the line stays runnable. The `llamastash` stub a keyless proxy ignores is not a secret and prints as is. `files` carries `{path, content}` for the pi extension and is empty for every other tool. A var the launch removes from the child's env (`ANTHROPIC_API_KEY` for `claude`) is `env -u <NAME>` at the start of the line and `env_remove` in the JSON, so a pasted line runs the tool the way `session` does.
+
+The tool's binary is looked up on `PATH` before a model is started, so a tool you have not installed exits `70` without paying for a load. A dry run prints even then: it describes a command rather than running one.
+
+**What is written.** Nothing in any tool's config directory. The only file `session` writes is the pi extension above, mode `0600`, in the cache dir. Those files accumulate, one per distinct model, context and proxy address, and are small. Files the tools write themselves are their own behavior and `session` neither prevents nor reads them: Claude Code records the model and its approvals in `~/.claude.json`, OpenCode keeps its recent-model state, Codex adds project trust entries.
+
+Examples: `llamastash session` (pick a tool, then a model if nothing is loaded), `llamastash session claude` (whatever is loaded right now), `llamastash session pi qwen@coder -- -p "hi"`, `llamastash session codex -- exec "hi"`, `llamastash session claude Qwen3.8-27B-UD-Q6_K --dry-run --json`.
+
 ### `llamastash api-key`
 
 ```
@@ -1786,14 +1871,14 @@ Source of truth: `src/cli/exit_codes.rs`. Codes are part of the public CLI contr
 | Code | Constant               | Meaning                                                                                                                                                |
 | ---- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `0`  | `SUCCESS`              | Success                                                                                                                                                |
-| `64` | `USAGE`                | Bad CLI usage — missing required arg, invalid flag combination, or config-load error. Clap also emits this on its own.                                 |
-| `65` | `DAEMON_UNREACHABLE`   | Daemon socket missing, peer hung up, or call timed out                                                                                                 |
-| `66` | `MODEL_NOT_FOUND`      | Model reference matched zero or multiple catalog rows; stderr carries a disambiguation hint                                                            |
-| `67` | `LAUNCH_FAILED`        | Daemon accepted `start_model` but the supervisor failed (probe timeout, port allocation, etc.)                                                         |
+| `64` | `USAGE`                | Bad CLI usage — missing required arg, invalid flag combination, or config-load error. Clap also emits this on its own. `session` uses it for a MODEL that is an embedding or rerank model, and for no TOOL where a picker cannot run. |
+| `65` | `DAEMON_UNREACHABLE`   | Daemon socket missing, peer hung up, or call timed out. `session` also uses it when the daemon is up but its proxy is not listening, since the tool's traffic has to reach it. |
+| `66` | `MODEL_NOT_FOUND`      | Model reference matched zero or multiple catalog rows; stderr carries a disambiguation hint. `session` also uses it when no chat model is running and none was named. |
+| `67` | `LAUNCH_FAILED`        | Daemon accepted `start_model` but the supervisor failed (probe timeout, port allocation, etc.). `session` also uses it when the launch it waited on settled in `error` or `stopped`, or never settled. |
 | `68` | `STOP_FAILED`          | `stop` couldn't reach the target (daemon error or process gone)                                                                                        |
 | `69` | `PULL_FAILED`          | `pull` couldn't complete (network, integrity, disk space)                                                                                              |
-| `70` | `BINARY_NOT_FOUND`     | The engine the model needs is unavailable: neither `llama-server` nor `llama` on PATH, with no `--llama-server` flag and `LLAMASTASH_LLAMA_SERVER` unset, or the model's backend is disabled / its launcher missing |
-| `71` | `UNKNOWN`              | Catch-all for unexpected errors that don't map to a documented class                                                                                   |
+| `70` | `BINARY_NOT_FOUND`     | The engine the model needs is unavailable: neither `llama-server` nor `llama` on PATH, with no `--llama-server` flag and `LLAMASTASH_LLAMA_SERVER` unset, or the model's backend is disabled / its launcher missing. `session` uses it when the tool binary (`claude`, `codex`, `opencode`, `pi`, `aider`) is not on PATH |
+| `71` | `UNKNOWN`              | Catch-all for unexpected errors that don't map to a documented class. `session` uses it when no cache directory is available for a per-run file, or writing one fails |
 | `72` | `INIT_ABORTED`         | `init` aborted before smoke — integrity check failed, archive defenses tripped, user declined confirm, or non-TTY config step without explicit consent |
 | `73` | `INIT_DOWNLOAD_FAILED` | `init`'s model-download step failed (distinct from `PULL_FAILED` so agents branch on cause)                                                            |
 | `74` | `INIT_SMOKE_FAILED`    | `init`'s smoke phase failed (binary doesn't run cleanly under `--version`)                                                                             |

@@ -49,7 +49,10 @@ pub async fn handle(args: StartArgs, cli: &Cli, config: &Config) -> CliResult {
   let row = match (&from_file, args.model.as_deref()) {
     (Some(sel), _) => select_start_row(&rows, &args, &sel.model_key)?,
     (None, Some(m)) => select_start_row(&rows, &args, m)?,
-    (None, None) => crate::cli::picker::pick_catalog_row(&rows, args.json).await?,
+    (None, None) => {
+      crate::cli::picker::ensure_interactive(args.json, "start")?;
+      crate::cli::picker::pick_catalog_row(&rows, "start", "Pick a model to start").await?
+    }
   };
 
   // The preset that actually applied. A launch file's `default:` picks one
@@ -232,74 +235,20 @@ async fn wait_and_emit(
   quiet: bool,
   bell: bool,
 ) -> CliResult {
-  use crate::cli::resolve::{fetch_status, running_index};
-
   let launch_id = resp
     .get("launch_id")
     .and_then(Value::as_str)
     .map(str::to_string);
-  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
-  // Final running row once terminal, or None if we time out / can't find it.
-  let mut settled: Option<crate::cli::resolve::RunningRow> = None;
-  // `resolved_ctx` is stamped by a separate recorder a beat *after* the
-  // Ready transition, so a row can read `ready` with no ctx yet. Once we
-  // first see Ready, give the recorder this grace window to land the
-  // actuals before settling — otherwise `--wait` prints `ctx=—`.
-  let mut ready_since: Option<std::time::Instant> = None;
-  let actuals_grace = std::time::Duration::from_secs(5);
-  // A daemon that dies mid-wait still ends the wait, so the bell still rings
-  // before the error surfaces.
-  let mut poll_error: Option<CliExit> = None;
-  while std::time::Instant::now() < deadline {
-    let snap = match fetch_status(client).await {
-      Ok(snap) => snap,
-      Err(e) => {
-        poll_error = Some(e);
-        break;
-      }
-    };
-    let index = running_index(&snap.models);
-    // Prefer the launch_id match; fall back to the model path (a daemon
-    // build without launch_id on the row still resolves by path).
-    let found = snap
-      .models
-      .iter()
-      .find(|m| Some(m.launch_id.as_str()) == launch_id.as_deref())
-      .cloned()
-      .or_else(|| index.get(&row.path).and_then(|rows| rows.first().cloned()));
-    if let Some(r) = found {
-      match r.state.as_str() {
-        // Error / Stopped are terminal immediately — no actuals to wait on.
-        "error" | "stopped" => {
-          settled = Some(r);
-          break;
-        }
-        // Ready settles once the resolved ctx is stamped, or after the
-        // grace window elapses (a build whose `/props` omits it, etc.).
-        "ready" => {
-          let since = *ready_since.get_or_insert_with(std::time::Instant::now);
-          if r.resolved_ctx.is_some() || since.elapsed() >= actuals_grace {
-            settled = Some(r);
-            break;
-          }
-        }
-        // launching / loading → keep polling.
-        _ => {}
-      }
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-  }
+  let outcome = poll_until_settled(client, launch_id.as_deref(), &row.path).await;
 
   // The wait is what the user walked away from, so it ends with the bell like a
   // pull does, whatever it ended on.
   crate::util::bell::ring_after_wait(bell, json, &mut crate::util::bell::tty_sink());
-  if let Some(e) = poll_error {
-    // The daemon went away: report that and stop. The follow-up below would read
-    // as a timeout that never happened, pointing at `llamastash status` for a
-    // daemon that is gone, and `--json` would carry `"state": null` exactly as
-    // the 900 s budget does.
-    return Err(e);
-  }
+  // A daemon that went away mid-wait is its own error, not a timeout: the
+  // follow-up below would point at `llamastash status` for a daemon that is
+  // gone, and `--json` would carry `"state": null` exactly as the 900 s
+  // budget does.
+  let settled = outcome?;
 
   let failed = matches!(settled.as_ref().map(|r| r.state.as_str()), Some("error"));
   if json {
@@ -337,6 +286,96 @@ async fn wait_and_emit(
     return Err(CliExit::code_only(LAUNCH_FAILED));
   }
   Ok(())
+}
+
+/// Poll `status` until `launch_id` (falling back to `model_path`, for a daemon
+/// that stamps no id) reaches a terminal-ish state: Ready, Error, or Stopped.
+/// `Ok(None)` is the timeout — the launch was accepted but never settled. The
+/// daemon's own probe budget (size-scaled) guarantees a stuck load eventually
+/// flips to Error, so the 15-minute ceiling here is only a safety net for
+/// pathological cases.
+pub(crate) async fn poll_until_settled(
+  client: &mut Client,
+  launch_id: Option<&str>,
+  model_path: &str,
+) -> Result<Option<crate::cli::resolve::RunningRow>, CliExit> {
+  use crate::cli::resolve::{fetch_status, running_index};
+
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+  // Final running row once terminal, or None if we time out / can't find it.
+  let mut settled: Option<crate::cli::resolve::RunningRow> = None;
+  // `resolved_ctx` is stamped by a separate recorder a beat *after* the
+  // Ready transition, so a row can read `ready` with no ctx yet. Once we
+  // first see Ready, give the recorder this grace window to land the
+  // actuals before settling — otherwise `--wait` prints `ctx=—`.
+  let mut ready_since: Option<std::time::Instant> = None;
+  let actuals_grace = std::time::Duration::from_secs(5);
+  while std::time::Instant::now() < deadline {
+    let snap = fetch_status(client).await?;
+    let index = running_index(&snap.models);
+    // Prefer the launch_id match; fall back to the model path (a daemon
+    // build without launch_id on the row still resolves by path).
+    let found = snap
+      .models
+      .iter()
+      .find(|m| Some(m.launch_id.as_str()) == launch_id)
+      .cloned()
+      .or_else(|| index.get(model_path).and_then(|rows| rows.first().cloned()));
+    if let Some(r) = found {
+      match r.state.as_str() {
+        // Error / Stopped are terminal immediately — no actuals to wait on.
+        "error" | "stopped" => {
+          settled = Some(r);
+          break;
+        }
+        // Ready settles once the resolved ctx is stamped, or after the
+        // grace window elapses (a build whose `/props` omits it, etc.).
+        "ready" => {
+          let since = *ready_since.get_or_insert_with(std::time::Instant::now);
+          if r.resolved_ctx.is_some() || since.elapsed() >= actuals_grace {
+            settled = Some(r);
+            break;
+          }
+        }
+        // launching / loading → keep polling.
+        _ => {}
+      }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+  }
+  Ok(settled)
+}
+
+/// Start one catalog row with an optional named preset, through the same steps
+/// `handle` takes: preset baseline, mode, payload, `start_model`. No
+/// per-invocation knob overrides, so `llamastash session` can bring a model up
+/// without going through `start`'s output path.
+pub(crate) async fn start_row_with_preset(
+  client: &mut Client,
+  row: &CatalogRow,
+  preset: Option<&str>,
+  mode: Option<CliLaunchMode>,
+) -> Result<Value, CliExit> {
+  // `presets_show` returns the saved params so the daemon doesn't have to
+  // re-resolve the model id; no preset means the daemon applies the model's
+  // own `default:`.
+  let params = match preset {
+    Some(name) => fetch_preset_params(client, &row.path, name).await?,
+    None => PartialParams::default(),
+  };
+  let mode = resolve_mode(row, mode, params.mode.as_deref())?;
+  let selection = if preset.is_some() {
+    "explicit"
+  } else {
+    "default"
+  };
+  let payload = build_payload(
+    &row.path, mode, &params, None, None, selection, false, None, preset,
+  );
+  client
+    .call("start_model", Some(payload))
+    .await
+    .map_err(|e| map_start_error(e, row))
 }
 
 /// One-line readiness summary appended under the `start` headline when

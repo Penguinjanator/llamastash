@@ -1,92 +1,141 @@
-//! Interactive cliclack pickers for `start` and `stop` when called
-//! without a positional argument.
+//! The one single-select prompt the CLI and the init wizard share, plus the
+//! `start` / `stop` pickers built on it when those commands are called without a
+//! positional argument.
 //!
-//! Both pickers refuse non-interactive contexts up front (no TTY or
-//! `--json`) so a piped / CI invocation gets an actionable error
-//! instead of a hung prompt. The cliclack call itself runs inside
-//! `spawn_blocking` because the underlying terminal reads are sync.
+//! Every picker refuses non-interactive contexts up front (no TTY or `--json`)
+//! so a piped / CI invocation gets an actionable error instead of a hung prompt.
+//! The cliclack call itself runs inside `spawn_blocking` because the underlying
+//! terminal reads are sync.
 
 use std::io::IsTerminal;
 
 use crate::cli::exit_codes::{CliExit, MODEL_NOT_FOUND, USAGE};
 use crate::cli::resolve::{CatalogRow, RunningRow};
 
-/// Refuse the picker up front when the caller can't drive it. Returns
-/// `Ok(())` when an interactive picker is allowed.
-fn ensure_interactive(json: bool, what: &str) -> Result<(), CliExit> {
+/// Why a picker could not run. Each command words its own message around this
+/// and maps it to its own exit code: `USAGE` for the run commands,
+/// `INIT_ABORTED` for the wizard.
+#[derive(Debug)]
+pub enum PromptError {
+  /// The blocking task holding the terminal read did not join.
+  Join(String),
+  /// The prompt itself failed: a closed terminal, Ctrl-C, Ctrl-D.
+  Interact(String),
+}
+
+impl PromptError {
+  /// Shape this failure into the caller's message. `join` and `prompt` are the
+  /// two prefixes each command has always printed.
+  pub fn into_exit(self, code: i32, join: &str, prompt: &str) -> CliExit {
+    match self {
+      PromptError::Join(e) => CliExit::new(code, format!("{join}: {e}")),
+      PromptError::Interact(e) => CliExit::new(code, format!("{prompt}: {e}")),
+    }
+  }
+}
+
+/// Whether a picker may be offered at all: a TTY to draw on and no `--json`.
+pub fn interactive(json: bool) -> bool {
+  !json && std::io::stdin().is_terminal()
+}
+
+/// Refuse the picker up front when the caller can't drive it. `session` words
+/// its own refusal because a missing model there is a model problem, not a
+/// usage one.
+pub fn ensure_interactive(json: bool, command: &str) -> Result<(), CliExit> {
   if json {
     return Err(CliExit::new(
       USAGE,
-      format!("interactive {what} picker is disabled with --json; pass an explicit argument"),
+      format!("interactive {command} picker is disabled with --json; pass an explicit argument"),
     ));
   }
   if !std::io::stdin().is_terminal() {
     return Err(CliExit::new(
       USAGE,
-      format!("interactive {what} picker requires a TTY; pass an explicit argument"),
+      format!("interactive {command} picker requires a TTY; pass an explicit argument"),
     ));
   }
   Ok(())
 }
 
-/// Open a cliclack picker over the catalog and return the chosen row.
-/// Wired into `start` when the user omits the model reference.
-pub async fn pick_catalog_row(rows: &[CatalogRow], json: bool) -> Result<CatalogRow, CliExit> {
-  ensure_interactive(json, "start")?;
+/// One single-select prompt: `title`, the highlighted row, and `(label, hint)`
+/// items in display order. Returns the index of the chosen item, so the caller
+/// keeps its own item type and its own meaning for each row.
+///
+/// `items` must not be empty; a caller with nothing to offer errors instead.
+pub async fn select_one(
+  title: String,
+  initial: usize,
+  items: Vec<(String, String)>,
+) -> Result<usize, PromptError> {
+  tokio::task::spawn_blocking(move || {
+    let mut select = cliclack::select::<usize>(title).initial_value(initial);
+    for (i, (label, hint)) in items.into_iter().enumerate() {
+      select = select.item(i, label, hint);
+    }
+    select.interact()
+  })
+  .await
+  .map_err(|e| PromptError::Join(e.to_string()))?
+  .map_err(|e| PromptError::Interact(e.to_string()))
+}
+
+/// Open a picker over the catalog and return the chosen row. Wired into `start`
+/// when the user omits the model reference, and into `session` when it has no
+/// MODEL and nothing is running. The caller guards interactivity itself when it
+/// has a refusal of its own to print; `command` names it in this one's text.
+pub async fn pick_catalog_row(
+  rows: &[CatalogRow],
+  command: &str,
+  title: &str,
+) -> Result<CatalogRow, CliExit> {
   if rows.is_empty() {
     return Err(CliExit::new(MODEL_NOT_FOUND, "no models discovered"));
   }
   let owned: Vec<CatalogRow> = rows.to_vec();
-  let chosen: CatalogRow = tokio::task::spawn_blocking(move || {
-    let mut select = cliclack::select::<usize>("Pick a model to start").initial_value(0);
-    for (i, r) in owned.iter().enumerate() {
-      let label = r.name();
-      let hint = catalog_hint(r);
-      select = select.item(i, label, hint);
-    }
-    let idx = select.interact()?;
-    Ok::<_, std::io::Error>(
-      owned
-        .into_iter()
-        .nth(idx)
-        .expect("select returns a valid idx"),
+  let items = owned.iter().map(|r| (r.name(), catalog_hint(r))).collect();
+  let idx = select_one(title.to_string(), 0, items).await.map_err(|e| {
+    e.into_exit(
+      USAGE,
+      &format!("{command} picker join"),
+      &format!("{command} picker"),
     )
-  })
-  .await
-  .map_err(|e| CliExit::new(USAGE, format!("start picker join: {e}")))?
-  .map_err(|e| CliExit::new(USAGE, format!("start picker: {e}")))?;
-  Ok(chosen)
+  })?;
+  Ok(
+    owned
+      .into_iter()
+      .nth(idx)
+      .expect("select returns a valid idx"),
+  )
 }
 
-/// Open a cliclack picker over running supervisors and return the
-/// chosen `launch_id`. Wired into `stop` when the user omits both
-/// `<target>` and `--all`.
+/// Open a picker over running supervisors and return the chosen `launch_id`.
+/// Wired into `stop` when the user omits both `<target>` and `--all`.
 pub async fn pick_running_target(rows: &[RunningRow], json: bool) -> Result<String, CliExit> {
   ensure_interactive(json, "stop")?;
   if rows.is_empty() {
     return Err(CliExit::new(MODEL_NOT_FOUND, "no managed launches to stop"));
   }
   let owned: Vec<RunningRow> = rows.to_vec();
-  let chosen: String = tokio::task::spawn_blocking(move || {
-    let mut select = cliclack::select::<usize>("Pick a launch to stop").initial_value(0);
-    for (i, r) in owned.iter().enumerate() {
-      let label = format!("{lid} {name}", lid = r.launch_id, name = r.name());
-      let hint = format!(":{port} {state}", port = r.port, state = r.state);
-      select = select.item(i, label, hint);
-    }
-    let idx = select.interact()?;
-    Ok::<_, std::io::Error>(
-      owned
-        .into_iter()
-        .nth(idx)
-        .expect("select returns a valid idx")
-        .launch_id,
-    )
-  })
-  .await
-  .map_err(|e| CliExit::new(USAGE, format!("stop picker join: {e}")))?
-  .map_err(|e| CliExit::new(USAGE, format!("stop picker: {e}")))?;
-  Ok(chosen)
+  let items = owned
+    .iter()
+    .map(|r| {
+      (
+        format!("{lid} {name}", lid = r.launch_id, name = r.name()),
+        format!(":{port} {state}", port = r.port, state = r.state),
+      )
+    })
+    .collect();
+  let idx = select_one("Pick a launch to stop".to_string(), 0, items)
+    .await
+    .map_err(|e| e.into_exit(USAGE, "stop picker join", "stop picker"))?;
+  Ok(
+    owned
+      .into_iter()
+      .nth(idx)
+      .expect("select returns a valid idx")
+      .launch_id,
+  )
 }
 
 /// Hint line for a catalog picker row — mirrors the columns the
@@ -100,4 +149,32 @@ fn catalog_hint(r: &CatalogRow) -> String {
     .map(|n| n.to_string())
     .unwrap_or_else(|| "?".to_string());
   format!("{arch} {quant} ctx={ctx}")
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn a_prompt_failure_keeps_whichever_message_the_command_uses() {
+    let join =
+      PromptError::Join("boom".into()).into_exit(USAGE, "start picker join", "start picker");
+    assert_eq!(join.message.as_deref(), Some("start picker join: boom"));
+    assert_eq!(join.code, USAGE);
+    let abort = PromptError::Interact("cancelled".into()).into_exit(
+      crate::cli::exit_codes::INIT_ABORTED,
+      "init: prompt join failed",
+      "init: model prompt",
+    );
+    assert_eq!(
+      abort.message.as_deref(),
+      Some("init: model prompt: cancelled")
+    );
+    assert_eq!(abort.code, crate::cli::exit_codes::INIT_ABORTED);
+  }
+
+  #[test]
+  fn json_rules_out_a_picker_even_on_a_tty() {
+    assert!(!interactive(true));
+  }
 }

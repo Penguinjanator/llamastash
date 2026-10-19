@@ -70,7 +70,12 @@ pub async fn from_running_daemon() -> Option<String> {
 /// The address a `listening` proxy reports in `status`. Any other state
 /// carries the address it tried to bind, which serves nothing.
 fn from_status(status: &Value) -> Option<String> {
-  let proxy = status.get("proxy")?;
+  from_proxy_block(status.get("proxy")?)
+}
+
+/// The same rule, given the `status.proxy` block alone — for a caller that has
+/// already read `status` and does not want a second round trip.
+pub(crate) fn from_proxy_block(proxy: &Value) -> Option<String> {
   if proxy.get("status").and_then(Value::as_str) != Some("listening") {
     return None;
   }

@@ -214,6 +214,7 @@ Full detail per feature in [`FEATURES.md`](FEATURES.md) — including trade-offs
 - [`llamastash pull <hf-repo>`](FEATURES.md#llamastash-pull-hf-repo--standalone-hf-fetch) — same primitive as the wizard, with disk-space prechecks.
 - [`llamastash recommend`](FEATURES.md#llamastash-recommend--hardware-aware-picks-in-your-shell) — the recommender on its own, agent-friendly.
 - [`llamastash integrations`](FEATURES.md#llamastash-integrations--point-your-ai-tools-at-the-proxy) — point OpenCode, Aider, Continue.dev, Zed, pi.dev or Codex CLI at the proxy, with your favorites registered and effort pickers wired for reasoning models.
+- [`llamastash session <tool> [model]`](docs/usage.md#llamastash-session-tool-model) — launch Claude Code, Codex, OpenCode, pi or Aider at one model for that run only, through env vars, flags or a per-run file, so no tool config is written.
 - [Reproducible pulls via `--revision <SHA>`](FEATURES.md#reproducible-pulls-via---revision-sha).
 
 ### [Drop-in OpenAI + Ollama proxy](FEATURES.md#drop-in-openai--ollama-proxy)

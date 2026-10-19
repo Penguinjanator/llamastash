@@ -260,6 +260,14 @@ pub enum Command {
   /// sourceable env snippets. Shortcut for `init --only integrations`
   /// that skips the rest of the wizard.
   Integrations(IntegrationsArgs),
+  /// Point a coding tool (Claude Code, Codex, OpenCode, pi, Aider) at a model
+  /// the proxy serves, for that one run. The tool's own config is never
+  /// written: its per-run settings go in as env vars, flags, or a file only
+  /// that run loads, then the tool is exec'd. Omit TOOL to pick one, and MODEL
+  /// to use the most recently started chat launch or pick one when none is
+  /// running; a MODEL that is not running is started first. Extra args after
+  /// `--` reach the tool unchanged.
+  Session(SessionArgs),
   /// Print the proxy's bearer key on stdout. For client configs that
   /// resolve a credential by shelling out (pi.dev's
   /// `apiKey: "!llamastash api-key"`) and for `$(...)` in scripts, so the
@@ -1256,6 +1264,69 @@ pub struct ApiKeyArgs {
   pub json: bool,
 }
 
+/// Which coding tool `llamastash session` launches. The variants are the tools
+/// `init`'s integrations step can patch that also take a per-run config; the
+/// mapping to patcher ids lives in [`SessionTool::patcher_id`].
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionTool {
+  /// Claude Code (`claude`), also accepted as `claude-code`.
+  #[value(name = "claude", alias = "claude-code")]
+  Claude,
+  /// Codex CLI (`codex`).
+  Codex,
+  /// OpenCode (`opencode`).
+  Opencode,
+  /// pi (`pi`).
+  Pi,
+  /// Aider (`aider`).
+  Aider,
+}
+
+impl SessionTool {
+  /// The name in output and `--json`.
+  pub fn as_str(&self) -> &'static str {
+    match self {
+      SessionTool::Claude => "claude",
+      SessionTool::Codex => "codex",
+      SessionTool::Opencode => "opencode",
+      SessionTool::Pi => "pi",
+      SessionTool::Aider => "aider",
+    }
+  }
+
+  /// The [`crate::init::external::ToolPatcher`] id whose `session` hook
+  /// describes this tool's launch.
+  pub fn patcher_id(&self) -> &'static str {
+    match self {
+      SessionTool::Claude => "claude-code",
+      _ => self.as_str(),
+    }
+  }
+}
+
+#[derive(Args, Debug)]
+pub struct SessionArgs {
+  /// The tool to launch. Omit to pick one.
+  #[arg(value_name = "TOOL")]
+  pub tool: Option<SessionTool>,
+  /// Model to point it at: a `proxy.aliases` name, a model reference, or
+  /// `<model>@<launch-name>`. Omit to use the most recently started chat
+  /// launch, or pick one when none is running.
+  pub model: Option<String>,
+  /// Resolve everything and print the launch without starting a model,
+  /// writing a file, or running the tool.
+  #[arg(long)]
+  pub dry_run: bool,
+  /// Print the resolved launch as JSON instead of the shell line. Only
+  /// meaningful with `--dry-run`, which is the case that has no side effects
+  /// to hide.
+  #[arg(long, requires = "dry_run")]
+  pub json: bool,
+  /// Args for the tool, passed through unchanged.
+  #[arg(last = true, value_name = "TOOL_ARG")]
+  pub tool_args: Vec<String>,
+}
+
 #[derive(Args, Debug)]
 pub struct IntegrationsArgs {
   /// Tools to patch (`opencode`, `aider`, `continue`, `zed`, `pi`,
@@ -1525,6 +1596,54 @@ mod tests {
       help.contains(&"run"),
       "`run` must show up in --help: {help:?}"
     );
+  }
+
+  /// `session` carries the tool, an optional model, and everything after `--`
+  /// for the tool itself.
+  #[test]
+  fn session_takes_a_tool_an_optional_model_and_tool_args() {
+    let session = |args: &[&str]| match parse(args).command {
+      Some(Command::Session(a)) => a,
+      other => panic!("expected session, got {other:?}"),
+    };
+    let plain = session(&["session", "claude"]);
+    assert_eq!(plain.tool, Some(SessionTool::Claude));
+    assert_eq!(plain.model, None);
+    assert!(plain.tool_args.is_empty());
+    assert!(!plain.dry_run && !plain.json);
+    // With no tool at all there is nothing to run yet: the command picks one.
+    let bare = session(&["session"]);
+    assert_eq!(bare.tool, None, "TOOL is optional");
+    // `claude-code` is the same tool under the patcher's own id.
+    let alias = session(&["session", "claude-code", "qwen"]);
+    assert_eq!(
+      (alias.tool, alias.model.as_deref()),
+      (Some(SessionTool::Claude), Some("qwen"))
+    );
+    let with_tail = session(&["session", "pi", "qwen@coder", "--", "-p", "hi"]);
+    assert_eq!(with_tail.tool, Some(SessionTool::Pi));
+    assert_eq!(with_tail.model.as_deref(), Some("qwen@coder"));
+    assert_eq!(with_tail.tool_args, ["-p", "hi"]);
+  }
+
+  /// `--json` describes a launch, and only `--dry-run` can describe one without
+  /// taking the action.
+  #[test]
+  fn session_json_only_pairs_with_dry_run() {
+    let err = Cli::try_parse_from(["llamastash", "session", "claude", "--json"]).unwrap_err();
+    assert!(err.to_string().contains("--dry-run"), "{err}");
+    Cli::try_parse_from(["llamastash", "session", "claude", "--dry-run", "--json"])
+      .expect("the pair parses");
+  }
+
+  #[test]
+  fn session_names_the_tools_it_accepts() {
+    let err = Cli::try_parse_from(["llamastash", "session", "cursor"]).unwrap_err();
+    let msg = err.to_string();
+    assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{msg}");
+    for tool in ["claude", "codex", "opencode", "pi", "aider"] {
+      assert!(msg.contains(tool), "the error should list {tool}: {msg}");
+    }
   }
 
   /// `--name` is half of a `model@name` address that every consumer re-splits
@@ -2541,6 +2660,7 @@ mod tests {
       "pull",
       "init",
       "doctor",
+      "session",
     ] {
       assert!(
         rendered.contains(sub),
