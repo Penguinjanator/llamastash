@@ -2097,6 +2097,8 @@ inheritance is visible at the row level.
 
 ### Right pane
 
+Moving the list cursor re-opens the pane on the focused row's first tab: `Requests` for a launch in any state (running, loading, errored, stopped), `Settings` for a model with no launch. A tab you pick yourself stays active until the cursor moves.
+
 | Key                                                       | Action                                                                                    |
 | --------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
 | `Tab` / `Shift+Tab`                                       | Cycle pane focus (universal across the TUI; `l` / `h` are vi aliases)                     |

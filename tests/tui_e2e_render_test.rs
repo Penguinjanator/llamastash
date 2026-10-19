@@ -136,6 +136,10 @@ fn seeded_dashboard_app() -> App {
   // Row 0 is the table header, row 1 is the `▶ Running` group,
   // row 2 is the running qwen-7b launch.
   app.list_cursor = 2;
+  // The opening tab of a launch is Requests (pinned by the `tui::app`
+  // tests); this frame pins the read-only launch-details layout, which
+  // is what `named-launch` and the Settings hint ride on.
+  app.right_tab = RightTab::Settings;
   app
 }
 

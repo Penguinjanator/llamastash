@@ -1032,6 +1032,11 @@ impl App {
       let next: Vec<ManagedRow> = arr.iter().filter_map(parse_status_row).collect();
       let prev_ids: std::collections::BTreeSet<String> =
         self.managed.iter().map(|m| m.launch_id.clone()).collect();
+      // The launch the cursor sat on last tick. The Running group can
+      // appear under a cursor that never moved, so comparing focused
+      // paths after the merge would miss it: the row at that index
+      // changed identity while the index stood still.
+      let prev_focus_launch = self.focused_managed().map(|m| m.launch_id.clone());
       // Detect transitions into `Error` so we can auto-jump the
       // right pane to Logs — the user explicitly wants to see the
       // failure tail, not the static Settings form. Keyed by
@@ -1085,6 +1090,13 @@ impl App {
       // genuinely new launch_id appeared on this tick.
       if let Some(launch_id) = newest {
         self.snap_cursor_to_launch(&launch_id);
+      }
+      // A cursor that now sits on a different launch than it did last
+      // tick gets the same treatment as an explicit move, which covers
+      // the opening frame and a launch that appeared under the cursor.
+      if self.focused_managed().map(|m| m.launch_id.clone()) != prev_focus_launch {
+        self.running_view_scroll.set(0);
+        self.right_tab = self.first_right_tab();
       }
       // If the focused launch just transitioned into Error, snap
       // the right pane to Logs so the user sees the failure tail
@@ -1453,25 +1465,21 @@ impl App {
     self.sync_picker_to_focus(before);
   }
 
-  /// Clear `launch_picker` when the cursor moved onto a different
-  /// path. Round-8: the right pane follows the cursor with no
-  /// sticky fallback — letting a picker staged for model A linger
-  /// while the user scrolls to model B would render the wrong
-  /// model name in the Settings tab. Caller passes the focused
-  /// path *before* the move so we can compare against the path
-  /// *after*.
+  /// Follow the cursor when it lands on a different path. The right
+  /// pane belongs to the focused row, with no sticky fallback: a picker
+  /// staged for model A must not linger while the user scrolls to
+  /// model B, and the active tab re-opens at the new row's first one,
+  /// so a launch opens on Requests and a model with no launch on
+  /// Settings. Caller passes the focused path *before* the move so we
+  /// can compare against the path *after*.
   fn sync_picker_to_focus(&mut self, before: Option<PathBuf>) {
     let after = self.focused_path();
     if before != after {
       // Scroll offset is per-focused-model; clear it on cursor moves
       // so the new model's running-launch view opens at the top.
       self.running_view_scroll.set(0);
-    }
-    if self.launch_picker.is_none() {
-      return;
-    }
-    if before != after {
       self.launch_picker = None;
+      self.right_tab = self.first_right_tab();
     }
   }
 
@@ -2037,10 +2045,7 @@ impl App {
       return;
     }
     if self.focused_managed().is_some() {
-      self.right_tab = *self
-        .available_right_tabs()
-        .first()
-        .unwrap_or(&RightTab::Settings);
+      self.right_tab = self.first_right_tab();
       self.focus = Focus::RightPane;
       self.running_view_scroll.set(0);
       return;
@@ -2294,6 +2299,15 @@ impl App {
     }
   }
 
+  /// The tab a row opens on: its first available one. Requests for any
+  /// launch, Settings for a selection with no launch behind it.
+  fn first_right_tab(&self) -> RightTab {
+    *self
+      .available_right_tabs()
+      .first()
+      .unwrap_or(&RightTab::Settings)
+  }
+
   /// Clamp `right_tab` back to a reachable choice if the focused
   /// model's available tabs shrink (e.g. the model dropped from
   /// Ready to Stopped, or the cursor moved to an unlaunched row).
@@ -2303,9 +2317,8 @@ impl App {
   /// pane painting nothing for those rows. Called by the renderer
   /// before drawing.
   pub fn ensure_right_tab_reachable(&mut self) {
-    let tabs = self.available_right_tabs();
-    if !tabs.contains(&self.right_tab) {
-      self.right_tab = tabs.first().copied().unwrap_or(RightTab::Settings);
+    if !self.available_right_tabs().contains(&self.right_tab) {
+      self.right_tab = self.first_right_tab();
     }
   }
 
@@ -4305,6 +4318,78 @@ mod tests {
     app.right_tab = RightTab::Chat;
     app.managed = vec![ready_managed("/m/a.gguf", 41100, SurfaceState::Stopped)];
     app.ensure_right_tab_reachable();
+    assert_eq!(app.right_tab, RightTab::Requests);
+  }
+
+  #[test]
+  fn a_cursor_move_reopens_the_pane_on_the_new_rows_first_tab() {
+    // Scrolling kept whatever tab the row before was on, so a launch
+    // reached from the Settings tab kept painting its read-only launch
+    // details instead of its requests.
+    let mut app = App::new(AppOptions::default());
+    app.models = vec![fake("/m/a.gguf", "/m"), fake("/m/b.gguf", "/m")];
+    app.managed = vec![ready_managed("/m/b.gguf", 41100, SurfaceState::Ready)];
+    app.list_cursor = 2; // the Running group's b launch
+    assert_eq!(app.focused_name().as_deref(), Some("b"));
+    app.right_tab = RightTab::Chat;
+    app.move_down();
+    assert_eq!(app.focused_name().as_deref(), Some("a"));
+    assert_eq!(
+      app.right_tab,
+      RightTab::Settings,
+      "a model with no launch opens on Settings"
+    );
+    app.right_tab = RightTab::Chat;
+    app.move_up();
+    assert_eq!(app.focused_name().as_deref(), Some("b"));
+    assert_eq!(
+      app.right_tab,
+      RightTab::Requests,
+      "a launch opens on Requests, not on the tab the row before used"
+    );
+  }
+
+  #[test]
+  fn the_opening_selection_of_a_launch_opens_on_requests() {
+    // The cursor starts on the column-label row, so the first catalog
+    // refresh clamps it onto the first launch. That move is a focus
+    // change like any other, so the pane opens on the row's first tab
+    // instead of the `Settings` the app was built with.
+    let mut app = App::new(AppOptions::default());
+    app.models = vec![fake("/m/a.gguf", "/m")];
+    app.managed = vec![ready_managed("/m/a.gguf", 41100, SurfaceState::Ready)];
+    assert_eq!(app.right_tab, RightTab::Settings, "built default");
+    app.clamp_cursor();
+    assert_eq!(app.focused_name().as_deref(), Some("a"));
+    assert_eq!(app.right_tab, RightTab::Requests);
+  }
+
+  #[test]
+  fn a_launch_appearing_under_the_cursor_reopens_the_pane_on_requests() {
+    // The catalog arrives before the first `status`, so the opening
+    // clamp lands the cursor on an idle row. The launch that shows up
+    // at that index a tick later never moves the cursor, and the pane
+    // still has to follow it.
+    let mut app = App::new(AppOptions::default());
+    app.models = vec![fake("/m/a.gguf", "/m")];
+    app.list_cursor = 2;
+    assert!(
+      app.focused_managed().is_none(),
+      "cursor starts on the idle row"
+    );
+    app.ingest_status(&serde_json::json!({
+      "models": [{
+        "launch_id": "L1",
+        "id": { "path": "/m/a.gguf", "header_hash": "h" },
+        "port": 41100,
+        "state": { "state": "ready" },
+      }]
+    }));
+    assert_eq!(
+      app.focused_managed().map(|m| m.launch_id.as_str()),
+      Some("L1"),
+      "the launch landed on the row the cursor was already on"
+    );
     assert_eq!(app.right_tab, RightTab::Requests);
   }
 

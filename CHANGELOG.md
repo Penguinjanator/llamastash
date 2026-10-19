@@ -21,6 +21,7 @@ This release is about putting a coding tool on a local model in one command, and
 
 ### Fixed
 
+- Moving the list cursor re-opens the right pane on the focused row's first tab: `Requests` for a launch in any state, `Settings` for a model with no launch. It kept the tab the previous row was on, so a running launch selected from Settings stayed on its read-only launch parameters.
 - A GGUF whose header carries no mode is judged by its name: an `*-embed*` file with an `unknown` mode hint is an embedding model to `session` and to `integrations`, not a chat model.
 - A `backend.generic` `env` value that starts with `~/` resolves against the home directory like `binary` does, so an engine that needs `LD_LIBRARY_PATH` beside its binary no longer dies with `exit code 127` and a loader error that does not name the path ([#115](https://github.com/llamastash/llamastash/pull/115)).
 - Request rows carry the speed an engine reports under `usage` as `decoding_speed_tps` and `prefill_speed_tps`, so FastFlowLM rows show its measured rate instead of one estimated from the proxy's clock ([#115](https://github.com/llamastash/llamastash/pull/115)).
