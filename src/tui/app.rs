@@ -1383,7 +1383,7 @@ impl App {
   /// the row isn't found (the merge may have ordered things
   /// differently on this tick).
   ///
-  /// Routes through `sync_picker_to_focus` so any picker staged
+  /// Routes through `sync_pane_to_focus` so any picker staged
   /// for the prior focused path is cleared when the snap lands on
   /// a different model — otherwise Settings would keep painting
   /// the stale picker's name/port for the just-snapped row.
@@ -1398,7 +1398,7 @@ impl App {
     }) {
       let before = self.focused_path();
       self.list_cursor = idx;
-      self.sync_picker_to_focus(before);
+      self.sync_pane_to_focus(before);
     }
   }
 
@@ -1455,14 +1455,14 @@ impl App {
     let rows = self.rendered_rows();
     let before = self.focused_path();
     self.move_down_in(&rows);
-    self.sync_picker_to_focus(before);
+    self.sync_pane_to_focus(before);
   }
 
   pub fn move_up(&mut self) {
     let rows = self.rendered_rows();
     let before = self.focused_path();
     self.move_up_in(&rows);
-    self.sync_picker_to_focus(before);
+    self.sync_pane_to_focus(before);
   }
 
   /// Follow the cursor when it lands on a different path. The right
@@ -1472,7 +1472,7 @@ impl App {
   /// so a launch opens on Requests and a model with no launch on
   /// Settings. Caller passes the focused path *before* the move so we
   /// can compare against the path *after*.
-  fn sync_picker_to_focus(&mut self, before: Option<PathBuf>) {
+  fn sync_pane_to_focus(&mut self, before: Option<PathBuf>) {
     let after = self.focused_path();
     if before != after {
       // Scroll offset is per-focused-model; clear it on cursor moves
@@ -1526,7 +1526,7 @@ impl App {
         self.move_up_in(&rows);
       }
     }
-    self.sync_picker_to_focus(before);
+    self.sync_pane_to_focus(before);
   }
 
   pub fn go_top(&mut self) {
@@ -1538,7 +1538,7 @@ impl App {
         break;
       }
     }
-    self.sync_picker_to_focus(before);
+    self.sync_pane_to_focus(before);
   }
 
   pub fn go_bottom(&mut self) {
@@ -1550,7 +1550,7 @@ impl App {
         break;
       }
     }
-    self.sync_picker_to_focus(before);
+    self.sync_pane_to_focus(before);
   }
 
   fn clamp_cursor(&mut self) {
@@ -4394,6 +4394,47 @@ mod tests {
   }
 
   #[test]
+  fn a_status_tick_leaves_the_tab_the_user_picked_alone() {
+    // The refresh runs several times a second, so following the focus
+    // must mean a different launch under the cursor, not any change to
+    // the one already there: a tick that re-snapped the pane would pull
+    // the user off Chat every half second.
+    let mut app = App::new(AppOptions::default());
+    app.models = vec![fake("/m/a.gguf", "/m")];
+    app.managed = vec![ready_managed("/m/a.gguf", 41100, SurfaceState::Ready)];
+    app.list_cursor = 2;
+    app.right_tab = RightTab::Chat;
+    // `ready_managed` mints `L-<port>`, and a different id here would
+    // be a genuine launch change.
+    let status = |state: &str| {
+      serde_json::json!({
+        "models": [{
+          "launch_id": "L-41100",
+          "id": { "path": "/m/a.gguf", "header_hash": "h" },
+          "port": 41100,
+          "state": { "state": state },
+        }]
+      })
+    };
+    app.ingest_status(&status("ready"));
+    assert_eq!(
+      app.right_tab,
+      RightTab::Chat,
+      "an unchanged tick keeps Chat"
+    );
+    app.ingest_status(&status("stopped"));
+    assert_eq!(
+      app.right_tab,
+      RightTab::Chat,
+      "a state change on the same launch is not a focus change"
+    );
+    // The render clamp, not the tick, is what moves him off a tab the
+    // new state no longer offers.
+    app.ensure_right_tab_reachable();
+    assert_eq!(app.right_tab, RightTab::Requests);
+  }
+
+  #[test]
   fn rendered_rows_cache_returns_memoized_value_inside_frame() {
     // Tier-C hoist: `rendered_rows()` is memoized via `rows_cache`
     // for the duration of a single render frame. The primer must
@@ -4426,7 +4467,7 @@ mod tests {
   #[test]
   fn snap_cursor_to_launch_clears_stale_launch_picker() {
     // F1 #3: `snap_cursor_to_launch` is the only `list_cursor`
-    // writer that used to skip `sync_picker_to_focus`. When a
+    // writer that used to skip `sync_pane_to_focus`. When a
     // status snapshot lands during launch and snaps to a different
     // path than the picker was staged for, Settings would render
     // ports/name for the *previous* path. Snap must now clear the
