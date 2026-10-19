@@ -6,6 +6,10 @@
 - `rows_from` on a `backend.generic` entry mints one row per model an engine's own listing reports, with that model's arch, params, quant, context and size, so `llamastash start qwen3:0.6b` and a proxy request naming it work with no `proxy.aliases` lines ([#115](https://github.com/llamastash/llamastash/pull/115)).
 - [`RECIPES.md`](RECIPES.md): tested configs for llama.cpp builds, vLLM/SGLang, gufo, Halogen, CIRU, ds4, Lemonade, FastFlowLM on an AMD NPU and whisper.cpp, with presets for Qwen3.8 Flash-Next, DeepSeek V4, GLM and Gemma 4. The engine examples moved there from `docs/usage.md`.
 
+### Changed
+
+- The TUI's right pane leads with Requests: every launch shows `Requests`, `Logs`, `Settings`, and a running model adds its Chat / Embed / Rerank tab after them. `Enter` on a launch now opens its requests instead of its settings.
+
 ### Removed
 
 - **Breaking: the `lifecycle` field of `status --json` backend rows, and the umbrella columns that came with it.** Every backend runs one process per model, so there is nothing left to distinguish ([#116](https://github.com/llamastash/llamastash/pull/116)).

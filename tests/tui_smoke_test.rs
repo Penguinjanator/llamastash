@@ -408,9 +408,9 @@ fn ready_chat_model_exposes_chat_tab_via_cycle() {
   app.go_top();
   let tabs = app.available_right_tabs();
   assert!(tabs.contains(&RightTab::Chat));
-  // The focus chain is [List, Settings, Logs, Chat] and the cursor
-  // starts on the list, so three Tabs reach Chat.
-  for _ in 0..3 {
+  // The focus chain is [List, Requests, Logs, Settings, Chat] and
+  // the cursor starts on the list, so four Tabs reach Chat.
+  for _ in 0..4 {
     pump_input(&mut app, key(KeyCode::Tab, KeyModifiers::NONE));
   }
   assert_eq!(app.right_tab, RightTab::Chat);
@@ -418,6 +418,34 @@ fn ready_chat_model_exposes_chat_tab_via_cycle() {
   assert!(
     frame.contains("Chat"),
     "Chat tab body must render once selected: {frame}"
+  );
+}
+
+#[test]
+fn tab_from_the_list_opens_the_requests_tab() {
+  use llamastash::tui::app::ManagedRow;
+  use llamastash::tui::keybindings::Focus;
+  use llamastash::tui::status_icons::SurfaceState;
+  use llamastash::tui::RightTab;
+  let mut app = App::new(AppOptions::default());
+  app.models = vec![fake_model("/m/qwen.gguf", "/m")];
+  app.managed = vec![ManagedRow {
+    launch_id: "L1".into(),
+    path: PathBuf::from("/m/qwen.gguf"),
+    port: 41100,
+    state: SurfaceState::Ready,
+    device: None,
+    rss_bytes: None,
+    cpu_pct: None,
+    ..Default::default()
+  }];
+  app.go_top();
+  pump_input(&mut app, key(KeyCode::Tab, KeyModifiers::NONE));
+  assert_eq!(app.focus, Focus::RightPane);
+  assert_eq!(
+    app.right_tab,
+    RightTab::Requests,
+    "the first right-pane tab of a launch is Requests"
   );
 }
 

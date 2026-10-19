@@ -1,8 +1,9 @@
 //! Right-pane tab dispatcher.
 //!
 //! The right pane is a single bordered Block. The block's title
-//! carries the tab strip (`Logs │ Chat`) so the active surface is
-//! visible without a separate strip row. Inside the block:
+//! carries the tab strip (the set from `App::available_right_tabs`)
+//! so the active surface is visible without a separate strip row.
+//! Inside the block:
 //!  1. A model-name line — bold, full width so long filenames have
 //!     somewhere to breathe.
 //!  2. A stats line — `:port  state  RAM  CPU`.
@@ -435,9 +436,9 @@ fn bottom_hint_line(chips: &[String], palette: &Palette) -> Line<'static> {
   Line::from(spans)
 }
 
-/// Compose the block title as a styled line: ` Settings │ Logs │
-/// Chat `. The active tab is highlighted; all key hints live on
-/// the *bottom* border now (see [`bottom_hint_chips`]) so the
+/// Compose the block title as a styled line: ` Requests │ Logs │
+/// Settings │ Chat `. The active tab is highlighted; all key hints
+/// live on the *bottom* border now (see [`bottom_hint_chips`]) so the
 /// top stays a clean tab strip.
 ///
 /// Also returns the per-tab on-screen rectangles, computed in

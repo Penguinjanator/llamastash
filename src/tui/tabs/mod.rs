@@ -15,23 +15,23 @@ pub mod settings;
 
 use crate::gguf::metadata::ModeHint;
 
-/// Identifier for one right-pane tab. `Settings` is always
-/// reachable; the mode-specific tabs become reachable when the
-/// focused model is `Ready` and its `ModeHint` matches. Variant
-/// order matches the user-facing tab strip: Settings is the
-/// canonical first stop, Logs follows, then the mode tab, then
-/// Requests.
+/// Identifier for one right-pane tab. `Settings` and `Logs` are
+/// always reachable for a model that has a launch; the
+/// mode-specific tabs become reachable when the focused model is
+/// `Ready` and its `ModeHint` matches. Variant order matches the
+/// user-facing tab strip: Requests leads, then Logs, then Settings,
+/// then the mode tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RightTab {
+  /// The proxy requests of the focused model.
+  Requests,
+  Logs,
   /// Launch-parameter form. Editable for not-yet-launched models;
   /// read-only for running models (shows the params used).
   Settings,
-  Logs,
   Chat,
   Embed,
   Rerank,
-  /// The proxy requests of the focused model.
-  Requests,
 }
 
 impl RightTab {
@@ -72,22 +72,25 @@ pub enum TabEvent {
   RerankErr(String),
 }
 
+/// The strip of any managed launch, before a mode surface is added:
+/// Requests leads because what a live model is doing matters more
+/// than how it was configured, Logs follows so the process pipeline
+/// is one Tab away, and Settings closes the strip.
+pub fn tabs_without_mode() -> Vec<RightTab> {
+  vec![RightTab::Requests, RightTab::Logs, RightTab::Settings]
+}
+
 /// Tabs available for a model with the supplied mode hint. The
 /// renderer only exposes the second tab when the model is `Ready`;
 /// this helper just declares which tab type is appropriate.
 pub fn tabs_for_mode(mode: ModeHint) -> Vec<RightTab> {
-  // Settings leads (it's always present and the home for launch
-  // params); Logs follows so a running model's process pipeline
-  // is one Tab away; the mode-specific surface (Chat / Embed /
-  // Rerank) is third, and Requests closes the strip.
-  let mut tabs = vec![RightTab::Settings, RightTab::Logs];
+  let mut tabs = tabs_without_mode();
   match mode {
     ModeHint::Chat => tabs.push(RightTab::Chat),
     ModeHint::Embedding => tabs.push(RightTab::Embed),
     ModeHint::Rerank => tabs.push(RightTab::Rerank),
     ModeHint::Unknown => {}
   }
-  tabs.push(RightTab::Requests);
   tabs
 }
 
@@ -96,24 +99,25 @@ mod tests {
   use super::*;
 
   #[test]
-  fn requests_closes_the_strip_after_the_mode_tab() {
+  fn requests_leads_the_strip_and_the_mode_tab_closes_it() {
     use RightTab::{Chat, Embed, Logs, Requests, Rerank, Settings};
     assert_eq!(
       tabs_for_mode(ModeHint::Chat),
-      vec![Settings, Logs, Chat, Requests]
+      vec![Requests, Logs, Settings, Chat]
     );
     assert_eq!(
       tabs_for_mode(ModeHint::Embedding),
-      vec![Settings, Logs, Embed, Requests]
+      vec![Requests, Logs, Settings, Embed]
     );
     assert_eq!(
       tabs_for_mode(ModeHint::Rerank),
-      vec![Settings, Logs, Rerank, Requests]
+      vec![Requests, Logs, Settings, Rerank]
     );
     assert_eq!(
       tabs_for_mode(ModeHint::Unknown),
-      vec![Settings, Logs, Requests]
+      vec![Requests, Logs, Settings]
     );
+    assert_eq!(tabs_without_mode(), vec![Requests, Logs, Settings]);
   }
 
   #[test]

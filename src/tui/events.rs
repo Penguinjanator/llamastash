@@ -4712,10 +4712,14 @@ mod tests {
     app.right_tab = RightTab::Logs;
     pump_input(&mut app, key(KeyCode::Tab, KeyModifiers::NONE));
     // Focus advances along the chain — for a Ready chat model the
-    // chain is [List, Settings, Logs, Chat]; Tab from Logs lands
-    // on the next entry (still RightPane focus, right_tab moves).
+    // chain is [List, Requests, Logs, Settings, Chat]; Tab from Logs
+    // lands on the next entry (still RightPane focus, right_tab moves).
     assert_eq!(app.focus, Focus::RightPane);
-    assert_eq!(app.right_tab, RightTab::Chat, "Tab walks the right tabs");
+    assert_eq!(
+      app.right_tab,
+      RightTab::Settings,
+      "Tab walks the right tabs"
+    );
     assert!(
       app.launch_picker.is_none(),
       "Tab in Logs must not materialise the picker"

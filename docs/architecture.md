@@ -504,14 +504,14 @@ Filtered out before classification: software adapters (`DXGI_ADAPTER_FLAG_SOFTWA
 
 | Model focus state | Mode | Tabs shown |
 |---|---|---|
-| Not launched | (n/a) | Settings |
-| Launching / Loading / Error / Stopped | any | Settings, Logs, Requests |
-| Ready | chat | Settings, Logs, Chat, Requests |
-| Ready | embedding | Settings, Logs, Embed, Requests |
-| Ready | rerank | Settings, Logs, Rerank, Requests |
-| Ready | unknown | Settings, Logs, Requests |
+| Not launched / external | (n/a) | Settings |
+| Launching / Loading / Error / Stopped | any | Requests, Logs, Settings |
+| Ready | chat | Requests, Logs, Settings, Chat |
+| Ready | embedding | Requests, Logs, Settings, Embed |
+| Ready | rerank | Requests, Logs, Settings, Rerank |
+| Ready | unknown | Requests, Logs, Settings |
 
-The source of truth is `App::available_right_tabs` (`src/tui/app.rs`) and `tabs_for_mode` (`src/tui/tabs/mod.rs`).
+The source of truth is `App::available_right_tabs` (`src/tui/app.rs`) and `tabs_for_mode` / `tabs_without_mode` (`src/tui/tabs/mod.rs`).
 
 The Requests tab reads `requests_tail` for the focused launch's id through its own poller (`spawn_requests_poller` in `src/tui/events.rs`), and only while the tab is open. Its table columns carry a rank and drop out as the pane narrows; the picker is `tui::columns::fit`, shared with the Models list.
 

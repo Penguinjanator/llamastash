@@ -491,7 +491,7 @@ _Shared context: `src/init/external/tools/`, the `doctor` findings, and what `--
 ## R16 (v0.9.0 checklist)
 
 - [ ] Agg PP tok/s seems wrong. Shows 3055 over 37.1s when there is only one connection and avg is 1211.
-- [ ] Consider making Requests the first tab for running launches, followed by Logs, Settings, Chat\*
+- [x] ~~Consider making Requests the first tab for running launches, followed by Logs, Settings, Chat\*~~ — done 2026-10-19: every launch shows Requests, Logs, Settings, with the mode tab (Chat / Embed / Rerank) last for a `Ready` model, and `Enter` on a launch opens Requests. A model with no launch gets Settings alone.
 - [x] ~~Add a recipes page with config for different engines and popular models like Qwen 3.8, Deepseek, GLM etc~~ — done: [`RECIPES.md`](RECIPES.md) holds the llama.cpp, vLLM/SGLang and generic-engine configs (gufo, Halogen, CIRU, ds4, Lemonade, FastFlowLM, whisper.cpp) with presets for Qwen3.8 Flash-Next, Qwen3.8 27B, DeepSeek V4, GLM and Gemma 4; the engine examples moved there from `docs/usage.md`, `config.example.yaml` and `docs/lemonade-setup.md`.
 
 ### Batch 1: Generic-backend engines and the multiplexer decision

@@ -21,7 +21,7 @@ use crate::tui::keybindings::{Action, Focus, KeyMap};
 use crate::tui::launch_picker::{LaunchPickerState, PresetChoice, PresetStop};
 use crate::tui::list_pane::{build_rows, ListRow, RowInputs, RunningLaunchRow};
 use crate::tui::status_icons::SurfaceState;
-use crate::tui::tabs::{tabs_for_mode, RightTab};
+use crate::tui::tabs::{tabs_for_mode, tabs_without_mode, RightTab};
 
 /// Maximum age of a toast before the App auto-clears it. Keeps
 /// transient yank confirmations from sticking around forever.
@@ -2017,12 +2017,12 @@ impl App {
   /// the Models list. Two branches:
   ///
   /// - **Focused row is running** (`focused_managed().is_some()`):
-  ///   focus the right pane in its read-only running view. *No*
-  ///   picker is staged — pressing `Enter` alone shouldn't silently
-  ///   spin up a duplicate launch before the user has any chance to
-  ///   inspect or edit the params. The bottom-strip chip leads with
-  ///   `e:edit for launch`; the user goes `e → edit fields → Enter`
-  ///   to launch a new instance.
+  ///   focus the right pane on its first tab, which is Requests.
+  ///   *No* picker is staged — pressing `Enter` alone shouldn't
+  ///   silently spin up a duplicate launch before the user has any
+  ///   chance to inspect or edit the params. The bottom-strip chip
+  ///   leads with `e:edit for launch`; the user goes `e → edit
+  ///   fields → Enter` to launch a new instance.
   /// - **Focused row is idle**: stage the launch picker with
   ///   last-used params so the next `Enter` (on the Settings tab)
   ///   dispatches the launch.
@@ -2037,7 +2037,10 @@ impl App {
       return;
     }
     if self.focused_managed().is_some() {
-      self.right_tab = RightTab::Settings;
+      self.right_tab = *self
+        .available_right_tabs()
+        .first()
+        .unwrap_or(&RightTab::Settings);
       self.focus = Focus::RightPane;
       self.running_view_scroll.set(0);
       return;
@@ -2250,13 +2253,14 @@ impl App {
   }
 
   /// Tabs the right pane should expose for the currently focused
-  /// model. Every *managed* selection gets Logs, whatever its
-  /// lifecycle state — the daemon's ring buffer outlives the child
-  /// process. What varies is the rest: a Ready selection adds the
-  /// mode-appropriate input tab, everything else pairs Logs with
-  /// Settings, and an unlaunched / unfocused row gets Settings
-  /// alone. There's no sticky fallback — what the user sees in the
-  /// right pane is the model under the cursor, nothing else.
+  /// model. Every *managed* selection gets Requests, Logs and
+  /// Settings, whatever its lifecycle state — the daemon's log ring
+  /// buffer outlives the child process, and the requests a launch
+  /// answered with stay filed under it. What varies is the rest: a
+  /// Ready selection adds the mode-appropriate input tab, and an
+  /// unlaunched / unfocused row gets Settings alone. There's no
+  /// sticky fallback — what the user sees in the right pane is the
+  /// model under the cursor, nothing else.
   pub fn available_right_tabs(&self) -> Vec<RightTab> {
     if let Some(cached) = self.right_tabs_cache.as_ref() {
       return cached.clone();
@@ -2271,30 +2275,21 @@ impl App {
       None => return vec![RightTab::Settings],
     };
     // A model with no mode surface (hint `Unknown`), or one that is not Ready,
-    // gets Logs and Requests: the 503s of a failed load are filed under the
-    // model, and Requests is where they show.
+    // gets the strip without one: the 503s of a failed load are filed under
+    // the model, and Requests is where they show.
     match managed.state {
       SurfaceState::Ready => tabs_for_mode(self.mode_hint_for(&managed.path)),
-      // Process alive but not yet serving — Settings stays the
-      // canonical first stop so the user can still tweak relaunch
-      // params, Logs sits next so the startup pipeline is one
-      // Tab away. Requests shows the request that is waiting on
-      // this load.
-      SurfaceState::Launching | SurfaceState::Loading => {
-        vec![RightTab::Settings, RightTab::Logs, RightTab::Requests]
-      }
-      // Error / Stopped: the daemon holds the ring buffer for as long as
-      // the registry entry lives, and `status` only reports rows that are
-      // still in the registry — so the tail is always fetchable here. It
-      // is the only surface that explains *why* the launch died: a
-      // post-Ready death (external kill, OOM) is recorded as plain
-      // `Stopped` with no cause, so the log is the whole story. A clean
-      // `stop` deregisters the launch, so a `Stopped` row the TUI can see
-      // is always an unexpected exit. Requests stays too: the 503s a
-      // failed auto-start answered with are filed under this model.
-      SurfaceState::Error | SurfaceState::Stopped => {
-        vec![RightTab::Settings, RightTab::Logs, RightTab::Requests]
-      }
+      // Process alive but not yet serving, or dead but still in the
+      // registry. Logs is fetchable either way: `status` only reports
+      // rows the registry still holds, and the ring buffer is the only
+      // surface that explains why a launch died (a post-Ready death by
+      // external kill or OOM is recorded as plain `Stopped` with no
+      // cause). Requests stays in both: the request waiting on a load,
+      // or the 503 a failed auto-start answered with, is filed here.
+      SurfaceState::Launching
+      | SurfaceState::Loading
+      | SurfaceState::Error
+      | SurfaceState::Stopped => tabs_without_mode(),
       _ => vec![RightTab::Settings],
     }
   }
@@ -3262,7 +3257,7 @@ mod tests {
   #[test]
   fn drill_into_focused_model_skips_picker_when_running() {
     // Running row: Enter-on-list should *not* stage a launch
-    // picker — it just shows the read-only running view. The
+    // picker — it lands on the launch's first tab (Requests). The
     // user explicitly stages via `e:edit for launch`, then Enter
     // launches. Avoids accidentally dispatching a duplicate
     // instance from a stray Enter.
@@ -3289,9 +3284,13 @@ mod tests {
     assert_eq!(
       app.focus,
       Focus::RightPane,
-      "drill still focuses the right pane (read-only running view)"
+      "drill still focuses the right pane"
     );
-    assert_eq!(app.right_tab, RightTab::Settings);
+    assert_eq!(
+      app.right_tab,
+      RightTab::Requests,
+      "drill opens the strip head, not the params view"
+    );
   }
 
   fn dev(selector: &str, gpu: &str) -> Device {
@@ -3953,7 +3952,7 @@ mod tests {
     );
     assert_eq!(
       app.available_right_tabs(),
-      vec![RightTab::Settings, RightTab::Logs, RightTab::Requests],
+      vec![RightTab::Requests, RightTab::Logs, RightTab::Settings],
       "stopped rows must expose the Logs and Requests tabs alongside Settings"
     );
   }
@@ -4148,12 +4147,12 @@ mod tests {
     assert_eq!(
       app.available_right_tabs(),
       vec![
-        RightTab::Settings,
+        RightTab::Requests,
         RightTab::Logs,
-        RightTab::Chat,
-        RightTab::Requests
+        RightTab::Settings,
+        RightTab::Chat
       ],
-      "Running-row selection exposes mode-appropriate tabs (Settings first)"
+      "Running-row selection exposes mode-appropriate tabs (Requests first)"
     );
     assert!(app.right_pane_focus().is_some());
 
@@ -4196,7 +4195,7 @@ mod tests {
     app.list_cursor = 2;
     assert_eq!(
       app.available_right_tabs(),
-      vec![RightTab::Settings, RightTab::Logs, RightTab::Requests]
+      vec![RightTab::Requests, RightTab::Logs, RightTab::Settings]
     );
   }
 
@@ -4292,6 +4291,21 @@ mod tests {
     app.right_tab = RightTab::Chat;
     app.ensure_right_tab_reachable();
     assert_eq!(app.right_tab, RightTab::Settings);
+  }
+
+  #[test]
+  fn ensure_right_tab_reachable_snaps_to_requests_on_a_managed_row() {
+    // A launch that dies while the user sits on Chat loses that tab,
+    // and the clamp falls back to the strip head — Requests for any
+    // managed row, so the failed request stays on screen.
+    let mut app = App::new(AppOptions::default());
+    app.models = vec![fake("/m/a.gguf", "/m")];
+    app.managed = vec![ready_managed("/m/a.gguf", 41100, SurfaceState::Ready)];
+    app.list_cursor = 2;
+    app.right_tab = RightTab::Chat;
+    app.managed = vec![ready_managed("/m/a.gguf", 41100, SurfaceState::Stopped)];
+    app.ensure_right_tab_reachable();
+    assert_eq!(app.right_tab, RightTab::Requests);
   }
 
   #[test]
