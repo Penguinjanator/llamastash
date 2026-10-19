@@ -500,7 +500,10 @@ impl RequestSummary {
     // An average that never landed prints the placeholder, so it is not the
     // same number and the aggregate stands on its own.
     let differs = match avg {
-      Some(avg) if avg > 0.0 => (value - avg).abs() / avg > NOISE,
+      // Under the first decimal `fmt_tps` collapses distinct speeds onto one
+      // print, so the relative test alone would print a cell repeating its own
+      // average. The matching print is its own answer.
+      Some(avg) if avg > 0.0 => printed != fmt_tps(avg) && (value - avg).abs() / avg > NOISE,
       _ => true,
     };
     differs.then(|| (label, format!("{printed} over {}", fmt_ms(busy_ms))))
@@ -2243,6 +2246,15 @@ mod tests {
       ..RequestSummary::default()
     };
     assert_eq!(agg_labels(&near), Vec::<&str>::new());
+    // A trickle prints `0.0` on both sides however far apart the figures are,
+    // and a cell repeating the number beside it is the cell this rule drops.
+    let trickle = RequestSummary {
+      tokens_per_second_avg: Some(0.033),
+      tokens_per_second_aggregate: Some(0.049),
+      busy_ms: Some(30_000),
+      ..RequestSummary::default()
+    };
+    assert_eq!(agg_labels(&trickle), Vec::<&str>::new());
     // Past the band the aggregate is a different figure again, so it prints.
     let over = RequestSummary {
       tokens_per_second_avg: Some(52.4),
