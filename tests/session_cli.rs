@@ -559,11 +559,21 @@ fn no_tool_named_is_a_usage_error_that_lists_the_tools() {
   }
 }
 
+/// A dir holding a stand-in `claude`. A missing tool exits 70 before the model is
+/// looked at, so a test about the model needs one on `PATH`, whatever the host
+/// has installed.
+fn path_with_fake_claude() -> String {
+  let tools = temp("tools");
+  fake_tool(&tools, "claude", &tools.join("dump"));
+  path_with(&tools)
+}
+
 #[test]
 fn nothing_running_and_no_model_named_is_a_model_not_found() {
   let daemon = Daemon::start(None);
   let out = daemon
     .cmd()
+    .env("PATH", path_with_fake_claude())
     .args(["session", "claude"])
     .output()
     .expect("run");
@@ -581,6 +591,7 @@ fn a_model_that_cannot_carry_a_chat_session_is_refused_before_it_starts() {
   let daemon = Daemon::start(None);
   let out = daemon
     .cmd()
+    .env("PATH", path_with_fake_claude())
     .args(["session", "claude", "embed"])
     .output()
     .expect("run");
