@@ -1,5 +1,10 @@
 ## [Unreleased]
 
+### Fixed
+
+- Moving the list cursor re-opens the right pane on the focused row's first tab: `Requests` for a launch in any state, `Settings` for a model with no launch. It kept the tab the previous row was on, so a running launch selected from Settings stayed on its read-only launch parameters.
+- The `llamastash requests` summary and the TUI Requests strip drop `Agg tok/s` and `Agg PP tok/s` when the figure lands within 5% of the average beside it, or prints the same number as it. One stream makes the two the same number, so printing both wasted the cells.
+
 ## [0.9.0] — 2026-10-19
 
 This release is about putting a coding tool on a local model in one command, and writing down how the engines actually run. `llamastash session claude qwen3.8` starts Claude Code with the proxy's URL, key and model for that run alone: nothing is written to the tool's own config, and a model that is not running is started first. [`RECIPES.md`](RECIPES.md) collects the tested configs, llama.cpp builds, vLLM, SGLang and the generic engines (gufo, Halogen, CIRU, ds4, Lemonade, FastFlowLM on an AMD NPU, whisper.cpp), with presets for Qwen3.8 Flash-Next, DeepSeek V4, GLM and Gemma 4. A `backend.generic` entry can mint one catalog row per model its engine lists, so `qwen3:0.6b` starts and routes with no `proxy.aliases` lines. Two removals: the dedicated Lemonade backend runs as a generic entry instead, and `status --json` drops `lifecycle` now that every backend is one process per model. The TUI's right pane leads with Requests, and `Agg PP tok/s` places a streamed prompt where it actually ran.
@@ -21,8 +26,6 @@ This release is about putting a coding tool on a local model in one command, and
 
 ### Fixed
 
-- Moving the list cursor re-opens the right pane on the focused row's first tab: `Requests` for a launch in any state, `Settings` for a model with no launch. It kept the tab the previous row was on, so a running launch selected from Settings stayed on its read-only launch parameters.
-- The `llamastash requests` summary and the TUI Requests strip drop `Agg tok/s` and `Agg PP tok/s` when the figure lands within 5% of the average beside it, or prints the same number as it. One stream makes the two the same number, so printing both wasted the cells.
 - A GGUF whose header carries no mode is judged by its name: an `*-embed*` file with an `unknown` mode hint is an embedding model to `session` and to `integrations`, not a chat model.
 - A `backend.generic` `env` value that starts with `~/` resolves against the home directory like `binary` does, so an engine that needs `LD_LIBRARY_PATH` beside its binary no longer dies with `exit code 127` and a loader error that does not name the path ([#115](https://github.com/llamastash/llamastash/pull/115)).
 - Request rows carry the speed an engine reports under `usage` as `decoding_speed_tps` and `prefill_speed_tps`, so FastFlowLM rows show its measured rate instead of one estimated from the proxy's clock ([#115](https://github.com/llamastash/llamastash/pull/115)).
