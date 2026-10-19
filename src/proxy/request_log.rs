@@ -164,6 +164,11 @@ pub struct RequestRow {
   /// How fast those tokens were computed, reported by the engine or estimated
   /// by the proxy.
   pub prefill_tokens_per_second: Option<f64>,
+  /// Milliseconds from receipt to the first byte that carried a generated
+  /// token, which is where prompt computation ended. A stream's first byte can
+  /// be response headers flushed before the prompt was computed, so
+  /// [`Self::ttfb_ms`] cannot mark that end.
+  pub prefill_end_ms: Option<u64>,
   /// No prefill timing reached the proxy, so [`Self::prefill_tokens_per_second`]
   /// is its own estimate.
   pub prefill_estimated: bool,
@@ -577,31 +582,32 @@ impl Throughput {
   /// mixing the two divides by a wall that runs long, and its aggregate reads
   /// below the average it belongs to.
   fn add_prefill(&mut self, row: &RequestRow) {
-    let (Some(tokens), Some(pps), Some(ttfb)) = (
-      row.prefill_tokens,
-      row.prefill_tokens_per_second,
-      row.ttfb_ms,
-    ) else {
+    let (Some(tokens), Some(pps)) = (row.prefill_tokens, row.prefill_tokens_per_second) else {
       return;
     };
-    if row.state == RequestState::InFlight || tokens == 0 || pps <= 0.0 || ttfb == 0 {
+    if row.state == RequestState::InFlight || tokens == 0 || pps <= 0.0 {
       return;
     }
-    // A response that arrives whole sends its first byte at the end of
-    // generation, so the prompt finished a generation-span earlier; a stream's
-    // first byte is about where its first token is. The earlier of the two
+    // Where prompt computation ended. The proxy watching a stream's first token
+    // arrive is the direct answer. Failing that: a response that arrives whole
+    // sends its first byte at the end of generation, so the prompt finished a
+    // generation-span earlier, and a stream whose tokens the proxy could not
+    // spot is about at its first byte. The earlier of that and the first byte
     // lands on the end of prompt computation for both.
-    let generated = match (row.completion_tokens, row.tokens_per_second) {
-      (Some(generated), Some(tps)) if generated > 0 && tps > 0.0 => {
-        (generated as f64 / tps * 1000.0).round() as u64
-      }
-      _ => 0,
-    };
-    let wait = row
-      .duration_ms
-      .unwrap_or(ttfb)
-      .saturating_sub(generated)
-      .min(ttfb);
+    let wait = row.prefill_end_ms.unwrap_or_else(|| {
+      let generated = match (row.completion_tokens, row.tokens_per_second) {
+        (Some(generated), Some(tps)) if generated > 0 && tps > 0.0 => {
+          (generated as f64 / tps * 1000.0).round() as u64
+        }
+        _ => 0,
+      };
+      let ttfb = row.ttfb_ms.unwrap_or(0);
+      row
+        .duration_ms
+        .unwrap_or(ttfb)
+        .saturating_sub(generated)
+        .min(ttfb)
+    });
     let end = row.started_at_ms.saturating_add(wait);
     let span = (tokens as f64 / pps * 1000.0).round() as u64;
     let start = end.saturating_sub(span).max(row.started_at_ms);
@@ -1362,6 +1368,14 @@ impl RequestRecord {
     }
   }
 
+  /// The first body byte carrying a generated token arrived, so the prompt is
+  /// computed. Later calls change nothing.
+  pub fn mark_first_token(&mut self) {
+    if self.row.prefill_end_ms.is_none() {
+      self.row.prefill_end_ms = Some(self.elapsed_ms());
+    }
+  }
+
   /// Copy the row as it stands into the log, so a reader sees a request
   /// that is still waiting on a load or still streaming.
   ///
@@ -2035,6 +2049,42 @@ mod tests {
       "{:?}",
       apart.cells("—")
     );
+  }
+
+  #[test]
+  fn a_streams_prompt_window_ends_at_its_first_token_not_its_first_byte() {
+    // An engine can flush response headers before it computes the prompt, so a
+    // 40 ms first byte sits nowhere near the 600 ms the prompt took. Anchoring
+    // on the first byte crams 300 tokens into a 40 ms window, and two prompts
+    // run one after the other read as one 80 ms wall at 7,500 tok/s.
+    let row = |start: u64| RequestRow {
+      started_at_ms: start,
+      state: RequestState::Done,
+      status: Some(200),
+      ttfb_ms: Some(40),
+      prefill_end_ms: Some(600),
+      duration_ms: Some(3_000),
+      completion_tokens: Some(120),
+      tokens_per_second: Some(60.0),
+      prefill_tokens: Some(300),
+      prefill_tokens_per_second: Some(500.0),
+      ..RequestRow::default()
+    };
+    let mut figures = RowFigures::default();
+    for each in [row(0), row(1_000)] {
+      figures.add(&each);
+    }
+    let mut summary = RequestSummary {
+      prefill_tokens_per_second: Some(500.0),
+      ..RequestSummary::default()
+    };
+    figures.stamp(&mut summary);
+    assert_eq!(
+      summary.prefill_busy_ms,
+      Some(1_200),
+      "two 600 ms prompt windows, not two 40 ms ones"
+    );
+    assert_eq!(summary.prefill_tokens_per_second_aggregate, Some(500.0));
   }
 
   #[test]

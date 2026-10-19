@@ -519,6 +519,7 @@ impl LoggedResponse {
           let now = Instant::now();
           self.first_token = Some(now);
           self.generating_since = now;
+          self.record.mark_first_token();
         }
         self.seen += data.len() as u64;
         if let Some(tap) = self.tap.as_mut() {
@@ -995,6 +996,14 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
     assert!(row.prefill_estimated);
     let est = row.prefill_tokens_per_second.expect("an estimate");
     assert!((39.0..=40.0).contains(&est), "{est}");
+    // The proxy notes where the first token landed, so the aggregate window has
+    // an end that is not the first byte. The first token cannot precede the
+    // first byte, and both are receipt-origin like `started_at_ms`, which is
+    // the clock `add_prefill` places windows on.
+    assert!(
+      row.prefill_end_ms.expect("a first token") >= row.ttfb_ms.unwrap_or(0),
+      "{row:?}"
+    );
   }
 
   #[test]
@@ -1007,6 +1016,9 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
     assert!(row.prefill_estimated);
     let est = row.prefill_tokens_per_second.expect("an estimate");
     assert!((49.0..=50.0).contains(&est), "{est}");
+    // Nothing marks the end of prompt computation but the first byte, which for
+    // a whole response is the end of generation.
+    assert_eq!(row.prefill_end_ms, None);
   }
 
   #[test]
