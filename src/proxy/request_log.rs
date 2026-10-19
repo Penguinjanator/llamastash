@@ -415,8 +415,8 @@ pub struct RequestSummary {
 impl RequestSummary {
   /// Label and text of the figures, in display order. `none` stands in for a
   /// figure no request has supplied yet, except for the two `Agg` figures,
-  /// which drop out entirely when nothing produced them or when they print the
-  /// number their own average prints.
+  /// which drop out entirely when nothing produced them or when they land
+  /// within noise of the average they belong to.
   pub fn cells(&self, none: &str) -> Vec<(&'static str, String)> {
     let [counts, speeds_and_totals] = self.cell_rows(none);
     counts.into_iter().chain(speeds_and_totals).collect()
@@ -480,9 +480,10 @@ impl RequestSummary {
   }
 
   /// The `X over <wall>` cell of an aggregate figure: absent when nothing
-  /// produced it, and absent when it prints the number its own average prints,
-  /// because with nothing running together the two are the same figure and the
-  /// cells the aggregate costs are better spent on the ones that differ.
+  /// produced it, and absent when it lands within a few percent of the average
+  /// it belongs to, because with nothing running together the two are the same
+  /// figure and the cells the aggregate costs are better spent on the ones that
+  /// differ.
   fn aggregate_cell(
     avg: Option<f64>,
     aggregate: Option<f64>,
@@ -492,12 +493,15 @@ impl RequestSummary {
     let (Some(value), Some(busy_ms)) = (aggregate, busy_ms) else {
       return None;
     };
+    // Speeds this close read as one number at a glance: a lone stream lands
+    // here, and so does a hair of overlap between two.
+    const NOISE: f64 = 0.05;
     let printed = fmt_tps(value);
     // An average that never landed prints the placeholder, so it is not the
     // same number and the aggregate stands on its own.
     let differs = match avg {
-      Some(avg) => printed != fmt_tps(avg),
-      None => true,
+      Some(avg) if avg > 0.0 => (value - avg).abs() / avg > NOISE,
+      _ => true,
     };
     differs.then(|| (label, format!("{printed} over {}", fmt_ms(busy_ms))))
   }
@@ -2204,7 +2208,15 @@ mod tests {
   }
 
   #[test]
-  fn an_aggregate_that_prints_its_averages_number_is_left_off_the_strip() {
+  fn an_aggregate_within_noise_of_its_average_is_left_off_the_strip() {
+    let agg_labels = |summary: &RequestSummary| -> Vec<&'static str> {
+      summary
+        .cells("—")
+        .into_iter()
+        .filter(|(label, _)| label.starts_with("Agg "))
+        .map(|(label, _)| label)
+        .collect()
+    };
     let labels =
       |summary: &RequestSummary| summary.cells("—").iter().map(|c| c.0).collect::<Vec<_>>();
     // Both pair 1 and pair 2 round to the same printed number as their average,
@@ -2218,14 +2230,35 @@ mod tests {
       prefill_busy_ms: Some(60_000),
       ..RequestSummary::default()
     };
-    assert_eq!(
-      labels(&same)
-        .iter()
-        .filter(|label| label.starts_with("Agg "))
-        .copied()
-        .collect::<Vec<_>>(),
-      Vec::<&str>::new()
-    );
+    assert_eq!(agg_labels(&same), Vec::<&str>::new());
+    // 52.4 against 53 prints two numbers and means the same speed: one stream
+    // with nothing sharing the wall.
+    let near = RequestSummary {
+      tokens_per_second_avg: Some(52.4),
+      tokens_per_second_aggregate: Some(53.0),
+      busy_ms: Some(60_000),
+      prefill_tokens_per_second: Some(1_043.0),
+      prefill_tokens_per_second_aggregate: Some(1_090.0),
+      prefill_busy_ms: Some(60_000),
+      ..RequestSummary::default()
+    };
+    assert_eq!(agg_labels(&near), Vec::<&str>::new());
+    // Past the band the aggregate is a different figure again, so it prints.
+    let over = RequestSummary {
+      tokens_per_second_avg: Some(52.4),
+      tokens_per_second_aggregate: Some(56.0),
+      busy_ms: Some(60_000),
+      ..RequestSummary::default()
+    };
+    assert_eq!(agg_labels(&over), ["Agg tok/s"]);
+    // The pair with no average to answer to has nothing to sit beside, so it
+    // prints whatever it is.
+    let no_average = RequestSummary {
+      tokens_per_second_aggregate: Some(52.4),
+      busy_ms: Some(6_300),
+      ..RequestSummary::default()
+    };
+    assert_eq!(agg_labels(&no_average), ["Agg tok/s"]);
     let apart = RequestSummary {
       tokens_per_second_avg: Some(41.3),
       tokens_per_second_aggregate: Some(52.4),
@@ -2235,14 +2268,7 @@ mod tests {
       prefill_busy_ms: Some(6_300),
       ..RequestSummary::default()
     };
-    assert_eq!(
-      labels(&apart)
-        .iter()
-        .filter(|label| label.starts_with("Agg "))
-        .copied()
-        .collect::<Vec<_>>(),
-      ["Agg tok/s", "Agg PP tok/s"]
-    );
+    assert_eq!(agg_labels(&apart), ["Agg tok/s", "Agg PP tok/s"]);
     // Each aggregate sits beside the average it belongs to, and one with no
     // average to answer to prints on its own.
     assert_eq!(
@@ -2253,12 +2279,6 @@ mod tests {
         .collect::<Vec<_>>(),
       [("Avg tok/s", "Agg tok/s"), ("Avg PP tok/s", "Agg PP tok/s")]
     );
-    let no_average = RequestSummary {
-      tokens_per_second_aggregate: Some(52.4),
-      busy_ms: Some(6_300),
-      ..RequestSummary::default()
-    };
-    assert!(labels(&no_average).contains(&"Agg tok/s"));
   }
 
   #[test]
