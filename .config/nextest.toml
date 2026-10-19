@@ -16,7 +16,7 @@
 # ~16 s local run. A 3-4 core CI runner never reaches 8 anyway.
 [test-groups]
 daemon-bound = { max-threads = 8 }
-# `session_cli` boots its daemons through the CLI, and a CLI daemon binds the
+# `session_cli` and `cli_integration_test` boot their daemons through the CLI, and a CLI daemon binds the
 # control plane on `DEFAULT_CONTROL_PORT` and only probes 5 ports above it. That
 # one window is shared by every daemon on the host — including a developer's own
 # running daemon — so a sixth daemon at once exits 71 before binding. Four leaves
@@ -24,11 +24,11 @@ daemon-bound = { max-threads = 8 }
 control-plane-bound = { max-threads = 4 }
 
 [[profile.default.overrides]]
-filter = 'binary(/^session_/)'
+filter = 'binary(/^(session_|cli_integration)/)'
 test-group = 'control-plane-bound'
 
 [[profile.default.overrides]]
-filter = 'binary(/^(proxy_|daemon_|control_plane|supervisor_|start_model|tui_|init_orchestration|list_models|cli_integration|uat_lifecycle|generic_backend|generic_rows_from|preset_config_ipc|sglang_backend|vllm_backend)/)'
+filter = 'binary(/^(proxy_|daemon_|control_plane|supervisor_|start_model|tui_|init_orchestration|list_models|uat_lifecycle|generic_backend|generic_rows_from|preset_config_ipc|sglang_backend|vllm_backend)/)'
 test-group = 'daemon-bound'
 
 [profile.ci]
@@ -43,9 +43,9 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 # Profile overrides don't inherit the default profile's, so repeat the
 # daemon-bound assignment here for the CI profile.
 [[profile.ci.overrides]]
-filter = 'binary(/^(proxy_|daemon_|control_plane|supervisor_|start_model|tui_|init_orchestration|list_models|cli_integration|uat_lifecycle|generic_backend|generic_rows_from|preset_config_ipc|sglang_backend|vllm_backend)/)'
+filter = 'binary(/^(proxy_|daemon_|control_plane|supervisor_|start_model|tui_|init_orchestration|list_models|uat_lifecycle|generic_backend|generic_rows_from|preset_config_ipc|sglang_backend|vllm_backend)/)'
 test-group = 'daemon-bound'
 
 [[profile.ci.overrides]]
-filter = 'binary(/^session_/)'
+filter = 'binary(/^(session_|cli_integration)/)'
 test-group = 'control-plane-bound'
