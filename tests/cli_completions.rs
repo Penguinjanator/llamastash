@@ -155,6 +155,7 @@ fn the_script_names_the_commands_that_get_completed() {
       "pull",
       "doctor",
       "completions",
+      "session",
     ] {
       assert!(script.contains(cmd), "{shell} lost `{cmd}`");
     }

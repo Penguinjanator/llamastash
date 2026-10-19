@@ -73,9 +73,12 @@ pub async fn handle(args: SessionArgs, cli: &Cli, config: &Config) -> CliResult 
   };
   // The tool binary is looked up before a model is picked or started: a tool
   // that is not installed should cost no question and no load, and the program
-  // depends only on the tool. The failure is carried, not raised, because a dry
-  // run describes a command it does not need to run.
-  let program = lookup_program(tool);
+  // depends only on the tool. A dry run carries the failure instead of raising
+  // it, because it describes a command it does not need to run.
+  let program = match lookup_program(tool) {
+    Err(e) if !args.dry_run => return Err(e),
+    found => found,
+  };
   let mut target = resolve_target(&catalog, &status.models, &args, config).await?;
   let mut launch = describe(
     tool,
@@ -599,22 +602,36 @@ fn emit_dry_run(
       "tool_args": args.tool_args,
     }))
   } else {
-    let mut line = String::new();
-    for (name, value) in &launch.env {
-      line.push_str(&format!(
-        "{name}={} ",
-        shell_quote(&shown_value(secret, value))
-      ));
-    }
-    line.push_str(launch.program);
-    for arg in launch.args.iter().chain(args.tool_args.iter()) {
-      line.push(' ');
-      line.push_str(&shell_quote(arg));
-    }
-    line
+    shell_line(launch, &args.tool_args, secret)
   };
   println!("{body}");
   Ok(())
+}
+
+/// The launch as one line a POSIX shell runs the same way `session` does. A var
+/// the launch removes goes through `env -u`, or a pasted line would hand the
+/// tool whatever the user's shell has set.
+fn shell_line(launch: &SessionLaunch, tool_args: &[String], secret: Option<&str>) -> String {
+  let mut line = String::new();
+  if !launch.env_remove.is_empty() {
+    line.push_str("env");
+    for name in &launch.env_remove {
+      line.push_str(&format!(" -u {name}"));
+    }
+    line.push(' ');
+  }
+  for (name, value) in &launch.env {
+    line.push_str(&format!(
+      "{name}={} ",
+      shell_quote(&shown_value(secret, value))
+    ));
+  }
+  line.push_str(launch.program);
+  for arg in launch.args.iter().chain(tool_args.iter()) {
+    line.push(' ');
+    line.push_str(&shell_quote(arg));
+  }
+  line
 }
 
 /// Single-quote a token the way a POSIX shell needs it, so the `--dry-run` line
@@ -1052,5 +1069,28 @@ mod tests {
     assert_eq!(shell_quote("plain"), "'plain'");
     assert_eq!(shell_quote("qwen'3"), r"'qwen'\''3'");
     assert_eq!(shell_quote("a b"), "'a b'");
+  }
+
+  #[test]
+  fn a_removed_var_stays_removed_when_the_line_is_pasted() {
+    let launch = SessionLaunch {
+      program: "claude",
+      args: Vec::new(),
+      env: vec![("ANTHROPIC_AUTH_TOKEN".into(), "s3cr3t".into())],
+      env_remove: vec!["ANTHROPIC_API_KEY".into()],
+      files: Vec::new(),
+    };
+    assert_eq!(
+      shell_line(&launch, &["-p".into(), "hi".into()], Some("s3cr3t")),
+      "env -u ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN='***' claude '-p' 'hi'"
+    );
+    let keeps_all = SessionLaunch {
+      env_remove: Vec::new(),
+      ..launch
+    };
+    assert_eq!(
+      shell_line(&keeps_all, &[], None),
+      "ANTHROPIC_AUTH_TOKEN='s3cr3t' claude"
+    );
   }
 }

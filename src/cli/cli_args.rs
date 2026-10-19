@@ -2660,6 +2660,7 @@ mod tests {
       "pull",
       "init",
       "doctor",
+      "session",
     ] {
       assert!(
         rendered.contains(sub),

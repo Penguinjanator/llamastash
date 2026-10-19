@@ -291,7 +291,15 @@ fn a_dry_run_prints_the_launch_and_changes_nothing() {
   daemon.start_model();
   let out = daemon
     .cmd()
-    .args(["session", "codex", "--dry-run", "--json"])
+    .args([
+      "session",
+      "codex",
+      "--dry-run",
+      "--json",
+      "--",
+      "exec",
+      "hi",
+    ])
     .output()
     .expect("run session");
   assert!(
@@ -306,8 +314,12 @@ fn a_dry_run_prints_the_launch_and_changes_nothing() {
   assert_eq!(body["launch_id"], "L1");
   assert_eq!(body["program"], "codex");
   assert_eq!(body["env"]["LLAMASTASH_API_KEY"], "llamastash");
-  assert_eq!(body["tool_args"], serde_json::json!([]));
+  assert_eq!(body["tool_args"], serde_json::json!(["exec", "hi"]));
   let args = body["args"].as_array().expect("args array");
+  assert!(
+    !args.contains(&Value::String("exec".into())),
+    "the pass-through is listed apart from the tool's own args: {args:?}"
+  );
   assert!(
     args.contains(&Value::String("-c".into())),
     "codex takes -c overrides: {args:?}"

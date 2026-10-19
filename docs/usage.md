@@ -1784,7 +1784,7 @@ Verified against Claude Code 2.1.302, Codex 0.163.0, OpenCode 1.19.3, pi 1.3.0 a
 
 ```console
 $ llamastash session claude Qwen3.8-27B-UD-Q6_K --dry-run
-ANTHROPIC_BASE_URL='http://127.0.0.1:11435' ANTHROPIC_AUTH_TOKEN='***' ANTHROPIC_MODEL='Qwen3.8-27B-UD-Q6_K' ... claude
+env -u ANTHROPIC_API_KEY ANTHROPIC_BASE_URL='http://127.0.0.1:11435' ANTHROPIC_AUTH_TOKEN='***' ANTHROPIC_MODEL='Qwen3.8-27B-UD-Q6_K' ... claude
 ```
 
 `--dry-run --json` prints the same launch as an object:
@@ -1805,7 +1805,7 @@ ANTHROPIC_BASE_URL='http://127.0.0.1:11435' ANTHROPIC_AUTH_TOKEN='***' ANTHROPIC
 }
 ```
 
-`launch_id` is `null` and `running` is `false` when the model is not up; a dry run never starts one. It still prints what the real run would use: the `@<name>` suffix from your reference, and a `context_window` taken from the preset `start` would launch with (your `@<name>` preset, else the model's `default:`), falling back to the trained window. `args` are the tool's own args and excludes your `--` pass-through, which is listed as `tool_args`. Only the bearer key is masked, and only when `proxy.api_key` is set: a real key prints as `***` and everything else prints as the child receives it, so the line stays runnable. The `llamastash` stub a keyless proxy ignores is not a secret and prints as is. `files` carries `{path, content}` for the pi extension and is empty for every other tool. The vars removed from the child's env appear only in the JSON form.
+`launch_id` is `null` and `running` is `false` when the model is not up; a dry run never starts one. It still prints what the real run would use: the `@<name>` suffix from your reference, and a `context_window` taken from the preset `start` would launch with (your `@<name>` preset, else the model's `default:`), falling back to the trained window. `args` are the tool's own args and excludes your `--` pass-through, which is listed as `tool_args`. Only the bearer key is masked, and only when `proxy.api_key` is set: a real key prints as `***` and everything else prints as the child receives it, so the line stays runnable. The `llamastash` stub a keyless proxy ignores is not a secret and prints as is. `files` carries `{path, content}` for the pi extension and is empty for every other tool. A var the launch removes from the child's env (`ANTHROPIC_API_KEY` for `claude`) is `env -u <NAME>` at the start of the line and `env_remove` in the JSON, so a pasted line runs the tool the way `session` does.
 
 The tool's binary is looked up on `PATH` before a model is started, so a tool you have not installed exits `70` without paying for a load. A dry run prints even then: it describes a command rather than running one.
 
