@@ -1,8 +1,12 @@
 ## [Unreleased]
 
+## [0.9.0] — 2026-10-19
+
+This release is about putting a coding tool on a local model in one command, and writing down how the engines actually run. `llamastash session claude qwen3.8` starts Claude Code with the proxy's URL, key and model for that run alone: nothing is written to the tool's own config, and a model that is not running is started first. [`RECIPES.md`](RECIPES.md) collects the tested configs, llama.cpp builds, vLLM, SGLang and the generic engines (gufo, Halogen, CIRU, ds4, Lemonade, FastFlowLM on an AMD NPU, whisper.cpp), with presets for Qwen3.8 Flash-Next, DeepSeek V4, GLM and Gemma 4. A `backend.generic` entry can mint one catalog row per model its engine lists, so `qwen3:0.6b` starts and routes with no `proxy.aliases` lines. Two removals: the dedicated Lemonade backend runs as a generic entry instead, and `status --json` drops `lifecycle` now that every backend is one process per model. The TUI's right pane leads with Requests, and `Agg PP tok/s` places a streamed prompt where it actually ran.
+
 ### Added
 
-- `llamastash session [tool] [model]` launches Claude Code, Codex, OpenCode, pi or Aider pointed at one model the proxy serves, for that run only. On a terminal, leaving the tool or the model out picks one from a menu. Its per-run settings arrive as env vars, flags or a file only that run loads, so no tool config is written; a model that is not running is started first, and `--dry-run` prints the launch with no side effects.
+- `llamastash session [tool] [model]` launches Claude Code, Codex, OpenCode, pi or Aider pointed at one model the proxy serves, for that run only. On a terminal, leaving the tool or the model out picks one from a menu. Its per-run settings arrive as env vars, flags or a file only that run loads, so no tool config is written; a model that is not running is started first, and `--dry-run` prints the launch with no side effects ([#117](https://github.com/llamastash/llamastash/pull/117)).
 - `rows_from` on a `backend.generic` entry mints one row per model an engine's own listing reports, with that model's arch, params, quant, context and size, so `llamastash start qwen3:0.6b` and a proxy request naming it work with no `proxy.aliases` lines ([#115](https://github.com/llamastash/llamastash/pull/115)).
 - [`RECIPES.md`](RECIPES.md): tested configs for llama.cpp builds, vLLM/SGLang, gufo, Halogen, CIRU, ds4, Lemonade, FastFlowLM on an AMD NPU and whisper.cpp, with presets for Qwen3.8 Flash-Next, DeepSeek V4, GLM and Gemma 4. The engine examples moved there from `docs/usage.md`.
 
@@ -22,6 +26,11 @@
 - Request rows carry the speed an engine reports under `usage` as `decoding_speed_tps` and `prefill_speed_tps`, so FastFlowLM rows show its measured rate instead of one estimated from the proxy's clock ([#115](https://github.com/llamastash/llamastash/pull/115)).
 - `Agg PP tok/s` places a streamed prompt where it actually ran, ending its window at the first token rather than the first response byte. An engine that opens a stream with a status event before computing the prompt read an aggregate 2 to 2.5 times its own average with a single client.
 - The Settings label column is sized from the keys the view renders, so a long `backend.generic` knob name like `halogen-cache-entries` no longer renders its value flush against the label.
+
+### Contributors
+
+- [@deepu105](https://github.com/deepu105): everything
+
 
 ## [0.8.0] — 2026-10-17
 
