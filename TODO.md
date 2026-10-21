@@ -521,6 +521,8 @@ _Shared context: `src/cli/` and `src/ipc/methods.rs` for the start and wait-for-
 
 ## Next
 
+- [ ] Show cache hit on request rows as well
+
 ### Batch 2: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
 
 - [ ] Keep a model's prompt cache across an unload
