@@ -7,7 +7,7 @@
 pkgname=llamastash
 pkgver=${version}
 pkgrel=1
-pkgdesc='Zero-overhead, terminal-native local-LLM manager'
+pkgdesc='Zero-overhead, terminal-native local-LLM orchestrator'
 arch=('x86_64' 'aarch64')
 url='https://github.com/llamastash/llamastash'
 license=('MIT')

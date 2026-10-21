@@ -17,9 +17,9 @@
   <img src="https://raw.githubusercontent.com/llamastash/llamastash/main/assets/logo-h.jpg" alt="Logo" width="50%">
 </p>
 
-**Zero-overhead, terminal-native local-LLM manager.**
+**Zero-overhead, terminal-native local-LLM orchestrator. Run any engine, any model via the same proxy.**
 
-A fast TUI **and** CLI with init wizard for managing local LLMs. One Rust binary that's a TUI, a CLI, a daemon, and an OpenAI-compatible proxy. [llama.cpp](https://github.com/ggml-org/llama.cpp) is the direct, zero-overhead default backend (vs raw `llama-server`), plus [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang) for safetensors, and a generic backend that runs any other OpenAI-compatible server you declare in config — [Lemonade](https://github.com/lemonade-sdk/lemonade) for NPU / multi-engine inference, [FastFlowLM](https://github.com/FastFlowLM/FastFlowLM) on AMD XDNA2, [ds4](https://github.com/antirez/ds4) for DeepSeek-V4, whisper.cpp and others. See [benchmarks](docs/benchmarks.md).
+A fast TUI **and** CLI with init wizard for running local LLMs. One Rust binary that's a TUI, a CLI, a daemon, and an OpenAI-compatible proxy. [llama.cpp](https://github.com/ggml-org/llama.cpp) is the direct, zero-overhead default backend (vs raw `llama-server`), plus [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang) for safetensors, and a generic backend that runs any other OpenAI-compatible server you declare in config — [Lemonade](https://github.com/lemonade-sdk/lemonade) for NPU / multi-engine inference, [FastFlowLM](https://github.com/FastFlowLM/FastFlowLM) on AMD XDNA2, [ds4](https://github.com/antirez/ds4) for DeepSeek-V4, whisper.cpp and others. See [benchmarks](docs/benchmarks.md).
 
 ![TUI Gif](https://raw.githubusercontent.com/llamastash/llamastash/main/assets/tui.gif)
 
@@ -42,7 +42,7 @@ A fast TUI **and** CLI with init wizard for managing local LLMs. One Rust binary
 
 ## Why
 
-Heavy abstractions (Ollama, LM Studio) hide llama.cpp; raw `llama-server` use is tedious. LlamaStash is a fast, transparent manager that is also a first-class shell-tool surface for agents — one binary, daemon on demand, same primitives in the TUI and the CLI.
+Heavy abstractions (Ollama, LM Studio) hide llama.cpp; raw `llama-server` use is tedious. LlamaStash is a fast, transparent orchestrator that is also a first-class shell-tool surface for agents — one binary, daemon on demand, same primitives in the TUI and the CLI.
 
 > **AI agents installing this for a user:** jump to [`INSTALL.md` § For AI agents](INSTALL.md#for-ai-agents). The non-interactive install + verify contract, and exit-code branching live there.
 

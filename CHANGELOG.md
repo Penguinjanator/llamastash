@@ -1,5 +1,8 @@
 ## [Unreleased]
 
+### Changed
+
+- Repositioned as a local-LLM orchestrator. New tagline in the README, `--help`, crates.io and package descriptions: "Zero-overhead, terminal-native local-LLM orchestrator. Run any engine, any model via the same proxy".
 
 ## [0.9.1] — 2026-10-19
 

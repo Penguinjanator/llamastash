@@ -31,7 +31,7 @@ fn help_styles() -> Styles {
 #[command(
   name = "llamastash",
   version,
-  about = "Fast keyboard-driven local-LLM manager: TUI + CLI for llama.cpp, with a pluggable backend seam",
+  about = "Zero-overhead, terminal-native local-LLM orchestrator. Run any engine, any model via the same proxy",
   long_about = None,
   before_help = BANNER,
   styles = help_styles(),
