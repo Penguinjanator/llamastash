@@ -6,7 +6,14 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// How long a test waits for an in-process daemon to come up.
+///
+/// Startup runs the real GPU probe. On a host with `nvidia-smi`, a dozen
+/// daemons booting at once under nextest queue on the driver and the probe
+/// takes ~4 s each (measured on an RTX 3050 Ti); alone it takes 10 ms.
+pub const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Unique temp directory for an integration test.
 ///

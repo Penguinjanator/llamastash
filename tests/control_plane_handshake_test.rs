@@ -13,6 +13,7 @@ use std::{
 
 use llamastash::daemon::{run_foreground, runtime_file, DaemonOptions};
 use llamastash::ipc::Client;
+use llamastash::test_support::DAEMON_STARTUP_TIMEOUT;
 use serde_json::{json, Value};
 use tokio::time::timeout;
 
@@ -28,14 +29,13 @@ fn opts_for(temp: &Path) -> DaemonOptions {
 }
 
 /// Poll the state directory until `runtime.json` lands; then return
-/// the parsed `RuntimeInfo`. Caps at 3 s — same budget as the
-/// Unix-socket smoke tests.
+/// the parsed `RuntimeInfo`.
 async fn wait_for_runtime_info(state_dir: &Path) -> runtime_file::RuntimeInfo {
-  let deadline = std::time::Instant::now() + Duration::from_secs(3);
+  let deadline = std::time::Instant::now() + DAEMON_STARTUP_TIMEOUT;
   loop {
     if std::time::Instant::now() > deadline {
       panic!(
-        "runtime.json did not appear within 3s in {}",
+        "runtime.json did not appear within {DAEMON_STARTUP_TIMEOUT:?} in {}",
         state_dir.display()
       );
     }

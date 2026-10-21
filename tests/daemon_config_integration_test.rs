@@ -12,6 +12,7 @@
 //!   the manifest-backed blob appears in `list_models` under
 //!   `source: "ollama"`.
 
+use llamastash::test_support::DAEMON_STARTUP_TIMEOUT;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -89,7 +90,7 @@ fn fast_watcher() -> WatcherOptions {
 }
 
 async fn wait_for_socket(path: &Path) {
-  let deadline = std::time::Instant::now() + Duration::from_secs(5);
+  let deadline = std::time::Instant::now() + DAEMON_STARTUP_TIMEOUT;
   loop {
     if std::time::Instant::now() > deadline {
       panic!("daemon did not become connectable: {}", path.display());

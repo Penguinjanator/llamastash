@@ -39,6 +39,7 @@ use llamastash::gguf::test_fixtures::build_minimal_gguf;
 use llamastash::ipc::Client;
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
+use llamastash::test_support::DAEMON_STARTUP_TIMEOUT;
 use llamastash::test_support::{fake_metadata, shutdown_listener, spawn_listener};
 use serde_json::Value;
 use tokio::net::TcpStream;
@@ -463,10 +464,13 @@ async fn health_models_discovered_matches_catalog_length() {
 // --- daemon-wiring smoke -------------------------------------------------
 
 async fn wait_for_socket(path: &Path) {
-  let deadline = std::time::Instant::now() + Duration::from_secs(3);
+  let deadline = std::time::Instant::now() + DAEMON_STARTUP_TIMEOUT;
   loop {
     if std::time::Instant::now() > deadline {
-      panic!("daemon not connectable within 3s: {}", path.display());
+      panic!(
+        "daemon not connectable within {DAEMON_STARTUP_TIMEOUT:?}: {}",
+        path.display()
+      );
     }
     if Client::connect(path).await.is_ok() {
       return;
@@ -476,10 +480,10 @@ async fn wait_for_socket(path: &Path) {
 }
 
 async fn wait_for_proxy(addr: SocketAddr) {
-  let deadline = std::time::Instant::now() + Duration::from_secs(3);
+  let deadline = std::time::Instant::now() + DAEMON_STARTUP_TIMEOUT;
   loop {
     if std::time::Instant::now() > deadline {
-      panic!("proxy not connectable within 3s: {addr}");
+      panic!("proxy not connectable within {DAEMON_STARTUP_TIMEOUT:?}: {addr}");
     }
     if TcpStream::connect(addr).await.is_ok() {
       return;

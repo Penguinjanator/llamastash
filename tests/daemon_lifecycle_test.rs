@@ -10,6 +10,7 @@ use std::{
 
 use llamastash::daemon::{run_foreground, start_detached_with_exe, DaemonOptions, StartOutcome};
 use llamastash::ipc::Client;
+use llamastash::test_support::DAEMON_STARTUP_TIMEOUT;
 use tokio::time::timeout;
 
 fn unique_temp_dir(label: &str) -> PathBuf {
@@ -28,11 +29,11 @@ fn opts_for(temp: &Path) -> DaemonOptions {
 /// previous run); only a successful round-trip proves the daemon is
 /// actually behind the URL+token we just read.
 async fn wait_for_socket(state_dir: &Path) {
-  let deadline = std::time::Instant::now() + Duration::from_secs(3);
+  let deadline = std::time::Instant::now() + DAEMON_STARTUP_TIMEOUT;
   loop {
     if std::time::Instant::now() > deadline {
       panic!(
-        "daemon did not become connectable within 3s: {}",
+        "daemon did not become connectable within {DAEMON_STARTUP_TIMEOUT:?}: {}",
         state_dir.display()
       );
     }

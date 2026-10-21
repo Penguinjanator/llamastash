@@ -8,6 +8,7 @@
 
 #![cfg(feature = "test-fixtures")]
 
+use llamastash::test_support::DAEMON_STARTUP_TIMEOUT;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -43,7 +44,7 @@ fn unique_temp(label: &str) -> PathBuf {
 }
 
 async fn wait_for_socket(path: &std::path::Path) {
-  let deadline = std::time::Instant::now() + Duration::from_secs(3);
+  let deadline = std::time::Instant::now() + DAEMON_STARTUP_TIMEOUT;
   loop {
     if std::time::Instant::now() > deadline {
       panic!("daemon socket never appeared: {}", path.display());

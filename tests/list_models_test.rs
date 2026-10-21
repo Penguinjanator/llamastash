@@ -10,6 +10,7 @@
 //! `list_models` within ~1 second."
 #![cfg(feature = "test-fixtures")]
 
+use llamastash::test_support::DAEMON_STARTUP_TIMEOUT;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -49,11 +50,11 @@ fn fast_discovery_for(root: &Path) -> DiscoveryOptions {
 }
 
 async fn wait_for_socket(path: &Path) {
-  let deadline = std::time::Instant::now() + Duration::from_secs(3);
+  let deadline = std::time::Instant::now() + DAEMON_STARTUP_TIMEOUT;
   loop {
     if std::time::Instant::now() > deadline {
       panic!(
-        "daemon did not become connectable within 3s: {}",
+        "daemon did not become connectable within {DAEMON_STARTUP_TIMEOUT:?}: {}",
         path.display()
       );
     }
