@@ -31,7 +31,7 @@ fn help_styles() -> Styles {
 #[command(
   name = "llamastash",
   version,
-  about = "Zero-overhead, terminal-native local-LLM orchestrator. Run any engine, any model via the same proxy",
+  about = "Zero-overhead, terminal-native local-LLM orchestrator. Run any engine, any model via the same proxy.",
   long_about = None,
   before_help = BANNER,
   styles = help_styles(),

@@ -2,7 +2,7 @@
 
 ### Changed
 
-- Repositioned as a local-LLM orchestrator. New tagline in the README, `--help`, crates.io and package descriptions: "Zero-overhead, terminal-native local-LLM orchestrator. Run any engine, any model via the same proxy".
+- Repositioned as a local-LLM orchestrator. New tagline in the README, `--help`, crates.io and package descriptions: "Zero-overhead, terminal-native local-LLM orchestrator. Run any engine, any model via the same proxy." Homebrew keeps the first sentence (80-character limit).
 
 ## [0.9.1] — 2026-10-19
 
