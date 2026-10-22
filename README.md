@@ -19,7 +19,7 @@
 
 [![Follow Deepu K Sasidharan on Bluesky](https://img.shields.io/badge/Bluesky-Follow%20deepu105-1185fe?logo=bluesky&logoColor=white)](https://bsky.app/profile/deepu105.bsky.social)
 
-A fast TUI **and** CLI with init wizard for running local LLMs. One Rust binary that's a TUI, a CLI, a daemon, and an OpenAI-compatible proxy. [llama.cpp](https://github.com/ggml-org/llama.cpp) is the direct, zero-overhead default backend (vs raw `llama-server`), plus [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang) for safetensors, and a generic backend that runs any other OpenAI-compatible server you declare in config — [Lemonade](https://github.com/lemonade-sdk/lemonade) for NPU / multi-engine inference, [FastFlowLM](https://github.com/FastFlowLM/FastFlowLM) on AMD XDNA2, [ds4](https://github.com/antirez/ds4) for DeepSeek-V4, whisper.cpp and [others](RECIPES.md). See [benchmarks](docs/benchmarks.md).
+A fast TUI **and** CLI with init wizard for running local LLMs. One Rust binary that's a TUI, a CLI, a daemon, and an OpenAI-compatible proxy. Bring any model and any engine: [llama.cpp](https://github.com/ggml-org/llama.cpp) for GGUFs with zero overhead vs raw `llama-server`, [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang) for safetensors, and a generic backend that runs any other OpenAI-compatible server you declare in config, such as [Lemonade](https://github.com/lemonade-sdk/lemonade) and [FastFlowLM](https://github.com/FastFlowLM/FastFlowLM) on the NPU, [ds4](https://github.com/antirez/ds4) for DeepSeek-V4, gufo, Halogen and whisper.cpp. You don't learn each engine's flags, ports and quirks: LlamaStash manages them all the same way, behind one proxy URL and one TUI, CLI and agent surface. See [Engines](#engines).
 
 ![TUI Gif](https://raw.githubusercontent.com/llamastash/llamastash/main/assets/tui.gif)
 
@@ -30,6 +30,7 @@ A fast TUI **and** CLI with init wizard for running local LLMs. One Rust binary 
 - [Why](#why)
 - [Install](#install)
 - [Quickstart](#quickstart)
+- [Engines](#engines)
 - [Agent Skills](#agent-skills)
 - [Features](#features)
 - [Benchmarks](#benchmarks)
@@ -42,7 +43,7 @@ A fast TUI **and** CLI with init wizard for running local LLMs. One Rust binary 
 
 ## Why
 
-Heavy abstractions (Ollama, LM Studio) hide llama.cpp; raw `llama-server` use is tedious. LlamaStash is a fast, transparent orchestrator that is also a first-class shell-tool surface for agents — one binary, daemon on demand, same primitives in the TUI and the CLI.
+Heavy abstractions (Ollama, LM Studio) hide the engine and tie you to the engines they bundle; running `llama-server`, `vllm serve` or any other engine by hand is tedious. LlamaStash is a fast, transparent orchestrator that runs whichever engine fits each model, and it is also a first-class shell-tool surface for agents — one binary, daemon on demand, same primitives in the TUI and the CLI.
 
 > **AI agents installing this for a user:** jump to [`INSTALL.md` § For AI agents](INSTALL.md#for-ai-agents). The non-interactive install + verify contract, and exit-code branching live there.
 
@@ -136,6 +137,83 @@ llamastash completions fish > ~/.config/fish/completions/llamastash.fish
 
 Full subcommand reference: [`docs/usage.md`](docs/usage.md). Proxy client setup (including an OpenCode example): [`docs/usage.md#opencode-setup`](docs/usage.md#opencode-setup). Tested configs for llama.cpp builds, vLLM, SGLang, gufo, Halogen, ds4, Lemonade, FastFlowLM and whisper.cpp, with model presets: [`RECIPES.md`](RECIPES.md). Architecture and IPC contract: [`docs/architecture.md`](docs/architecture.md). When things go wrong: [`docs/troubleshooting.md`](docs/troubleshooting.md).
 
+## Engines
+
+Any model, any engine, one proxy URL. Every launch gets the same treatment whatever runs it: a reserved port, a readiness probe, the admission gate, proxy routing, the same `start` / `stop` / `status` / `--json` commands, and a row in the TUI. You install the engines you want and LlamaStash drives them. The one exception is `llama-server`, which `llamastash init` can install for you.
+
+| Engine                               | Runs                          | Status          | Turn it on                                          |
+| ------------------------------------ | ----------------------------- | --------------- | --------------------------------------------------- |
+| [llama.cpp](#llamacpp-default)       | any GGUF                      | stable, default | built in; `llamastash init` installs `llama-server` |
+| [Generic](#generic-bring-any-engine) | any OpenAI-compatible server, e.g. Lemonade, FastFlowLM, ds4, gufo, whisper.cpp | stable          | a `backend.generic.servers` entry in `config.yaml`  |
+| [vLLM](#vllm-experimental)           | safetensors HuggingFace repos | experimental    | on when a `vllm` launcher resolves                  |
+| [SGLang](#sglang-experimental)       | safetensors HuggingFace repos | experimental    | on when a `sglang` launcher resolves                |
+
+### llama.cpp (default)
+
+- **Unmodified upstream `llama-server`, no measured overhead** against running it by hand (see [Benchmarks](#benchmarks)). Every GGUF binds to it by default.
+- **Several builds side by side.** List a ROCm, a Vulkan and a CPU build under `backend.llamacpp.servers` and each one is a server you pick per launch or per preset. Recipe: [llama.cpp builds](RECIPES.md#llamacpp-builds).
+- Arch defaults, context auto-fit, MTP, mmproj pairing and device selection are listed under [Features](#features).
+
+### Generic: bring any engine
+
+If an engine speaks the OpenAI API, LlamaStash can run it. A `backend.generic.servers` entry declares the binary (or a wrapper script around `docker run`), its args with `{port}` / `{model}` placeholders, its readiness path, its stop grace and its own knobs. LlamaStash supervises it, admission-gates it and routes the proxy to it like a llama.cpp launch. No Rust code and no LlamaStash release needed.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: gufo # server id: generic-gufo
+        model: Qwen3.8-Flash-Next-UD-Q4_K_XL # catalog GGUF(s) it runs; globs work
+        binary: /path/to/gufo/build/release/gufo
+        args:
+          [
+            serve,
+            --host,
+            "{host}",
+            --port,
+            "{port}",
+            llm,
+            --served-model-name,
+            "{name}",
+            --model,
+            "{model}",
+          ]
+        knobs:
+          - { flag: --context, ctx: true, default: "131072" }
+          - --seed
+        ready: /ready
+        stop_grace_secs: 60
+        rewrite_model: true # gufo answers only to {name}
+```
+
+- **Run a GGUF through another engine.** An entry with `model:` becomes a server option on the matching catalog rows, next to llama.cpp, in the TUI Server row, `--server` and presets. Its knobs show up in the launch editor, presets and last-used like any other.
+- **Or serve models LlamaStash can't see.** An entry without `model:` is its own row, for engines with their own weight format. `rows_from` asks the engine for its installed models and lists one row per model.
+- **Tested engines**, each with a working config in [`RECIPES.md`](RECIPES.md):
+
+| Engine                                                          | Use it for                                                                          | Recipe                                             |
+| --------------------------------------------------------------- | ----------------------------------------------------------------------------------- | -------------------------------------------------- |
+| [Lemonade](https://github.com/lemonade-sdk/lemonade) (`lemond`) | NPU and multi-engine inference behind one server                                    | [Lemonade](RECIPES.md#lemonade)                    |
+| [FastFlowLM](https://github.com/FastFlowLM/FastFlowLM) (`flm`)  | LLMs and Whisper on the AMD XDNA2 NPU                                               | [FastFlowLM](RECIPES.md#fastflowlm-amd-npu)        |
+| [ds4](https://github.com/antirez/ds4) (`ds4-server`)            | DeepSeek-V4 Flash / PRO, with MTP, DSpark, SSD streaming and disk KV cache as knobs | [DeepSeek V4](RECIPES.md#deepseek-v4)              |
+| gufo, Halogen (Docker), CIRU                                    | Qwen3.8 Flash-Next                                                                  | [Qwen3.8 Flash-Next](RECIPES.md#qwen38-flash-next) |
+| whisper.cpp                                                     | speech to text                                                                      | [whisper.cpp](RECIPES.md#whispercpp)               |
+
+Field reference: [`docs/usage.md` § Generic backend](docs/usage.md#generic-backend). ds4 and Lemonade used to be dedicated backends; a generic entry now does the same job with the same argv and speed ([why](docs/plans/2026-10-17-002-refactor-drop-lemonade-backend-plan.md)).
+
+### vLLM (experimental)
+
+- **⚠️ Experimental**: tested with vLLM 0.27.1; behaviour and config may change.
+- **The non-GGUF half of your cache.** Safetensors repos in `~/.cache/huggingface` appear in the catalog and launch through `vllm serve`. A GGUF still binds llama.cpp; vLLM claims safetensors repos only.
+- **Default-on when a `vllm` launcher resolves** (PATH or `backend.vllm.servers`); force with `--vllm` / `LLAMASTASH_VLLM=1`, opt out with `backend.vllm.enabled: false`. Zero footprint when absent. On ROCm, where vLLM ships only as a container, point the config at a small wrapper script: see **[vLLM setup](docs/vllm-setup.md)**.
+- **Nine native knobs** (`--kv-cache-memory-bytes`, `--gpu-memory-utilization`, `--tensor-parallel-size`, `--dtype`, `--kv-cache-dtype`, `--quantization`, `--max-num-seqs`, `--enforce-eager`, `--trust-remote-code`) in the launch picker and presets; `--ctx` maps to `--max-model-len`.
+
+### SGLang (experimental)
+
+- **⚠️ Experimental**: tested with SGLang 0.5.18; behaviour and config may change.
+- **The same rows vLLM serves.** Safetensors repos launch through `sglang serve`; a GGUF still binds llama.cpp. With both engines installed a repo lists both and `auto` picks vLLM; `--backend sglang` selects SGLang.
+- **Default-on when a `sglang` launcher resolves** (PATH or `backend.sglang.servers`); force with `--sglang` / `LLAMASTASH_SGLANG=1`, opt out with `backend.sglang.enabled: false`. Zero footprint when absent. Setup: **[SGLang setup](docs/sglang-setup.md)**.
+- **A token cap, not a byte cap, on unified-memory hosts.** SGLang's only fixed bound on its KV pool is `--max-total-tokens`, so the launcher divides the shared byte budget by the model's KV bytes per token, read from `config.json`. Eight native knobs in the launch picker and presets; `--ctx` maps to `--context-length`.
+
 ## Agent Skills
 
 The CLI ships with an [Agent Skills](https://agentskills.io) manifest so supported agents can load repo-specific instructions for using `llamastash` as a local model-management CLI.
@@ -225,32 +303,6 @@ Full detail per feature in [`FEATURES.md`](FEATURES.md) — including trade-offs
 - [Ollama discovery surface](FEATURES.md#ollama-discovery-surface) — `GET /api/tags` / `/api/version` / `/api/ps`, `POST /api/show` so tools that auto-detect Ollama via `OLLAMA_HOST` recognise llamastash and fall through to the OpenAI-compat endpoints for inference.
 - **Ollama drop-in mode is opt-in.** Enable with `--ollama-compat` (or `proxy.ollama_compat: true` / `LLAMASTASH_OLLAMA_COMPAT=1`) and the proxy claims port `11434`, answers `GET /` with the byte-exact `"Ollama is running"` handshake string, and works as a transparent replacement for the official `ollama` CLI and other Ollama-Go-based clients. Leaving compat off keeps the safe coexistence default (port `11435`, `"LlamaStash is running"` identity).
 - [Loopback by default, opt-in LAN with auth](FEATURES.md#auth-posture) — the proxy binds `127.0.0.1` and runs keyless for the same-machine threat model. Expose it on the LAN with `--proxy-host 0.0.0.0` (or `proxy.host`) and llamastash auto-generates a bearer key, requires it on every request, and refuses to bind a routable address with no key unless you pass `--insecure-no-auth`. TLS is on the roadmap; LAN mode is plaintext for now (trusted network or front with a reverse proxy). The control plane and `llama-server` children always stay loopback.
-
-### [Other engines (NPU, ASR, anything) through the generic backend](docs/usage.md#generic-backend)
-
-- **A `backend.generic.servers` entry runs any OpenAI-compatible server you declare**: its argv, its readiness path, its knobs, its stop grace. Supervised, admission-gated, proxy-routed like llama.cpp.
-- **NPU inference works here.** [Lemonade](https://github.com/lemonade-sdk/lemonade) (`lemond`) runs behind one entry plus one `proxy.aliases` line per model. [FastFlowLM](https://github.com/FastFlowLM/FastFlowLM) (`flm`) runs on AMD XDNA2 as its own entry at 82.9 t/s, no umbrella needed. Recipes: [Lemonade](RECIPES.md#lemonade), [FastFlowLM](RECIPES.md#fastflowlm-amd-npu), [whisper.cpp](RECIPES.md#whispercpp).
-- **You install the engine; LlamaStash drives it.** No auto-install anywhere — LlamaStash launches the binary you point at, polls readiness, routes requests, and stops it on your grace period. The dedicated Lemonade backend that shipped through 0.8.0 is gone; a generic entry does the same job ([why](docs/plans/2026-10-17-002-refactor-drop-lemonade-backend-plan.md)).
-
-### [vLLM — safetensors HuggingFace repos (experimental)](docs/vllm-setup.md)
-
-- **⚠️ Experimental** — tested with vLLM 0.27.1; behaviour and config may change.
-- **The non-GGUF half of your cache.** Safetensors repos sitting in `~/.cache/huggingface` were invisible to LlamaStash before; now they appear in the catalog and launch through `vllm serve`. No competition with llama.cpp — a GGUF still binds llama.cpp, and vLLM claims safetensors repos only.
-- **You install vLLM; LlamaStash drives it.** Default-on when a `vllm` launcher resolves (PATH or `backend.vllm.servers`); force with `--vllm` / `LLAMASTASH_VLLM=1`, opt out with `backend.vllm.enabled: false`. Zero footprint when absent. On ROCm, where vLLM ships only as a container, point the config at a small wrapper script — the recipe is in **[vLLM setup](docs/vllm-setup.md)**.
-- **Nine native knobs** (`--kv-cache-memory-bytes`, `--gpu-memory-utilization`, `--tensor-parallel-size`, `--dtype`, `--kv-cache-dtype`, `--quantization`, `--max-num-seqs`, `--enforce-eager`, `--trust-remote-code`) in the launch picker and presets; `--ctx` maps to `--max-model-len`.
-
-### [SGLang — safetensors HuggingFace repos (experimental)](docs/sglang-setup.md)
-
-- **⚠️ Experimental** — tested with SGLang 0.5.18; behaviour and config may change.
-- **The same rows vLLM serves.** Safetensors repos launch through `sglang serve`; a GGUF still binds llama.cpp. With both engines installed a repo lists both and `auto` picks vLLM — `--backend sglang` selects SGLang.
-- **You install SGLang; LlamaStash drives it.** Default-on when a `sglang` launcher resolves (PATH or `backend.sglang.servers`); force with `--sglang` / `LLAMASTASH_SGLANG=1`, opt out with `backend.sglang.enabled: false`. Zero footprint when absent.
-- **A token cap, not a byte cap, on unified-memory hosts.** SGLang's only deterministic bound on its KV pool is `--max-total-tokens`, so the launcher divides the shared byte budget by the model's KV bytes per token, read from `config.json`. Eight native knobs in the launch picker and presets; `--ctx` maps to `--context-length`.
-
-### [Generic — any OpenAI-compatible server](docs/usage.md#generic-backend)
-
-- **Engines LlamaStash has no backend for.** Declare a binary (or a wrapper script around `docker run`), its args with `{port}` / `{model}` placeholders, its readiness path and its own knobs in `config.yaml`. LlamaStash reserves the port, waits for ready, routes the proxy and stops it with a per-entry grace floor. Works with gufo, Halogen (Docker) and CIRU.
-- **Run a GGUF through another engine.** An entry with `model: "<glob>"` becomes a server option on the matching catalog rows, next to llama.cpp, in the TUI Server row, `--server`, and presets. Its knobs show up in the launch editor, presets and last-used like any other.
-- **ds4 for DeepSeek-V4.** antirez's [ds4](https://github.com/antirez/ds4) (`ds4-server`) runs as a generic entry with its MTP, DSpark, SSD-streaming and disk KV cache flags as knobs. Same argv and speed as the dedicated backend it replaces. See **[Running ds4 as a generic server](RECIPES.md#deepseek-v4)**.
 
 ### [Built to be safe to run](FEATURES.md#built-to-be-safe-to-run)
 
