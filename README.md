@@ -1,5 +1,11 @@
 # LlamaStash
 
+**Zero-overhead, terminal-native local-LLM orchestrator. Run any engine, any model via the same proxy.**
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/llamastash/llamastash/main/assets/logo-h.jpg" alt="Logo" width="50%">
+</p>
+
 ![ci](https://github.com/llamastash/llamastash/actions/workflows/ci.yml/badge.svg)
 ![release](https://github.com/llamastash/llamastash/actions/workflows/release.yml/badge.svg)
 [![crates.io](https://img.shields.io/crates/v/llamastash.svg)](https://crates.io/crates/llamastash)
@@ -10,12 +16,6 @@
 ![Code size](https://img.shields.io/github/languages/code-size/llamastash/llamastash)
 [![Coverage](https://coveralls.io/repos/github/llamastash/llamastash/badge.svg?branch=main)](https://coveralls.io/github/llamastash/llamastash?branch=main)
 [![GitHub stars](https://img.shields.io/github/stars/llamastash/llamastash?style=social)](https://github.com/llamastash/llamastash)
-
-**Zero-overhead, terminal-native local-LLM orchestrator. Run any engine, any model via the same proxy.**
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/llamastash/llamastash/main/assets/logo-h.jpg" alt="Logo" width="50%">
-</p>
 
 [![Follow Deepu K Sasidharan on Bluesky](https://img.shields.io/badge/Bluesky-Follow%20deepu105-1185fe?logo=bluesky&logoColor=white)](https://bsky.app/profile/deepu105.bsky.social)
 
