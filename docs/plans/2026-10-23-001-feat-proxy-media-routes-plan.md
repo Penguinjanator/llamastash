@@ -131,7 +131,11 @@ Shipped as specified. Where the build differs from the plan text:
 - The declared-path hook is `Backend::declared_path_prefix(path, server, request_path)` and reads the config entry rather than a live port: prefixes are config, and the row is already resolved before the hook is asked.
 - A prefix nested inside another is refused only across entries. Nested prefixes inside one entry are that entry's longest-match business, which is how `/internal` and `/internal/deep` coexist on one row.
 - A declared path buffers through `proxy.max_body_size` and, unlike a curated route, never refuses an unparsable body: a body the proxy cannot read names no model and is forwarded as sent.
-- No `/v1/models` change: media modes are informational only, and a dormant media row still prints its inferred hint (`chat`) there. Tracked in `TODO.md`, with the chat routes not being mode-gated, video, `/v1/realtime`, and a media engine's own model list.
+- `/v1/models` publishes a declared media mode. `ModeHint` gained `Image` / `Tts` / `Stt`, so a row for an entry with `modes: [stt]` prints `stt` rather than `chat`; the three hints resolve to a chat launch and carry no Ollama capabilities, which is what keeps them routing-only.
+- A declared path resolves dot segments before it matches anything (`src/util/http_path.rs`), including the `%2e` spellings a URL parser would decode, and forwards the resolved path rather than what the client wrote. A configured prefix containing a dot segment is refused at load. Without this, `/internal/../metrics` reached the metrics endpoint beside a declared `/internal`.
+- A declared path rewrites nothing at all, not even the launch's own `rewrite_model` pin: `forward::Target::pin_request_model` is off there. The pin is the entry's contract on the OpenAI routes, not a licence over the engine's own API bodies.
+- The declared-path lookup skips every row for a backend that declares no paths, so an unlisted path costs a config flag and a row scan instead of a backend resolution and an identity probe per row.
+- Tracked in `TODO.md`: the chat routes are not mode-gated, video, `/v1/realtime`, a media engine's own model list, and built-in engines claiming a media mode.
 - The `TODO.md` strike the plan called for (an unlisted path prefix item) is not in the file; nothing needed striking for U2.
 
 ## Definition of done
