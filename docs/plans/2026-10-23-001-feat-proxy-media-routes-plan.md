@@ -101,6 +101,25 @@ Before finishing:
 
 The pre-commit hook runs fmt + lint + doc on each commit.
 
+Result (2026-10-23): `make lint`, `cargo nextest run --features test-fixtures`
+(3396 tests) and `cargo test --doc --features test-fixtures` pass on the branch
+tip. Beyond the suite, the real binary against a real third-party engine
+(python's `http.server` as the generic entry) confirmed the shapes end to end:
+`GET /inference` and `/inference?task=asr` answered from the engine with the
+entry auto-started, `POST /v1/audio/transcriptions -F model=whisper-1` came
+back `x-llamastash-served-by: httpbin` with `x-llamastash-fallback-reason:
+mode_match`, an undeclared `/static` 404s, and `llamastash requests` files the
+two under `/inference` and `audio/transcriptions`.
+
+New tests: multipart field parse and rewrite (`src/util/multipart_body.rs`),
+`endpoint_mode`, the media modes being the declared-only ones (`src/launch/mode.rs`),
+the declared-route config refusals (`src/backend/generic/config.rs`), and in
+`tests/generic_backend_test.rs`: media routes forwarding multipart and JSON with
+auto-start, mode fallback with the rewrite and its header, a mode mismatch
+refused before any launch, a model-less media request, and a declared prefix
+reaching its engine (query kept, unparsable body forwarded, log filed under the
+prefix, undeclared paths 404).
+
 ## Implementation notes
 
 Shipped as specified. Where the build differs from the plan text:
