@@ -519,23 +519,25 @@ _Shared context: `src/cli/` and `src/ipc/methods.rs` for the start and wait-for-
 
 - [x] ~~`llamastash session claude|pi|codex|opencode` should launch the harness with active model or with an optional model arg (an alias or model name or model name@preset)~~ — done: `llamastash session <tool> [model]` covers `claude`, `codex`, `opencode`, `pi` and `aider`. With no MODEL it takes the newest live chat launch; a MODEL (alias, reference, or `model@preset`) is started and waited for if it is not up. Each tool's settings go in per-run (env, `-c` overrides, `OPENCODE_CONFIG_CONTENT`, a generated pi extension, Aider env), so no tool config is written, and `--` passes args through. Plan: [`docs/plans/2026-10-18-002-feat-session-launcher-plan.md`](docs/plans/2026-10-18-002-feat-session-launcher-plan.md).
 
-## Next
+## R17 (v0.10.0 checklist)
 
 - [x] ~~Show cache hit on request rows as well~~ — done: each row carries its own `cache_hit_ratio` (`cached_tokens` over its own `prompt_tokens`), shown as `CACHE` between `In` and `Out` in the TUI, the `requests` table, and the row JSON. It ranks below both token counts, so it is the first of the token figures to drop when the pane narrows.
 - [ ] audio/tts/video/etc support on proxy, support all common paths
-
-### Batch 2: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
-
-- [ ] Keep a model's prompt cache across an unload
-- [ ] Warm the page cache before a load (`llamastash warm <model>`)
 
 ### Batch 4: `proxy.aliases` visibility and coverage
 
 _Shared context: Alias resolution in the proxy, the `/v1/models` and `/api/tags` rows, `status --json`, `list --json`, `doctor`._
 
-- [ ] An alias of a vLLM model gets vLLM's `404` (`NotFoundError`): the proxy forwards the client's `model` unchanged and vLLM answers only to the `--served-model-name` it was given (seen on 0.27.1, 2026-10-15). vLLM takes several served names, so the backend could pass the aliases that name the model, or rewrite `body.model` through `Backend::rewrite_request_body` the way a generic entry's `rewrite_model` does. `docs/usage.md` and `docs/vllm-setup.md` say an alias does not reach vLLM today.
-- [ ] A `proxy.aliases` entry is invisible to an agent until a client hits it: nothing in `status --json`, `list --json` or `doctor` shows the table or which of its entries name no model, so the only signal is one daemon log line per problem on first use. Wants a read-only surface and a validity check run after the first scan at startup the catalog is empty, so every target would look dead. The two listings now publish every alias that can route, which covers the client's half; this is the operator's.
+- [ ] An alias of a vLLM model gets vLLM's `404` (`NotFoundError`): the proxy forwards the client's `model` unchanged and vLLM answers only to the `--served-model-name` it was given (seen on 0.27.1, 2026-10-15). vLLM takes several served names, so the backend could pass the aliases that name the model, or rewrite `body.model` through `Backend::rewrite_request_body` the way a generic entry's `rewrite_model` does. `docs/usage.md` and `docs/vllm-setup.md` say an alias does not reach vLLM today. Make a config in vLLM backend config to enable model rewrite.
+- [ ] A `proxy.aliases` entry is invisible to an agent until a client hits it: nothing in `status --json`, `list --json` or `doctor` shows the table or which of its entries name no model, so the only signal is one daemon log line per problem on first use. Wants a read-only surface and a validity check run after the first scan at startup the catalog is empty, so every target would look dead. The two listings now publish every alias that can route, which covers the client's half; this is the operator's. Show aliases in `list --json`.
 - [ ] Three claims about the alias rows in `/v1/models` and `/api/tags` have no test behind them: an alias whose target two models answer to (the `ambiguous_model` refusal that keeps it out of the listing), the `mode` field an alias row inherits from the model it names, and that a listing never spends the once-per-name alias warnings real requests need. The case-only shadow (`Qwen3` id beside a `qwen3` alias) is pinned in both listings.
+
+## Next
+
+### Batch 2: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
+
+- [ ] Keep a model's prompt cache across an unload
+- [ ] Warm the page cache before a load (`llamastash warm <model>`)
 
 ### Batch 8: Test-helper consolidation
 
