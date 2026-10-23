@@ -140,6 +140,20 @@ pub async fn fetch_catalog(client: &mut Client) -> Result<Vec<CatalogRow>, CliEx
   )
 }
 
+/// The `proxy.aliases` table as the daemon audits it: one `{name, target, state}`
+/// row per entry, in the order the config lists them. Best-effort like
+/// [`fetch_status`] — a daemon that cannot answer leaves the list empty rather
+/// than failing the listing, and one with no `proxy.aliases` configured answers
+/// `[]`.
+pub async fn fetch_alias_rows(client: &mut Client) -> Vec<Value> {
+  client
+    .call("proxy_aliases", None)
+    .await
+    .ok()
+    .and_then(|body| body.get("aliases").and_then(Value::as_array).cloned())
+    .unwrap_or_default()
+}
+
 /// Find a catalog row that matches `reference`. Disambiguation rules
 /// (in order):
 /// 1. exact canonical-path match,

@@ -417,7 +417,10 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
     .with_external(external_combined)
     .with_proxy_status(std::sync::Arc::clone(&proxy_status_cell))
     .with_preload(opts.preload.clone())
-    .with_backend(opts.backend.clone(), opts.backend_force.clone());
+    .with_backend(opts.backend.clone(), opts.backend_force.clone())
+    // One table for the whole daemon: the proxy routes through it, the
+    // `proxy_aliases` handler audits it, and both share its warn set.
+    .with_aliases(&opts.proxy.aliases);
   if opts.binary.is_none() {
     log::info!(
       "daemon started without the default server binary; only backends with their own binary can launch"
@@ -549,7 +552,6 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
         opts.proxy.fallback_enabled,
         opts.proxy.api_key.clone(),
         opts.proxy.max_body_size,
-        &opts.proxy.aliases,
       );
       let token_for_proxy = token.clone();
       let status_for_proxy = std::sync::Arc::clone(&proxy_status_cell);
@@ -667,6 +669,18 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
     let preload_token = token.clone();
     supervisor::spawn_supervised("daemon_preload", async move {
       preload::run(preload_ctx, preload_entries, preload_token).await;
+    });
+  }
+
+  // 8f. One report of the `proxy.aliases` entries that cannot route. It waits
+  // for the first catalog row, because at this point the catalog may still be
+  // empty and every target would read dead. Same table the proxy answers from,
+  // so a name reported here is quiet on the first request for it, and a name
+  // the pass never reached still gets its line from that request.
+  {
+    let alias_ctx = ctx.clone();
+    supervisor::spawn_supervised("proxy_alias_audit", async move {
+      proxy::alias::audit_after_first_scan(&alias_ctx).await;
     });
   }
 

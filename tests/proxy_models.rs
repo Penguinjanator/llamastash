@@ -93,7 +93,7 @@ async fn proxy_state_with_models(models: Vec<DiscoveredModel>) -> Arc<ProxyState
 }
 
 /// Like [`proxy_state_with_models`] with a `proxy.aliases` table, the way the
-/// daemon hands it to `from_context_with_auth`.
+/// daemon hands it to the context behind `from_context_with_auth`.
 async fn proxy_state_with_aliases(
   models: Vec<DiscoveredModel>,
   aliases: &[(&str, &str)],
@@ -108,7 +108,13 @@ async fn proxy_state_with_aliases(
       .iter()
       .map(|(name, target)| (name.to_string(), target.to_string())),
   );
-  ProxyState::from_context_with_auth(&ctx, false, true, None, DEFAULT_BODY_LIMIT_BYTES, &aliases)
+  ProxyState::from_context_with_auth(
+    &ctx.with_aliases(&aliases),
+    false,
+    true,
+    None,
+    DEFAULT_BODY_LIMIT_BYTES,
+  )
 }
 
 // --- direct-listener tests ----------------------------------------------

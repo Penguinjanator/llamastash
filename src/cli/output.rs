@@ -286,7 +286,19 @@ pub(crate) fn display_size(row: &CatalogRow) -> String {
 /// against this, so column drift requires deliberate intent. Wrapped
 /// in `{"models": [...]}` so every CLI `--json` surface lives behind
 /// the same "always object at the root" rule.
-pub fn list_json(rows: &[CatalogRow], running: &HashMap<String, Vec<RunningRow>>) -> Value {
+/// JSON projection of `list`: the catalog rows the daemon published, the
+/// running state of each, and the `proxy.aliases` table as the catalog answers
+/// it (`[]` when none is configured, like every other `--json` key).
+///
+/// `aliases` rows are the daemon's `proxy_aliases` objects, passed through
+/// verbatim — `{name, target, state}`, where `state` is `ok` or the reason the
+/// name cannot route. The audit is the daemon's, so `list --json` and a raw IPC
+/// client read one rule.
+pub fn list_json(
+  rows: &[CatalogRow],
+  running: &HashMap<String, Vec<RunningRow>>,
+  aliases: &[Value],
+) -> Value {
   let arr: Vec<Value> = rows
     .iter()
     .map(|r| {
@@ -312,7 +324,7 @@ pub fn list_json(rows: &[CatalogRow], running: &HashMap<String, Vec<RunningRow>>
       row
     })
     .collect();
-  serde_json::json!({"models": arr})
+  serde_json::json!({"models": arr, "aliases": aliases})
 }
 
 /// One live launch as the nested `status` / `launches[]` object: the keys
@@ -1155,7 +1167,7 @@ mod tests {
   #[test]
   fn list_json_wraps_rows_in_models_object_with_documented_keys() {
     let rows = vec![row("qwen", "qwen2", "Q4_K", 8192)];
-    let v = list_json(&rows, &HashMap::new());
+    let v = list_json(&rows, &HashMap::new(), &[]);
     let arr = v
       .get("models")
       .and_then(|m| m.as_array())
@@ -1197,12 +1209,33 @@ mod tests {
       r.get("multimodal").is_some(),
       "multimodal key present (null when absent)"
     );
+    // `aliases` is always present, like every other `--json` key, so a consumer
+    // never has to tell "no aliases" from "older daemon".
+    assert_eq!(
+      v.get("aliases"),
+      Some(&serde_json::json!([])),
+      "`aliases` is an empty array when nothing is configured"
+    );
+  }
+
+  #[test]
+  fn list_json_passes_the_alias_audit_through_unchanged() {
+    // The audit is the daemon's, so the CLI must not re-shape it: the three keys
+    // an agent pins are `name`, `target` and `state`.
+    let aliases = vec![serde_json::json!({
+      "name": "gpt-4o-mini",
+      "target": "qwen3",
+      "state": "ok",
+    })];
+    let v = list_json(&[], &HashMap::new(), &aliases);
+    assert_eq!(v.get("aliases"), Some(&serde_json::json!(aliases)));
+    assert_eq!(v["aliases"][0]["state"], "ok");
   }
 
   #[test]
   fn list_json_empty_catalog_returns_empty_models_array() {
-    let v = list_json(&[], &HashMap::new());
-    assert_eq!(v, serde_json::json!({"models": []}));
+    let v = list_json(&[], &HashMap::new(), &[]);
+    assert_eq!(v, serde_json::json!({"models": [], "aliases": []}));
   }
 
   #[test]
@@ -1218,20 +1251,20 @@ mod tests {
     let mut idx = HashMap::new();
     idx.insert(path.to_string(), vec![pinned]);
     assert_eq!(
-      list_json(&rows, &idx)["models"][0]["status"]["device"],
+      list_json(&rows, &idx, &[])["models"][0]["status"]["device"],
       serde_json::json!("ROCm0")
     );
 
     let mut all_gpu = HashMap::new();
     all_gpu.insert(path.to_string(), vec![running("L1", "ready", 41100, path)]);
     assert_eq!(
-      list_json(&rows, &all_gpu)["models"][0]["status"]["device"],
+      list_json(&rows, &all_gpu, &[])["models"][0]["status"]["device"],
       Value::Null,
       "no override serialises as null, not the human `all`"
     );
 
     // No supervisor → no `status` object at all (unchanged).
-    assert!(list_json(&rows, &HashMap::new())["models"][0]
+    assert!(list_json(&rows, &HashMap::new(), &[])["models"][0]
       .get("status")
       .is_none());
   }
@@ -1268,7 +1301,7 @@ mod tests {
     // BLAKE3 column.
     let mut r = row("qwen", "qwen2", "Q4_K", 8192);
     r.model_id = None;
-    let v = list_json(&[r], &HashMap::new());
+    let v = list_json(&[r], &HashMap::new(), &[]);
     let row_v = v["models"][0].clone();
     assert!(
       row_v.get("model_id").is_none(),
@@ -1862,7 +1895,7 @@ mod tests {
     let mut idx = HashMap::new();
     idx.insert(path.to_string(), vec![coder, writer]);
 
-    let v = list_json(&rows, &idx);
+    let v = list_json(&rows, &idx, &[]);
     let launches = v["models"][0]["launches"]
       .as_array()
       .expect("every live launch is listed");

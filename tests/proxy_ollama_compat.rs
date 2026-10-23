@@ -138,8 +138,8 @@ async fn proxy_state_with_models(models: Vec<DiscoveredModel>) -> Arc<ProxyState
 
 /// One build seam for every state in this file: the catalog, the optional
 /// supervisor registry, Ollama drop-in mode, and the `proxy.aliases` table the
-/// daemon hands `from_context_with_auth` in production. The wrappers below are
-/// what the tests call.
+/// daemon puts on the context behind `from_context_with_auth`. The wrappers
+/// below are what the tests call.
 async fn build_state(
   models: Vec<DiscoveredModel>,
   registry: Option<SupervisorRegistry>,
@@ -161,12 +161,11 @@ async fn build_state(
       .map(|(name, target)| (name.to_string(), target.to_string())),
   );
   ProxyState::from_context_with_auth(
-    &ctx,
+    &ctx.with_aliases(&aliases),
     ollama_compat,
     true,
     None,
     DEFAULT_BODY_LIMIT_BYTES,
-    &aliases,
   )
 }
 

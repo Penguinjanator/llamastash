@@ -4,6 +4,7 @@
 
 - Each request row now reports its own KV-cache hit: a `Cache` column between `In` and `Out` in the TUI and the `llamastash requests` table, and `cache_hit_ratio` on the row JSON. It drops before both token counts when the pane narrows.
 - `backend.vllm.rewrite_model` answers a vLLM launch with the name it was served, so a `proxy.aliases` name for a vLLM model reaches the model instead of vLLM's `404`.
+- `llamastash list --json` carries the `proxy.aliases` table under `aliases`, every entry read `ok` or the reason it cannot route, so a dead alias shows up without a client having to send it.
 
 
 ## [0.9.1] — 2026-10-19

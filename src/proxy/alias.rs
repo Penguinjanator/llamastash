@@ -15,6 +15,40 @@
 use std::collections::HashSet;
 use std::sync::RwLock;
 
+use serde::Serialize;
+
+use crate::launch::resolve::{CatalogRow, ResolveError};
+
+/// What one `proxy.aliases` entry means against the catalog right now, as the
+/// operator sees it in `llamastash list --json`.
+///
+/// Every state but [`AliasState::Ok`] is a name that cannot route, for the one
+/// reason [`crate::proxy::router`] refuses it, so the audit, the two listings
+/// and the daemon's own warning lines never disagree about what is broken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AliasState {
+  /// The value names exactly one model, so the alias answers.
+  Ok,
+  /// A real model owns the name, so the alias never answers and the model does.
+  Shadowed,
+  /// The value names no model, outright or as a partial match.
+  Dead,
+  /// Two or more models answer to the value; naming one is the operator's call.
+  Ambiguous,
+  /// The value is another alias name, so the chain reaches no model.
+  Chain,
+}
+
+/// One audited entry: the client's name, the reference it points at, and why it
+/// can or cannot route.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct AliasIssue {
+  pub(crate) name: String,
+  pub(crate) target: String,
+  pub(crate) state: AliasState,
+}
+
 /// Client name → model reference, plus the warnings already logged about it.
 ///
 /// One table per daemon, held behind an `Arc` because `ProxyState` derives
@@ -99,6 +133,77 @@ impl AliasTable {
   /// alias.
   pub(crate) fn target(&self, requested: &str) -> Option<&str> {
     self.lookup(requested).map(|(_, target)| target.as_str())
+  }
+
+  /// `true` when no alias is configured, which is the common case and the one
+  /// with nothing to audit.
+  pub(crate) fn is_empty(&self) -> bool {
+    self.targets.is_empty()
+  }
+
+  /// Every entry in config order, judged against `cat`. This is the operator's
+  /// half of the same decisions the listings make per request: a row here
+  /// reads not `ok` exactly when `/v1/models` and `/api/tags` leave it out and
+  /// a request under that name cannot be served. It asks only what the
+  /// listings' own pass over the table asks, so a listing and an audit answer
+  /// with one rule.
+  pub(crate) fn audit(&self, cat: &[CatalogRow]) -> Vec<AliasIssue> {
+    self
+      .targets
+      .iter()
+      .map(|(name, target)| AliasIssue {
+        name: name.clone(),
+        target: target.clone(),
+        state: self.state_of(cat, name, target),
+      })
+      .collect()
+  }
+
+  /// The one judgement behind [`Self::audit`]: the name first, because a model
+  /// that owns it answers instead of the alias, then the value the way a
+  /// request would.
+  fn state_of(&self, cat: &[CatalogRow], name: &str, target: &str) -> AliasState {
+    if crate::launch::resolve::resolve_exact_reference(cat, name).is_ok() {
+      return AliasState::Shadowed;
+    }
+    match crate::launch::resolve::resolve_exact_reference(cat, target) {
+      Ok(_) => AliasState::Ok,
+      Err(ResolveError::Many(_)) => AliasState::Ambiguous,
+      // Nothing owns the value outright. It is either another alias name, which
+      // reaches no model, or it names nothing at all.
+      Err(ResolveError::None | ResolveError::Empty) => {
+        if self.target(target).is_some() {
+          AliasState::Chain
+        } else {
+          AliasState::Dead
+        }
+      }
+    }
+  }
+
+  /// Say everything in the table that cannot route, once per name and kind.
+  ///
+  /// These are the same once-per-name reports a request would spend, so the
+  /// startup pass cannot double-log and the first request for a name the pass
+  /// already named stays quiet — the operator already has the line.
+  pub(crate) fn warn_unroutable(&self, cat: &[CatalogRow]) {
+    for issue in self.audit(cat) {
+      match issue.state {
+        AliasState::Ok => {}
+        AliasState::Shadowed => {
+          self.warn_shadowed(&issue.name);
+        }
+        AliasState::Ambiguous => {
+          self.warn_ambiguous_target(&issue.name, &issue.target);
+        }
+        AliasState::Dead => {
+          self.warn_dead_target(&issue.name, &issue.target);
+        }
+        AliasState::Chain => {
+          self.warn_points_at_alias(&issue.name, &issue.target);
+        }
+      }
+    }
   }
 
   /// The entry a client's string means, if it means one at all. Nearly every
@@ -216,6 +321,34 @@ impl AliasTable {
       .map(|mut seen| seen.insert(key))
       .unwrap_or(false)
   }
+}
+
+/// How long the startup audit waits for a catalog to have a row in it, and how
+/// often it looks. The first scan runs as the daemon comes up, so this is a
+/// ceiling for a slow scan root rather than a typical wait.
+const AUDIT_CATALOG_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+const AUDIT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Report the alias table once, as soon as there is a catalog to judge it
+/// against.
+///
+/// At daemon start the catalog is empty and every target would read `dead`, so
+/// the pass waits for the first row. It is bounded and it runs once: a scan
+/// root that discovers nothing is a valid configuration, and an alias that
+/// goes unreported there still gets its line from the first real request.
+pub(crate) async fn audit_after_first_scan(ctx: &crate::daemon::context::MethodContext) {
+  if ctx.aliases.is_empty() {
+    return;
+  }
+  let deadline = std::time::Instant::now() + AUDIT_CATALOG_WAIT;
+  while ctx.catalog.len().await == 0 && std::time::Instant::now() < deadline {
+    tokio::time::sleep(AUDIT_POLL).await;
+  }
+  if ctx.catalog.len().await == 0 {
+    return;
+  }
+  let (_snap, cat) = ctx.catalog.shared_pair().await;
+  ctx.aliases.warn_unroutable(&cat);
 }
 
 #[cfg(test)]
@@ -396,5 +529,148 @@ mod tests {
     let t = AliasTable::from_config(&crate::config::ProxyAliases::default());
     assert_eq!(t.target("anything"), None);
     assert!(!t.warn_shadowed("anything"));
+  }
+
+  /// Rows in the shape the catalog hands the resolver: `path` and
+  /// `display_label` are all the rungs here read.
+  fn cat(paths: &[&str]) -> Vec<CatalogRow> {
+    paths
+      .iter()
+      .map(|p| CatalogRow::for_resolution(p.to_string(), None, None))
+      .collect()
+  }
+
+  /// One row per entry, in config order, each carrying the reason it can or
+  /// cannot route. `/one/a/dup.gguf` and `/two/a/dup.gguf` share the qualified
+  /// id `a/dup`, so two models answer to it and only the operator can pick.
+  #[test]
+  fn audit_gives_every_entry_its_state_in_config_order() {
+    let t = table(&[
+      ("gpt-4o-mini", "qwen3"),
+      ("llama", "nowhere"),
+      ("hardwired", "gpt-4o-mini"),
+      ("qwen3", "llama"),
+      ("dual", "a/dup"),
+    ]);
+    let audit = t.audit(&cat(&[
+      "/m/qwen3.gguf",
+      "/one/a/dup.gguf",
+      "/two/a/dup.gguf",
+    ]));
+    let states: Vec<(&str, &str, AliasState)> = audit
+      .iter()
+      .map(|i| (i.name.as_str(), i.target.as_str(), i.state))
+      .collect();
+    assert_eq!(
+      states,
+      vec![
+        ("gpt-4o-mini", "qwen3", AliasState::Ok),
+        ("llama", "nowhere", AliasState::Dead),
+        ("hardwired", "gpt-4o-mini", AliasState::Chain),
+        ("qwen3", "llama", AliasState::Shadowed),
+        ("dual", "a/dup", AliasState::Ambiguous),
+      ],
+      "one row per entry, each with the reason it can or cannot route"
+    );
+  }
+
+  /// An audit only reads, so the once-per-name line a real request still owes
+  /// is unspent afterwards. A listing that printed a problem and silently
+  /// collected the warning would leave the operator with neither.
+  #[test]
+  fn an_audit_leaves_every_report_unspent() {
+    let t = table(&[
+      ("gpt-4o-mini", "qwen3"),
+      ("llama", "nowhere"),
+      ("hardwired", "gpt-4o-mini"),
+    ]);
+    let cat = cat(&["/m/qwen3.gguf"]);
+    assert_eq!(t.audit(&cat).len(), 3);
+    assert!(
+      t.warn_dead_target("llama", "nowhere"),
+      "the audit must not spend the dead-target line"
+    );
+    assert!(
+      t.warn_points_at_alias("hardwired", "gpt-4o-mini"),
+      "nor the chain one"
+    );
+    assert!(
+      t.report_pending("gpt-4o-mini", REPORT_PARTIAL),
+      "and a routable name has nothing reported at all"
+    );
+  }
+
+  /// The startup pass says each unroutable name once, and spends the report a
+  /// later request for the same alias would otherwise make: the operator has the
+  /// line either way, and a second pass adds nothing.
+  #[test]
+  fn the_startup_pass_says_each_unroutable_name_once() {
+    let t = table(&[
+      ("gpt-4o-mini", "qwen3"),
+      ("llama", "nowhere"),
+      ("hardwired", "gpt-4o-mini"),
+    ]);
+    let cat = cat(&["/m/qwen3.gguf"]);
+    t.warn_unroutable(&cat);
+    assert!(
+      !t.warn_dead_target("llama", "nowhere"),
+      "the pass already said the dead target"
+    );
+    assert!(
+      !t.warn_points_at_alias("hardwired", "gpt-4o-mini"),
+      "and the chain"
+    );
+    t.warn_unroutable(&cat);
+    assert!(
+      t.report_pending("gpt-4o-mini", REPORT_PARTIAL),
+      "a routable alias keeps its own reports"
+    );
+  }
+
+  fn discovered_at(path: &str) -> crate::discovery::DiscoveredModel {
+    let p = std::path::PathBuf::from(path);
+    crate::discovery::DiscoveredModel {
+      parent: p
+        .parent()
+        .unwrap_or(std::path::Path::new("/"))
+        .to_path_buf(),
+      path: p,
+      source: crate::discovery::ModelSource::UserPath,
+      metadata: Some(crate::test_support::fake_metadata("llama")),
+      parse_error: None,
+      split_siblings: Vec::new(),
+      display_label: None,
+      multimodal: None,
+      supported_backends: Vec::new(),
+      mtp_head: None,
+    }
+  }
+
+  /// A catalog that already has a row is the case the wait exists for: with
+  /// nothing to judge against every target would read dead, and with a row the
+  /// pass reports straight away.
+  #[tokio::test]
+  async fn the_startup_pass_reports_once_a_catalog_row_exists() {
+    let catalog = crate::discovery::ModelCatalog::new();
+    catalog.upsert(discovered_at("/m/qwen3.gguf")).await;
+    let ctx = crate::daemon::context::MethodContext::with_catalog(
+      crate::daemon::shutdown::ShutdownToken::new(),
+      catalog,
+    )
+    .with_aliases(&crate::config::ProxyAliases::from_pairs(vec![
+      ("gpt-4o-mini".to_string(), "qwen3".to_string()),
+      ("llama".to_string(), "nowhere".to_string()),
+    ]));
+
+    super::audit_after_first_scan(&ctx).await;
+
+    assert!(
+      !ctx.aliases.warn_dead_target("llama", "nowhere"),
+      "the pass reported the dead alias, so the first request for it stays quiet"
+    );
+    assert!(
+      ctx.aliases.report_pending("gpt-4o-mini", REPORT_PARTIAL),
+      "the alias that routes was not reported"
+    );
   }
 }

@@ -130,6 +130,11 @@ pub struct MethodContext {
   /// configured" from "preload has nothing to start"; the entries themselves are
   /// what [`crate::daemon::preload`] resolved against the catalog at boot.
   pub preload: Arc<Vec<String>>,
+  /// `proxy.aliases`: client names that stand in for a local model. Built once
+  /// from `config.yaml` and shared with the proxy (see
+  /// [`crate::proxy::alias`]), so a problem with a name is reported once for the
+  /// whole daemon — by the startup pass or by the first request, never by both.
+  pub(crate) aliases: std::sync::Arc<crate::proxy::alias::AliasTable>,
 }
 
 /// Wrapper around the in-memory `DaemonState` plus the directory
@@ -300,7 +305,16 @@ impl MethodContext {
       backend_force: std::collections::BTreeMap::new(),
       admission: Arc::new(crate::launch::admission::Ledger::default()),
       preload: Arc::new(Vec::new()),
+      aliases: std::sync::Arc::new(crate::proxy::alias::AliasTable::default()),
     }
+  }
+
+  /// Builder helper: install the `proxy.aliases` table. One table per daemon,
+  /// read by the proxy and by the `proxy_aliases` handler alike, so they share
+  /// one warn set rather than each starting a fresh one.
+  pub fn with_aliases(mut self, aliases: &crate::config::ProxyAliases) -> Self {
+    self.aliases = Arc::new(crate::proxy::alias::AliasTable::from_config(aliases));
+    self
   }
 
   /// Builder helper: record the `daemon.preload:` list the daemon was started

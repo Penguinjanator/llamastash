@@ -444,7 +444,7 @@ fn resolve_reference(
 ) -> Result<ResolvedRef, ClientRefMiss> {
   match crate::launch::resolve::resolve_exact_reference(rows, reference) {
     Ok(row) => {
-      state.aliases.warn_shadowed(reference);
+      state.ctx.aliases.warn_shadowed(reference);
       return Ok(ResolvedRef::plain(row));
     }
     // No outright model under this name, so an alias of it is next. A name two
@@ -453,7 +453,7 @@ fn resolve_reference(
     Err(ResolveError::Empty) => return Err(ClientRefMiss::NotFound),
   }
 
-  if let Some(target) = state.aliases.target(reference) {
+  if let Some(target) = state.ctx.aliases.target(reference) {
     return resolve_aliased_reference(state, rows, reference, target);
   }
 
@@ -483,8 +483,8 @@ fn resolve_aliased_reference(
     // said rather than the generic line: it is another alias name, so the chain
     // reaches nothing, or several models answer to it once the rungs loosen.
     Err(ResolveError::None | ResolveError::Empty) => {
-      if state.aliases.target(target).is_some() {
-        state.aliases.warn_points_at_alias(reference, target);
+      if state.ctx.aliases.target(target).is_some() {
+        state.ctx.aliases.warn_points_at_alias(reference, target);
         return Err(ClientRefMiss::NotFound);
       }
       match resolve_model_with_candidates(rows, target) {
@@ -492,7 +492,7 @@ fn resolve_aliased_reference(
           Err(aliased_ambiguous(state, rows, reference, target, err))
         }
         _ => {
-          state.aliases.warn_dead_target(reference, target);
+          state.ctx.aliases.warn_dead_target(reference, target);
           Err(ClientRefMiss::NotFound)
         }
       }
@@ -510,7 +510,7 @@ fn aliased_ambiguous(
   target: &str,
   error: ResolveError,
 ) -> ClientRefMiss {
-  state.aliases.warn_ambiguous_target(reference, target);
+  state.ctx.aliases.warn_ambiguous_target(reference, target);
   client_miss(rows, error)
 }
 
@@ -538,6 +538,7 @@ fn note_moved_partial(
   row: &CatalogRow,
 ) {
   if !state
+    .ctx
     .aliases
     .report_pending(reference, super::alias::REPORT_PARTIAL)
   {
@@ -546,6 +547,7 @@ fn note_moved_partial(
   if let Ok(other) = resolve_model_with_candidates(rows, reference) {
     if other.path != row.path {
       state
+        .ctx
         .aliases
         .warn_moved_partial(reference, target, &other.name());
     }

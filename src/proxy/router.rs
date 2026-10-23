@@ -522,7 +522,7 @@ fn alias_rows<'a>(
   snap: &'a [DiscoveredModel],
 ) -> Vec<(String, &'a DiscoveredModel)> {
   let mut out: Vec<(String, &DiscoveredModel)> = Vec::new();
-  for (name, target) in state.aliases.pairs() {
+  for (name, target) in state.ctx.aliases.pairs() {
     if crate::launch::resolve::resolve_exact_reference(cat, name).is_ok() {
       continue;
     }

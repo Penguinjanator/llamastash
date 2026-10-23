@@ -8,7 +8,9 @@ use crate::cli::cli_args::{Cli, ListArgs};
 use crate::cli::client::connect_or_spawn;
 use crate::cli::exit_codes::CliResult;
 use crate::cli::output::{filter_rows, list_human, list_json, pretty_json};
-use crate::cli::resolve::{fetch_catalog, fetch_status, multi_device, running_index};
+use crate::cli::resolve::{
+  fetch_alias_rows, fetch_catalog, fetch_status, multi_device, running_index,
+};
 use crate::config::Config;
 
 pub async fn handle(args: ListArgs, cli: &Cli, config: &Config) -> CliResult {
@@ -26,7 +28,8 @@ pub async fn handle(args: ListArgs, cli: &Cli, config: &Config) -> CliResult {
     Err(_) => (Default::default(), false),
   };
   if args.json {
-    println!("{}", pretty_json(&list_json(&rows, &running)));
+    let aliases = fetch_alias_rows(&mut client).await;
+    println!("{}", pretty_json(&list_json(&rows, &running, &aliases)));
   } else {
     print!("{}", list_human(&rows, &running, multi_dev));
   }

@@ -154,8 +154,9 @@ async fn proxy_state_with(
 }
 
 /// One build seam for every state in this file: the catalog, the registry it is
-/// served from, the `proxy.max_body_size` cap, and the `proxy.aliases` table. The
-/// daemon hands all of these to `from_context_with_auth`; the wrappers below are
+/// served from, the `proxy.max_body_size` cap, and the `proxy.aliases` table,
+/// which the daemon puts on the context the state reads. The
+/// daemon hands all of these over the same way; the wrappers below are
 /// what the tests call.
 async fn build_state(
   models: Vec<DiscoveredModel>,
@@ -174,8 +175,9 @@ async fn build_state(
       .iter()
       .map(|(name, target)| (name.to_string(), target.to_string())),
   );
+  let ctx = ctx.with_aliases(&aliases);
   (
-    ProxyState::from_context_with_auth(&ctx, false, true, None, max_body_size, &aliases),
+    ProxyState::from_context_with_auth(&ctx, false, true, None, max_body_size),
     ctx,
   )
 }

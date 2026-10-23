@@ -85,12 +85,6 @@ pub struct ProxyState {
   /// the check (no cap). Set once at daemon startup; never mutated
   /// thereafter.
   pub(crate) max_body_size: usize,
-  /// `proxy.aliases`: client names that stand in for a local model. Built
-  /// once at daemon startup from `config.yaml`; read-only thereafter. See
-  /// [`super::alias`]. Behind an `Arc`, like the other per-daemon fields here,
-  /// so a `ProxyState` clone shares one table and one warn set rather than
-  /// starting a fresh one.
-  pub(crate) aliases: Arc<super::alias::AliasTable>,
 }
 
 impl ProxyState {
@@ -111,35 +105,28 @@ impl ProxyState {
   /// `ProxyConfig` (after the CLI / env OR-chain); `max_body_size` the
   /// resolved body cap. Auth is disabled (loopback, same-UID posture)
   /// — production uses [`Self::from_context_with_auth`] to attach a
-  /// bearer key.
+  /// bearer key. The `proxy.aliases` table rides in `ctx` like every other
+  /// daemon-side handle, so the proxy and the `proxy_aliases` handler read one
+  /// table with one warn set.
   pub fn from_context(
     ctx: &MethodContext,
     ollama_compat: bool,
     fallback_enabled: bool,
     max_body_size: usize,
   ) -> Arc<Self> {
-    Self::from_context_with_auth(
-      ctx,
-      ollama_compat,
-      fallback_enabled,
-      None,
-      max_body_size,
-      &Default::default(),
-    )
+    Self::from_context_with_auth(ctx, ollama_compat, fallback_enabled, None, max_body_size)
   }
 
   /// Like [`Self::from_context`] but with a resolved bearer `api_key`
-  /// (`None` disables auth) and the `proxy.aliases` table. The daemon's
-  /// `run_foreground` passes both from the loaded
-  /// [`crate::config::loader::ProxyConfig`]; tests use the keyless,
-  /// alias-less [`Self::from_context`].
+  /// (`None` disables auth). The daemon's `run_foreground` passes the key from
+  /// the loaded [`crate::config::loader::ProxyConfig`]; tests use the keyless
+  /// [`Self::from_context`].
   pub fn from_context_with_auth(
     ctx: &MethodContext,
     ollama_compat: bool,
     fallback_enabled: bool,
     api_key: Option<String>,
     max_body_size: usize,
-    aliases: &crate::config::ProxyAliases,
   ) -> Arc<Self> {
     Arc::new(Self {
       http_client: Arc::new(build_http_client()),
@@ -151,7 +138,6 @@ impl ProxyState {
       fallback_enabled,
       auth: super::auth::ProxyAuth::new(api_key),
       max_body_size,
-      aliases: Arc::new(super::alias::AliasTable::from_config(aliases)),
     })
   }
 }

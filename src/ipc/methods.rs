@@ -122,6 +122,12 @@ pub async fn dispatch_request(ctx: &MethodContext, req: Request) -> Response {
       Response::ok(id, body)
     }
     "status" => Response::ok(id, crate::ipc::status::status_response(ctx).await),
+    "proxy_aliases" => {
+      // The `proxy.aliases` table as the catalog answers it right now, so an
+      // agent can see a dead alias without sending a request that trips it.
+      let (_models, rows) = ctx.catalog.shared_pair().await;
+      Response::ok(id, json!({ "aliases": ctx.aliases.audit(&rows) }))
+    }
     "start_model" => respond(id, start_model_handler(ctx, req.params).await),
     "stop_model" => respond(id, stop_model_handler(ctx, req.params).await),
     "stop_all" => respond(id, stop_all_handler(ctx, req.params).await),
@@ -504,6 +510,7 @@ const PUBLIC_METHODS: &[&str] = &[
   "shutdown",
   "list_models",
   "status",
+  "proxy_aliases",
   "start_model",
   "stop_model",
   "stop_all",
