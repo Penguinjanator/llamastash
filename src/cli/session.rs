@@ -946,10 +946,13 @@ mod tests {
       non_chat_mode(&gated(Some("rerank"), None)),
       Some("a rerank")
     );
-    assert_eq!(
-      non_chat_mode(&gated(Some("stt"), None)),
-      Some("a speech-to-text")
-    );
+    for (hint, label) in [
+      ("image", "an image"),
+      ("tts", "a text-to-speech"),
+      ("stt", "a speech-to-text"),
+    ] {
+      assert_eq!(non_chat_mode(&gated(Some(hint), None)), Some(label));
+    }
     assert_eq!(non_chat_mode(&gated(None, None)), None);
     assert_eq!(non_chat_mode(&gated(Some("chat"), None)), None);
     // A GGUF with no mode hint is called embedding by the patchers' own id rule,

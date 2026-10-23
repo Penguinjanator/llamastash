@@ -819,6 +819,25 @@ servers:
       "the upload arrives as sent: {echoed}"
     );
 
+    // The entry is running now, so this one takes the Ready path instead of the
+    // auto-start one, and it keeps the client's name too.
+    let (body, content_type) = transcription_body("whisper-1");
+    let echoed: Value = http
+      .post(format!("{base}/v1/audio/transcriptions"))
+      .header(reqwest::header::CONTENT_TYPE, content_type)
+      .body(body)
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("second proxy request")
+      .json()
+      .await
+      .unwrap();
+    assert_eq!(
+      echoed["model"], "whisper-1",
+      "a Ready launch keeps the name too: {echoed}"
+    );
+
     // A media route picks its row by mode alone, so a request that names no model
     // at all is routed rather than refused for a missing model.
     let resp = http

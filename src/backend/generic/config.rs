@@ -372,7 +372,7 @@ impl GenericConfig {
             "`routes` entry `{p}` must be a plain path prefix, with no query, fragment or wildcard"
           )));
         }
-        if p.split('/').any(is_dot_segment) {
+        if p.split(['/', '\\']).any(is_dot_segment) {
           return Err(entry(format!(
             "`routes` entry `{p}` must name a path directly; no `.` or `..` segments"
           )));
@@ -778,6 +778,8 @@ servers:
       "/internal/..",
       "/internal/../metrics",
       "/internal/%2e%2e/metrics",
+      // YAML-escaped `/x\..\y`: a backslash separates segments too.
+      r"/x\\..\\y",
       "/",
       "/ui",
       "/ui/x",

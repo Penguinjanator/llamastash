@@ -76,10 +76,6 @@ pub(crate) struct Target<'a> {
   pub served_model_key: &'a crate::gguf::identity::ModelId,
   pub fallback: bool,
   pub fallback_reason: Option<&'a str>,
-  /// The model name to put in the body, for a request whose own name reached
-  /// this target by the endpoint's mode instead of by name. A launch that pins
-  /// its own request-model name wins over this.
-  pub request_model: Option<&'a str>,
   /// `false` on a path the engine declared for itself, where the body is forwarded
   /// as it arrived: not even the launch's own `rewrite_model` pin may touch it.
   pub pin_request_model: bool,
@@ -114,7 +110,6 @@ pub(crate) async fn forward_to_upstream(
     served_model_key,
     fallback,
     fallback_reason,
-    request_model,
     pin_request_model,
   } = target;
   let content_type = content_type_of(&inbound_headers).map(str::to_string);
@@ -132,14 +127,9 @@ pub(crate) async fn forward_to_upstream(
         return unreachable_response(record, "model exited before forwarding could begin");
       }
     };
-  // The launch's own pinned name is its entry's contract with its engine, so it
-  // beats the router's fallback name; the fallback is what a client that named
-  // nothing of ours gets told instead. On a declared path neither applies: the
-  // engine owns that path and its body.
-  let request_model = pin_request_model
-    .then_some(launch_request_model)
-    .flatten()
-    .or_else(|| request_model.map(str::to_string));
+  // On a declared path the engine owns the body, so not even the launch's own
+  // pinned name is written into it.
+  let request_model = pin_request_model.then_some(launch_request_model).flatten();
   if let Some(record) = record.as_mut() {
     record.set_launch(launch_id.as_str());
     record.publish();

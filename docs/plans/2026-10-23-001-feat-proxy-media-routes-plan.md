@@ -60,13 +60,13 @@ One lane, sequential. U1 and U2 share `src/proxy/router.rs` and the docs.
 
 Files:
 - `src/launch/mode.rs`: add `Image`, `Tts`, `Stt` (labels `image`, `tts`, `stt`); fix every exhaustive match the compiler flags. CLI `--mode` (`src/cli/cli_args.rs` `LaunchMode`) stays chat/embedding/rerank.
-- `src/proxy/router.rs`: add the six routes to `GENERATION_ROUTES`; replace the inline path→mode match with one `fn endpoint_mode(path) -> Option<LaunchMode>`; mode fallback + rewrite wiring in `forward_request`.
+- `src/proxy/router.rs`: add the six routes to `GENERATION_ROUTES`; replace the inline path→mode match with one `fn endpoint_mode(path) -> Option<LaunchMode>`; mode fallback wiring in `forward_request`.
 - `src/proxy/route.rs`: `buffer_and_extract` takes the `Content-Type` and reads `model` from multipart; the fallback candidate pick (a helper next to `decide`).
-- `src/proxy/forward.rs`: `with_model` (or a sibling) also rewrites the multipart `model` part; a way for the router to pass the fallback's served name as the request-model name.
+- `src/proxy/forward.rs`: `with_model` (or a sibling) also rewrites the multipart `model` part, for an entry with `rewrite_model: true`. (The router's fallback name was dropped with the rewrite on fallback.)
 - `src/util/multipart_body.rs` (new) + `src/util/mod.rs`: find a field's value range, replace it.
 - `src/backend/mod.rs` + `src/backend/generic/mod.rs`: a trait method telling whether a row's entry lists a mode explicitly (default `false`; generic returns `modes.contains`). llama.cpp / vLLM / SGLang `serves_mode` false for the new modes.
 - `src/backend/generic/config.rs`: `modes` accepts the new labels.
-- Tests: unit tests for the multipart parser and rewrite (field first, last, missing, CRLF boundaries, binary file part), `endpoint_mode`, the candidate pick; one integration test in `tests/` that sends a multipart `/v1/audio/transcriptions` and a JSON `/v1/audio/speech` through the proxy to a fake server, covering: routed by `model`; unknown `model` routed by mode fallback with the body's `model` rewritten and the `mode_match` header; two `tts` entries + unknown name → `model_not_found`. Reuse the existing generic-entry test fixtures.
+- Tests: unit tests for the multipart parser and rewrite (field first, last, missing, CRLF boundaries, binary file part), `endpoint_mode`, the candidate pick; one integration test in `tests/` that sends a multipart `/v1/audio/transcriptions` and a JSON `/v1/audio/speech` through the proxy to a fake server, covering: routed by `model`; unknown `model` routed by mode fallback, body forwarded as sent, with the `mode_match` header; two `tts` entries + unknown name → `model_not_found`. Reuse the existing generic-entry test fixtures.
 
 ### U2. Declared routes on generic entries
 
@@ -80,7 +80,7 @@ Files:
 
 ### U3. Docs (same commits as the code)
 
-- `docs/usage.md`: proxy route list, `modes` values, `routes` field row in the generic entry table, mode fallback + rewrite + `mode_match` header, config errors.
+- `docs/usage.md`: proxy route list, `modes` values, `routes` field row in the generic entry table, mode fallback + `mode_match` header, config errors.
 - `docs/architecture.md`: proxy scope (curated routes + declared prefixes).
 - `AGENTS.md` "Proxy scope" bullet: one-line update, stay under 200 lines.
 - `config.example.yaml`: a commented `modes`/`routes` example on a generic entry.
@@ -115,7 +115,7 @@ New tests: multipart field parse and rewrite (`src/util/multipart_body.rs`),
 `endpoint_mode`, the media modes being the declared-only ones (`src/launch/mode.rs`),
 the declared-route config refusals (`src/backend/generic/config.rs`), and in
 `tests/generic_backend_test.rs`: media routes forwarding multipart and JSON with
-auto-start, mode fallback with the rewrite and its header, a mode mismatch
+auto-start, mode fallback with the name kept and its header, a mode mismatch
 refused before any launch, a model-less media request, and a declared prefix
 reaching its engine (query kept, unparsable body forwarded, log filed under the
 prefix, undeclared paths 404).

@@ -459,10 +459,6 @@ async fn forward_request(
           served_model_key: &served_model_key,
           fallback,
           fallback_reason: fallback_reason.as_deref(),
-          // A mode fallback keeps the client's name: a multi-model engine
-          // (Speaches, LocalAI) maps `whisper-1` / `tts-1` itself and has never
-          // heard of the entry's name.
-          request_model: None,
           pin_request_model: declared.is_none(),
         },
         Some(record),

@@ -315,7 +315,6 @@ async fn forward_to_launch(
       served_model_key: &entry.model_id,
       fallback: false,
       fallback_reason: None,
-      request_model: None,
       pin_request_model: true,
     },
     // Web-UI traffic that reaches a model is logged (`ui` marks the row);
