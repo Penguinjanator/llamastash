@@ -375,9 +375,9 @@ impl GenericConfig {
         if p.is_empty() || !p.starts_with('/') {
           return Err(entry(format!("`routes` entry `{p}` must start with `/`")));
         }
-        if p.contains('?') || p.contains('#') || p.chars().any(char::is_whitespace) {
+        if p.contains(['?', '#', '*']) || p.chars().any(char::is_whitespace) {
           return Err(entry(format!(
-            "`routes` entry `{p}` must be a plain path prefix, with no query, fragment or whitespace"
+            "`routes` entry `{p}` must be a plain path prefix, with no query, fragment, wildcard or whitespace"
           )));
         }
         if p.contains('<') || p.contains('>') || p.contains('{') || p.contains('}') {
@@ -769,6 +769,7 @@ servers:
       "inference",
       "/a?b=1",
       "/a#b",
+      "/a*b",
       "/a b",
       "/x/<name>",
       "/{name}",
