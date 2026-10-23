@@ -12,6 +12,23 @@ use serde::{Deserialize, Serialize};
 /// must name one of the entry's knobs.
 pub const BUILTIN_PLACEHOLDERS: &[&str] = &["port", "host", "name", "model"];
 
+/// The comparable form of a path prefix: repeated slashes collapsed, trailing
+/// slash dropped. `None` for `/` alone, which would cover the whole proxy.
+fn normalize_prefix(path: &str) -> Option<String> {
+  let kept = path
+    .split('/')
+    .filter(|seg| !seg.is_empty() && *seg != ".")
+    .collect::<Vec<_>>()
+    .join("/");
+  (!kept.is_empty()).then(|| format!("/{kept}"))
+}
+
+/// Whether one prefix covers the other at a path boundary: `/ui` and `/ui/x`
+/// are the same surface, `/uice` is not.
+fn prefixes_clash(a: &str, b: &str) -> bool {
+  a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct GenericConfig {
@@ -54,6 +71,12 @@ pub struct GenericServer {
   /// (the default) means all, so the engine answers or refuses each request.
   #[serde(default)]
   pub modes: Vec<crate::launch::mode::LaunchMode>,
+  /// Path prefixes of this server's own API to forward through the proxy, beside
+  /// the routes `modes` covers: an engine whose API is not the OpenAI shape
+  /// (whisper.cpp's `/inference`) reaches the proxy through here. Empty (the
+  /// default) forwards nothing beyond the curated routes.
+  #[serde(default)]
+  pub routes: Vec<String>,
   /// Row info for an entry without `model`, for the Arch / Params / Quant /
   /// Ctx columns. The catalog carries it like GGUF metadata, so `arch` also
   /// ranks proxy fallback candidates. A `model` row reads its GGUF.
@@ -190,6 +213,19 @@ impl KnobSpec {
 }
 
 impl GenericServer {
+  /// The longest declared `routes` prefix covering `request_path`, as the
+  /// normalized prefix itself, so a caller can rank two declarations and log
+  /// under one it controls. `None` when the entry declares nothing covering it.
+  pub fn declared_prefix(&self, request_path: &str) -> Option<String> {
+    let req = normalize_prefix(request_path)?;
+    self
+      .routes
+      .iter()
+      .filter_map(|p| normalize_prefix(p))
+      .filter(|p| req == *p || req.starts_with(&format!("{p}/")))
+      .max_by_key(|p| p.len())
+  }
+
   /// `binary` with a leading `~` expanded.
   pub fn binary_path(&self) -> PathBuf {
     crate::util::paths::expand_user_path(&self.binary)
@@ -321,6 +357,55 @@ impl GenericConfig {
   /// attaches to rows found elsewhere.
   pub fn declares_rows(&self) -> bool {
     self.servers.iter().any(|s| s.model.is_none())
+  }
+
+  /// Every config-load refusal of the declared `routes` prefixes, as one error
+  /// naming the entry. `owned` is every path the proxy answers itself: a declared
+  /// prefix may not equal, lie under, or contain one of them, and one prefix has
+  /// exactly one owning entry, though nested prefixes inside one entry are its own
+  /// longest-match business. The caller supplies the list, so this module names no
+  /// proxy route of its own.
+  pub fn validate_routes(&self, owned: &[&str]) -> Result<(), String> {
+    // (normalized prefix, entry) in config order: one owner per path.
+    let mut declared: Vec<(String, &str)> = Vec::new();
+    for s in &self.servers {
+      let entry = |msg: String| format!("backend.generic entry `{}`: {msg}", s.name);
+      for p in &s.routes {
+        if p.is_empty() || !p.starts_with('/') {
+          return Err(entry(format!("`routes` entry `{p}` must start with `/`")));
+        }
+        if p.contains('?') || p.contains('#') || p.chars().any(char::is_whitespace) {
+          return Err(entry(format!(
+            "`routes` entry `{p}` must be a plain path prefix, with no query, fragment or whitespace"
+          )));
+        }
+        if p.contains('<') || p.contains('>') || p.contains('{') || p.contains('}') {
+          return Err(entry(format!(
+            "`routes` entry `{p}` is matched as written: no placeholders in a path prefix"
+          )));
+        }
+        let Some(norm) = normalize_prefix(p) else {
+          return Err(entry(
+            "`routes` must name a path below the root; `/` would take the whole proxy".into(),
+          ));
+        };
+        if let Some(clash) = owned.iter().find(|r| prefixes_clash(&norm, r)) {
+          return Err(entry(format!(
+            "`routes` entry `{p}` overlaps the proxy's own `{clash}`; remove it"
+          )));
+        }
+        let clash = declared
+          .iter()
+          .find(|(prev, owner)| *owner != s.name && prefixes_clash(&norm, prev));
+        if let Some((prev, owner)) = clash {
+          return Err(entry(format!(
+            "`routes` entry `{p}` overlaps entry `{owner}`'s `{prev}`; one path has one owner"
+          )));
+        }
+        declared.push((norm, s.name.as_str()));
+      }
+    }
+    Ok(())
   }
 
   /// Every config-load refusal, as one error naming the entry. `taken` says
@@ -636,6 +721,81 @@ servers:
     parse(yaml).validate(&builtin).unwrap();
   }
 
+  /// The proxy paths a declared prefix may not overlap, as the proxy hands them.
+  const OWNED: &[&str] = &[
+    "/health",
+    "/metrics",
+    "/ui",
+    "/api",
+    "/v1/models",
+    "/v1/chat/completions",
+    "/v1/audio/transcriptions",
+  ];
+
+  fn route_refusal(entry: &str) -> String {
+    parse(&format!("servers:\n  - {entry}\n"))
+      .validate_routes(OWNED)
+      .unwrap_err()
+  }
+
+  #[test]
+  fn a_declared_route_is_a_plain_path_below_the_proxies_own() {
+    let ok = parse(
+      "servers:\n  - {name: e, binary: /b, ready: /h, routes: [/inference, /inference/deep, /uice]}\n",
+    );
+    ok.validate_routes(OWNED).unwrap();
+    let e = &ok.servers[0];
+    assert_eq!(
+      e.declared_prefix("/inference").as_deref(),
+      Some("/inference")
+    );
+    assert_eq!(
+      e.declared_prefix("//inference/").as_deref(),
+      Some("/inference")
+    );
+    // The longest declaration of one entry covers the request.
+    assert_eq!(
+      e.declared_prefix("/inference/deep/x").as_deref(),
+      Some("/inference/deep")
+    );
+    // A prefix ends at a slash, so a longer name is not a match.
+    assert_eq!(e.declared_prefix("/inferences"), None);
+    assert_eq!(e.declared_prefix("/uicex"), None);
+    assert_eq!(e.declared_prefix("/"), None);
+
+    for bad in [
+      "",
+      "inference",
+      "/a?b=1",
+      "/a#b",
+      "/a b",
+      "/x/<name>",
+      "/{name}",
+      "/",
+      "/ui",
+      "/ui/x",
+      "/metrics",
+      "/health",
+      "/api/tags",
+      "/v1",
+      "/v1/models/x",
+      "/v1/audio/transcriptions",
+    ] {
+      let msg = route_refusal(&format!(
+        "{{name: e, binary: /b, ready: /h, routes: [\"{bad}\"]}}"
+      ));
+      assert!(msg.contains("`routes`"), "{bad} accepted: {msg}");
+    }
+  }
+
+  #[test]
+  fn one_declared_path_has_one_owner() {
+    let msg = route_refusal(
+      "{name: a, binary: /b, ready: /h, routes: [/internal]}\n  - {name: b, binary: /b, ready: /h, routes: [/internal/deep]}",
+    );
+    assert!(msg.contains("`a`") && msg.contains("/internal"), "{msg}");
+  }
+
   #[test]
   fn each_refusal_names_the_entry() {
     let cases = [
@@ -779,6 +939,7 @@ servers:
       ready_timeout_secs: None,
       rewrite_model: false,
       modes: vec![],
+      routes: vec![],
       arch: None,
       params: None,
       quant: None,

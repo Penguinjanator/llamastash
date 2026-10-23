@@ -745,6 +745,36 @@ vllm:time_to_first_token_seconds_count{model_name=\"fake\"} 1\n",
       )
       .await?;
     }
+    // Engine paths a generic entry can declare through `routes`: the reply names
+    // the target the engine was asked for, query included, so a test can tell a
+    // forwarded request from one the proxy answered itself and check the query
+    // survived.
+    ("GET" | "POST", p2) if p2 == "/inference" || p2.starts_with("/internal") => {
+      let content_type = headers
+        .get("content-type")
+        .map(String::as_str)
+        .unwrap_or("");
+      let body_text = String::from_utf8_lossy(&body).to_string();
+      let echoed_model = if llamastash::util::multipart_body::is_multipart(content_type) {
+        llamastash::util::multipart_body::field_value(&body, content_type, "model")
+          .and_then(|raw| std::str::from_utf8(raw).ok())
+          .map(str::to_string)
+      } else {
+        extract_body_model(&body_text)
+      };
+      let body = serde_json::json!({
+        "target": path,
+        "model": echoed_model,
+        "received_body": body_text,
+      });
+      write_response(
+        &mut wr,
+        200,
+        "application/json",
+        serde_json::to_vec(&body)?.as_slice(),
+      )
+      .await?;
+    }
     _ => {
       write_response(
         &mut wr,

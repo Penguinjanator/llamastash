@@ -141,6 +141,12 @@ servers:
     ready: /health
     memory_gib: 1.0
     modes: [tts]
+  - name: gen-routes
+    binary: {bin}
+    args: [--port, "{{port}}"]
+    ready: /health
+    memory_gib: 1.0
+    routes: [/inference, /internal, /internal/deep]
 "#,
       bin = fake()
     );
@@ -764,6 +770,18 @@ servers:
       "only the field changed: {echoed}"
     );
 
+    // A media route picks its row by mode alone, so a request that names no model
+    // at all is routed rather than refused for a missing model.
+    let resp = http
+      .post(format!("{base}/v1/audio/transcriptions"))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("model-less media request");
+    let code = resp.status().as_u16();
+    let text = resp.text().await.unwrap();
+    assert_eq!(code, 200, "mode alone picks the row: {text}");
+
     let row = loop {
       let tail = client
         .call("requests_tail", Some(json!({"limit": 50})))
@@ -786,6 +804,35 @@ servers:
     assert_eq!(row["route"], "/v1/audio/transcriptions", "{row}");
     assert_eq!(row["fallback"], "mode_match", "{row}");
     assert_eq!(row["model"], "gen-stt", "{row}");
+
+    // A row that does not declare the route's mode is refused, and a row that is
+    // not even running is refused before the launch: naming it cannot start
+    // something that has no endpoint for the request.
+    for (name, path) in [("gen-routes", "/v1/audio/transcriptions")] {
+      let resp = http
+        .post(format!("{base}{path}"))
+        .json(&json!({"model": name, "input": "hi"}))
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .expect("mode mismatch");
+      let status = resp.status();
+      let body: Value = resp.json().await.unwrap();
+      assert_eq!(
+        body["error"]["type"].as_str().unwrap_or("ok"),
+        "unsupported_endpoint",
+        "{name} on {path}: {status} {body}"
+      );
+    }
+    // The refusal came before the launch: the chat entry nobody asked for never
+    // started.
+    let status = client.call("status", None).await.unwrap();
+    assert!(
+      !status["models"]
+        .to_string()
+        .contains("generic://gen-routes"),
+      "a mode mismatch started a launch: {status}"
+    );
 
     // Two entries declare `tts` and neither is Ready: no single answer.
     let resp = http
@@ -1057,6 +1104,135 @@ servers:
     let r = wait_state(&mut client, &id, "ready").await;
     assert_eq!(r["backend"], "llamacpp", "{r}");
     assert!(r["params"]["server"].is_null(), "{r}");
+    shutdown(client, daemon).await;
+  }
+
+  /// A declared prefix is the engine's own API: the row that publishes it answers,
+  /// the proxy's own surfaces stay the proxy's, the log files the row under the
+  /// declared prefix, and a path nobody declares is a 404.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_declared_path_reaches_the_engine_that_publishes_it() {
+    let proxy_port = std::net::TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .port();
+    let (mut client, daemon) = boot(opts(unique_temp("routes"), Some(proxy_port))).await;
+    let http = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{proxy_port}");
+    let deadline = Instant::now() + Duration::from_secs(40);
+    wait_listed(&mut client, "gen-routes").await;
+
+    // An upload naming a model no row answers still reaches the entry that
+    // publishes the path, and keeps the name the client sent: an engine that owns
+    // the path owns the name inside it too.
+    let (body, content_type) = transcription_body("whisper-client");
+    let resp = http
+      .post(format!("{base}/inference"))
+      .header(reqwest::header::CONTENT_TYPE, content_type)
+      .body(body)
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("declared upload");
+    assert_eq!(resp.status().as_u16(), 200);
+    let echoed: Value = resp.json().await.unwrap();
+    assert_eq!(echoed["target"], "/inference", "{echoed}");
+    assert_eq!(echoed["model"], "whisper-client", "name kept: {echoed}");
+    assert!(
+      echoed["received_body"]
+        .as_str()
+        .is_some_and(|b| b.contains("RIFFdata")),
+      "the file part is untouched: {echoed}"
+    );
+
+    // A prefix covers what hangs below it, keeps the query, and never matches a
+    // longer name.
+    for (path, want) in [
+      ("/internal", 200u16),
+      ("/internal?x=1", 200),
+      ("/internal/extra", 200),
+      ("/internal/deep/x", 200),
+      ("/internalsuffix", 404),
+      ("/nonsense", 404),
+    ] {
+      let resp = http
+        .get(format!("{base}{path}"))
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .expect("declared GET");
+      assert_eq!(resp.status().as_u16(), want, "{path}");
+      if want == 200 {
+        let echoed: Value = resp.json().await.unwrap();
+        assert_eq!(echoed["target"], path, "{path}");
+      }
+    }
+    // A body the proxy cannot read is the engine's business, not a refusal: the
+    // declared path forwards it as it arrived.
+    let resp = http
+      .post(format!("{base}/internal"))
+      .header(reqwest::header::CONTENT_TYPE, "text/plain")
+      .body("not json at all")
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("declared POST");
+    assert_eq!(resp.status().as_u16(), 200);
+    let echoed: Value = resp.json().await.unwrap();
+    assert_eq!(echoed["received_body"], "not json at all", "{echoed}");
+    assert!(echoed["model"].is_null(), "nothing to read: {echoed}");
+
+    // The client normalizes `..` before sending, so what has to be declared is the
+    // path that arrives.
+    let resp = http
+      .get(format!("{base}/internal/../nonsense"))
+      .send()
+      .await
+      .expect("dotted GET");
+    assert_eq!(resp.status().as_u16(), 404);
+
+    // The proxy keeps its own surfaces: `/api/tags` is the catalog's Ollama list
+    // and `/ui` is the built-in page, whatever an entry declares.
+    let resp = http
+      .get(format!("{base}/api/tags"))
+      .send()
+      .await
+      .expect("tags");
+    assert!(
+      resp.json::<Value>().await.unwrap().get("models").is_some(),
+      "the curated route answered"
+    );
+    let resp = http.get(format!("{base}/ui")).send().await.expect("ui");
+    assert_ne!(resp.status().as_u16(), 404, "the built-in page answered");
+
+    let rows = loop {
+      let tail = client
+        .call("requests_tail", Some(json!({"limit": 50})))
+        .await
+        .unwrap();
+      let rows = tail["requests"].as_array().unwrap().clone();
+      if rows.iter().any(|r| r["route"] == "/internal/deep") {
+        break rows;
+      }
+      assert!(
+        Instant::now() < deadline,
+        "the declared routes were never logged: {rows:?}"
+      );
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let row_for = |route: &str| {
+      rows
+        .iter()
+        .find(|r| r["route"] == route)
+        .cloned()
+        .unwrap_or_else(|| panic!("no row for {route}: {rows:?}"))
+    };
+    // Filed under the declared prefix, never under whatever the client sent.
+    assert_eq!(row_for("/inference")["model"], "gen-routes");
+    assert_eq!(row_for("/inference")["requested_model"], "whisper-client");
+    assert_eq!(row_for("/internal")["route"], "/internal");
+    assert_eq!(row_for("/internal/deep")["route"], "/internal/deep");
     shutdown(client, daemon).await;
   }
 }

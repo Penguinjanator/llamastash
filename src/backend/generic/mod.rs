@@ -291,6 +291,7 @@ impl Backend for GenericBackend {
   fn install_config(&self, config: &super::BackendConfig) -> Result<(), String> {
     let generic = &config.generic;
     generic.validate(&|id| crate::launch::knobs::registry::resolve_static_id(id).is_some())?;
+    generic.validate_routes(&crate::proxy::router::proxy_owned_paths())?;
     let mut table = entries().write().unwrap_or_else(|e| e.into_inner());
     // Merge rather than replace: a process loads config once, and replacing
     // would let an unrelated load (a test, a migration re-read) drop entries
@@ -337,6 +338,17 @@ impl Backend for GenericBackend {
     mode: crate::launch::mode::LaunchMode,
   ) -> bool {
     entry_for_launch(path, server).is_some_and(|e| e.server.modes.contains(&mode))
+  }
+
+  fn declared_path_prefix(
+    &self,
+    path: &Path,
+    server: Option<&str>,
+    request_path: &str,
+  ) -> Option<String> {
+    entry_for_launch(path, server)?
+      .server
+      .declared_prefix(request_path)
   }
 
   fn config_effort(&self, path: &Path) -> super::DeclaredEffort {

@@ -188,6 +188,32 @@ pub(crate) async fn buffer_and_extract(
   Ok(ParsedBody { bytes, model })
 }
 
+/// [`buffer_and_extract`] for a path a row declared as its own API. The body is
+/// forwarded as it arrived, so a shape the proxy cannot read names no model
+/// rather than refusing the request: an engine that owns the path decides what a
+/// body means. Only the size cap can fail here.
+pub(crate) async fn buffer_and_extract_tolerant(
+  body: Incoming,
+  cap: usize,
+  content_type: Option<&str>,
+) -> Result<ParsedBody, BodyError> {
+  let bytes = buffer_body(body, cap).await?;
+  let model = match content_type {
+    Some(ct) if crate::util::multipart_body::is_multipart(ct) => {
+      crate::util::multipart_body::field_value(&bytes, ct, "model")
+        .and_then(|raw| std::str::from_utf8(raw).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    }
+    _ => serde_json::from_slice::<JustModel>(&bytes)
+      .ok()
+      .and_then(|parsed| parsed.model)
+      .map(|s| s.trim().to_string())
+      .filter(|s| !s.is_empty()),
+  };
+  Ok(ParsedBody { bytes, model })
+}
+
 /// The `model` a buffered body names, or `None` for a body that is empty, is
 /// not JSON, or names nothing. Unlike [`buffer_and_extract`] this never fails,
 /// so a caller can label a row without deciding the body's validity — the
@@ -446,6 +472,104 @@ pub(crate) async fn decide_by_mode(
       name: None,
       alias: false,
     },
+  })
+}
+
+/// The prefix a catalog row declares for `request_path`, or `None` when no row
+/// publishes it. The proxy logs this instead of the client's path, so what lands
+/// in the request log is a name the config chose. The proxy asks it before
+/// answering 404, so an unlisted path costs one row scan and nothing more.
+pub(crate) async fn declared_prefix(state: &Arc<ProxyState>, request_path: &str) -> Option<String> {
+  declaring_rows(state, request_path)
+    .await
+    .into_iter()
+    .map(|(prefix, _)| prefix)
+    .max_by_key(|p| p.len())
+}
+
+/// The rows that declare `request_path`, each with the prefix of its own that
+/// covers it. Config load refuses two entries claiming one path, so everything
+/// here belongs to one entry.
+async fn declaring_rows(state: &Arc<ProxyState>, request_path: &str) -> Vec<(String, CatalogRow)> {
+  use crate::backend::Backend as _;
+  let rows = state.ctx.catalog.shared_rows().await;
+  let mut hits = Vec::new();
+  for row in rows.iter() {
+    let Some(backend) = would_route_backend(state, row).await else {
+      continue;
+    };
+    if let Some(prefix) =
+      backend.declared_path_prefix(std::path::Path::new(&row.path), None, request_path)
+    {
+      hits.push((prefix, row.clone()));
+    }
+  }
+  hits
+}
+
+/// A request on a path a row declares for itself. This is not a model route: the
+/// body's name settles nothing on its own, so the answer is the entry that
+/// published the path — a Ready launch of it when one is up, its one row when it
+/// has exactly one, and its row list as `ambiguous_model` when it has several and
+/// none is up. A name that already lands on a row publishing the path keeps that
+/// row, so a client that names its engine reaches it. `None` is the proxy's own
+/// 404: nothing publishes the path. The body's model is never rewritten here — an
+/// engine that owns the path owns the name inside it too.
+pub(crate) async fn decide_declared(
+  state: &Arc<ProxyState>,
+  model: Option<String>,
+  request_path: &str,
+) -> Option<RouteDecision> {
+  let mut hits = declaring_rows(state, request_path).await;
+  if hits.is_empty() {
+    return None;
+  }
+  let named = decide(state, model).await;
+  let landed = match &named {
+    RouteDecision::ReadyAt { model_path, .. } => Some(model_path.clone()),
+    RouteDecision::NotRunning {
+      resolved_row,
+      name: _,
+      alias: _,
+      requested_model: _,
+    } => Some(resolved_row.path.clone()),
+    _ => None,
+  };
+  if let Some(path) = &landed {
+    if hits
+      .iter()
+      .any(|(_, r)| same_path(std::path::Path::new(&r.path), path))
+    {
+      return Some(named);
+    }
+  }
+  let sup_snap = state.ctx.supervisors.snapshot().await;
+  for (_, row) in hits.iter() {
+    if let Some((port, served_model_key)) = ready_launch(&sup_snap, &row.path).await {
+      return Some(RouteDecision::ReadyAt {
+        port,
+        served_model_id: served_name_for_row(row),
+        served_model_key,
+        model_path: row.path.clone(),
+        alias: false,
+        fallback: false,
+        fallback_reason: None,
+      });
+    }
+  }
+  if hits.len() == 1 {
+    let (_, row) = hits.remove(0);
+    let served_model_id = served_name_for_row(&row);
+    return Some(RouteDecision::NotRunning {
+      requested_model: served_model_id,
+      resolved_row: Box::new(row),
+      name: None,
+      alias: false,
+    });
+  }
+  Some(RouteDecision::Ambiguous {
+    requested_model: request_path.to_string(),
+    candidates: hits.iter().map(|(_, r)| served_name_for_row(r)).collect(),
   })
 }
 

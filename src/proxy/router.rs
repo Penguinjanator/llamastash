@@ -74,6 +74,21 @@ pub(crate) struct ClientAddr(pub std::net::SocketAddr);
 /// This is the whole forwarded surface: nothing else reaches an engine unless a
 /// generic entry declares the path (see `routes` in `docs/usage.md`), so engine
 /// admin and metrics paths stay unreachable through the proxy.
+/// Paths the proxy answers itself besides the forwarded routes in
+/// [`GENERATION_ROUTES`]: the ones it builds rather than pipes. The two together
+/// are what a generic entry may not claim as a declared `routes` prefix; the list
+/// is handed to generic config validation so that module names no route itself.
+pub(crate) const PROXY_OWNED_PATHS: [&str; 5] =
+  ["/health", "/metrics", "/ui", "/api", "/v1/models"];
+
+/// Every path the proxy owns: [`PROXY_OWNED_PATHS`] plus every forwarded route.
+pub(crate) fn proxy_owned_paths() -> Vec<&'static str> {
+  PROXY_OWNED_PATHS
+    .into_iter()
+    .chain(GENERATION_ROUTES)
+    .collect()
+}
+
 pub(crate) const GENERATION_ROUTES: [&str; 14] = [
   "/v1/chat/completions",
   "/v1/completions",
@@ -166,7 +181,7 @@ pub async fn route(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyRespo
     // so the proxy byte-pipes it like any other `/v1` route (same body-`model`
     // resolution, same streaming). Agents that prefer the Responses surface
     // attach through the one stable proxy URL.
-    (&Method::POST, p) if GENERATION_ROUTES.contains(&p) => forward_request(state, req).await,
+    (&Method::POST, p) if GENERATION_ROUTES.contains(&p) => forward_request(state, req, None).await,
     // Ollama-compat Tier 1: discovery-only endpoints.
     (&Method::GET, "/api/tags") => ollama_tags(state).await,
     (&Method::GET, "/api/version") => ollama_version(),
@@ -186,8 +201,21 @@ pub async fn route(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyRespo
     // the chosen backend. See docs/plans/2026-06-15-001-...-plan.md.
     (&Method::GET, "/ui") => super::ui::redirect_to_ui_slash(),
     (_, p) if p.starts_with("/ui/") => super::ui::serve(state, req).await,
-    _ => not_found(),
+    // A row's own API paths, declared by its entry rather than by this table, and
+    // forwarded to that row alone. Everything above is the proxy's own surface, so
+    // a declared prefix only ever sees what the table left over.
+    _ => declared_or_not_found(state, req).await,
   }
+}
+
+/// A path this table did not answer: the proxy's own 404, unless a catalog row
+/// declares it as part of that engine's API. The lookup is a catalog row scan, so
+/// an unknown path costs that scan and forwards nothing.
+async fn declared_or_not_found(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyResponse {
+  let Some(prefix) = route::declared_prefix(&state, req.uri().path()).await else {
+    return not_found();
+  };
+  forward_request(state, req, Some(prefix)).await
 }
 
 /// `GET / | HEAD /` — server-identity probe. Returns `200 OK` with a
@@ -222,8 +250,14 @@ fn text_response(status: StatusCode, body: &'static str) -> Response<BoxBody<Byt
 
 /// Forwarding pipeline: buffer the body under the daemon's cap,
 /// extract `body.model`, run the resolver, pick a Ready supervisor,
-/// forward.
-async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyResponse {
+/// forward. `declared` marks a path a row declared for its own engine: the
+/// routing question is then which row published the path, not which model the
+/// body names.
+async fn forward_request(
+  state: Arc<ProxyState>,
+  req: Request<Incoming>,
+  declared: Option<String>,
+) -> ProxyResponse {
   let client = req.extensions().get::<ClientAddr>().map(|c| c.0);
   let content_type = forward::content_type_of(req.headers()).map(str::to_string);
   let (method, uri, headers, body) = forward::deconstruct(req);
@@ -231,10 +265,20 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
   // The log row for this request. A request that reaches a model hands it
   // to the forward path; an answer the proxy builds itself finishes it
   // through `answered`. A return that did neither drops it, which logs
-  // the request as closed by the client.
-  let mut record = state.ctx.requests.begin(uri.path(), client);
+  // the request as closed by the client. A declared route is filed under the
+  // prefix the config declared, never under whatever path the client sent.
+  let mut record = state
+    .ctx
+    .requests
+    .begin(declared.as_deref().unwrap_or_else(|| uri.path()), client);
 
-  let parsed = match route::buffer_and_extract(body, cap, content_type.as_deref()).await {
+  let parsed = match if declared.is_some() {
+    // A declared path is the engine's own API: whatever it was sent is forwarded,
+    // and a body the proxy cannot read simply names no model.
+    route::buffer_and_extract_tolerant(body, cap, content_type.as_deref()).await
+  } else {
+    route::buffer_and_extract(body, cap, content_type.as_deref()).await
+  } {
     Ok(p) => p,
     Err(e) => return answered(record, route::body_error_response(e, cap)),
   };
@@ -245,7 +289,15 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
   // entry that declares the mode; clients hardcode `whisper-1` and `tts-1`, and
   // the hint below is what tells an operator who has no such entry how to fix it.
   let media_route = req_mode.is_some_and(|m| m.is_declared_only());
-  let mut decision = route::decide(&state, parsed.model).await;
+  let mut decision = if declared.is_some() {
+    match route::decide_declared(&state, parsed.model.clone(), uri.path()).await {
+      Some(d) => d,
+      // The row let go of the path between the lookup here and the one there.
+      None => return answered(record, not_found()),
+    }
+  } else {
+    route::decide(&state, parsed.model).await
+  };
   let mut mode_fallback = false;
   if media_route
     && matches!(
@@ -322,7 +374,16 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
       _ => None,
     };
     if let Some((b, path, server)) = target {
-      if !b.serves_mode(&path, server.as_deref(), mode) {
+      // A media route is answered only by a row that *declares* the mode. The
+      // looser `serves_mode` treats an entry with no `modes:` as an OpenAI server
+      // for everything, which would let a plain chat entry take an upload it has
+      // no endpoint for.
+      let serves = if mode.is_declared_only() {
+        b.declares_mode(&path, server.as_deref(), mode)
+      } else {
+        b.serves_mode(&path, server.as_deref(), mode)
+      };
+      if !serves {
         // Name the actual backend for the user (dynamic, so the code names none).
         let msg = format!(
           "this model on the {} backend does not serve {req_path}; \

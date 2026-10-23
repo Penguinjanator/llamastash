@@ -478,6 +478,21 @@ pub trait Backend {
     false
   }
 
+  /// The longest path prefix the engine behind `path` / `server` declares for its
+  /// own API that covers `request_path`, or `None` when it declares none. A
+  /// declared prefix is forwarded to that row and to nothing else, and the proxy
+  /// logs the prefix rather than the client's path; `/ui` and the curated `/v1`
+  /// routes stay the proxy's. Default `None`: a row forwards only the curated
+  /// routes.
+  fn declared_path_prefix(
+    &self,
+    _path: &Path,
+    _server: Option<&str>,
+    _request_path: &str,
+  ) -> Option<String> {
+    None
+  }
+
   /// A pre-spawn refusal for a model this backend recognizes but cannot launch,
   /// or `None` to proceed.
   ///
@@ -1114,6 +1129,15 @@ impl Backend for Backends {
 
   fn declares_mode(&self, path: &Path, server: Option<&str>, mode: LaunchMode) -> bool {
     for_each_backend!(self, b => b.declares_mode(path, server, mode))
+  }
+
+  fn declared_path_prefix(
+    &self,
+    path: &Path,
+    server: Option<&str>,
+    request_path: &str,
+  ) -> Option<String> {
+    for_each_backend!(self, b => b.declared_path_prefix(path, server, request_path))
   }
 
   fn refuses(&self, arch: Option<&str>, path: &Path) -> Option<String> {
