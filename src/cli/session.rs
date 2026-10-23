@@ -439,6 +439,9 @@ fn not_chat(row: &CatalogRow, id: &str) -> Option<&'static str> {
   }
   match row.mode_hint.as_deref() {
     Some("rerank") => Some("a rerank"),
+    Some("image") => Some("an image"),
+    Some("tts") => Some("a text-to-speech"),
+    Some("stt") => Some("a speech-to-text"),
     _ => None,
   }
 }
@@ -942,6 +945,10 @@ mod tests {
     assert_eq!(
       non_chat_mode(&gated(Some("rerank"), None)),
       Some("a rerank")
+    );
+    assert_eq!(
+      non_chat_mode(&gated(Some("stt"), None)),
+      Some("a speech-to-text")
     );
     assert_eq!(non_chat_mode(&gated(None, None)), None);
     assert_eq!(non_chat_mode(&gated(Some("chat"), None)), None);
