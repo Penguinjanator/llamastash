@@ -522,6 +522,7 @@ _Shared context: `src/cli/` and `src/ipc/methods.rs` for the start and wait-for-
 ## Next
 
 - [ ] Show cache hit on request rows as well
+- [ ] audio/tts/video/etc support on proxy, support all common paths
 
 ### Batch 2: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
 
