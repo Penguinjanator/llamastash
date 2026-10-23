@@ -524,8 +524,7 @@ _Shared context: `src/cli/` and `src/ipc/methods.rs` for the start and wait-for-
 
 - [ ] Show cache hit on request rows as well
 - [x] ~~audio/tts/video/etc support on proxy, support all common paths~~ — audio and image routes are served (`/v1/images/generations` `edits` `variations`, `/v1/audio/speech` `transcriptions` `translations`), and a generic entry can open any other path its engine serves through `routes`. Plan: [`docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md`](docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md).
-  - [x] ~~audio route on proxy: `POST /v1/audio/transcriptions` launches an stt entry~~ — shipped with the media routes, along with `/v1/audio/translations` and `/v1/audio/speech`.
-  - [x] ~~TTS route on proxy (openai-translator regression)~~ — `/v1/audio/speech` forwards to an entry that declares `tts`.
+  - [x] ~~**The proxy has no route for audio, so an ASR engine is launch-managed only.**~~ — done: `/v1/audio/transcriptions` and `/v1/audio/translations` are routes, `stt` / `tts` / `image` are declared-only launch modes, and a generic entry that lists one in `modes` answers them with its upload forwarded as sent. Seen 2026-10-17. Plan: [`docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md`](docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md).
   - [ ] **No video generation route: `/v1/videos` is a jobs API.** The image and audio routes are one request in, one response out, which is all the proxy forwards. Video generation (OpenAI's `/v1/videos`, llama.cpp's `-vg` builds) submits a job and polls it, so it needs a job model the proxy does not have: create, status, download, and a job that outlives the request that made it. Named by the media-routes plan as out of scope, not a gap in it.
   - [ ] **`/v1/realtime` needs a WebSocket upgrade.** The proxy is an HTTP/1.1 pass-through with no upgrade path, so a realtime audio session cannot ride it. Separate transport work; the media-routes plan leaves it out. A declared `routes` prefix carries a request and a response, so it does not carry a stream either.
   - [ ] **A media engine's own model list is not routable.** Media routes resolve only against rows llamastash already has, and a generic entry publishes one row (or one per `rows_from` tag). An engine that lists models on its own `/v1/models` — whisper.cpp reports nothing, Kokoro names its voices — publishes no rows, so its names reach the proxy only when it is the sole declarer of that mode. Closing this means minting rows from an engine's listing without launching it to read the list, which is what `rows_from` does with a command.
@@ -564,8 +563,6 @@ _Shared context: the `src/gpu/` probes (nvidia, vulkan, sysfs, dxgi), the per-se
 Items are grouped into batches by what a work session loads to do them - the same modules, docs and test surface. A batch is one unit of work.
 
 ### High priority
-
-- [x] ~~**The proxy has no route for audio, so an ASR engine is launch-managed only.**~~ — done: `/v1/audio/transcriptions` and `/v1/audio/translations` are routes, `stt` / `tts` / `image` are declared-only launch modes, and a generic entry that lists one in `modes` answers them with its upload forwarded as sent. Seen 2026-10-17. Plan: [`docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md`](docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md).
 
 #### Batch H1 - New CLI verbs on the agent contract
 
