@@ -1834,6 +1834,7 @@ mod tests {
           enabled: Some(false),
           servers: vec![],
           cors: true,
+          rewrite_model: false,
         },
         ..Default::default()
       },

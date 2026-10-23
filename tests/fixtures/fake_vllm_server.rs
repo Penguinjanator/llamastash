@@ -14,7 +14,9 @@
 //! - **served-model-name**: `GET /v1/models` reports the `--served-model-name`
 //!   value, never the model path. That is what readiness matches on, so
 //!   `--served-model-name` lets a test stand up a *foreign* server (wrong id)
-//!   on the reserved port and prove the probe rejects it.
+//!   on the reserved port and prove the probe rejects it. A generation reply
+//!   echoes the `model` the request carried, which is how a test sees what the
+//!   proxy actually put on the wire.
 //!
 //! Argv mirrors the real invocation: `serve <model>`, `--served-model-name`,
 //! `--host`, `--port`, `--max-model-len`, plus the native-knob flags, which
@@ -199,6 +201,15 @@ fn content_length(head: &str) -> Option<usize> {
     .and_then(|v| v.trim().parse().ok())
 }
 
+/// The `model` a request body names, so a reply can hand it back untouched.
+fn body_model(body: &str) -> Option<String> {
+  serde_json::from_str::<serde_json::Value>(body)
+    .ok()?
+    .get("model")?
+    .as_str()
+    .map(str::to_string)
+}
+
 async fn route_and_reply(
   sock: &mut tokio::net::TcpStream,
   raw: &str,
@@ -230,10 +241,14 @@ async fn route_and_reply(
       } else if body.contains("fail") {
         (500, r#"{"error":"injected failure"}"#.to_string())
       } else {
+        // The engine reads the model off the request, so the reply carries it
+        // back: a test can tell the client's own name from the one the proxy
+        // substituted.
+        let echoed = body_model(body).unwrap_or_else(|| served.to_string());
         (
           200,
           format!(
-            r#"{{"id":"cmpl-fake","object":"chat.completion","created":0,"model":"{served}","choices":[{{"index":0,"message":{{"role":"assistant","content":"ok"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}}}"#
+            r#"{{"id":"cmpl-fake","object":"chat.completion","created":0,"model":"{echoed}","choices":[{{"index":0,"message":{{"role":"assistant","content":"ok"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}}}"#
           ),
         )
       }

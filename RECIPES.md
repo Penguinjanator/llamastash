@@ -84,6 +84,8 @@ backend:
     servers:
       - binary: /home/you/.venvs/vllm/bin/vllm
     cors: false                         # vLLM allows every origin by default, and the proxy relays that
+    # rewrite_model: true               # answer with the repo id rather than the name the client sent:
+                                        # what lets a proxy.aliases name reach a vLLM model instead of its 404
   sglang:
     servers:
       - binary: /home/you/.venvs/sglang/bin/sglang

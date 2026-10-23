@@ -51,6 +51,16 @@ pub struct VllmConfig {
   /// on, any page you visit can read completions off the loopback listener.
   #[serde(default = "default_true")]
   pub cors: bool,
+  /// Tell vLLM the name it was served with instead of what the client sent.
+  ///
+  /// vLLM answers only to its `--served-model-name` list, so a client sending a
+  /// `proxy.aliases` name — or any other spelling our own resolver accepted —
+  /// gets vLLM's `404` for a model that is running. With this on the proxy
+  /// replaces `body.model` with the served name on the way out. Off by
+  /// default, like a generic entry's `rewrite_model`, because it overwrites what
+  /// the client asked for.
+  #[serde(default)]
+  pub rewrite_model: bool,
 }
 
 fn default_true() -> bool {
@@ -63,6 +73,7 @@ impl Default for VllmConfig {
       enabled: None,
       servers: Vec::new(),
       cors: true,
+      rewrite_model: false,
     }
   }
 }
@@ -395,6 +406,21 @@ impl Backend for VllmBackend {
       VLLM_KNOB_CORS.to_string(),
       ctx.backend.vllm.cors.to_string(),
     );
+    // The rewrite target is the name `served_model_aliases` registers first, so
+    // it is always one vLLM answers to. Stamped, never an argv change: the flag
+    // list stays byte-identical to raw `vllm serve` either way.
+    if ctx.backend.vllm.rewrite_model {
+      params.launch_config.insert(
+        crate::backend::REQUEST_MODEL_KEY.to_string(),
+        served_model_name(&params.model_path),
+      );
+    } else {
+      // A flip back to `false` has to clear a stamp an earlier launch inherited
+      // through `last_params`, or the rewrite would outlive the config.
+      params
+        .launch_config
+        .remove(crate::backend::REQUEST_MODEL_KEY);
+    }
   }
 
   async fn resolve_knobs(
@@ -1293,6 +1319,57 @@ mod tests {
     assert!(VllmConfig::default().cors);
     let parsed: VllmConfig = yaml_serde::from_str("{}").expect("empty vllm config");
     assert_eq!(parsed, VllmConfig::default());
+    assert!(
+      !VllmConfig::default().rewrite_model,
+      "rewriting what the client sent is opt-in"
+    );
+  }
+
+  fn ctx_rewriting(rewrite_model: bool) -> crate::daemon::context::MethodContext {
+    let mut ctx =
+      crate::daemon::context::MethodContext::new(crate::daemon::shutdown::ShutdownToken::new());
+    ctx.backend.vllm.rewrite_model = rewrite_model;
+    ctx
+  }
+
+  /// `backend.vllm.rewrite_model` is a proxy-side stamp, never a flag: the argv
+  /// stays byte-identical to raw `vllm serve` either way, and the stamped name
+  /// is the one `served_model_aliases` registers first, so it is always a name
+  /// vLLM answers to.
+  #[test]
+  fn rewrite_model_stamps_the_served_name_without_touching_argv() {
+    let b = VllmBackend::new();
+    let dir = "/c/models--o--n/snapshots/rev";
+    let stamped = |params: &LaunchParams| {
+      params
+        .launch_config
+        .get(crate::backend::REQUEST_MODEL_KEY)
+        .cloned()
+    };
+
+    let mut off = params(dir);
+    crate::backend::Backend::seed_launch_knobs(&b, &ctx_rewriting(false), &mut off);
+    assert_eq!(stamped(&off), None, "off forwards the client's own name");
+
+    let mut on = params(dir);
+    crate::backend::Backend::seed_launch_knobs(&b, &ctx_rewriting(true), &mut on);
+    assert_eq!(
+      stamped(&on).as_deref(),
+      Some(served_model_name(Path::new(dir)).as_str()),
+      "the stamp must be the served name"
+    );
+    assert_eq!(
+      argv_strings(&on, 41100),
+      argv_strings(&off, 41100),
+      "the flag list must not depend on the knob"
+    );
+
+    // A flip back to `false` has to clear the stamp a previous launch persisted
+    // into `last_params`, or the rewrite would outlive the config that asked for
+    // it.
+    let mut stale = on;
+    crate::backend::Backend::seed_launch_knobs(&b, &ctx_rewriting(false), &mut stale);
+    assert_eq!(stamped(&stale), None, "a stale stamp must not survive");
   }
 
   /// One derivation, so the identity the chat path sends is the name

@@ -126,7 +126,7 @@ mod lifecycle {
   use std::time::Duration;
 
   use llamastash::backend::{BackendConfig, ServerConfig};
-  use llamastash::config::{PortRange, VllmConfig};
+  use llamastash::config::{PortRange, ProxyAliases, ProxyConfig, VllmConfig};
   use llamastash::daemon::{run_foreground, DaemonOptions};
   use llamastash::ipc::Client;
   use serde_json::{json, Value};
@@ -405,6 +405,82 @@ mod lifecycle {
       .call("stop_model", Some(json!({ "launch_id": launch_id })))
       .await
       .expect("stop_model");
+
+    let _ = client.call("shutdown", None).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), daemon).await;
+    let _ = std::fs::remove_dir_all(&state);
+    let _ = std::fs::remove_dir_all(&cache);
+  }
+
+  /// A client name vLLM has never heard of reaches the model once
+  /// `backend.vllm.rewrite_model` is on: the proxy answers the engine with the
+  /// name it was served, not the alias the client sent — which is what vLLM
+  /// `404`s on its own.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn an_alias_vllm_does_not_know_is_sent_as_the_served_name() {
+    let state = unique_temp("rewrite");
+    let cache = unique_temp("rewrite-cache");
+    seed_repo(&cache, "Qwen/Qwen2.5-0.5B-Instruct");
+    let proxy_port = std::net::TcpListener::bind("127.0.0.1:0")
+      .expect("free port")
+      .local_addr()
+      .expect("addr")
+      .port();
+
+    let mut opts = opts_with_vllm(state.clone());
+    opts.backend.vllm.rewrite_model = true;
+    opts.proxy = ProxyConfig {
+      enabled: true,
+      port: Some(proxy_port),
+      aliases: ProxyAliases::from_pairs([(
+        "hardwired-name".to_string(),
+        "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
+      )]),
+      ..ProxyConfig::default()
+    };
+    opts.discovery.scan_roots = vec![llamastash::discovery::scanner::ScanRoot {
+      path: cache.clone(),
+      source: llamastash::discovery::ModelSource::HuggingFace,
+    }];
+    let socket = opts.state_dir.clone();
+    let daemon = tokio::spawn(async move { run_foreground(opts).await });
+    wait_for_socket(&socket).await;
+    let mut client = Client::connect(&socket).await.expect("connect");
+
+    // The alias resolves against the catalog, so the row has to be there first.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !client
+      .call("list_models", None)
+      .await
+      .expect("list_models")
+      .to_string()
+      .contains("Qwen/Qwen2.5-0.5B-Instruct")
+    {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the repo never listed"
+      );
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let resp = reqwest::Client::new()
+      .post(format!("http://127.0.0.1:{proxy_port}/v1/chat/completions"))
+      .json(&json!({
+        "model": "hardwired-name",
+        "messages": [{"role": "user", "content": "hi"}],
+      }))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("proxy request");
+    let status = resp.status();
+    // The fixture echoes the `model` it was sent.
+    let text = resp.text().await.unwrap();
+    assert!(status.is_success(), "status {status}: {text}");
+    assert!(
+      text.contains(r#""model":"Qwen/Qwen2.5-0.5B-Instruct""#),
+      "vLLM is told the name it serves, not the client's alias: {text}"
+    );
 
     let _ = client.call("shutdown", None).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), daemon).await;
