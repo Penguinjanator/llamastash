@@ -218,17 +218,17 @@ async fn declared_or_not_found(
   // Dot segments resolve to the path the engine would actually be asked for, so a
   // declared prefix can never be walked sideways into a path beside it. A `..`
   // that climbs past the root names no path at all and is refused outright.
-  let Some(path) = crate::util::http_path::normalize_path(req.uri().path()) else {
+  let Some(resolved) = crate::util::http_path::resolve_path(req.uri().path()) else {
     return not_found();
   };
-  let Some(prefix) = route::declared_prefix(&state, &path).await else {
+  let Some(prefix) = route::declared_prefix(&state, &resolved.matched).await else {
     return not_found();
   };
-  if req.uri().path() != path {
+  if req.uri().path() != resolved.forwarded {
     // What the engine is sent is what was matched on, not what the client wrote.
     let target = match req.uri().query() {
-      Some(query) => format!("{path}?{query}"),
-      None => path.clone(),
+      Some(query) => format!("{}?{query}", resolved.forwarded),
+      None => resolved.forwarded.clone(),
     };
     let Ok(uri) = target.parse() else {
       return not_found();
@@ -540,9 +540,9 @@ fn mode_hint(media_route: bool, miss: Option<&route::ModeMiss>) -> String {
     Some(route::ModeMiss::SeveralReady { declarers, ready }) => {
       format!("{declarers} entries declare this endpoint's mode and {ready} are running")
     }
-    // Nothing claims the mode, which is also the answer when the fallback never
-    // ran because the client named a row of ours.
-    _ => "no entry declares this endpoint's mode".to_string(),
+    // Nothing claims the mode. `None` is the same answer: the fallback never ran
+    // because the client named a row of ours, and no row of ours serves the route.
+    Some(route::ModeMiss::NoDeclarer) | None => "no entry declares this endpoint's mode".into(),
   };
   format!("; {found}, so name a model that serves it or add a `proxy.aliases` entry")
 }

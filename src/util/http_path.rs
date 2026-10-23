@@ -13,16 +13,30 @@ pub fn is_dot_segment(segment: &str) -> bool {
   matches!(decoded_segment(segment).as_str(), "." | "..")
 }
 
-/// The comparable form of a path: dot segments resolved, repeated slashes
-/// collapsed, trailing slash dropped.
+/// A request path with its dot segments resolved: one form to match a declared
+/// prefix on, one to ask the engine for.
+pub struct ResolvedPath {
+  /// What the prefix match uses: dot segments gone, repeated slashes collapsed, no
+  /// trailing slash.
+  pub matched: String,
+  /// What the engine is asked for: the same resolution with the request's trailing
+  /// slash kept, because FastAPI and ComfyUI route `/x/` and `/x` apart.
+  pub forwarded: String,
+}
+
+/// The resolved form of a request path.
 ///
 /// `None` when nothing is left below the root, which would name the whole
 /// service, or when a `..` would climb out of it: what an engine would be asked
 /// for then is not the path the client wrote, so the caller refuses rather than
 /// matches on a guess.
-pub fn normalize_path(path: &str) -> Option<String> {
+///
+/// Nothing else is decoded. Only the `%2e` spelling is read, to recognize a dot
+/// segment; a `%2f` inside a segment stays the escape it was written as. Backslash
+/// splits because the URL parser splits it for `http`.
+pub fn resolve_path(path: &str) -> Option<ResolvedPath> {
   let mut kept: Vec<&str> = Vec::new();
-  for segment in path.split('/') {
+  for segment in path.split(['/', '\\']) {
     if segment.is_empty() {
       continue;
     }
@@ -34,7 +48,20 @@ pub fn normalize_path(path: &str) -> Option<String> {
     }
     kept.push(segment);
   }
-  (!kept.is_empty()).then(|| format!("/{}", kept.join("/")))
+  if kept.is_empty() {
+    return None;
+  }
+  let matched = format!("/{}", kept.join("/"));
+  let forwarded = match path.ends_with(['/', '\\']) {
+    true => format!("{matched}/"),
+    false => matched.clone(),
+  };
+  Some(ResolvedPath { matched, forwarded })
+}
+
+/// The matching form of a path, as a declared prefix is stored and compared.
+pub fn normalize_path(path: &str) -> Option<String> {
+  resolve_path(path).map(|resolved| resolved.matched)
 }
 
 #[cfg(test)]
@@ -75,6 +102,41 @@ mod tests {
     assert_eq!(
       normalize_path("/internal/%2E/x").as_deref(),
       Some("/internal/x")
+    );
+  }
+
+  #[test]
+  fn a_backslash_splits_the_way_the_url_parser_reads_one() {
+    assert_eq!(
+      resolve_path("/internal/x\\..\\..\\metrics")
+        .map(|r| r.matched)
+        .as_deref(),
+      Some("/metrics")
+    );
+    assert_eq!(
+      resolve_path("/internal/x\\..\\metrics")
+        .map(|r| r.matched)
+        .as_deref(),
+      Some("/internal/metrics")
+    );
+  }
+
+  #[test]
+  fn a_trailing_slash_reaches_the_engine_though_matching_drops_it() {
+    let bare = resolve_path("/internal").unwrap();
+    assert_eq!(
+      (bare.matched.as_str(), bare.forwarded.as_str()),
+      ("/internal", "/internal")
+    );
+    let slashed = resolve_path("/internal/").unwrap();
+    assert_eq!(
+      (slashed.matched.as_str(), slashed.forwarded.as_str()),
+      ("/internal", "/internal/")
+    );
+    let doubled = resolve_path("/internal//").unwrap();
+    assert_eq!(
+      (doubled.matched.as_str(), doubled.forwarded.as_str()),
+      ("/internal", "/internal/")
     );
   }
 

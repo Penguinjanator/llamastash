@@ -760,6 +760,29 @@ servers:
     wait_listed(&mut client, "gen-stt").await;
     wait_listed(&mut client, "gen-tts-a").await;
 
+    // Nothing has started, and the listing already publishes the mode each entry
+    // declared, so a client can pick the endpoint from `/v1/models` first.
+    let listed: Value = http
+      .get(format!("{base}/v1/models"))
+      .send()
+      .await
+      .expect("model list")
+      .json()
+      .await
+      .expect("model list body");
+    let mode_of = |name: &str| {
+      listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == name)
+        .and_then(|row| row["mode"].as_str())
+        .unwrap_or_else(|| panic!("{name} is not listed: {listed}"))
+        .to_string()
+    };
+    assert_eq!(mode_of("gen-stt"), "stt");
+    assert_eq!(mode_of("gen-tts-a"), "tts");
+
     let (body, content_type) = transcription_body("whisper-1");
     let resp = http
       .post(format!("{base}/v1/audio/transcriptions"))
@@ -859,29 +882,6 @@ servers:
       "a mode mismatch started a launch: {status}"
     );
 
-    // The listing publishes the mode the entry declared, so a client can pick the
-    // right endpoint from `/v1/models` instead of guessing.
-    let listed: Value = http
-      .get(format!("{base}/v1/models"))
-      .send()
-      .await
-      .expect("model list")
-      .json()
-      .await
-      .expect("model list body");
-    let mode_of = |name: &str| {
-      listed["data"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["id"] == name)
-        .and_then(|row| row["mode"].as_str())
-        .unwrap_or_else(|| panic!("{name} is not listed: {listed}"))
-        .to_string()
-    };
-    assert_eq!(mode_of("gen-stt"), "stt");
-    assert_eq!(mode_of("gen-tts-a"), "tts");
-
     // A mode no entry declares is refused as such, not as a name to add.
     let resp = http
       .post(format!("{base}/v1/images/generations"))
@@ -974,6 +974,7 @@ servers:
       ("/internal/x/../../slots", 404),
       ("/internal/%2e%2e/metrics", 404),
       ("/internal/%2E%2E/props", 404),
+      ("/internal/x\\..\\..\\metrics", 404),
       ("/../metrics", 404),
       ("/slots", 404),
     ] {
@@ -981,12 +982,28 @@ servers:
       assert_eq!(status, want, "{target}");
     }
 
-    // What the engine is asked for is the resolved path, not the one written.
-    let (status, text) = raw_get(proxy_port, "/internal/x/../deep/y").await;
+    // What the engine is asked for is the resolved path, not the one written. A
+    // backslash splits here because the URL parser reads it as a separator.
+    for (target, want) in [
+      ("/internal/x/../deep/y", "/internal/deep/y"),
+      ("/internal/x\\..\\metrics", "/internal/metrics"),
+      ("/internal/x\\deep", "/internal/x/deep"),
+    ] {
+      let (status, text) = raw_get(proxy_port, target).await;
+      assert_eq!(status, 200, "{target}");
+      let want = format!("\"target\":\"{want}\"");
+      assert!(text.contains(&want), "the engine saw {want}: {text}");
+    }
+
+    // An escape inside a segment stays an escape: only the `%2e` spelling is read, to
+    // spot a dot segment, so nothing else about the path is decoded on the way.
+    let (status, text) = raw_get(proxy_port, "/internal/%2e%2e%2fmetrics").await;
     assert_eq!(status, 200);
     assert!(
-      text.contains("\"target\":\"/internal/deep/y\""),
-      "the engine saw the resolved path: {text}"
+      text
+        .to_ascii_uppercase()
+        .contains("\"TARGET\":\"/INTERNAL/%2E%2E%2FMETRICS\""),
+      "the escape reaches the engine as written: {text}"
     );
     shutdown(client, daemon).await;
   }
@@ -1019,6 +1036,21 @@ servers:
     assert_eq!(
       echoed["model"], "keep-me",
       "the pin is not applied: {echoed}"
+    );
+
+    // Again with the launch up: a Ready forward pins nothing either.
+    let resp = http
+      .post(format!("{base}/rw/pinned"))
+      .json(&json!({"model": "keep-me-again", "other": 2}))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("declared POST to a running launch");
+    assert_eq!(resp.status().as_u16(), 200);
+    let echoed: Value = resp.json().await.unwrap();
+    assert_eq!(
+      echoed["model"], "keep-me-again",
+      "the pin is not applied to a running launch: {echoed}"
     );
     shutdown(client, daemon).await;
   }
@@ -1311,11 +1343,13 @@ servers:
     );
 
     // A prefix covers what hangs below it, keeps the query, and never matches a
-    // longer name.
+    // longer name. A trailing slash survives, because engines route `/x/` and `/x`
+    // apart; matching is still on the slash-less form.
     for (path, want) in [
       ("/internal", 200u16),
       ("/internal?x=1", 200),
       ("/internal/extra", 200),
+      ("/internal/", 200),
       ("/internal/deep/x", 200),
       ("/internalsuffix", 404),
       ("/nonsense", 404),

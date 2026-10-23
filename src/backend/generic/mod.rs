@@ -300,10 +300,6 @@ impl Backend for GenericBackend {
     let generic = &config.generic;
     generic.validate(&|id| crate::launch::knobs::registry::resolve_static_id(id).is_some())?;
     generic.validate_routes(&crate::proxy::router::proxy_owned_paths())?;
-    ANY_ROUTES.store(
-      generic.servers.iter().any(|s| !s.routes.is_empty()),
-      std::sync::atomic::Ordering::Relaxed,
-    );
     let mut table = entries().write().unwrap_or_else(|e| e.into_inner());
     // Merge rather than replace: a process loads config once, and replacing
     // would let an unrelated load (a test, a migration re-read) drop entries
@@ -326,6 +322,12 @@ impl Backend for GenericBackend {
         }),
       );
     }
+    // Read back the merged table: entries survive a load that does not carry them,
+    // so the flag has to describe all of them and not the last block installed.
+    ANY_ROUTES.store(
+      table.values().any(|e| !e.server.routes.is_empty()),
+      std::sync::atomic::Ordering::Relaxed,
+    );
     Ok(())
   }
 
