@@ -60,6 +60,8 @@ pub(crate) struct AliasIssue {
 /// candidates for the same entry.
 pub(crate) enum TargetVerdict {
   /// The value names exactly one model, and this is the row a request reaches.
+  /// Boxed: a `CatalogRow` is far larger than the verdict's other payloads, and
+  /// the row is only read to be handed to the caller that will route it.
   Routes(Box<CatalogRow>),
   /// Two or more models answer to the value; these are the candidates to choose
   /// between.
