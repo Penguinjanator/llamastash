@@ -17,7 +17,7 @@ use std::sync::RwLock;
 
 use serde::Serialize;
 
-use crate::launch::resolve::{CatalogRow, ResolveError};
+use crate::launch::resolve::{resolve_model_with_candidates, CatalogRow, ResolveError};
 
 /// What one `proxy.aliases` entry means against the catalog right now, as the
 /// operator sees it in `llamastash list --json`.
@@ -32,9 +32,10 @@ pub(crate) enum AliasState {
   Ok,
   /// A real model owns the name, so the alias never answers and the model does.
   Shadowed,
-  /// The value names no model, outright or as a partial match.
+  /// The value names no model, outright or even as a partial match.
   Dead,
-  /// Two or more models answer to the value; naming one is the operator's call.
+  /// Two or more models answer to the value, outright or once the rungs loosen;
+  /// naming one is the operator's call.
   Ambiguous,
   /// The value is another alias name, so the chain reaches no model.
   Chain,
@@ -47,6 +48,27 @@ pub(crate) struct AliasIssue {
   pub(crate) name: String,
   pub(crate) target: String,
   pub(crate) state: AliasState,
+}
+
+/// One alias value, judged against the catalog the way a request judges it.
+///
+/// The ladder is the request's own, in one place: a value that names one model
+/// outright, one that several models answer to (outright, or once the rungs
+/// loosen), one that is another alias name, or one that reaches nothing. Both the
+/// client's error and the operator's audit state come from here, so `list --json`
+/// cannot send someone hunting a typo while the client is being handed two
+/// candidates for the same entry.
+pub(crate) enum TargetVerdict {
+  /// The value names exactly one model, and this is the row a request reaches.
+  Routes(Box<CatalogRow>),
+  /// Two or more models answer to the value; these are the candidates to choose
+  /// between.
+  Ambiguous(Vec<CatalogRow>),
+  /// The value is another alias name, so the chain reaches no model.
+  Chain,
+  /// Nothing answers to the value: no row at all, or only rows that merely
+  /// contain it, which an alias may not answer with.
+  Dead,
 }
 
 /// Client name → model reference, plus the warnings already logged about it.
@@ -142,11 +164,11 @@ impl AliasTable {
   }
 
   /// Every entry in config order, judged against `cat`. This is the operator's
-  /// half of the same decisions the listings make per request: a row here
-  /// reads not `ok` exactly when `/v1/models` and `/api/tags` leave it out and
-  /// a request under that name cannot be served. It asks only what the
-  /// listings' own pass over the table asks, so a listing and an audit answer
-  /// with one rule.
+  /// half of the same decisions the listings and the request path make: a row here
+  /// reads not `ok` exactly when `/v1/models` and `/api/tags` leave it out, and it
+  /// names the same reason a request under that name would be given. So a value
+  /// two models answer to reads `ambiguous` here and in the client's `400`, never
+  /// one of each.
   pub(crate) fn audit(&self, cat: &[CatalogRow]) -> Vec<AliasIssue> {
     self
       .targets
@@ -159,6 +181,29 @@ impl AliasTable {
       .collect()
   }
 
+  /// What one alias value amounts to against `cat`, walked in the order a request
+  /// walks it: outright first, then whether the value is another alias name, then
+  /// the looser rungs that decide *why* nothing answered. Naming a model outright
+  /// is the bar an alias has to clear — a value that only some longer file name
+  /// contains would auto-start whichever row happened to contain it, and the
+  /// client sending the alias name has no way to refine it — so a loose single
+  /// match is `Dead` here, while a loose match on two rows is `Ambiguous`, which
+  /// is exactly what that client is told.
+  pub(crate) fn verdict(&self, cat: &[CatalogRow], target: &str) -> TargetVerdict {
+    match crate::launch::resolve::resolve_exact_reference(cat, target) {
+      Ok(row) => return TargetVerdict::Routes(Box::new(row)),
+      Err(ResolveError::Many(candidates)) => return TargetVerdict::Ambiguous(candidates),
+      Err(ResolveError::None | ResolveError::Empty) => {}
+    }
+    if self.target(target).is_some() {
+      return TargetVerdict::Chain;
+    }
+    match resolve_model_with_candidates(cat, target) {
+      Err(ResolveError::Many(candidates)) => TargetVerdict::Ambiguous(candidates),
+      _ => TargetVerdict::Dead,
+    }
+  }
+
   /// The one judgement behind [`Self::audit`]: the name first, because a model
   /// that owns it answers instead of the alias, then the value the way a
   /// request would.
@@ -166,18 +211,11 @@ impl AliasTable {
     if crate::launch::resolve::resolve_exact_reference(cat, name).is_ok() {
       return AliasState::Shadowed;
     }
-    match crate::launch::resolve::resolve_exact_reference(cat, target) {
-      Ok(_) => AliasState::Ok,
-      Err(ResolveError::Many(_)) => AliasState::Ambiguous,
-      // Nothing owns the value outright. It is either another alias name, which
-      // reaches no model, or it names nothing at all.
-      Err(ResolveError::None | ResolveError::Empty) => {
-        if self.target(target).is_some() {
-          AliasState::Chain
-        } else {
-          AliasState::Dead
-        }
-      }
+    match self.verdict(cat, target) {
+      TargetVerdict::Routes(_) => AliasState::Ok,
+      TargetVerdict::Ambiguous(_) => AliasState::Ambiguous,
+      TargetVerdict::Chain => AliasState::Chain,
+      TargetVerdict::Dead => AliasState::Dead,
     }
   }
 
@@ -529,6 +567,24 @@ mod tests {
     let t = AliasTable::from_config(&crate::config::ProxyAliases::default());
     assert_eq!(t.target("anything"), None);
     assert!(!t.warn_shadowed("anything"));
+  }
+
+  /// Audit state `target` would be given: `ambiguous` for a value two rows answer
+  /// to once the rungs loosen, where the exact rung alone would have said `dead`.
+  /// The client sending this alias is handed a candidate list, not a typo hint, so
+  /// the two surfaces have to agree.
+  #[test]
+  fn a_loose_match_two_rows_answer_to_is_ambiguous_not_dead() {
+    // `qwen3-it` is no row's name, published id or qualified id, but both file
+    // names contain it, so a request under the alias gets `ambiguous_model` with
+    // two candidates. A `dead` audit here sends the operator hunting a typo.
+    let t = table(&[("gpt-4o-mini", "qwen3-it")]);
+    let cat = cat(&["/m/qwen3-it-q4.gguf", "/n/qwen3-it-q8.gguf"]);
+    assert_eq!(
+      t.audit(&cat)[0].state,
+      AliasState::Ambiguous,
+      "the audit must name the reason a request gets"
+    );
   }
 
   /// Rows in the shape the catalog hands the resolver: `path` and

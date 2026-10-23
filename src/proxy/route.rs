@@ -33,6 +33,7 @@ use crate::launch::resolve::{
   parse_named_reference, resolve_model_with_candidates, CatalogRow, ResolveError,
 };
 
+use super::alias::TargetVerdict;
 use super::launch::{self, LaunchOutcome};
 use super::mru::{pick_fallback, FallbackCandidate};
 use super::request_log::RequestRecord;
@@ -467,51 +468,42 @@ fn resolve_reference(
 /// is written once and the client sending its name cannot refine it, so answering
 /// a loose target with a substring match would auto-start whichever row happened
 /// to contain it, and nothing downstream could tell that was not the model named.
+///
+/// The verdict comes from the table's own ladder, which is also what `list --json`
+/// reports, so the reason in the operator's audit and the reason in this response
+/// are decided by one walk over the same rungs.
 fn resolve_aliased_reference(
   state: &ProxyState,
   rows: &[CatalogRow],
   reference: &str,
   target: &str,
 ) -> Result<ResolvedRef, ClientRefMiss> {
-  match crate::launch::resolve::resolve_exact_reference(rows, target) {
-    Ok(row) => {
+  match state.ctx.aliases.verdict(rows, target) {
+    TargetVerdict::Routes(row) => {
       note_moved_partial(state, rows, reference, target, &row);
-      Ok(ResolvedRef::aliased(row))
+      Ok(ResolvedRef::aliased(*row))
     }
-    Err(err @ ResolveError::Many(_)) => Err(aliased_ambiguous(state, rows, reference, target, err)),
-    // The target named no model outright. Two readings are left and each gets
-    // said rather than the generic line: it is another alias name, so the chain
-    // reaches nothing, or several models answer to it once the rungs loosen.
-    Err(ResolveError::None | ResolveError::Empty) => {
-      if state.ctx.aliases.target(target).is_some() {
-        state.ctx.aliases.warn_points_at_alias(reference, target);
-        return Err(ClientRefMiss::NotFound);
-      }
-      match resolve_model_with_candidates(rows, target) {
-        Err(err @ ResolveError::Many(_)) => {
-          Err(aliased_ambiguous(state, rows, reference, target, err))
-        }
-        _ => {
-          state.ctx.aliases.warn_dead_target(reference, target);
-          Err(ClientRefMiss::NotFound)
-        }
-      }
+    // The value is another alias name, so the chain reaches nothing; or nothing
+    // owns it, not even loosely. Each gets its own line rather than the generic
+    // miss, because each is fixed a different way in `config.yaml`.
+    TargetVerdict::Chain => {
+      state.ctx.aliases.warn_points_at_alias(reference, target);
+      Err(ClientRefMiss::NotFound)
+    }
+    TargetVerdict::Dead => {
+      state.ctx.aliases.warn_dead_target(reference, target);
+      Err(ClientRefMiss::NotFound)
+    }
+    // Two or more models answer to the value, which is a mistake only the
+    // operator can fix, and the client is handed the same candidate list any
+    // ambiguous reference gets.
+    TargetVerdict::Ambiguous(candidates) => {
+      state.ctx.aliases.warn_ambiguous_target(reference, target);
+      Err(ClientRefMiss::Ambiguous(
+        crate::launch::resolve::published_ids_for(rows, &candidates),
+      ))
     }
   }
-}
-
-/// A value two or more models answer to, which is a mistake only the operator can
-/// fix: said as an ambiguous target and answered with the candidate list any
-/// ambiguous reference gets.
-fn aliased_ambiguous(
-  state: &ProxyState,
-  rows: &[CatalogRow],
-  reference: &str,
-  target: &str,
-  error: ResolveError,
-) -> ClientRefMiss {
-  state.ctx.aliases.warn_ambiguous_target(reference, target);
-  client_miss(rows, error)
 }
 
 /// What a failed resolve means to the client: a candidate list when several models

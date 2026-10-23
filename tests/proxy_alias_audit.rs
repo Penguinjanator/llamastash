@@ -58,13 +58,21 @@ async fn wait_for_socket(path: &Path) {
 /// A daemon with one model on disk and one alias that names it beside one that
 /// names nothing.
 async fn boot(aliases: &[(&str, &str)]) -> (PathBuf, Client) {
+  boot_with(&["qwen3.gguf"], aliases).await
+}
+
+/// A daemon with `models` written into its scan root and `aliases` configured, in
+/// the order they are listed here.
+async fn boot_with(models: &[&str], aliases: &[(&str, &str)]) -> (PathBuf, Client) {
   let state = unique_temp("state");
   let scan = unique_temp("scan");
-  fs::write(
-    scan.join("qwen3.gguf"),
-    llamastash::gguf::test_fixtures::build_minimal_gguf("llama"),
-  )
-  .unwrap();
+  for name in models {
+    fs::write(
+      scan.join(name),
+      llamastash::gguf::test_fixtures::build_minimal_gguf("llama"),
+    )
+    .unwrap();
+  }
   let mut opts = DaemonOptions {
     discovery: discovery_for(&scan),
     ..DaemonOptions::rooted_at(state.clone())
@@ -137,6 +145,69 @@ async fn a_dead_alias_reads_dead_and_a_live_one_reads_ok() {
       ),
     ],
     "one row per entry, in config order, each with its state"
+  );
+
+  let _ = client.call("shutdown", None).await;
+  let _ = std::fs::remove_dir_all(&state);
+}
+
+/// All five states on the wire, not just the two an `ok`/`dead` pair shows. These
+/// strings are what `list --json` prints, and an agent that cannot read the daemon
+/// log has only them to tell one kind of broken alias from another.
+///
+/// `qwen3-it` is no row's own name, but two file names contain it, so the alias
+/// reading it gets the same `ambiguous` a client gets. `Claude-Haiku` comes back
+/// folded down: that trimmed, lower-cased form is the spelling a client sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_state_reads_its_own_string_on_the_wire() {
+  let (state, mut client) = boot_with(
+    &["qwen3.gguf", "qwen3-it-q4.gguf", "qwen3-it-q8.gguf"],
+    &[
+      ("gpt-4o-mini", "qwen3"),
+      ("Claude-Haiku", "qwen3"),
+      ("qwen3", "qwen3-it-q4"),
+      ("hardwired", "gpt-4o-mini"),
+      ("dual", "qwen3-it"),
+      ("nowhere", "no-such-model"),
+    ],
+  )
+  .await;
+
+  assert_eq!(
+    audit(&mut client).await,
+    vec![
+      (
+        "gpt-4o-mini".to_string(),
+        "qwen3".to_string(),
+        "ok".to_string(),
+      ),
+      (
+        "claude-haiku".to_string(),
+        "qwen3".to_string(),
+        "ok".to_string(),
+      ),
+      (
+        "qwen3".to_string(),
+        "qwen3-it-q4".to_string(),
+        "shadowed".to_string(),
+      ),
+      (
+        "hardwired".to_string(),
+        "gpt-4o-mini".to_string(),
+        "chain".to_string(),
+      ),
+      (
+        "dual".to_string(),
+        "qwen3-it".to_string(),
+        "ambiguous".to_string(),
+      ),
+      (
+        "nowhere".to_string(),
+        "no-such-model".to_string(),
+        "dead".to_string(),
+      ),
+    ],
+    "one row per entry, in config order, each with the reason it cannot route"
   );
 
   let _ = client.call("shutdown", None).await;
