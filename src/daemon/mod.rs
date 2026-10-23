@@ -674,9 +674,10 @@ pub async fn run_foreground(opts: DaemonOptions) -> Result<StartOutcome> {
 
   // 8f. One report of the `proxy.aliases` entries that cannot route. It waits
   // for the first catalog row, because at this point the catalog may still be
-  // empty and every target would read dead. Same table the proxy answers from,
-  // so a name reported here is quiet on the first request for it, and a name
-  // the pass never reached still gets its line from that request.
+  // empty and every target would read dead, and it gives up if the daemon is
+  // told to stop first. Same table the proxy answers from, so a name reported
+  // here is quiet on the first request for it, and a name the pass never reached
+  // still gets its line from that request.
   {
     let alias_ctx = ctx.clone();
     supervisor::spawn_supervised("proxy_alias_audit", async move {

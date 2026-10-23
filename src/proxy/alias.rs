@@ -373,14 +373,23 @@ const AUDIT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 /// At daemon start the catalog is empty and every target would read `dead`, so
 /// the pass waits for the first row. It is bounded and it runs once: a scan
 /// root that discovers nothing is a valid configuration, and an alias that
-/// goes unreported there still gets its line from the first real request.
+/// goes unreported there still gets its line from the first real request. The
+/// wait ends at shutdown as well — a daemon asked to stop while its scan roots
+/// are still being walked has no more use for this report than for the catalog
+/// it is waiting on.
 pub(crate) async fn audit_after_first_scan(ctx: &crate::daemon::context::MethodContext) {
   if ctx.aliases.is_empty() {
     return;
   }
   let deadline = std::time::Instant::now() + AUDIT_CATALOG_WAIT;
-  while ctx.catalog.len().await == 0 && std::time::Instant::now() < deadline {
-    tokio::time::sleep(AUDIT_POLL).await;
+  while ctx.catalog.len().await == 0
+    && !ctx.shutdown.is_triggered()
+    && std::time::Instant::now() < deadline
+  {
+    tokio::select! {
+      _ = tokio::time::sleep(AUDIT_POLL) => {}
+      _ = ctx.shutdown.wait_until_triggered() => return,
+    }
   }
   if ctx.catalog.len().await == 0 {
     return;
@@ -727,6 +736,31 @@ mod tests {
     assert!(
       ctx.aliases.report_pending("gpt-4o-mini", REPORT_PARTIAL),
       "the alias that routes was not reported"
+    );
+  }
+
+  /// A daemon told to stop while its scan roots are still being walked has no more
+  /// use for this report than for the catalog it is waiting on, and must not leave
+  /// a poller behind holding the context.
+  #[tokio::test]
+  async fn the_startup_pass_gives_up_when_the_daemon_is_stopping() {
+    let ctx = crate::daemon::context::MethodContext::with_catalog(
+      crate::daemon::shutdown::ShutdownToken::new(),
+      crate::discovery::ModelCatalog::new(),
+    )
+    .with_aliases(&crate::config::ProxyAliases::from_pairs(vec![(
+      "gpt-4o-mini".to_string(),
+      "qwen3".to_string(),
+    )]));
+    ctx.shutdown.trigger();
+
+    let started = std::time::Instant::now();
+    super::audit_after_first_scan(&ctx).await;
+
+    assert!(
+      started.elapsed() < AUDIT_POLL,
+      "shutdown ends the wait at once, not one poll late: {:?}",
+      started.elapsed()
     );
   }
 }
