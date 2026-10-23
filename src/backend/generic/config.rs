@@ -67,7 +67,8 @@ pub struct GenericServer {
   /// a server that refuses any other model name.
   #[serde(default)]
   pub rewrite_model: bool,
-  /// The endpoints the server answers: `chat`, `embedding`, `rerank`. Empty
+  /// The endpoints the server answers: `chat`, `embedding`, `rerank`, `image`,
+  /// `tts`, `stt`. Empty
   /// (the default) means all, so the engine answers or refuses each request.
   #[serde(default)]
   pub modes: Vec<crate::launch::mode::LaunchMode>,
