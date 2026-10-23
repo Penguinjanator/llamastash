@@ -21,6 +21,7 @@ What each field means is in [`docs/usage.md`](docs/usage.md): § [Generic backen
 | faster-whisper + Kokoro (STT and TTS) | Speaches | [Speaches](#speaches) |
 | Whisper, Kokoro, SD (STT, TTS, image) | LocalAI | [LocalAI](#localai) |
 | Piper voices (TTS) | Piper | [Piper](#piper) |
+| Chatterbox (TTS) | Chatterbox TTS API | [Chatterbox TTS API](#chatterbox-tts-api) |
 | SD 1.5 and other ComfyUI workflows | ComfyUI | [ComfyUI](#comfyui) |
 
 ## llama.cpp builds
@@ -816,3 +817,30 @@ backend:
 ```
 
 `GET :11435/system_stats` auto-started it, and a 20-step SD 1.5 workflow posted to `/prompt` finished in 15 s, with the PNG fetched through `/view`. Paths that are not declared (`/extensions`, `/internal/logs`) get the proxy's 404, and so does ComfyUI's `/api/...` spelling, because `/api` belongs to the proxy's Ollama surface. ComfyUI's progress WebSocket (`/ws`) cannot ride the proxy; poll `/history` instead.
+
+### Chatterbox TTS API
+
+[chatterbox-tts-api](https://github.com/travisvn/chatterbox-tts-api) serves Resemble AI's Chatterbox on OpenAI's `POST /v1/audio/speech`. Tested from a `main` checkout (`a5f4661`, December 2025) on an RTX 3050 Ti with the English model, installed with `uv sync` plus `uv pip install 'setuptools<81'`: without `pkg_resources` the watermarker import fails quietly and model loading stops with `TypeError: 'NoneType' object is not callable`. The first start downloads the weights.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: chatterbox
+        binary: /path/to/chatterbox-tts-api/.venv/bin/uvicorn
+        args: [app.main:app, --host, "{host}", --port, "{port}"]
+        env:
+          PYTHONPATH: /path/to/chatterbox-tts-api
+          DEVICE: cuda
+          USE_MULTILINGUAL_MODEL: "false"     # the English model, smaller
+          MODEL_CACHE_DIR: /path/to/chatterbox-tts-api/models
+          VOICE_SAMPLE_PATH: /path/to/chatterbox-tts-api/voice-sample.mp3
+          VOICE_LIBRARY_DIR: /path/to/chatterbox-tts-api/voices
+          LONG_TEXT_DATA_DIR: /path/to/chatterbox-tts-api/data/long_text_jobs
+        ready: /health
+        modes: [tts]
+        memory_gib: 4
+        ready_timeout_secs: 600
+```
+
+The loaded model took 3.2 GB of the 4 GB card; with another engine already on the GPU it failed with `CUDA out of memory`. `/health` answers 200 while the model is still loading (`"model_loaded": false`), so llamastash marks the launch ready early and a request in that window gets `500 Model not loaded`; retry once `model_loaded` is `true`. After that, `{"model":"chatterbox","input":"...","voice":"alloy"}` returned a 24 kHz WAV that transcribed back to its input.
