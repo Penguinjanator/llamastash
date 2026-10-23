@@ -16,6 +16,8 @@ What each field means is in [`docs/usage.md`](docs/usage.md): § [Generic backen
 | any Lemonade model | Lemonade (`lemond`) | [Lemonade](#lemonade) |
 | NPU LLMs, Whisper | FastFlowLM | [FastFlowLM (AMD NPU)](#fastflowlm-amd-npu) |
 | Whisper | whisper.cpp | [whisper.cpp](#whispercpp) |
+| Kokoro 82M (TTS) | Kokoro-FastAPI | [Kokoro-FastAPI](#kokoro-fastapi) |
+| MOSS-Image, other diffusion GGUFs | stable-diffusion.cpp (`sd-server`) | [stable-diffusion.cpp](#stable-diffusioncpp) |
 
 ## llama.cpp builds
 
@@ -629,3 +631,80 @@ backend:
 Leave the two path flags out and whisper answers `/inference` instead; `routes: [/inference]` on the entry then forwards that path to it, upload included, and the request logs under `/inference`.
 
 `ready` moves with the request path: `--request-path /v1/audio` puts health at `/v1/audio/health` and `/health` answers 404. Two gotchas: the binary needs `LD_LIBRARY_PATH` set to its own directory or it dies with `libwhisper.so.1: cannot open shared object file` (exit 127), and a leading `~/` in an `env` value resolves to your home directory the way `binary` does (the rest of the value is passed through, so a `~` in the middle of a path list is literal). Its weights are `ggml-*.bin`, which the model scanner does not list, so the path lives in the entry.
+
+Also tested with whisper.cpp v1.9.5 built with CUDA (`build-cuda/bin/whisper-server`) and `ggml-large-v3-turbo-q5_0.bin` on an RTX 3050 Ti (4 GB), with both entries below in one config. A client that sends OpenAI's own name, `model=whisper-1`, reaches `whisper-turbo` because it is the only entry declaring `stt`; the reply carries `x-llamastash-served-by: whisper-turbo` and `x-llamastash-fallback-reason: mode_match`. `POST /v1/audio/translations` is forwarded to the same entry, but whisper-server answers only the one inference path it was given, so it returns its own 404 there.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: whisper-turbo
+        binary: /path/to/whisper.cpp/build-cuda/bin/whisper-server
+        args: [-m, /path/to/ggml-large-v3-turbo-q5_0.bin, --host, "{host}", --port, "{port}",
+               --request-path, /v1/audio, --inference-path, /transcriptions]
+        env: {LD_LIBRARY_PATH: /path/to/whisper.cpp/build-cuda/bin}
+        ready: /v1/audio/health
+        modes: [stt]
+        memory_gib: 2
+      - name: whisper-native   # whisper's own API through the proxy
+        binary: /path/to/whisper.cpp/build-cuda/bin/whisper-server
+        args: [-m, /path/to/ggml-large-v3-turbo-q5_0.bin, --host, "{host}", --port, "{port}"]
+        env: {LD_LIBRARY_PATH: /path/to/whisper.cpp/build-cuda/bin}
+        ready: /health
+        routes: [/inference]
+        memory_gib: 2
+```
+
+`POST :11435/inference` reaches `whisper-native`; its other paths (`/load`, `/health`) stay closed on the proxy, and so do spellings that try to climb out of the prefix (`/inference/../health`, `/inference/%2e%2e/health`, `/inference\..\health` all get the proxy's 404).
+
+### Kokoro-FastAPI
+
+[Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) v0.9.0 serves the Kokoro 82M text-to-speech model on OpenAI's `POST /v1/audio/speech`. Tested from a source checkout (`uv sync --extra gpu`, which downloads the model into `api/src/models` on first run) on an RTX 3050 Ti. Its config defaults are the Docker image's absolute paths (`/app/api/src/...`), so a launch outside the container needs `MODEL_DIR`, `VOICES_DIR`, `WEB_PLAYER_PATH` and `PYTHONPATH` pointed at the checkout.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: kokoro
+        binary: /path/to/Kokoro-FastAPI/.venv/bin/uvicorn
+        args: [api.src.main:app, --host, "{host}", --port, "{port}"]
+        env:
+          USE_GPU: "true"
+          PYTHONPATH: /path/to/Kokoro-FastAPI:/path/to/Kokoro-FastAPI/api
+          MODEL_DIR: /path/to/Kokoro-FastAPI/api/src/models
+          VOICES_DIR: /path/to/Kokoro-FastAPI/api/src/voices/v1_0
+          WEB_PLAYER_PATH: /path/to/Kokoro-FastAPI/web
+        ready: /v1/models
+        modes: [tts]
+        memory_gib: 2
+        ready_timeout_secs: 180   # first start loads torch and the model
+```
+
+`{"model":"kokoro","input":"...","voice":"af_heart","response_format":"wav"}` returns 24 kHz mono WAV, `mp3` and streamed `pcm` work too, and `model: tts-1` reaches the entry through the mode fallback. With two `tts` entries configured, `tts-1` goes to whichever one is running; with neither running it is a 404 that says `2 entries declare this endpoint's mode and none is running`, and a `proxy.aliases` entry (`tts-1: kokoro`) settles it.
+
+### stable-diffusion.cpp
+
+`sd-server` from [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) serves OpenAI's `POST /v1/images/generations` and `/v1/images/edits` plus the A1111 API under `/sdapi/v1`. Tested with build `master-995-fd21ecf` (two builds behind `master-997` at the time) built with CUDA, running MOSS-Image (`MOSS-Image-SFT-Q4_K.gguf` with a Qwen3.5 9B text encoder and the FLUX.2 VAE) on an RTX 3050 Ti with 4 GB, which needs `--offload-to-cpu`.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: moss-image
+        binary: /path/to/stable-diffusion.cpp/build-cuda/bin/sd-server
+        args: [--diffusion-model, /path/to/MOSS-Image-SFT-Q4_K.gguf,
+               --llm, /path/to/Qwen3.5-9B-Q4_K_M.gguf,
+               --vae, /path/to/flux2-vae.safetensors,
+               --tokenizer, /path/to/tokenizer.json,
+               --offload-to-cpu, --cfg-scale, "3.0",
+               --listen-ip, "{host}", --listen-port, "{port}"]
+        ready: /v1/models
+        modes: [image]
+        routes: [/sdapi/v1]   # the A1111 API, for clients that speak it
+        memory_gib: 10
+        ready_timeout_secs: 300
+```
+
+`{"model":"dall-e-3","prompt":"...","size":"512x512","response_format":"b64_json"}` reaches the entry through the mode fallback and returns a 512x512 PNG; a multipart `POST /v1/images/edits` with an `image` file works the same way. `GET :11435/sdapi/v1/samplers` and `POST /sdapi/v1/txt2img` go to the engine through the declared prefix, and the request log lists them under `/sdapi/v1`.
+
+sd-server prints `listening on` before it binds and exits 0 when the bind fails, so a launch that loses its port to a process that is still shutting down shows up as `launch_failed` with a clean exit. Starting it again works.
