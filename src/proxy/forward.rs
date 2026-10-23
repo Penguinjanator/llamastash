@@ -76,6 +76,10 @@ pub(crate) struct Target<'a> {
   pub served_model_key: &'a crate::gguf::identity::ModelId,
   pub fallback: bool,
   pub fallback_reason: Option<&'a str>,
+  /// The model name to put in the body, for a request whose own name reached
+  /// this target by the endpoint's mode instead of by name. A launch that pins
+  /// its own request-model name wins over this.
+  pub request_model: Option<&'a str>,
 }
 
 /// Forward an inbound `hyper::Request` to the upstream
@@ -107,7 +111,9 @@ pub(crate) async fn forward_to_upstream(
     served_model_key,
     fallback,
     fallback_reason,
+    request_model,
   } = target;
+  let content_type = content_type_of(&inbound_headers).map(str::to_string);
   // Re-verify the supervisor at `port` is still the one we picked,
   // and take an in-flight guard on the matching ManagedModel in the
   // same snapshot walk so concurrent eviction can't tear down the
@@ -115,13 +121,17 @@ pub(crate) async fn forward_to_upstream(
   // guard's `Drop` decrements the inflight counter — covers happy-
   // path body completion, abandoned client connections, and upstream
   // errors uniformly because the response body owns the guard.
-  let (inflight_guard, launch_id, request_model, backend) =
+  let (inflight_guard, launch_id, launch_request_model, backend) =
     match acquire_inflight_guard(state, port, served_model_key).await {
       Some(g) => g,
       None => {
         return unreachable_response(record, "model exited before forwarding could begin");
       }
     };
+  // The launch's own pinned name is its entry's contract with its engine, so it
+  // beats the router's fallback name; the fallback is what a client that named
+  // nothing of ours gets told instead.
+  let request_model = launch_request_model.or_else(|| request_model.map(str::to_string));
   if let Some(record) = record.as_mut() {
     record.set_launch(launch_id.as_str());
     record.publish();
@@ -190,6 +200,7 @@ pub(crate) async fn forward_to_upstream(
     inbound_uri.path(),
     &backend,
     request_model.as_deref(),
+    content_type.as_deref(),
   );
   let request = client
     .request(upstream_method, &upstream_url)
@@ -277,20 +288,21 @@ async fn acquire_inflight_guard(
   None
 }
 
-/// The request body as sent upstream: `body` with the launch's request-model
-/// name, then the serving backend's own rewrite for `endpoint`.
+/// The request body as sent upstream: the `model` name the caller settled on,
+/// then the serving backend's own rewrite for `endpoint`.
 fn outbound_body(
   ctx: &crate::daemon::context::MethodContext,
   body: Bytes,
   endpoint: &str,
   backend: &crate::backend::Backends,
   request_model: Option<&str>,
+  content_type: Option<&str>,
 ) -> Bytes {
   use crate::backend::Backend as _;
   // Two surgical edits, each copying every untouched entry as the client's own
   // bytes.
   let body = match request_model {
-    Some(model) => with_model(body, model),
+    Some(model) => with_model(body, model, content_type),
     None => body,
   };
   match backend.rewrite_request_body(ctx, endpoint, &body) {
@@ -299,11 +311,26 @@ fn outbound_body(
   }
 }
 
-/// `body` with its top-level `model` set to `model`. Every other entry is
-/// copied as its raw bytes, in order, so key order and nested content survive
-/// and no `Value` tree is built for a multi-MB image body. A body that is not a
-/// JSON object carrying `model` is returned unchanged.
-fn with_model(body: Bytes, model: &str) -> Bytes {
+/// The `Content-Type` of a request, for the two places that have to know which
+/// shape a body is.
+pub(crate) fn content_type_of(headers: &HeaderMap) -> Option<&str> {
+  headers
+    .get(hyper::header::CONTENT_TYPE)
+    .and_then(|v| v.to_str().ok())
+}
+
+/// `body` with its `model` set to `model`, in whichever shape `content_type`
+/// says it arrived: the top-level JSON member, or the `model` field of a
+/// `multipart/form-data` body. Both edits copy every untouched byte, so key
+/// order, nested content, and an uploaded file all survive; a body that carries
+/// no `model` at all is returned unchanged.
+fn with_model(body: Bytes, model: &str, content_type: Option<&str>) -> Bytes {
+  if let Some(ct) = content_type.filter(|ct| crate::util::multipart_body::is_multipart(ct)) {
+    return match crate::util::multipart_body::replace_field(&body, ct, "model", model.as_bytes()) {
+      Some(rewritten) => Bytes::from(rewritten),
+      None => body,
+    };
+  }
   let Some(entries) = crate::util::json_body::entries(&body) else {
     return body;
   };
@@ -679,6 +706,7 @@ mod tests {
     let out = with_model(
       Bytes::from(r#"{"model":"q@other","messages":[{"model":"keep"}],"stream":true}"#),
       "q",
+      None,
     );
     let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(v["model"], "q");
@@ -686,17 +714,48 @@ mod tests {
     assert_eq!(v["stream"], true);
 
     assert_eq!(
-      with_model(Bytes::from(r#"{"z":1,"model":"a","b":{"y":1,"x":2}}"#), "q"),
+      with_model(
+        Bytes::from(r#"{"z":1,"model":"a","b":{"y":1,"x":2}}"#),
+        "q",
+        None
+      ),
       r#"{"z":1,"model":"q","b":{"y":1,"x":2}}"#.as_bytes(),
       "key order survives the rewrite"
     );
 
     for untouched in [r#"{"messages":[]}"#, "not json", "[1]", ""] {
       assert_eq!(
-        with_model(Bytes::from(untouched), "q"),
+        with_model(Bytes::from(untouched), "q", None),
         untouched.as_bytes()
       );
     }
+  }
+
+  #[test]
+  fn with_model_replaces_the_multipart_field_and_nothing_else() {
+    let body = b"--x\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\
+                 Content-Type: audio/wav\r\n\r\nRIFFdata\r\n\
+                 --x\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n\
+                 --x--\r\n";
+    let ct = "multipart/form-data; boundary=x";
+    let out = with_model(Bytes::from(&body[..]), "my-whisper", Some(ct));
+    assert_eq!(
+      crate::util::multipart_body::field_value(&out, ct, "model"),
+      Some(&b"my-whisper"[..])
+    );
+    assert!(
+      out.windows(b"RIFFdata".len()).any(|w| w == b"RIFFdata"),
+      "the upload is untouched"
+    );
+    // A multipart body with no `model` field is forwarded as it arrived.
+    let none = b"--x\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nblob\r\n--x--\r\n";
+    assert_eq!(with_model(Bytes::from(&none[..]), "q", Some(ct)), &none[..]);
+    // The same bytes read as JSON when the header does not say multipart.
+    assert_eq!(
+      with_model(Bytes::from(&body[..]), "q", None),
+      &body[..],
+      "a binary body is not JSON either"
+    );
   }
 
   #[test]
@@ -741,7 +800,14 @@ mod tests {
     ] {
       for backend in Backends::all() {
         assert_eq!(
-          outbound_body(&ctx, Bytes::from(body), "/v1/messages", &backend, None),
+          outbound_body(
+            &ctx,
+            Bytes::from(body),
+            "/v1/messages",
+            &backend,
+            None,
+            None,
+          ),
           body.as_bytes(),
           "{} on {body}",
           backend.id(),
@@ -762,6 +828,7 @@ mod tests {
         "/v1/chat/completions",
         &test_backend(crate::backend::DEFAULT_BACKEND_ID),
         Some("launch-name"),
+        None,
       ),
       r#"{"model":"launch-name","stream":true}"#.as_bytes(),
     );

@@ -10,6 +10,7 @@ pub mod http_auth;
 pub mod json_body;
 pub mod logging;
 pub mod model_caches;
+pub mod multipart_body;
 pub mod paths;
 pub mod process;
 pub mod process_control;

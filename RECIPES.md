@@ -608,7 +608,7 @@ Three FLM notes: `/v1/models` lists FLM's whole model list, not what you downloa
 
 ### whisper.cpp
 
-`whisper-server` (whisper.cpp v1.8.4, from `lemonade backends install whispercpp:cpu`) serves two routes: `GET /health` and `POST /inference` (multipart `file=@clip.wav`, replies `{"text": ...}`). It has no `/v1/models`. Two flags rename its own routes onto the OpenAI transcription shape: `--request-path /v1/audio --inference-path /transcriptions` answers `POST /v1/audio/transcriptions` with 200 and `{"text": ...}`, and the plain `/inference` then 404s. The llamastash proxy does not forward that route yet (see [Proxy routes](docs/usage.md#proxy-openai-compatible-listener)), so an ASR client posts to the launch port from `llamastash status`.
+`whisper-server` (whisper.cpp v1.8.4, from `lemonade backends install whispercpp:cpu`) serves two routes: `GET /health` and `POST /inference` (multipart `file=@clip.wav`, replies `{"text": ...}`). It has no `/v1/models`. Two flags rename its own routes onto the OpenAI transcription shape: `--request-path /v1/audio --inference-path /transcriptions` answers `POST /v1/audio/transcriptions` with 200 and `{"text": ...}`, and the plain `/inference` then 404s. With `modes: [stt]` the llamastash proxy forwards that route to this entry, so an ASR client posts its file to the proxy instead of the launch port `llamastash status` shows; the upload is forwarded as sent and the engine answers it.
 
 ```yaml
 backend:
@@ -622,6 +622,7 @@ backend:
         env:
           LD_LIBRARY_PATH: ~/.cache/lemonade/bin/whispercpp/cpu   # the binary's own dir
         ready: /v1/audio/health
+        modes: [stt]
         memory_gib: 1
 ```
 

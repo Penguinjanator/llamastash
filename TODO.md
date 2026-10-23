@@ -522,7 +522,11 @@ _Shared context: `src/cli/` and `src/ipc/methods.rs` for the start and wait-for-
 ## Next
 
 - [ ] Show cache hit on request rows as well
-- [ ] audio/tts/video/etc support on proxy, support all common paths
+- [x] ~~audio/tts/video/etc support on proxy, support all common paths~~ — audio and image routes are served (`/v1/images/generations` `edits` `variations`, `/v1/audio/speech` `transcriptions` `translations`); video stays out, see the video item below. Plan: [`docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md`](docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md).
+- [ ] **No video generation route: `/v1/videos` is a jobs API.** The image and audio routes are one request in, one response out, which is all the proxy forwards. Video generation (OpenAI's `/v1/videos`, llama.cpp's `-vg` builds) submits a job and polls it, so it needs a job model the proxy does not have: create, status, download, and a job that outlives the request that made it. Named by the media-routes plan as out of scope, not a gap in it.
+- [ ] **`/v1/realtime` needs a WebSocket upgrade.** The proxy is an HTTP/1.1 pass-through with no upgrade path, so a realtime audio session cannot ride it. Separate transport work; the media-routes plan leaves it out.
+- [ ] **A media engine's own model list is not routable.** Media routes resolve only against rows llamastash already has, and a generic entry publishes one row (or one per `rows_from` tag). An engine that lists models on its own `/v1/models` — whisper.cpp reports nothing, Kokoro names its voices — publishes no rows, so its names reach the proxy only when it is the sole declarer of that mode. Closing this means minting rows from an engine's listing without launching it to read the list, which is what `rows_from` does with a command.
+- [ ] **Built-in engines claim no media mode.** `serves_mode` and `declares_mode` answer false for `image` / `tts` / `stt` on llama.cpp, vLLM and SGLang, so a GGUF on a media route is a refusal even when the build serves it (llama.cpp `-vg`). Letting one claim the modes is that engine's decision, with its own readiness and argv work.
 
 ### Batch 2: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
 
@@ -557,7 +561,7 @@ Items are grouped into batches by what a work session loads to do them - the sam
 
 ### High priority
 
-- [ ] **The proxy has no route for audio, so an ASR engine is launch-managed only.** `GENERATION_ROUTES` covers 8 paths and `/v1/audio/transcriptions` is not one, so FLM's NPU Whisper answers on its launch port and never through `:11435`. Wants that route plus a `transcription` mode (`LaunchMode` has chat / embedding / rerank, and Lemonade's `transcription` label already maps to `ModeHint::Unknown`), or a written decision to keep ASR out of the proxy's scope. Seen 2026-10-17.
+- [x] ~~**The proxy has no route for audio, so an ASR engine is launch-managed only.**~~ — done: `/v1/audio/transcriptions` and `/v1/audio/translations` are routes, `stt` / `tts` / `image` are declared-only launch modes, and a generic entry that lists one in `modes` answers them with its upload forwarded as sent. Seen 2026-10-17. Plan: [`docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md`](docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md).
 
 #### Batch H1 - New CLI verbs on the agent contract
 

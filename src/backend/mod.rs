@@ -458,13 +458,24 @@ pub trait Backend {
     false
   }
 
-  /// Whether a launch of `path` on `server` serves `mode`. Default `true` —
-  /// serves chat / embedding / rerank alike. A backend that serves only some
-  /// modes overrides this; an `Auto` launch in an unserved mode falls back to
+  /// Whether a launch of `path` on `server` serves `mode`. Default serves the
+  /// modes every engine is composed for — chat / embedding / rerank alike — and
+  /// refuses the media modes, which no built-in engine answers yet; a backend
+  /// that serves one overrides this. A backend that serves only some modes
+  /// overrides it; an `Auto` launch in an unserved mode falls back to
   /// the identity default, a routing input, not an error. The proxy refuses an
   /// embeddings or rerank request bound for a launch that does not serve it.
-  fn serves_mode(&self, _path: &Path, _server: Option<&str>, _mode: LaunchMode) -> bool {
-    true
+  fn serves_mode(&self, _path: &Path, _server: Option<&str>, mode: LaunchMode) -> bool {
+    !mode.is_declared_only()
+  }
+
+  /// Whether this row's own declaration names `mode` among the modes it serves,
+  /// as opposed to serving every mode by default. The proxy's media-route
+  /// fallback picks only a row that answers yes here: a row that declares no
+  /// mode would match any request, which is a guess at what the client meant.
+  /// Default `false` — a declared mode list is a registry-entry feature.
+  fn declares_mode(&self, _path: &Path, _server: Option<&str>, _mode: LaunchMode) -> bool {
+    false
   }
 
   /// A pre-spawn refusal for a model this backend recognizes but cannot launch,
@@ -1099,6 +1110,10 @@ impl Backend for Backends {
 
   fn serves_mode(&self, path: &Path, server: Option<&str>, mode: LaunchMode) -> bool {
     for_each_backend!(self, b => b.serves_mode(path, server, mode))
+  }
+
+  fn declares_mode(&self, path: &Path, server: Option<&str>, mode: LaunchMode) -> bool {
+    for_each_backend!(self, b => b.declares_mode(path, server, mode))
   }
 
   fn refuses(&self, arch: Option<&str>, path: &Path) -> Option<String> {

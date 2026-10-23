@@ -123,6 +123,24 @@ servers:
     args: [--port, "{{port}}", -m, "{{name}}", --print-argv]
     ready: /health
     rewrite_model: true
+  - name: gen-stt
+    binary: {bin}
+    args: [--port, "{{port}}"]
+    ready: /health
+    memory_gib: 1.0
+    modes: [stt]
+  - name: gen-tts-a
+    binary: {bin}
+    args: [--port, "{{port}}"]
+    ready: /health
+    memory_gib: 1.0
+    modes: [tts]
+  - name: gen-tts-b
+    binary: {bin}
+    args: [--port, "{{port}}"]
+    ready: /health
+    memory_gib: 1.0
+    modes: [tts]
 "#,
       bin = fake()
     );
@@ -264,6 +282,36 @@ servers:
   ) {
     let _ = client.call("shutdown", None).await;
     let _ = tokio::time::timeout(Duration::from_secs(30), daemon).await;
+  }
+
+  /// Wait until the proxy can see an entry's catalog row.
+  async fn wait_listed(client: &mut Client, entry: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !client
+      .call("list_models", None)
+      .await
+      .unwrap()
+      .to_string()
+      .contains(&format!("generic://{entry}"))
+    {
+      assert!(Instant::now() < deadline, "{entry} never listed");
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+  }
+
+  /// A whisper.cpp-shaped upload: a file part and a `model` field.
+  fn transcription_body(model: &str) -> (Vec<u8>, String) {
+    let b = "----lsTestBoundary";
+    let body = format!(
+      "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\
+       Content-Type: audio/wav\r\n\r\nRIFFdata\r\n\
+       --{b}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
+       --{b}--\r\n"
+    );
+    (
+      body.into_bytes(),
+      format!("multipart/form-data; boundary={b}"),
+    )
   }
 
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -599,6 +647,167 @@ servers:
     assert!(
       !status["models"].to_string().contains("generic://gen-chat"),
       "refused before launch: {status}"
+    );
+    shutdown(client, daemon).await;
+  }
+
+  /// The image and audio endpoints forward like any other `/v1` route: the body
+  /// names the entry, and a multipart upload reaches the engine untouched.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn the_media_routes_forward_and_auto_start_the_named_entry() {
+    let proxy_port = std::net::TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .port();
+    let (mut client, daemon) = boot(opts(unique_temp("media"), Some(proxy_port))).await;
+    let http = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{proxy_port}");
+    wait_listed(&mut client, "gen-stt").await;
+    wait_listed(&mut client, "gen-tts-a").await;
+
+    let (body, content_type) = transcription_body("gen-stt");
+    let resp = http
+      .post(format!("{base}/v1/audio/transcriptions"))
+      .header(reqwest::header::CONTENT_TYPE, content_type)
+      .body(body)
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("proxy request");
+    let status = resp.status();
+    let served_by = resp.headers().get("x-llamastash-served-by").cloned();
+    let echoed: Value = resp.json().await.unwrap();
+    assert!(status.is_success(), "status {status}: {echoed}");
+    assert_eq!(echoed["model"], "gen-stt", "{echoed}");
+    assert!(
+      echoed["received_body"]
+        .as_str()
+        .is_some_and(|b| b.contains("RIFFdata") && b.contains("name=\"model\"")),
+      "the upload and its fields reach the engine: {echoed}"
+    );
+    assert_eq!(served_by, None, "routing by name is not a fallback");
+
+    let resp = http
+      .post(format!("{base}/v1/audio/speech"))
+      .json(&json!({"model": "gen-tts-a", "input": "hi", "voice": "alloy"}))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("proxy request");
+    let status = resp.status();
+    let echoed: Value = resp.json().await.unwrap();
+    assert!(status.is_success(), "status {status}: {echoed}");
+    assert_eq!(echoed["model"], "gen-tts-a", "{echoed}");
+
+    let status = client.call("status", None).await.unwrap();
+    let running = status["models"].as_array().unwrap();
+    assert!(
+      running
+        .iter()
+        .any(|m| m["id"]["path"] == "generic://gen-stt" && state_of(m) == "ready"),
+      "the media route auto-started the entry it named: {status}"
+    );
+    shutdown(client, daemon).await;
+  }
+
+  /// A client that hardcodes `whisper-1` still reaches the one entry that
+  /// declares `stt`: the body's `model` is rewritten to that entry, the response
+  /// says so, and the log row keeps it. Two entries for one mode leaves nothing
+  /// to pick, so that answer stays `model_not_found` and says how to fix it.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn an_unknown_media_model_falls_back_to_the_entry_that_declares_the_mode() {
+    let proxy_port = std::net::TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .port();
+    let (mut client, daemon) = boot(opts(unique_temp("modefb"), Some(proxy_port))).await;
+    let http = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{proxy_port}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    wait_listed(&mut client, "gen-stt").await;
+    wait_listed(&mut client, "gen-tts-a").await;
+
+    let (body, content_type) = transcription_body("whisper-1");
+    let resp = http
+      .post(format!("{base}/v1/audio/transcriptions"))
+      .header(reqwest::header::CONTENT_TYPE, content_type)
+      .body(body)
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("proxy request");
+    let status = resp.status();
+    let served_by = resp
+      .headers()
+      .get("x-llamastash-served-by")
+      .and_then(|v| v.to_str().ok())
+      .map(str::to_string);
+    let reason = resp
+      .headers()
+      .get("x-llamastash-fallback-reason")
+      .and_then(|v| v.to_str().ok())
+      .map(str::to_string);
+    let echoed: Value = resp.json().await.unwrap();
+    assert!(status.is_success(), "status {status}: {echoed}");
+    assert_eq!(served_by.as_deref(), Some("gen-stt"), "{echoed}");
+    assert_eq!(reason.as_deref(), Some("mode_match"));
+    assert_eq!(
+      echoed["model"], "gen-stt",
+      "the body is rewritten: {echoed}"
+    );
+    assert!(
+      echoed["received_body"]
+        .as_str()
+        .is_some_and(|b| b.contains("RIFFdata")),
+      "only the field changed: {echoed}"
+    );
+
+    let row = loop {
+      let tail = client
+        .call("requests_tail", Some(json!({"limit": 50})))
+        .await
+        .unwrap();
+      if let Some(r) = tail["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["requested_model"] == "whisper-1")
+      {
+        break r.clone();
+      }
+      assert!(
+        Instant::now() < deadline,
+        "the request was never logged: {tail}"
+      );
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(row["route"], "/v1/audio/transcriptions", "{row}");
+    assert_eq!(row["fallback"], "mode_match", "{row}");
+    assert_eq!(row["model"], "gen-stt", "{row}");
+
+    // Two entries declare `tts` and neither is Ready: no single answer.
+    let resp = http
+      .post(format!("{base}/v1/audio/speech"))
+      .json(&json!({"model": "tts-1", "input": "hi"}))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("proxy request");
+    assert_eq!(resp.status().as_u16(), 404);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "model_not_found", "{body}");
+    assert!(
+      body["error"]["message"]
+        .as_str()
+        .is_some_and(|m| m.contains("proxy.aliases")),
+      "the refusal says how to make the name work: {body}"
+    );
+    let status = client.call("status", None).await.unwrap();
+    assert!(
+      !status["models"].to_string().contains("generic://gen-tts"),
+      "an ambiguous mode fallback starts nothing: {status}"
     );
     shutdown(client, daemon).await;
   }

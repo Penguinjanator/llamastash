@@ -330,7 +330,7 @@ fn start_params(launch: &PreloadLaunch) -> StartParams {
     // daemon's own mode resolution (preset pin > header hint) handles that case
     // better than a forced `chat` on the wire.
     mode: match params.mode {
-      LaunchMode::Chat => None,
+      LaunchMode::Chat | LaunchMode::Image | LaunchMode::Tts | LaunchMode::Stt => None,
       LaunchMode::Embedding => Some(LaunchModeWire::Embedding),
       LaunchMode::Rerank => Some(LaunchModeWire::Rerank),
     },

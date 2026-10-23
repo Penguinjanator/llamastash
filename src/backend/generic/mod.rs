@@ -330,6 +330,15 @@ impl Backend for GenericBackend {
       .is_none_or(|e| e.server.modes.is_empty() || e.server.modes.contains(&mode))
   }
 
+  fn declares_mode(
+    &self,
+    path: &Path,
+    server: Option<&str>,
+    mode: crate::launch::mode::LaunchMode,
+  ) -> bool {
+    entry_for_launch(path, server).is_some_and(|e| e.server.modes.contains(&mode))
+  }
+
   fn config_effort(&self, path: &Path) -> super::DeclaredEffort {
     entry_for_path(path)
       .map(|e| super::DeclaredEffort {
@@ -669,6 +678,28 @@ mod tests {
       row.metadata.unwrap().mode_hint,
       crate::gguf::metadata::ModeHint::Embedding
     );
+  }
+
+  /// Only a mode the entry lists counts as declared, which is what lets the
+  /// proxy's media-route fallback pick it. An entry that lists no mode serves
+  /// everything, so choosing it for a request would be a guess.
+  #[test]
+  fn only_a_listed_mode_is_declared() {
+    use crate::backend::Backend;
+    use crate::launch::mode::LaunchMode::{Stt, Tts};
+    install(
+      "servers:\n  \
+       - {name: dc-stt, binary: /b, ready: /h, modes: [stt]}\n  \
+       - {name: dc-any, binary: /b, ready: /h}\n",
+    );
+    let row = |name: &str| std::path::PathBuf::from(format!("generic://{name}"));
+    let b = GenericBackend::new();
+    assert!(b.declares_mode(&row("dc-stt"), None, Stt));
+    assert!(!b.declares_mode(&row("dc-stt"), None, Tts));
+    assert!(!b.declares_mode(&row("dc-any"), None, Stt));
+    assert!(!b.declares_mode(&row("md-none"), None, Stt));
+    // An entry with no mode list still serves the mode: the engine answers.
+    assert!(b.serves_mode(&row("dc-any"), None, Stt));
   }
 
   /// Declared row info fills the list columns verbatim; Ctx falls back to the
