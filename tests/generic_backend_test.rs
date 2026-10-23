@@ -743,8 +743,9 @@ servers:
   }
 
   /// A client that hardcodes `whisper-1` still reaches the one entry that
-  /// declares `stt`: the body's `model` is rewritten to that entry, the response
-  /// says so, and the log row keeps it. Two entries for one mode leaves nothing
+  /// declares `stt`: the body reaches it untouched, so an engine that maps
+  /// `whisper-1` itself still can, the response says which entry answered, and
+  /// the log row keeps it. Two entries for one mode leaves nothing
   /// to pick, so that answer stays `model_not_found` and says how to fix it.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn an_unknown_media_model_falls_back_to_the_entry_that_declares_the_mode() {
@@ -808,14 +809,14 @@ servers:
     assert_eq!(served_by.as_deref(), Some("gen-stt"), "{echoed}");
     assert_eq!(reason.as_deref(), Some("mode_match"));
     assert_eq!(
-      echoed["model"], "gen-stt",
-      "the body is rewritten: {echoed}"
+      echoed["model"], "whisper-1",
+      "the body is not rewritten: {echoed}"
     );
     assert!(
       echoed["received_body"]
         .as_str()
         .is_some_and(|b| b.contains("RIFFdata")),
-      "only the field changed: {echoed}"
+      "the upload arrives as sent: {echoed}"
     );
 
     // A media route picks its row by mode alone, so a request that names no model

@@ -893,7 +893,7 @@ pub(crate) struct NotRunningPlan {
   /// The `@<name>` half of the client's reference, `None` for unnamed launches.
   pub name: Option<String>,
   /// The endpoint's mode picked this row rather than the client's name, so the
-  /// forward carries the `mode_match` header and the row's own name on the wire.
+  /// forward carries the `mode_match` header.
   pub mode_fallback: bool,
   /// `false` when the request arrived on a path the engine declared for itself,
   /// where nothing in the body is rewritten.
@@ -954,7 +954,7 @@ pub(crate) async fn handle_not_running(
           served_model_key: &model_id,
           fallback: mode_fallback,
           fallback_reason: mode_fallback.then_some(MODE_MATCH),
-          request_model: mode_fallback.then_some(served.as_str()),
+          request_model: None,
           pin_request_model,
         },
         Some(record),

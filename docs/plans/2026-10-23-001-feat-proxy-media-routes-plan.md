@@ -38,7 +38,7 @@ Keep it simple. No new crates. No engine probing.
   4. Otherwise the original answer (`model_not_found` / `model_required`), with the message also saying to name the model or add a `proxy.aliases` entry.
   - `Ambiguous` from step 1 is returned as today, no fallback: the client named something two models match.
   - The fallback applies to the new media routes only. Chat, embedding and rerank routing is unchanged.
-- **Rewrite on fallback.** When steps 2-3 pick the row, the forwarded body's `model` is set to that row's served name (the same edit `rewrite_model` does), for JSON and multipart. The client's name meant nothing to us, so this is safe and lets strict engines answer. A body with no `model` field stays unchanged. The response carries the existing `x-llamastash-served-by` header and `x-llamastash-fallback-reason: mode_match`, and the request-log row's `fallback` is `mode_match`.
+- **No rewrite on fallback.** When steps 2-3 pick the row, the body is forwarded as the client sent it. The plan first set `model` to the row's name; testing against real engines reversed that: Speaches and LocalAI serve several models and map `whisper-1` / `tts-1` themselves, so they rejected the entry's name, and Kokoro-FastAPI accepts only its own list (`tts-1`, `kokoro`, ...), so an entry named `kokoro-b` broke it. whisper.cpp and sd.cpp ignore the name. An engine that needs its own name sets `rewrite_model: true`. The response carries the existing `x-llamastash-served-by` header and `x-llamastash-fallback-reason: mode_match`, and the request-log row's `fallback` is `mode_match`.
 - **Declared routes: `routes:` on a generic entry**, a list of path prefixes (`routes: [/prompt, /view, /history]`).
   - Prefix match on a segment boundary: `/prompt` matches `/prompt` and `/prompt/x`, not `/prompts`.
   - Any method; query string kept; body buffered under `proxy.max_body_size` and forwarded verbatim (no JSON parse, no rewrite); response streamed back.
@@ -141,6 +141,6 @@ Shipped as specified. Where the build differs from the plan text:
 ## Definition of done
 
 - All routes in the table forward through the proxy, multipart included.
-- Mode fallback and rewrite behave as specified, observable in headers and the request log.
+- Mode fallback behaves as specified, observable in headers and the request log.
 - Declared routes forward, auto-start, log, and every config refusal fires with a clear message.
 - Docs and `TODO.md` updated in the same commits. Verification commands pass.
