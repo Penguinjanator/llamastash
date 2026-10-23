@@ -101,6 +101,20 @@ Before finishing:
 
 The pre-commit hook runs fmt + lint + doc on each commit.
 
+## Implementation notes
+
+Shipped as specified. Where the build differs from the plan text:
+
+- The mode gate uses `declares_mode`, not `serves_mode`, for `image` / `tts` / `stt`. `serves_mode` treats an entry with no `modes:` as an OpenAI server for everything, which let a plain chat entry take an upload it has no endpoint for.
+- The fallback and the gate live in `forward_request` (`src/proxy/router.rs`), after `route::decide`, rather than inside `decide`. A media route whose name resolves to a row is answered or refused by that row; the mode pick only runs when the name resolves to nothing.
+- Media routes are `POST`/`PUT` like the rest of the curated list, so the "no name at all" case is a body-less `POST`, which routes on the mode alone. A `GET` on those paths stays a 404.
+- The rewrite is byte surgery on the `model` part (`src/util/multipart_body.rs`), no new dependency; part order, boundaries and file bytes are untouched, which the fake server proves by echoing the request bytes.
+- The declared-path hook is `Backend::declared_path_prefix(path, server, request_path)` and reads the config entry rather than a live port: prefixes are config, and the row is already resolved before the hook is asked.
+- A prefix nested inside another is refused only across entries. Nested prefixes inside one entry are that entry's longest-match business, which is how `/internal` and `/internal/deep` coexist on one row.
+- A declared path buffers through `proxy.max_body_size` and, unlike a curated route, never refuses an unparsable body: a body the proxy cannot read names no model and is forwarded as sent.
+- No `/v1/models` change: media modes are informational only, and a dormant media row still prints its inferred hint (`chat`) there. Tracked in `TODO.md`, with the chat routes not being mode-gated, video, `/v1/realtime`, and a media engine's own model list.
+- The `TODO.md` strike the plan called for (an unlisted path prefix item) is not in the file; nothing needed striking for U2.
+
 ## Definition of done
 
 - All routes in the table forward through the proxy, multipart included.
