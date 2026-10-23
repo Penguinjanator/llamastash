@@ -18,6 +18,10 @@ What each field means is in [`docs/usage.md`](docs/usage.md): § [Generic backen
 | Whisper | whisper.cpp | [whisper.cpp](#whispercpp) |
 | Kokoro 82M (TTS) | Kokoro-FastAPI | [Kokoro-FastAPI](#kokoro-fastapi) |
 | MOSS-Image, other diffusion GGUFs | stable-diffusion.cpp (`sd-server`) | [stable-diffusion.cpp](#stable-diffusioncpp) |
+| faster-whisper + Kokoro (STT and TTS) | Speaches | [Speaches](#speaches) |
+| Whisper, Kokoro, SD (STT, TTS, image) | LocalAI | [LocalAI](#localai) |
+| Piper voices (TTS) | Piper | [Piper](#piper) |
+| SD 1.5 and other ComfyUI workflows | ComfyUI | [ComfyUI](#comfyui) |
 
 ## llama.cpp builds
 
@@ -547,6 +551,31 @@ What one entry does not do:
 - **No context control.** `lemond` takes context as the `ctx_size` field of its `POST /api/v1/load`, which argv cannot reach. You get whatever `~/.config/lemonade/config.json` says, and `--ctx` on a generic entry does nothing here.
 - **`lemond`'s own children show up as `external`.** The `llama-server` it spawns appears in `status` as an unmanaged row.
 
+**Audio and image models.** `lemond` also serves `/v1/audio/transcriptions`, `/v1/audio/speech` and `/v1/images/generations`. Tested with the embeddable `lemond` 2026.43.3 (`lemonade-embeddable-2026.43.3-ubuntu-x64.tar.gz`) on an RTX 3050 Ti, after `lemonade backends install whispercpp:cpu kokoro:cpu sd-cpp:cuda` (one per command) and `lemonade pull Whisper-Tiny`, `kokoro-v1`, `SD-Turbo-GGUF`. List the media modes next to `chat`, since `modes` replaces the default list:
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: lemonade
+        binary: /path/to/lemonade-embeddable-2026.43.3-ubuntu-x64/lemond
+        args: ["--port", "{port}", "--host", "{host}", "--no-broadcast", "--log-file", "disabled"]
+        env: {HF_HOME: /path/to/huggingface}   # where lemonade pull put the models
+        ready: /live
+        ready_timeout_secs: 90
+        stop_grace_secs: 20
+        modes: [chat, stt, tts, image]
+        memory_gib: 1
+
+proxy:
+  aliases:
+    Whisper-Tiny: lemonade
+    kokoro-v1: lemonade
+    SD-Turbo-GGUF: lemonade
+```
+
+`Whisper-Tiny` returned the JFK sample's text, `kokoro-v1` returned a WAV that transcribed back to its input, and `SD-Turbo-GGUF` returned a 512x512 PNG, each auto-starting `lemond` through its alias. Two things to know: llamastash removes `HF_*` variables from every engine's environment, so `lemond` looks in `~/.cache/huggingface` unless the entry sets `HF_HOME`; and an entry whose name matches an alias with different case (`whisper-tiny` next to `Whisper-Tiny: lemonade`) takes the request, because names win over aliases.
+
 ### FastFlowLM (AMD NPU)
 
 [FastFlowLM](https://github.com/ROCm/FastFlowLM) (`flm`) runs LLMs, Whisper ASR and embedding models on AMD XDNA2 NPUs. It speaks the OpenAI shape, so it needs no dedicated backend. Written for `flm` v1.0.9 (portable `fastflowlm_1.0.9_linux.tar.gz`) on Linux 7.2.10 with the in-tree `amdxdna` driver, NPU firmware 1.1.2.65 and `xrt` + `xrt-plugin-amdxdna`. `flm validate` should pass before you add the entry.
@@ -610,7 +639,7 @@ Three FLM notes: `/v1/models` lists FLM's whole model list, not what you downloa
 
 ### whisper.cpp
 
-`whisper-server` (whisper.cpp v1.8.4, from `lemonade backends install whispercpp:cpu`) serves two routes: `GET /health` and `POST /inference` (multipart `file=@clip.wav`, replies `{"text": ...}`). It has no `/v1/models`. Two flags rename its own routes onto the OpenAI transcription shape: `--request-path /v1/audio --inference-path /transcriptions` answers `POST /v1/audio/transcriptions` with 200 and `{"text": ...}`, and the plain `/inference` then 404s. With `modes: [stt]` the llamastash proxy forwards that route to this entry, so an ASR client posts its file to the proxy instead of the launch port `llamastash status` shows; the upload is forwarded as sent and the engine answers it.
+`whisper-server` (whisper.cpp v1.8.4, from `lemonade backends install whispercpp:cpu`; tested through the proxy with Lemonade 2026.43.3's copy and `ggml-tiny.bin`) serves two routes: `GET /health` and `POST /inference` (multipart `file=@clip.wav`, replies `{"text": ...}`). It has no `/v1/models`. Two flags rename its own routes onto the OpenAI transcription shape: `--request-path /v1/audio --inference-path /transcriptions` answers `POST /v1/audio/transcriptions` with 200 and `{"text": ...}`, and the plain `/inference` then 404s. With `modes: [stt]` the llamastash proxy forwards that route to this entry, so an ASR client posts its file to the proxy instead of the launch port `llamastash status` shows; the upload is forwarded as sent and the engine answers it.
 
 ```yaml
 backend:
@@ -708,3 +737,82 @@ backend:
 `{"model":"dall-e-3","prompt":"...","size":"512x512","response_format":"b64_json"}` reaches the entry through the mode fallback and returns a 512x512 PNG; a multipart `POST /v1/images/edits` with an `image` file works the same way. `GET :11435/sdapi/v1/samplers` and `POST /sdapi/v1/txt2img` go to the engine through the declared prefix, and the request log lists them under `/sdapi/v1`.
 
 sd-server prints `listening on` before it binds and exits 0 when the bind fails, so a launch that loses its port to a process that is still shutting down shows up as `launch_failed` with a clean exit. Starting it again works.
+
+### Speaches
+
+[Speaches](https://github.com/speaches-ai/speaches) serves faster-whisper for STT and Kokoro or Piper for TTS behind one OpenAI-shaped server, so one entry declares both modes. Tested from a `main` checkout (`993994f`, after v0.9.0-rc.3) on an RTX 3050 Ti, installed with `uv sync`, then upgraded with `uv pip install ctranslate2==4.8.3`: the 4.5.0 wheel in its lockfile asks for an executable stack, which glibc 2.44 refused here (`cannot enable executable stack`). Models are downloaded through Speaches itself, once, with the server running on its own (`curl -X POST localhost:8000/v1/models/Systran/faster-whisper-small`, then `speaches-ai/Kokoro-82M-v1.0-ONNX`).
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: speaches
+        binary: /bin/sh   # Speaches mounts realtime-console/dist by relative path
+        args: [-c, 'cd /path/to/speaches && exec .venv/bin/uvicorn --factory speaches.main:create_app --host "$1" --port "$2"',
+               sh, "{host}", "{port}"]
+        env: {HF_HOME: /path/to/huggingface}   # llamastash strips HF_* from engines
+        ready: /health
+        modes: [stt, tts]
+        memory_gib: 2
+        ready_timeout_secs: 180
+```
+
+Clients send Speaches' own model ids (`Systran/faster-whisper-small`, `speaches-ai/Kokoro-82M-v1.0-ONNX`) or OpenAI's names, and the proxy forwards them unchanged to the one entry that declares the mode. Speaches maps `tts-1` to Kokoro, which worked, and `whisper-1` to `Systran/faster-whisper-large-v3` through `model_aliases.json` in the checkout; download that model or edit the file. Started without `cd`, it exits with `Directory 'realtime-console/dist' does not exist`.
+
+### LocalAI
+
+[LocalAI](https://github.com/mudler/LocalAI) is itself a model manager: one binary that loads many models on demand. Under llamastash it is one entry with every model inside it, so llamastash cannot account for what LocalAI loads. Tested with the `local-ai-v4.12.1-linux-amd64` release binary on an RTX 3050 Ti, which LocalAI treated as CPU-only (`VRAM is less than 4GB, defaulting to CPU`), after `mkdir backends` and `local-ai models install localai@whisper-base-q5_1` (and `localai@kokoro`, `localai@sd-1.5-ggml`).
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: localai
+        binary: /path/to/local-ai-v4.12.1-linux-amd64
+        args: [run, --address, "{host}:{port}", --models-path, /path/to/localai/models,
+               --backends-path, /path/to/localai/backends, --data-path, /path/to/localai/data]
+        ready: /readyz
+        modes: [stt, tts, image]
+        memory_gib: 4
+        ready_timeout_secs: 180
+```
+
+Requests that name a LocalAI model (`whisper-base-q5_1`, `sd-1.5-ggml`) reach it through the mode fallback with the name unchanged. LocalAI has no `whisper-1`, `tts-1` or `dall-e-3` by default and answers those with its own 404. A `proxy.aliases` line does not help, because the alias name stays in the body; copy the model's YAML under `models/` with `name: whisper-1` (and `tts-1`, `dall-e-3`) instead, which made all three work. A LocalAI model whose name matches a llamastash entry (its `kokoro` next to a Kokoro-FastAPI entry named `kokoro`) is never reached by that name.
+
+### Piper
+
+[Piper](https://github.com/OHF-Voice/piper1-gpl) v1.8.0 (`pip install 'piper-tts[http]'`) is a fast CPU TTS with its own HTTP API: `POST /synthesize` with `{"text": ...}` returns a WAV, `GET /voices` lists voices. It is not OpenAI-shaped, so the entry declares those paths instead of a mode. Voices download with `python -m piper.download_voices --data-dir /path/to/voices en_US-lessac-medium`.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: piper
+        binary: /path/to/piper/.venv/bin/python
+        args: [-m, piper.http_server, -m, en_US-lessac-medium, --data-dir, /path/to/voices,
+               --host, "{host}", --port, "{port}"]
+        ready: /voices
+        routes: [/synthesize, /voices]
+        memory_gib: 1
+```
+
+`POST :11435/synthesize` returned a 22 kHz WAV that transcribed back to its input. Piper's `/download` (fetch a voice) and `/info` stay closed on the proxy because they are not declared.
+
+### ComfyUI
+
+[ComfyUI](https://github.com/Comfy-Org/ComfyUI) v0.42.1 has its own API: a workflow is posted to `/prompt`, its result read from `/history/<id>`, and the image fetched from `/view`. Tested on an RTX 3050 Ti with SD 1.5 (`v1-5-pruned-emaonly-fp16.safetensors` in `models/checkpoints`), installed into a venv with the CUDA 12.8 torch wheels and `requirements.txt`.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: comfyui
+        binary: /path/to/ComfyUI/.venv/bin/python
+        args: [/path/to/ComfyUI/main.py, --listen, "{host}", --port, "{port}"]
+        ready: /system_stats
+        routes: [/prompt, /history, /view, /upload, /object_info, /queue, /system_stats]
+        memory_gib: 4
+        ready_timeout_secs: 300
+```
+
+`GET :11435/system_stats` auto-started it, and a 20-step SD 1.5 workflow posted to `/prompt` finished in 15 s, with the PNG fetched through `/view`. Paths that are not declared (`/extensions`, `/internal/logs`) get the proxy's 404, and so does ComfyUI's `/api/...` spelling, because `/api` belongs to the proxy's Ollama surface. ComfyUI's progress WebSocket (`/ws`) cannot ride the proxy; poll `/history` instead.
