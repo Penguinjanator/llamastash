@@ -123,6 +123,7 @@ servers:
     args: [--port, "{{port}}", -m, "{{name}}", --print-argv]
     ready: /health
     rewrite_model: true
+    routes: [/rw/pinned]
   - name: gen-stt
     binary: {bin}
     args: [--port, "{{port}}"]
@@ -306,6 +307,30 @@ servers:
   }
 
   /// A whisper.cpp-shaped upload: a file part and a `model` field.
+  /// A `GET` written straight onto the socket, so nothing resolves dot segments on
+  /// the way: `reqwest` normalizes the path before it leaves, which is exactly the
+  /// step a client trying to walk sideways skips. Returns the status and the body.
+  async fn raw_get(port: u16, target: &str) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+      .await
+      .expect("connect");
+    let request = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.expect("write");
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut buf))
+      .await
+      .expect("read")
+      .expect("body");
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let status = text
+      .split_whitespace()
+      .nth(1)
+      .and_then(|code| code.parse::<u16>().ok())
+      .unwrap_or_else(|| panic!("no status line in {text:?}"));
+    (status, text)
+  }
+
   fn transcription_body(model: &str) -> (Vec<u8>, String) {
     let b = "----lsTestBoundary";
     let body = format!(
@@ -834,6 +859,47 @@ servers:
       "a mode mismatch started a launch: {status}"
     );
 
+    // The listing publishes the mode the entry declared, so a client can pick the
+    // right endpoint from `/v1/models` instead of guessing.
+    let listed: Value = http
+      .get(format!("{base}/v1/models"))
+      .send()
+      .await
+      .expect("model list")
+      .json()
+      .await
+      .expect("model list body");
+    let mode_of = |name: &str| {
+      listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == name)
+        .and_then(|row| row["mode"].as_str())
+        .unwrap_or_else(|| panic!("{name} is not listed: {listed}"))
+        .to_string()
+    };
+    assert_eq!(mode_of("gen-stt"), "stt");
+    assert_eq!(mode_of("gen-tts-a"), "tts");
+
+    // A mode no entry declares is refused as such, not as a name to add.
+    let resp = http
+      .post(format!("{base}/v1/images/generations"))
+      .json(&json!({"model": "sdxl-turbo", "prompt": "hi"}))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("proxy request");
+    assert_eq!(resp.status().as_u16(), 404);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "model_not_found", "{body}");
+    assert!(
+      body["error"]["message"]
+        .as_str()
+        .is_some_and(|m| m.contains("no entry declares")),
+      "the refusal says nothing declares the mode: {body}"
+    );
+
     // Two entries declare `tts` and neither is Ready: no single answer.
     let resp = http
       .post(format!("{base}/v1/audio/speech"))
@@ -845,16 +911,114 @@ servers:
     assert_eq!(resp.status().as_u16(), 404);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["type"], "model_not_found", "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
     assert!(
-      body["error"]["message"]
-        .as_str()
-        .is_some_and(|m| m.contains("proxy.aliases")),
-      "the refusal says how to make the name work: {body}"
+      message.contains("2 entries declare this endpoint's mode")
+        && message.contains("proxy.aliases"),
+      "the refusal says who declares the mode and how to make the name work: {body}"
     );
     let status = client.call("status", None).await.unwrap();
     assert!(
       !status["models"].to_string().contains("generic://gen-tts"),
       "an ambiguous mode fallback starts nothing: {status}"
+    );
+
+    // Name one of the two and the ambiguity goes away: the entry that is up is the
+    // one the mode picks for a name it cannot place.
+    let resp = http
+      .post(format!("{base}/v1/audio/speech"))
+      .json(&json!({"model": "gen-tts-a", "input": "hi"}))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("named tts launch");
+    assert_eq!(resp.status().as_u16(), 200);
+    let resp = http
+      .post(format!("{base}/v1/audio/speech"))
+      .json(&json!({"model": "tts-1", "input": "hi"}))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("proxy request");
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+      resp
+        .headers()
+        .get("x-llamastash-served-by")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default(),
+      "gen-tts-a"
+    );
+    shutdown(client, daemon).await;
+  }
+
+  /// A declared prefix covers its own paths and nothing a client can spell with dot
+  /// segments: `/internal/../metrics` would ask the engine for `/metrics`, which
+  /// nobody declared, so the proxy refuses it instead of forwarding it.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_declared_prefix_does_not_open_the_rest_of_the_engine() {
+    let proxy_port = std::net::TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .port();
+    let (mut client, daemon) = boot(opts(unique_temp("dots"), Some(proxy_port))).await;
+    wait_listed(&mut client, "gen-routes").await;
+
+    for (target, want) in [
+      ("/internal", 200u16),
+      ("/internal/./x", 200),
+      ("/internal/../internal", 200),
+      ("/internal/../metrics", 404),
+      ("/internal/../props", 404),
+      ("/internal/x/../../slots", 404),
+      ("/internal/%2e%2e/metrics", 404),
+      ("/internal/%2E%2E/props", 404),
+      ("/../metrics", 404),
+      ("/slots", 404),
+    ] {
+      let (status, _) = raw_get(proxy_port, target).await;
+      assert_eq!(status, want, "{target}");
+    }
+
+    // What the engine is asked for is the resolved path, not the one written.
+    let (status, text) = raw_get(proxy_port, "/internal/x/../deep/y").await;
+    assert_eq!(status, 200);
+    assert!(
+      text.contains("\"target\":\"/internal/deep/y\""),
+      "the engine saw the resolved path: {text}"
+    );
+    shutdown(client, daemon).await;
+  }
+
+  /// A launch that pins its request-model name pins it on the OpenAI routes, not on
+  /// a path its entry declared: the engine owns its own API and the body arrives as
+  /// the client wrote it.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_declared_path_keeps_the_body_of_an_entry_that_pins_its_name() {
+    let proxy_port = std::net::TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .port();
+    let (mut client, daemon) = boot(opts(unique_temp("pin"), Some(proxy_port))).await;
+    let http = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{proxy_port}");
+    wait_listed(&mut client, "gen-rw").await;
+
+    let resp = http
+      .post(format!("{base}/rw/pinned"))
+      .json(&json!({"model": "keep-me", "other": 1}))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("declared POST");
+    assert_eq!(resp.status().as_u16(), 200);
+    let echoed: Value = resp.json().await.unwrap();
+    assert_eq!(echoed["target"], "/rw/pinned", "{echoed}");
+    assert_eq!(
+      echoed["model"], "keep-me",
+      "the pin is not applied: {echoed}"
     );
     shutdown(client, daemon).await;
   }

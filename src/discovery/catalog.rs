@@ -210,6 +210,9 @@ fn mode_hint_label(h: ModeHint) -> &'static str {
     ModeHint::Chat => "chat",
     ModeHint::Embedding => "embedding",
     ModeHint::Rerank => "rerank",
+    ModeHint::Image => "image",
+    ModeHint::Tts => "tts",
+    ModeHint::Stt => "stt",
     ModeHint::Unknown => "unknown",
   }
 }

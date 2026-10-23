@@ -8,20 +8,12 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::util::http_path::is_dot_segment;
+use crate::util::http_path::normalize_path as normalize_prefix;
+
 /// The placeholders the daemon fills in itself. Everything else inside `{…}`
 /// must name one of the entry's knobs.
 pub const BUILTIN_PLACEHOLDERS: &[&str] = &["port", "host", "name", "model"];
-
-/// The comparable form of a path prefix: repeated slashes collapsed, trailing
-/// slash dropped. `None` for `/` alone, which would cover the whole proxy.
-fn normalize_prefix(path: &str) -> Option<String> {
-  let kept = path
-    .split('/')
-    .filter(|seg| !seg.is_empty() && *seg != ".")
-    .collect::<Vec<_>>()
-    .join("/");
-  (!kept.is_empty()).then(|| format!("/{kept}"))
-}
 
 /// Whether one prefix covers the other at a path boundary: `/ui` and `/ui/x`
 /// are the same surface, `/uice` is not.
@@ -375,14 +367,14 @@ impl GenericConfig {
         if p.is_empty() || !p.starts_with('/') {
           return Err(entry(format!("`routes` entry `{p}` must start with `/`")));
         }
-        if p.contains(['?', '#', '*']) || p.chars().any(char::is_whitespace) {
+        if p.contains(['?', '#', '*']) {
           return Err(entry(format!(
-            "`routes` entry `{p}` must be a plain path prefix, with no query, fragment, wildcard or whitespace"
+            "`routes` entry `{p}` must be a plain path prefix, with no query, fragment or wildcard"
           )));
         }
-        if p.contains('<') || p.contains('>') || p.contains('{') || p.contains('}') {
+        if p.split('/').any(is_dot_segment) {
           return Err(entry(format!(
-            "`routes` entry `{p}` is matched as written: no placeholders in a path prefix"
+            "`routes` entry `{p}` must name a path directly; no `.` or `..` segments"
           )));
         }
         let Some(norm) = normalize_prefix(p) else {
@@ -763,6 +755,17 @@ servers:
     assert_eq!(e.declared_prefix("/inferences"), None);
     assert_eq!(e.declared_prefix("/uicex"), None);
     assert_eq!(e.declared_prefix("/"), None);
+    // Dot segments resolve to what the engine is actually asked for, so a
+    // declared prefix never hands out the paths beside it. `%2e` is a dot, as the
+    // outbound URL parser reads it.
+    assert_eq!(
+      e.declared_prefix("/inference/./x").as_deref(),
+      Some("/inference")
+    );
+    assert_eq!(e.declared_prefix("/inference/../ui"), None);
+    assert_eq!(e.declared_prefix("/inference/%2e%2e/ui"), None);
+    assert_eq!(e.declared_prefix("/inference/x/../../metrics"), None);
+    assert_eq!(e.declared_prefix("/.."), None);
 
     for bad in [
       "",
@@ -770,9 +773,11 @@ servers:
       "/a?b=1",
       "/a#b",
       "/a*b",
-      "/a b",
-      "/x/<name>",
-      "/{name}",
+      "/.",
+      "/..",
+      "/internal/..",
+      "/internal/../metrics",
+      "/internal/%2e%2e/metrics",
       "/",
       "/ui",
       "/ui/x",

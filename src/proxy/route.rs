@@ -165,12 +165,7 @@ pub(crate) async fn buffer_and_extract(
   // An empty body is allowed in principle — `model` extraction
   // then returns None and the caller emits `model_required`.
   let model = match content_type {
-    Some(ct) if crate::util::multipart_body::is_multipart(ct) => {
-      crate::util::multipart_body::field_value(&bytes, ct, "model")
-        .and_then(|raw| std::str::from_utf8(raw).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    }
+    Some(ct) if crate::util::multipart_body::is_multipart(ct) => multipart_model(&bytes, ct),
     _ if bytes.is_empty() => None,
     _ => match serde_json::from_slice::<JustModel>(&bytes) {
       Ok(parsed) => parsed
@@ -199,12 +194,7 @@ pub(crate) async fn buffer_and_extract_tolerant(
 ) -> Result<ParsedBody, BodyError> {
   let bytes = buffer_body(body, cap).await?;
   let model = match content_type {
-    Some(ct) if crate::util::multipart_body::is_multipart(ct) => {
-      crate::util::multipart_body::field_value(&bytes, ct, "model")
-        .and_then(|raw| std::str::from_utf8(raw).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    }
+    Some(ct) if crate::util::multipart_body::is_multipart(ct) => multipart_model(&bytes, ct),
     _ => serde_json::from_slice::<JustModel>(&bytes)
       .ok()
       .and_then(|parsed| parsed.model)
@@ -212,6 +202,15 @@ pub(crate) async fn buffer_and_extract_tolerant(
       .filter(|s| !s.is_empty()),
   };
   Ok(ParsedBody { bytes, model })
+}
+
+/// The `model` form field of a `multipart/form-data` body, trimmed, `None` when
+/// the body names none. An upload's file part is never read.
+fn multipart_model(bytes: &[u8], content_type: &str) -> Option<String> {
+  crate::util::multipart_body::field_value(bytes, content_type, "model")
+    .and_then(|raw| std::str::from_utf8(raw).ok())
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
 }
 
 /// The `model` a buffered body names, or `None` for a body that is empty, is
@@ -417,17 +416,14 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
 
 /// The row a media endpoint falls back to when the client's name settled
 /// nothing: the only catalog row whose entry declares the endpoint's mode, or,
-/// when several declare it, the only one of those that is Ready. `None` leaves
-/// the caller's `model_not_found` / `model_required` answer standing.
+/// when several declare it, the only one of those that is Ready. A miss says what
+/// was found, so the caller's refusal can name it.
 ///
 /// This exists because clients hardcode names (`whisper-1`, `tts-1`) that no
 /// model of ours answers to, and one declared entry per mode leaves no real
 /// ambiguity. A row that declares no mode is not a candidate: it would answer
 /// anything, so picking it is a guess at what the client meant.
-pub(crate) async fn decide_by_mode(
-  state: &Arc<ProxyState>,
-  mode: LaunchMode,
-) -> Option<RouteDecision> {
+pub(crate) async fn decide_by_mode(state: &Arc<ProxyState>, mode: LaunchMode) -> ModePick {
   use crate::backend::Backend as _;
   let rows = state.ctx.catalog.shared_rows().await;
   let mut declared: Vec<CatalogRow> = Vec::new();
@@ -440,7 +436,7 @@ pub(crate) async fn decide_by_mode(
     }
   }
   if declared.is_empty() {
-    return None;
+    return ModePick::Miss(ModeMiss::NoDeclarer);
   }
   let sup_snap = state.ctx.supervisors.snapshot().await;
   let mut ready: Vec<usize> = Vec::new();
@@ -452,11 +448,17 @@ pub(crate) async fn decide_by_mode(
   let pick = match (declared.len(), ready.len()) {
     (1, _) => 0,
     (_, 1) => ready[0],
-    _ => return None,
+    (n, 0) => return ModePick::Miss(ModeMiss::NoneRunning(n)),
+    (n, r) => {
+      return ModePick::Miss(ModeMiss::SeveralReady {
+        declarers: n,
+        ready: r,
+      })
+    }
   };
   let row = declared.remove(pick);
   let served_model_id = served_name_for_row(&row);
-  Some(match ready_launch(&sup_snap, &row.path).await {
+  ModePick::Hit(match ready_launch(&sup_snap, &row.path).await {
     Some((port, served_model_key)) => RouteDecision::ReadyAt {
       port,
       served_model_id,
@@ -473,6 +475,24 @@ pub(crate) async fn decide_by_mode(
       alias: false,
     },
   })
+}
+
+/// What the mode fallback settled on, or why it could not.
+pub(crate) enum ModePick {
+  Hit(RouteDecision),
+  Miss(ModeMiss),
+}
+
+/// Why the mode fallback left the proxy's own refusal standing, so the refusal
+/// can say what was found instead of guessing.
+pub(crate) enum ModeMiss {
+  /// Nothing claims the route's mode at all.
+  NoDeclarer,
+  /// `declarers` entries claim it and every one is stopped.
+  NoneRunning(usize),
+  /// `ready` of `declarers` entries claim it are running, so the name has to
+  /// choose and the client named none that matches.
+  SeveralReady { declarers: usize, ready: usize },
 }
 
 /// The prefix a catalog row declares for `request_path`, or `None` when no row
@@ -492,14 +512,21 @@ pub(crate) async fn declared_prefix(state: &Arc<ProxyState>, request_path: &str)
 /// here belongs to one entry.
 async fn declaring_rows(state: &Arc<ProxyState>, request_path: &str) -> Vec<(String, CatalogRow)> {
   use crate::backend::Backend as _;
+  // Only a backend that can declare paths is asked, and no row is resolved to a
+  // backend first: a request for a path nobody declared costs a config flag and a
+  // row scan, not an identity probe per row. Unlisted paths are what scanners and
+  // mistyped URLs send.
+  let declarers = crate::backend::Backends::path_declarers();
+  if declarers.is_empty() {
+    return Vec::new();
+  }
   let rows = state.ctx.catalog.shared_rows().await;
   let mut hits = Vec::new();
   for row in rows.iter() {
-    let Some(backend) = would_route_backend(state, row).await else {
-      continue;
-    };
-    if let Some(prefix) =
-      backend.declared_path_prefix(std::path::Path::new(&row.path), None, request_path)
+    let path = std::path::Path::new(&row.path);
+    if let Some(prefix) = declarers
+      .iter()
+      .find_map(|b| b.declared_path_prefix(path, None, request_path))
     {
       hits.push((prefix, row.clone()));
     }
@@ -511,37 +538,16 @@ async fn declaring_rows(state: &Arc<ProxyState>, request_path: &str) -> Vec<(Str
 /// body's name settles nothing on its own, so the answer is the entry that
 /// published the path — a Ready launch of it when one is up, its one row when it
 /// has exactly one, and its row list as `ambiguous_model` when it has several and
-/// none is up. A name that already lands on a row publishing the path keeps that
-/// row, so a client that names its engine reaches it. `None` is the proxy's own
-/// 404: nothing publishes the path. The body's model is never rewritten here — an
-/// engine that owns the path owns the name inside it too.
+/// none is up. `None` is the proxy's own 404: nothing publishes the path. The
+/// body is forwarded as it arrived — an engine that owns the path owns the name
+/// inside it too.
 pub(crate) async fn decide_declared(
   state: &Arc<ProxyState>,
-  model: Option<String>,
   request_path: &str,
 ) -> Option<RouteDecision> {
   let mut hits = declaring_rows(state, request_path).await;
   if hits.is_empty() {
     return None;
-  }
-  let named = decide(state, model).await;
-  let landed = match &named {
-    RouteDecision::ReadyAt { model_path, .. } => Some(model_path.clone()),
-    RouteDecision::NotRunning {
-      resolved_row,
-      name: _,
-      alias: _,
-      requested_model: _,
-    } => Some(resolved_row.path.clone()),
-    _ => None,
-  };
-  if let Some(path) = &landed {
-    if hits
-      .iter()
-      .any(|(_, r)| same_path(std::path::Path::new(&r.path), path))
-    {
-      return Some(named);
-    }
   }
   let sup_snap = state.ctx.supervisors.snapshot().await;
   for (_, row) in hits.iter() {
@@ -889,6 +895,9 @@ pub(crate) struct NotRunningPlan {
   /// The endpoint's mode picked this row rather than the client's name, so the
   /// forward carries the `mode_match` header and the row's own name on the wire.
   pub mode_fallback: bool,
+  /// `false` when the request arrived on a path the engine declared for itself,
+  /// where nothing in the body is rewritten.
+  pub pin_request_model: bool,
 }
 
 /// Auto-start entry point — invoked from `router.rs` when a request
@@ -923,6 +932,7 @@ pub(crate) async fn handle_not_running(
     resolved_row,
     name,
     mode_fallback,
+    pin_request_model,
   } = plan;
   let outcome = launch::auto_start(state, &resolved_row, endpoint_mode, name, &mut record).await;
   match outcome {
@@ -945,6 +955,7 @@ pub(crate) async fn handle_not_running(
           fallback: mode_fallback,
           fallback_reason: mode_fallback.then_some(MODE_MATCH),
           request_model: mode_fallback.then_some(served.as_str()),
+          pin_request_model,
         },
         Some(record),
       )
@@ -984,6 +995,7 @@ pub(crate) async fn handle_not_running(
             fallback: true,
             fallback_reason: Some(reason),
             request_model: None,
+            pin_request_model,
           },
           Some(record),
         )

@@ -209,12 +209,32 @@ pub async fn route(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyRespo
 }
 
 /// A path this table did not answer: the proxy's own 404, unless a catalog row
-/// declares it as part of that engine's API. The lookup is a catalog row scan, so
-/// an unknown path costs that scan and forwards nothing.
-async fn declared_or_not_found(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyResponse {
-  let Some(prefix) = route::declared_prefix(&state, req.uri().path()).await else {
+/// declares it as part of that engine's API. Nothing is forwarded before the path
+/// is settled, so a request for a path nobody declared costs a row scan at most.
+async fn declared_or_not_found(
+  state: Arc<ProxyState>,
+  mut req: Request<Incoming>,
+) -> ProxyResponse {
+  // Dot segments resolve to the path the engine would actually be asked for, so a
+  // declared prefix can never be walked sideways into a path beside it. A `..`
+  // that climbs past the root names no path at all and is refused outright.
+  let Some(path) = crate::util::http_path::normalize_path(req.uri().path()) else {
     return not_found();
   };
+  let Some(prefix) = route::declared_prefix(&state, &path).await else {
+    return not_found();
+  };
+  if req.uri().path() != path {
+    // What the engine is sent is what was matched on, not what the client wrote.
+    let target = match req.uri().query() {
+      Some(query) => format!("{path}?{query}"),
+      None => path.clone(),
+    };
+    let Ok(uri) = target.parse() else {
+      return not_found();
+    };
+    *req.uri_mut() = uri;
+  }
   forward_request(state, req, Some(prefix)).await
 }
 
@@ -290,7 +310,7 @@ async fn forward_request(
   // the hint below is what tells an operator who has no such entry how to fix it.
   let media_route = req_mode.is_some_and(|m| m.is_declared_only());
   let mut decision = if declared.is_some() {
-    match route::decide_declared(&state, parsed.model.clone(), uri.path()).await {
+    match route::decide_declared(&state, uri.path()).await {
       Some(d) => d,
       // The row let go of the path between the lookup here and the one there.
       None => return answered(record, not_found()),
@@ -299,16 +319,19 @@ async fn forward_request(
     route::decide(&state, parsed.model).await
   };
   let mut mode_fallback = false;
+  let mut mode_miss: Option<route::ModeMiss> = None;
   if media_route
     && matches!(
       decision,
       RouteDecision::NotFound { .. } | RouteDecision::ModelRequired
     )
   {
-    if let Some(picked) = route::decide_by_mode(&state, req_mode.unwrap_or(LaunchMode::Chat)).await
-    {
-      decision = picked;
-      mode_fallback = true;
+    match route::decide_by_mode(&state, req_mode.unwrap_or(LaunchMode::Chat)).await {
+      route::ModePick::Hit(picked) => {
+        decision = picked;
+        mode_fallback = true;
+      }
+      route::ModePick::Miss(miss) => mode_miss = Some(miss),
     }
   }
   match &decision {
@@ -439,6 +462,7 @@ async fn forward_request(
           // The client's name meant nothing to us, so the engine is told the
           // name of the row that is answering.
           request_model: mode_match.then_some(served_model_id.as_str()),
+          pin_request_model: declared.is_none(),
         },
         Some(record),
       )
@@ -459,6 +483,7 @@ async fn forward_request(
           resolved_row: *resolved_row,
           name,
           mode_fallback,
+          pin_request_model: declared.is_none(),
         },
         record,
       )
@@ -467,7 +492,10 @@ async fn forward_request(
     RouteDecision::NotFound { requested_model } => error_with_matches(
       StatusCode::NOT_FOUND,
       "model_not_found",
-      &format!("{requested_model} not found{}", mode_hint(media_route)),
+      &format!(
+        "{requested_model} not found{}",
+        mode_hint(media_route, mode_miss.as_ref())
+      ),
       Vec::<String>::new(),
     ),
     RouteDecision::Ambiguous {
@@ -488,7 +516,10 @@ async fn forward_request(
     RouteDecision::ModelRequired => error_with_code(
       StatusCode::BAD_REQUEST,
       "invalid_request",
-      &format!("the `model` field is required{}", mode_hint(media_route)),
+      &format!(
+        "the `model` field is required{}",
+        mode_hint(media_route, mode_miss.as_ref())
+      ),
       "model_required",
       Some("model"),
     ),
@@ -496,15 +527,24 @@ async fn forward_request(
   answered(record, response)
 }
 
-/// What a media endpoint's refusal adds to its message: the two ways to make a
-/// name the proxy cannot settle work.
-fn mode_hint(media_route: bool) -> &'static str {
-  if media_route {
-    "; no entry declares this endpoint's mode, so name a model that serves it or \
-     add a `proxy.aliases` entry"
-  } else {
-    ""
+/// What a media endpoint's refusal adds to its message: what was found, and the
+/// two ways to make a name the proxy cannot settle work.
+fn mode_hint(media_route: bool, miss: Option<&route::ModeMiss>) -> String {
+  if !media_route {
+    return String::new();
   }
+  let found = match miss {
+    Some(route::ModeMiss::NoneRunning(n)) => {
+      format!("{n} entries declare this endpoint's mode and none is running")
+    }
+    Some(route::ModeMiss::SeveralReady { declarers, ready }) => {
+      format!("{declarers} entries declare this endpoint's mode and {ready} are running")
+    }
+    // Nothing claims the mode, which is also the answer when the fallback never
+    // ran because the client named a row of ours.
+    _ => "no entry declares this endpoint's mode".to_string(),
+  };
+  format!("; {found}, so name a model that serves it or add a `proxy.aliases` entry")
 }
 
 async fn health(state: Arc<ProxyState>) -> ProxyResponse {
@@ -1002,6 +1042,8 @@ fn build_model_info(
 ///   - `Embedding` → `["embedding"]`
 ///   - `Rerank` → `["rerank"]` (Ollama doesn't define this; emitted
 ///     for parity with our own `/v1/rerank` surface)
+///   - `Image` / `Tts` / `Stt` → empty (the media routes are not Ollama
+///     capabilities, so a media row claims none)
 ///   - `Unknown` → empty (catalog has no hint)
 fn capabilities_for(discovered: Option<&DiscoveredModel>) -> Vec<&'static str> {
   let mode = discovered
@@ -1012,7 +1054,7 @@ fn capabilities_for(discovered: Option<&DiscoveredModel>) -> Vec<&'static str> {
     ModeHint::Chat => vec!["completion"],
     ModeHint::Embedding => vec!["embedding"],
     ModeHint::Rerank => vec!["rerank"],
-    ModeHint::Unknown => Vec::new(),
+    ModeHint::Image | ModeHint::Tts | ModeHint::Stt | ModeHint::Unknown => Vec::new(),
   }
 }
 

@@ -749,7 +749,9 @@ vllm:time_to_first_token_seconds_count{model_name=\"fake\"} 1\n",
     // the target the engine was asked for, query included, so a test can tell a
     // forwarded request from one the proxy answered itself and check the query
     // survived.
-    ("GET" | "POST", p2) if p2 == "/inference" || p2.starts_with("/internal") => {
+    ("GET" | "POST", p2)
+      if p2 == "/inference" || p2.starts_with("/internal") || p2.starts_with("/rw") =>
+    {
       let content_type = headers
         .get("content-type")
         .map(String::as_str)

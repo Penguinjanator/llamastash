@@ -60,6 +60,19 @@ impl LaunchMode {
     matches!(self, LaunchMode::Image | LaunchMode::Tts | LaunchMode::Stt)
   }
 
+  /// The mode to publish for a row that declares this one first, so `/v1/models`
+  /// and the MODE column name what the entry actually answers.
+  pub fn mode_hint(&self) -> ModeHint {
+    match self {
+      LaunchMode::Chat => ModeHint::Chat,
+      LaunchMode::Embedding => ModeHint::Embedding,
+      LaunchMode::Rerank => ModeHint::Rerank,
+      LaunchMode::Image => ModeHint::Image,
+      LaunchMode::Tts => ModeHint::Tts,
+      LaunchMode::Stt => ModeHint::Stt,
+    }
+  }
+
   /// Resolve the launch mode from an optional user-supplied override
   /// (CLI `--mode`, already converted to the domain enum) plus the GGUF
   /// discovery hint. Contract: when the override is `None` and the hint
@@ -73,6 +86,10 @@ impl LaunchMode {
       ModeHint::Chat => Some(LaunchMode::Chat),
       ModeHint::Embedding => Some(LaunchMode::Embedding),
       ModeHint::Rerank => Some(LaunchMode::Rerank),
+      // A media hint says which route the row answers, not how to launch it: a
+      // row declaring only `stt` still starts as a plain chat launch, and the
+      // media mode arrives with the request's endpoint.
+      ModeHint::Image | ModeHint::Tts | ModeHint::Stt => Some(LaunchMode::Chat),
       ModeHint::Unknown => None,
     }
   }

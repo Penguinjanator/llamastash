@@ -478,6 +478,14 @@ pub trait Backend {
     false
   }
 
+  /// Whether any entry of this backend declares path prefixes of its own API
+  /// through `declared_path_prefix`. The proxy asks this before it walks the
+  /// catalog for a declared path, so an unlisted request costs nothing when
+  /// nothing is declared. Default `false`.
+  fn declares_any_paths(&self) -> bool {
+    false
+  }
+
   /// The longest path prefix the engine behind `path` / `server` declares for its
   /// own API that covers `request_path`, or `None` when it declares none. A
   /// declared prefix is forwarded to that row and to nothing else, and the proxy
@@ -985,6 +993,16 @@ impl Backends {
       Backends::Sglang(SglangBackend::new()),
       Backends::Generic(GenericBackend::new()),
     ]
+  }
+
+  /// The backends that can declare path prefixes at all, so a request for a path
+  /// nobody declared is refused without a catalog walk. Rebuilt per call: backend
+  /// objects are stateless handles over the installed config.
+  pub fn path_declarers() -> Vec<Backends> {
+    Self::all()
+      .into_iter()
+      .filter(|b| for_each_backend!(b, x => x.declares_any_paths()))
+      .collect()
   }
 
   /// The backend whose [`Backend::id`] is `id`, or `None` for an unknown id.

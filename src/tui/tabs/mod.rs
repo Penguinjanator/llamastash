@@ -89,7 +89,7 @@ pub fn tabs_for_mode(mode: ModeHint) -> Vec<RightTab> {
     ModeHint::Chat => tabs.push(RightTab::Chat),
     ModeHint::Embedding => tabs.push(RightTab::Embed),
     ModeHint::Rerank => tabs.push(RightTab::Rerank),
-    ModeHint::Unknown => {}
+    ModeHint::Image | ModeHint::Tts | ModeHint::Stt | ModeHint::Unknown => {}
   }
   tabs
 }

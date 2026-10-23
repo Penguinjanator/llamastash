@@ -49,6 +49,14 @@ struct Entry {
   scope: &'static str,
 }
 
+/// Whether any installed entry declares `routes`, so a request for a path nobody
+/// declared costs one atomic load instead of a catalog walk.
+fn any_routes_declared() -> bool {
+  ANY_ROUTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static ANY_ROUTES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn entries() -> &'static RwLock<BTreeMap<String, Arc<Entry>>> {
   static ENTRIES: OnceLock<RwLock<BTreeMap<String, Arc<Entry>>>> = OnceLock::new();
   ENTRIES.get_or_init(Default::default)
@@ -151,11 +159,11 @@ impl GenericBackend {
         chat_template: None,
         tokenizer_kind: None,
         reasoning_hint: !server.reasoning_effort.is_empty(),
-        mode_hint: match server.modes.first() {
-          Some(LaunchMode::Embedding) => ModeHint::Embedding,
-          Some(LaunchMode::Rerank) => ModeHint::Rerank,
-          _ => ModeHint::Chat,
-        },
+        mode_hint: server
+          .modes
+          .first()
+          .map(LaunchMode::mode_hint)
+          .unwrap_or(ModeHint::Chat),
         // The declared figure is the launch's whole resident demand: it feeds
         // the size column, the probe budget and the admission gate alike.
         weights_bytes: server.memory_gib.map(gib_to_bytes),
@@ -292,6 +300,10 @@ impl Backend for GenericBackend {
     let generic = &config.generic;
     generic.validate(&|id| crate::launch::knobs::registry::resolve_static_id(id).is_some())?;
     generic.validate_routes(&crate::proxy::router::proxy_owned_paths())?;
+    ANY_ROUTES.store(
+      generic.servers.iter().any(|s| !s.routes.is_empty()),
+      std::sync::atomic::Ordering::Relaxed,
+    );
     let mut table = entries().write().unwrap_or_else(|e| e.into_inner());
     // Merge rather than replace: a process loads config once, and replacing
     // would let an unrelated load (a test, a migration re-read) drop entries
@@ -340,12 +352,19 @@ impl Backend for GenericBackend {
     entry_for_launch(path, server).is_some_and(|e| e.server.modes.contains(&mode))
   }
 
+  fn declares_any_paths(&self) -> bool {
+    any_routes_declared()
+  }
+
   fn declared_path_prefix(
     &self,
     path: &Path,
     server: Option<&str>,
     request_path: &str,
   ) -> Option<String> {
+    if !any_routes_declared() {
+      return None;
+    }
     entry_for_launch(path, server)?
       .server
       .declared_prefix(request_path)
@@ -669,12 +688,16 @@ mod tests {
   #[test]
   fn modes_limit_what_an_entry_serves() {
     use crate::backend::Backend;
+    use crate::gguf::metadata::ModeHint;
     use crate::launch::mode::LaunchMode;
     install(
       "servers:\n  \
        - {name: md-chat, binary: /b, ready: /h, modes: [chat]}\n  \
        - {name: md-embed, binary: /b, ready: /h, modes: [embedding]}\n  \
-       - {name: md-any, binary: /b, ready: /h}\n",
+       - {name: md-any, binary: /b, ready: /h}\n  \
+       - {name: md-stt, binary: /b, ready: /h, modes: [stt]}\n  \
+       - {name: md-tts, binary: /b, ready: /h, modes: [tts]}\n  \
+       - {name: md-image, binary: /b, ready: /h, modes: [image]}\n",
     );
     let serves = |name: &str, mode| {
       GenericBackend::new().serves_mode(Path::new(&format!("generic://{name}")), None, mode)
@@ -684,12 +707,19 @@ mod tests {
     assert!(!serves("md-chat", LaunchMode::Rerank));
     assert!(serves("md-embed", LaunchMode::Embedding));
     assert!(serves("md-any", LaunchMode::Rerank));
-    let embed = entry_named("md-embed").unwrap();
-    let row = GenericBackend::catalog_row(&embed.server);
-    assert_eq!(
-      row.metadata.unwrap().mode_hint,
-      crate::gguf::metadata::ModeHint::Embedding
-    );
+    assert!(serves("md-stt", LaunchMode::Stt));
+    assert!(!serves("md-stt", LaunchMode::Chat));
+    for (name, want) in [
+      ("md-embed", ModeHint::Embedding),
+      ("md-stt", ModeHint::Stt),
+      ("md-tts", ModeHint::Tts),
+      ("md-image", ModeHint::Image),
+      ("md-chat", ModeHint::Chat),
+      ("md-any", ModeHint::Chat),
+    ] {
+      let row = GenericBackend::catalog_row(&entry_named(name).unwrap().server);
+      assert_eq!(row.metadata.unwrap().mode_hint, want, "{name}");
+    }
   }
 
   /// Only a mode the entry lists counts as declared, which is what lets the
