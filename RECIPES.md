@@ -659,7 +659,7 @@ backend:
 
 ### Kokoro-FastAPI
 
-[Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) v0.9.0 serves the Kokoro 82M text-to-speech model on OpenAI's `POST /v1/audio/speech`. Tested from a source checkout (`uv sync --extra gpu`, which downloads the model into `api/src/models` on first run) on an RTX 3050 Ti. Its config defaults are the Docker image's absolute paths (`/app/api/src/...`), so a launch outside the container needs `MODEL_DIR`, `VOICES_DIR`, `WEB_PLAYER_PATH` and `PYTHONPATH` pointed at the checkout.
+[Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) v0.9.0 serves the Kokoro 82M text-to-speech model on OpenAI's `POST /v1/audio/speech`. Tested from a source checkout (`uv sync --extra gpu`, then `python docker/scripts/download_model.py --output api/src/models/v1_0` for the weights) on an RTX 3050 Ti. Its config defaults are the Docker image's absolute paths (`/app/api/src/...`), so a launch outside the container needs `MODEL_DIR`, `VOICES_DIR`, `WEB_PLAYER_PATH` and `PYTHONPATH` pointed at the checkout.
 
 ```yaml
 backend:
