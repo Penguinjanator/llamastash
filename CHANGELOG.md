@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Added
+
+- Each request row now reports its own KV-cache hit: a `Cache` column between `In` and `Out` in the TUI and the `llamastash requests` table, and `cache_hit_ratio` on the row JSON. It drops before both token counts when the pane narrows.
+
 
 ## [0.9.1] — 2026-10-19
 

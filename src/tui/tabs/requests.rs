@@ -41,6 +41,7 @@ enum ColumnId {
   Total,
   Ttfb,
   In,
+  Cache,
   Out,
   Note,
   RequestFor,
@@ -97,6 +98,14 @@ const COLUMNS: &[Column<ColumnId>] = &[
     label: "In",
     width: 6,
     rank: 50,
+  },
+  Column {
+    id: ColumnId::Cache,
+    label: "Cache",
+    // The cached share of `In`, beside it. Fits `100.0%`, and rank 65 keeps it
+    // until `PP/s` and `Note` have gone, and gives way before `In` and `Out`.
+    width: 6,
+    rank: 65,
   },
   Column {
     id: ColumnId::Out,
@@ -372,6 +381,7 @@ fn column_value(id: ColumnId, cells: &RequestCells) -> &str {
     ColumnId::Prefill => &cells.prefill,
     ColumnId::Total => &cells.total,
     ColumnId::In => &cells.tokens_in,
+    ColumnId::Cache => &cells.cache_hit,
     ColumnId::Out => &cells.tokens_out,
     ColumnId::Ttfb => &cells.ttfb,
     ColumnId::Client => &cells.client,
@@ -447,7 +457,7 @@ mod tests {
   fn columns_drop_by_rank_as_the_pane_narrows() {
     // Each column costs its width plus one separator. Running totals in
     // rank order: Time 9, Code 14, Tok/s 21, Total 29, TTFB 37, In 44,
-    // Out 51, PP/s 58, Note 69, Request for 94, Client 116, Route 133.
+    // Out 51, Cache 58, PP/s 65, Note 76, Request for 101, Client 123, Route 140.
     // `Note` shows last but outranks the four columns before it, so it stays
     // when they have gone.
     let full = [
@@ -458,13 +468,14 @@ mod tests {
       "Total",
       "TTFB",
       "In",
+      "Cache",
       "Out",
       "Request for",
       "Client",
       "Route",
       "Note",
     ];
-    assert_eq!(labels(133), full);
+    assert_eq!(labels(140), full);
     // Route ranks highest of all, so it is the first to go.
     let no_route = [
       "Time",
@@ -474,13 +485,14 @@ mod tests {
       "Total",
       "TTFB",
       "In",
+      "Cache",
       "Out",
       "Request for",
       "Client",
       "Note",
     ];
-    assert_eq!(labels(132), no_route);
-    assert_eq!(labels(116), no_route);
+    assert_eq!(labels(139), no_route);
+    assert_eq!(labels(123), no_route);
     let no_client = [
       "Time",
       "Code",
@@ -489,23 +501,33 @@ mod tests {
       "Total",
       "TTFB",
       "In",
+      "Cache",
       "Out",
       "Request for",
       "Note",
     ];
-    assert_eq!(labels(115), no_client);
-    assert_eq!(labels(94), no_client);
+    assert_eq!(labels(122), no_client);
+    assert_eq!(labels(101), no_client);
     // `Note` is the next to go, and `PP/s` outlasts it.
     let no_request_for = [
-      "Time", "Code", "Tok/s", "PP/s", "Total", "TTFB", "In", "Out", "Note",
+      "Time", "Code", "Tok/s", "PP/s", "Total", "TTFB", "In", "Cache", "Out", "Note",
     ];
-    assert_eq!(labels(93), no_request_for);
-    assert_eq!(labels(69), no_request_for);
+    assert_eq!(labels(100), no_request_for);
+    assert_eq!(labels(76), no_request_for);
     let no_note = [
-      "Time", "Code", "Tok/s", "PP/s", "Total", "TTFB", "In", "Out",
+      "Time", "Code", "Tok/s", "PP/s", "Total", "TTFB", "In", "Cache", "Out",
     ];
-    assert_eq!(labels(68), no_note);
-    assert_eq!(labels(58), no_note);
+    assert_eq!(labels(75), no_note);
+    assert_eq!(labels(65), no_note);
+    // `Cache` outlasts `PP/s` and `Note`, and gives way before `Out`.
+    assert_eq!(
+      labels(64),
+      vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Cache", "Out"]
+    );
+    assert_eq!(
+      labels(58),
+      vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Cache", "Out"]
+    );
     assert_eq!(
       labels(57),
       vec!["Time", "Code", "Tok/s", "Total", "TTFB", "In", "Out"]
@@ -553,7 +575,7 @@ mod tests {
     assert_eq!(wide.width_of(route), ROUTE_W);
     // At the width `Request for` just fits, the only spare cell is the
     // separator after the last column, and `Note` grows first.
-    assert_eq!(layout_columns(94).note_w, MIN_NOTE_W + 1);
+    assert_eq!(layout_columns(101).note_w, MIN_NOTE_W + 1);
     // Too narrow for `Note`: it gets nothing and the row ends earlier.
     assert_eq!(layout_columns(61).note_w, 0);
   }
@@ -572,6 +594,7 @@ mod tests {
         "Total",
         "TTFB",
         "In",
+        "Cache",
         "Out",
         "Request for",
         "Client",

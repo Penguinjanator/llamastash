@@ -521,7 +521,7 @@ _Shared context: `src/cli/` and `src/ipc/methods.rs` for the start and wait-for-
 
 ## Next
 
-- [ ] Show cache hit on request rows as well
+- [x] ~~Show cache hit on request rows as well~~ — done: each row carries its own `cache_hit_ratio` (`cached_tokens` over its own `prompt_tokens`), shown as `CACHE` between `In` and `Out` in the TUI, the `requests` table, and the row JSON. It ranks below both token counts, so it is the first of the token figures to drop when the pane narrows.
 - [ ] audio/tts/video/etc support on proxy, support all common paths
 
 ### Batch 2: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))

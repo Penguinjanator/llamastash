@@ -85,7 +85,7 @@ fn requests_human(body: &Value, one_model: bool) -> String {
     return out;
   }
   let mut header = vec![
-    "TIME", "CODE", "TOK/S", "PP/S", "TOTAL", "TTFB", "IN", "OUT",
+    "TIME", "CODE", "TOK/S", "PP/S", "TOTAL", "TTFB", "IN", "CACHE", "OUT",
   ];
   if !one_model {
     header.push("MODEL");
@@ -193,6 +193,7 @@ fn cells_for(row: &RequestRow, one_model: bool) -> Vec<String> {
     c.total,
     c.ttfb,
     c.tokens_in,
+    c.cache_hit,
     c.tokens_out,
   ];
   if !one_model {
@@ -285,7 +286,7 @@ mod tests {
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(
       lines[0],
-      "TIME\tCODE\tTOK/S\tPP/S\tTOTAL\tTTFB\tIN\tOUT\tMODEL\tLAUNCH\tCLIENT\tREQUEST FOR\tROUTE\tNOTE"
+      "TIME\tCODE\tTOK/S\tPP/S\tTOTAL\tTTFB\tIN\tCACHE\tOUT\tMODEL\tLAUNCH\tCLIENT\tREQUEST FOR\tROUTE\tNOTE"
     );
     assert_eq!(lines.len(), 2);
     let cells: Vec<&str> = lines[1].split('\t').collect();
@@ -298,6 +299,7 @@ mod tests {
         "1.2s",
         "180ms",
         "41",
+        "-",
         "12.3k",
         "Qwen3.8-27B",
         "L1",
@@ -310,10 +312,24 @@ mod tests {
   }
 
   #[test]
+  fn a_row_prints_its_cache_share_between_in_and_out() {
+    // What a finished row carries: the count and the share from one response.
+    let hit = RequestRow {
+      prompt_tokens: Some(36_093),
+      cached_tokens: Some(32_768),
+      cache_hit_ratio: Some(32_768.0 / 36_093.0),
+      ..row()
+    };
+    let out = piped(&[hit], false);
+    let cells: Vec<&str> = out.lines().nth(1).expect("row").split('\t').collect();
+    assert_eq!(&cells[6..9], ["36.1k", "90.8%", "12.3k"]);
+  }
+
+  #[test]
   fn a_model_filter_drops_the_model_column() {
     let out = piped(&[row()], true);
     assert!(!out.lines().next().unwrap().contains("MODEL"));
-    assert_eq!(out.lines().nth(1).unwrap().split('\t').count(), 13);
+    assert_eq!(out.lines().nth(1).unwrap().split('\t').count(), 14);
   }
 
   #[test]
@@ -336,11 +352,12 @@ mod tests {
     assert_eq!(cells[2], "-");
     assert_eq!(cells[3], "-");
     assert_eq!(cells[5], "-");
-    assert_eq!(cells[8], "qwen");
-    assert_eq!(cells[9], "-");
-    assert_eq!(cells[11], "qwen");
-    assert_eq!(cells[12], "chat/completions");
-    assert_eq!(cells[13], "model_not_found");
+    assert_eq!(cells[7], "-");
+    assert_eq!(cells[9], "qwen");
+    assert_eq!(cells[10], "-");
+    assert_eq!(cells[12], "qwen");
+    assert_eq!(cells[13], "chat/completions");
+    assert_eq!(cells[14], "model_not_found");
   }
 
   /// Terminal rendering, with the process-wide color flag restored. It
@@ -388,6 +405,8 @@ mod tests {
     // The prompt figures sit beside the generation ones they complete.
     assert!(at("TOK/S") < at("PP/S"), "{header}");
     assert!(at("PP/S") < at("TOTAL"), "{header}");
+    assert!(at("IN") < at("CACHE"), "{header}");
+    assert!(at("CACHE") < at("OUT"), "{header}");
     assert!(at("CLIENT") < at("REQUEST FOR"), "{header}");
     assert!(at("REQUEST FOR") < at("ROUTE"), "{header}");
     assert!(at("ROUTE") < at("NOTE"), "{header}");
@@ -443,8 +462,8 @@ mod tests {
       .expect("row")
       .to_string();
     let cells: Vec<&str> = line.split('\t').collect();
-    assert_eq!(cells[8], long, "MODEL keeps the whole name");
-    assert_eq!(cells[11], long, "REQUEST FOR keeps the whole name");
+    assert_eq!(cells[9], long, "MODEL keeps the whole name");
+    assert_eq!(cells[12], long, "REQUEST FOR keeps the whole name");
   }
 
   #[test]
@@ -484,8 +503,8 @@ mod tests {
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(lines.len(), 2, "{lines:?}");
     let cells: Vec<&str> = lines[1].split('\t').collect();
-    assert_eq!(cells.len(), 14);
-    assert!(cells[13].ends_with("lower --ctx-size"), "{}", cells[13]);
+    assert_eq!(cells.len(), 15);
+    assert!(cells[14].ends_with("lower --ctx-size"), "{}", cells[14]);
   }
 
   #[test]
