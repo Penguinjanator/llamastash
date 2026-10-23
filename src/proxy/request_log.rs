@@ -174,6 +174,10 @@ pub struct RequestRow {
   pub prefill_estimated: bool,
   /// Prompt tokens served from the KV cache.
   pub cached_tokens: Option<u64>,
+  /// [`Self::cached_tokens`] over the prompt it was served from, clamped to
+  /// that prompt. `None` when the row reports only one half of the pair or has
+  /// no prompt to divide by, which is not the same answer as `0`.
+  pub cache_hit_ratio: Option<f64>,
 }
 
 /// A row as table-cell text. The CLI table and the TUI tab both render
@@ -189,6 +193,8 @@ pub struct RequestCells {
   /// Prompt-processing speed, `~` when it is the proxy's estimate.
   pub prefill: String,
   pub tokens_in: String,
+  /// Cached share of the prompt, `48.8%`.
+  pub cache_hit: String,
   pub tokens_out: String,
   /// The route without its `/v1/` prefix, which every logged route has.
   pub route: String,
@@ -235,6 +241,14 @@ impl RequestRow {
         format!("{mark}{}", fmt_tps(t))
       })),
       tokens_in: or_none(self.prompt_tokens.map(fmt_count)),
+      cache_hit: or_none(
+        self
+          .cache_hit_ratio
+          // A row from a daemon older than the field still carries both counts,
+          // so the cell divides them rather than showing the no-data placeholder.
+          .or_else(|| cache_hit_ratio(self.cached_tokens, self.prompt_tokens))
+          .map(fmt_pct),
+      ),
       tokens_out: or_none(self.completion_tokens.map(fmt_count)),
       route: self
         .route
@@ -287,6 +301,23 @@ impl RequestRow {
     }
     parts.join(", ")
   }
+}
+
+/// The cached share of one prompt, clamped to the prompt it was served from.
+/// Needs both halves and a prompt to divide by, so a row that reported one
+/// reads `None` rather than `0`. [`Totals::add`] applies the same rule to the
+/// scope figures, which is what ties a row's share and the summary's to one
+/// another.
+fn cache_hit_ratio(cached: Option<u64>, prompt: Option<u64>) -> Option<f64> {
+  let (Some(cached), Some(prompt)) = (cached, prompt) else {
+    return None;
+  };
+  (prompt > 0).then(|| cached.min(prompt) as f64 / prompt as f64)
+}
+
+/// A share for a table cell: `48.8%`.
+fn fmt_pct(ratio: f64) -> String {
+  format!("{:.1}%", ratio * 100.0)
 }
 
 /// A token count for a table cell: `9999`, `12.3k`, `1.2M`.
@@ -469,7 +500,7 @@ impl RequestSummary {
         (
           "Cached",
           match self.cache_hit_ratio {
-            Some(ratio) => format!("{} ({:.1}%)", fmt_count(self.cached_tokens), ratio * 100.0),
+            Some(ratio) => format!("{} ({})", fmt_count(self.cached_tokens), fmt_pct(ratio)),
             None => none.to_string(),
           },
         ),
@@ -1429,6 +1460,7 @@ impl RequestRecord {
     self.row.prefill_tokens_per_second = usage.prefill_tokens_per_second;
     self.row.prefill_estimated = usage.prefill_estimated;
     self.row.cached_tokens = usage.cached_tokens;
+    self.row.cache_hit_ratio = cache_hit_ratio(usage.cached_tokens, usage.prompt_tokens);
     {
       let mut inner = self.log.lock();
       let inner = &mut *inner;
@@ -2591,6 +2623,7 @@ mod tests {
         c.speed,
         c.prefill,
         c.tokens_in,
+        c.cache_hit,
         c.tokens_out,
         c.route,
         c.model,
@@ -2605,6 +2638,7 @@ mod tests {
         "39.6",
         "-",
         "41",
+        "-",
         "12.3k",
         "chat/completions",
         "Qwen3.8-27B",
@@ -2663,11 +2697,12 @@ mod tests {
         p.speed,
         p.prefill,
         p.tokens_in,
+        p.cache_hit,
         p.tokens_out,
         p.launch,
         p.client
       ],
-      ["-"; 9]
+      ["-"; 10]
     );
   }
 
@@ -2679,9 +2714,10 @@ mod tests {
       (
         row.prefill_tokens,
         row.prefill_tokens_per_second,
-        row.cached_tokens
+        row.cached_tokens,
+        row.cache_hit_ratio
       ),
-      (None, None, None)
+      (None, None, None, None)
     );
     assert!(!row.prefill_estimated);
     let summary: RequestSummary = serde_json::from_str("{}").expect("a summary");
@@ -2831,6 +2867,62 @@ mod tests {
       Some(1.0),
       "a ratio above 1 is not a hit rate"
     );
+  }
+
+  #[test]
+  fn each_row_carries_its_own_cache_hit_share() {
+    let cached = |prompt, hit| Usage {
+      prompt_tokens: Some(prompt),
+      cached_tokens: Some(hit),
+      ..Usage::default()
+    };
+    let log = RequestLog::new();
+    served(&log, "/m/a.gguf", "L1", cached(1_000, 200));
+    // A cached count over its own prompt clamps to the whole prompt.
+    served(&log, "/m/a.gguf", "L1", cached(80, 1_000));
+    let rows = log.tail(LogScope::All, 10).rows;
+    assert_eq!(rows[0].cells("-").cache_hit, "100.0%");
+    assert_eq!(rows[1].cache_hit_ratio, Some(0.2));
+    assert_eq!(rows[1].cells("-").cache_hit, "20.0%");
+
+    // No cached count: the placeholder, not a zero that reads as a total miss.
+    let quiet = RequestLog::new();
+    served(
+      &quiet,
+      "/m/a.gguf",
+      "L1",
+      Usage {
+        prompt_tokens: Some(80),
+        ..Usage::default()
+      },
+    );
+    assert_eq!(
+      quiet.tail(LogScope::All, 1).rows[0].cells("-").cache_hit,
+      "-"
+    );
+
+    // An empty prompt leaves nothing to divide by, which is also not a miss.
+    let empty = RequestLog::new();
+    served(&empty, "/m/a.gguf", "L1", cached(0, 0));
+    let row = &empty.tail(LogScope::All, 1).rows[0];
+    assert_eq!(
+      (row.cache_hit_ratio, row.cells("-").cache_hit.as_str()),
+      (None, "-")
+    );
+
+    // The widest the cell can reach is the clamp: one whole prompt, which is
+    // exactly the six cells the column has.
+    assert_eq!(fmt_pct(1.0).chars().count(), 6);
+  }
+
+  #[test]
+  fn a_row_from_an_older_daemon_divides_its_own_counts() {
+    // A daemon predating the field sends both counts and no ratio, so the cell
+    // works the share out instead of printing the no-data placeholder.
+    let row: RequestRow =
+      serde_json::from_str(r#"{"prompt_tokens":1000,"cached_tokens":250}"#).expect("a row");
+    assert_eq!(row.cache_hit_ratio, None);
+    assert_eq!(row.cells("-").cache_hit, "25.0%");
   }
 
   #[test]
@@ -3313,6 +3405,7 @@ mod tests {
       "prefill_tokens_per_second",
       "prefill_estimated",
       "cached_tokens",
+      "cache_hit_ratio",
     ] {
       assert!(v.get(key).is_some(), "missing key {key}");
     }

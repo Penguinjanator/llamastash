@@ -520,9 +520,9 @@ _Shared context: `src/cli/` and `src/ipc/methods.rs` for the start and wait-for-
 
 - [x] ~~`llamastash session claude|pi|codex|opencode` should launch the harness with active model or with an optional model arg (an alias or model name or model name@preset)~~ — done: `llamastash session <tool> [model]` covers `claude`, `codex`, `opencode`, `pi` and `aider`. With no MODEL it takes the newest live chat launch; a MODEL (alias, reference, or `model@preset`) is started and waited for if it is not up. Each tool's settings go in per-run (env, `-c` overrides, `OPENCODE_CONFIG_CONTENT`, a generated pi extension, Aider env), so no tool config is written, and `--` passes args through. Plan: [`docs/plans/2026-10-18-002-feat-session-launcher-plan.md`](docs/plans/2026-10-18-002-feat-session-launcher-plan.md).
 
-## Next
+## R17 (v0.10.0 checklist)
 
-- [ ] Show cache hit on request rows as well
+- [x] ~~Show cache hit on request rows as well~~ — done: each row carries its own `cache_hit_ratio` (`cached_tokens` over its own `prompt_tokens`), shown as `CACHE` between `In` and `Out` in the TUI, the `requests` table, and the row JSON. It ranks below both token counts, so it is the first of the token figures to drop when the pane narrows.
 - [x] ~~audio/tts/video/etc support on proxy, support all common paths~~ — audio and image routes are served (`/v1/images/generations` `edits` `variations`, `/v1/audio/speech` `transcriptions` `translations`), and a generic entry can open any other path its engine serves through `routes`. Plan: [`docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md`](docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md).
   - [x] ~~**The proxy has no route for audio, so an ASR engine is launch-managed only.**~~ — done: `/v1/audio/transcriptions` and `/v1/audio/translations` are routes, `stt` / `tts` / `image` are declared-only launch modes, and a generic entry that lists one in `modes` answers them with its upload forwarded as sent. Seen 2026-10-17. Plan: [`docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md`](docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md).
   - [ ] **No video generation route: `/v1/videos` is a jobs API.** The image and audio routes are one request in, one response out, which is all the proxy forwards. Video generation (OpenAI's `/v1/videos`, llama.cpp's `-vg` builds) submits a job and polls it, so it needs a job model the proxy does not have: create, status, download, and a job that outlives the request that made it. Named by the media-routes plan as out of scope, not a gap in it.
@@ -534,18 +534,20 @@ _Shared context: `src/cli/` and `src/ipc/methods.rs` for the start and wait-for-
   - [ ] **`daemon_restart_from_nothing_starts_a_daemon` fails while another llamastash daemon runs on the box.** In [`tests/cli_integration_test.rs`](tests/cli_integration_test.rs), the detached daemon exits 71 (`exited before binding control plane`) under the full suite when an unrelated daemon with its own `LLAMASTASH_STATE_DIR` and `--proxy-port 41435` is up; it passes alone and with that daemon stopped. Seen twice on 2026-10-23 as a pre-push failure. The test is not isolated from something that daemon holds, likely a default port.
   - [ ] **Review follow-ups from the media-routes branch.** (a) No test for a 413 on a declared path (checked by hand: 18 MiB to `/internal` gets `payload_too_large`) or for `decide_declared`'s `ambiguous_model` arm (needs a `model:` glob entry minting several rows). (b) The multipart scan in [`src/util/multipart_body.rs`](src/util/multipart_body.rs) uses `windows().position()` and scans skipped parts to their delimiter; `memchr` is already in `Cargo.lock`. (c) `/ui/...` reverse-proxies client-written paths and was not checked for dot-segment escapes the way declared prefixes now are.
 
-### Batch 2: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
-
-- [ ] Keep a model's prompt cache across an unload
-- [ ] Warm the page cache before a load (`llamastash warm <model>`)
-
 ### Batch 4: `proxy.aliases` visibility and coverage
 
 _Shared context: Alias resolution in the proxy, the `/v1/models` and `/api/tags` rows, `status --json`, `list --json`, `doctor`._
 
-- [ ] An alias of a vLLM model gets vLLM's `404` (`NotFoundError`): the proxy forwards the client's `model` unchanged and vLLM answers only to the `--served-model-name` it was given (seen on 0.27.1, 2026-10-15). vLLM takes several served names, so the backend could pass the aliases that name the model, or rewrite `body.model` through `Backend::rewrite_request_body` the way a generic entry's `rewrite_model` does. `docs/usage.md` and `docs/vllm-setup.md` say an alias does not reach vLLM today.
-- [ ] A `proxy.aliases` entry is invisible to an agent until a client hits it: nothing in `status --json`, `list --json` or `doctor` shows the table or which of its entries name no model, so the only signal is one daemon log line per problem on first use. Wants a read-only surface and a validity check run after the first scan at startup the catalog is empty, so every target would look dead. The two listings now publish every alias that can route, which covers the client's half; this is the operator's.
+- [ ] An alias of a vLLM model gets vLLM's `404` (`NotFoundError`): the proxy forwards the client's `model` unchanged and vLLM answers only to the `--served-model-name` it was given (seen on 0.27.1, 2026-10-15). vLLM takes several served names, so the backend could pass the aliases that name the model, or rewrite `body.model` through `Backend::rewrite_request_body` the way a generic entry's `rewrite_model` does. `docs/usage.md` and `docs/vllm-setup.md` say an alias does not reach vLLM today. Make a config in vLLM backend config to enable model rewrite.
+- [ ] A `proxy.aliases` entry is invisible to an agent until a client hits it: nothing in `status --json`, `list --json` or `doctor` shows the table or which of its entries name no model, so the only signal is one daemon log line per problem on first use. Wants a read-only surface and a validity check run after the first scan at startup the catalog is empty, so every target would look dead. The two listings now publish every alias that can route, which covers the client's half; this is the operator's. Show aliases in `list --json`.
 - [ ] Three claims about the alias rows in `/v1/models` and `/api/tags` have no test behind them: an alias whose target two models answer to (the `ambiguous_model` refusal that keeps it out of the listing), the `mode` field an alias row inherits from the model it names, and that a listing never spends the once-per-name alias warnings real requests need. The case-only shadow (`Qwen3` id beside a `qwen3` alias) is pinned in both listings.
+
+## Next
+
+### Batch 2: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
+
+- [ ] Keep a model's prompt cache across an unload
+- [ ] Warm the page cache before a load (`llamastash warm <model>`)
 
 ### Batch 8: Test-helper consolidation
 

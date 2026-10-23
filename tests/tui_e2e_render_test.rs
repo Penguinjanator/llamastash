@@ -282,11 +282,11 @@ fn requests_view_golden_render_matches_fixture() {
 #[cfg_attr(target_os = "macos", ignore = "fixture uses Linux key glyphs")]
 #[test]
 fn requests_view_wide_golden_render_matches_fixture() {
-  // The wide frame is the only golden that shows `Request for`, `Note`
-  // and `Route`, and the only one where a long note is cut to its first
-  // words with an ellipsis instead of being dropped with the column.
+  // The wide frame is the only golden that shows `Request for`, `Client` and
+  // `Note`, and the only one where a long note is cut to its first words with
+  // an ellipsis instead of being dropped with the column.
   let mut app = seeded_requests_view_app();
-  let rendered = mask_clock_times(&render_to_lines_at(&mut app, 350, 30).join("\n"));
+  let rendered = mask_clock_times(&render_to_lines_at(&mut app, 400, 30).join("\n"));
   assert_golden_text(rendered + "\n", "tests/golden/requests-view-wide.txt");
 }
 
@@ -478,6 +478,7 @@ fn seeded_requests_view_app() -> App {
     prefill_tokens: Some(4_096),
     prefill_tokens_per_second: Some(612.4),
     cached_tokens: Some(14_336),
+    cache_hit_ratio: Some(14_336.0 / 18_432.0),
     ..RequestRow::default()
   };
   let rows = vec![
@@ -500,6 +501,7 @@ fn seeded_requests_view_app() -> App {
       prefill_tokens: None,
       prefill_tokens_per_second: None,
       cached_tokens: None,
+      cache_hit_ratio: None,
       ..row(5)
     },
     RequestRow {
@@ -512,6 +514,7 @@ fn seeded_requests_view_app() -> App {
       prefill_tokens: None,
       prefill_tokens_per_second: None,
       cached_tokens: None,
+      cache_hit_ratio: None,
       ..row(6)
     },
     RequestRow {
@@ -522,6 +525,7 @@ fn seeded_requests_view_app() -> App {
       prefill_tokens: None,
       prefill_tokens_per_second: None,
       cached_tokens: None,
+      cache_hit_ratio: None,
       route: "/v1/messages".into(),
       ..row(4)
     },
@@ -544,6 +548,7 @@ fn seeded_requests_view_app() -> App {
       prefill_tokens: None,
       prefill_tokens_per_second: None,
       cached_tokens: None,
+      cache_hit_ratio: None,
       ..row(3)
     },
     RequestRow {

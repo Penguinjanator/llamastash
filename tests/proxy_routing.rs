@@ -1363,6 +1363,7 @@ async fn tokens_and_speed_come_from_the_end_of_the_response() {
   assert_eq!(row.tokens_per_second, Some(38.64));
   assert!(!row.tokens_per_second_estimated, "the server reported it");
   assert_eq!(row.cached_tokens, Some(40));
+  assert_eq!(row.cache_hit_ratio, Some(40.0 / 41.0));
   assert_eq!(row.prefill_tokens, Some(1));
   assert_eq!(
     row.prefill_tokens_per_second,
