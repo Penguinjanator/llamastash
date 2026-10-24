@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::proxy::request_log::{RequestCells, RequestRow, RequestSummary};
+use crate::proxy::request_log::{Aggregates, RequestCells, RequestRow, RequestSummary};
 use crate::theme::Palette;
 use crate::tui::columns::{self, cell, cell_words, Column};
 
@@ -274,14 +274,48 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &RequestsTabState, palet
 
 /// The summary figures as `Label value` cells, in the two rows the layout
 /// asks for, each wrapped to `width` on its own. A figure is never split
-/// across lines.
+/// across lines. An aggregate rides inside the average it belongs to as
+/// `Avg tok/s 48.4 (Agg 56.1 over 12.0s)`, with the wall it averages over kept
+/// unbold so it reads like a label.
 fn summary_lines(summary: &RequestSummary, width: usize, palette: &Palette) -> Vec<Line<'static>> {
   let mut lines: Vec<Line<'static>> = Vec::new();
-  for row in summary.cell_rows(NONE) {
+  for row in summary.cell_rows(NONE, Aggregates::WhenTheyDiffer) {
+    let mut cells: Vec<(&'static str, Vec<Span<'static>>)> = Vec::new();
+    for (label, value) in row {
+      let value_style = if label == "Errors" && summary.errors > 0 {
+        palette.error_style()
+      } else {
+        palette.text_style().add_modifier(Modifier::BOLD)
+      };
+      // Its average is always earlier in the row, but not always the cell
+      // before it: the session figure can sit between the two.
+      let parent = label
+        .strip_prefix("Agg ")
+        .and_then(|rest| cells.iter().position(|(l, _)| *l == format!("Avg {rest}")));
+      if let Some(i) = parent {
+        let (speed, wall) = value.split_once(' ').unwrap_or((value.as_str(), ""));
+        let cell = &mut cells[i].1;
+        cell.push(Span::styled(" (Agg ", palette.muted_style()));
+        cell.push(Span::styled(speed.to_string(), value_style));
+        cell.push(Span::styled(
+          if wall.is_empty() {
+            ")".to_string()
+          } else {
+            format!(" {wall})")
+          },
+          palette.muted_style(),
+        ));
+      } else {
+        cells.push((label, vec![Span::styled(value, value_style)]));
+      }
+    }
+
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
-    for (label, value) in row {
-      let cell_w = label.chars().count() + 1 + value.chars().count();
+    for (label, value) in cells {
+      let value_w: usize = value.iter().map(|s| s.content.chars().count()).sum();
+      let label_w = label.chars().count() + 1;
+      let cell_w = label_w + value_w;
       if !spans.is_empty() && used + SUMMARY_GAP + cell_w > width {
         lines.push(Line::from(std::mem::take(&mut spans)));
         used = 0;
@@ -290,13 +324,8 @@ fn summary_lines(summary: &RequestSummary, width: usize, palette: &Palette) -> V
         spans.push(Span::raw(" ".repeat(SUMMARY_GAP)));
         used += SUMMARY_GAP;
       }
-      let value_style = if label == "Errors" && summary.errors > 0 {
-        palette.error_style()
-      } else {
-        palette.text_style().add_modifier(Modifier::BOLD)
-      };
       spans.push(Span::styled(format!("{label} "), palette.muted_style()));
-      spans.push(Span::styled(value, value_style));
+      spans.extend(value);
       used += cell_w;
     }
     if !spans.is_empty() {
@@ -711,6 +740,50 @@ mod tests {
     assert!(text.contains("Requests 12"), "{text}");
     assert!(text.contains("Avg total 1.2s"), "{text}");
     assert!(text.contains("Avg tok/s —"), "{text}");
+  }
+
+  #[test]
+  fn summary_folds_an_aggregate_into_its_own_average() {
+    let palette = palette();
+    let summary = RequestSummary {
+      tokens_per_second_avg: Some(48.4),
+      tokens_per_second_aggregate: Some(56.1),
+      busy_ms: Some(12_000),
+      prefill_tokens_per_second: Some(1_379.0),
+      prefill_tokens_per_second_aggregate: Some(1_200.0),
+      prefill_busy_ms: Some(12_000),
+      ..RequestSummary::default()
+    };
+    let lines = summary_lines(&summary, 200, palette);
+    let text = lines[1].to_string();
+    assert!(
+      text.contains("Avg tok/s 48.4 (Agg 56.1 over 12.0s)"),
+      "{text}"
+    );
+    assert!(
+      text.contains("Avg PP tok/s 1379 (Agg 1200 over 12.0s)"),
+      "{text}"
+    );
+    // The wall reads like a label: only the speed carries the value style.
+    let bold: Vec<String> = lines[1]
+      .spans
+      .iter()
+      .filter(|s| s.style.add_modifier.contains(Modifier::BOLD))
+      .map(|s| s.content.to_string())
+      .collect();
+    assert!(bold.contains(&"56.1".to_string()), "{bold:?}");
+    assert!(!bold.iter().any(|s| s.contains("over")), "{bold:?}");
+
+    // An aggregate that reads as its own average still drops out of the strip.
+    let quiet = RequestSummary {
+      tokens_per_second_avg: Some(48.4),
+      tokens_per_second_aggregate: Some(48.9),
+      busy_ms: Some(12_000),
+      ..RequestSummary::default()
+    };
+    let quiet_text = summary_lines(&quiet, 200, palette)[1].to_string();
+    assert!(quiet_text.starts_with("Avg tok/s 48.4 "), "{quiet_text}");
+    assert!(!quiet_text.contains("Agg"), "{quiet_text}");
   }
 
   #[test]

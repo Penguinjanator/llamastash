@@ -443,13 +443,24 @@ pub struct RequestSummary {
   pub evictions: u64,
 }
 
+/// Whether a summary keeps an aggregate figure that reads as the average beside
+/// it. A launch nothing runs together makes the two the same number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Aggregates {
+  /// Print every aggregate the data supports, so the block has the same cells
+  /// whatever is running.
+  Always,
+  /// Leave out one that prints its own average or lands within a few percent of
+  /// it, since then they are one figure.
+  WhenTheyDiffer,
+}
+
 impl RequestSummary {
   /// Label and text of the figures, in display order. `none` stands in for a
-  /// figure no request has supplied yet, except for the two `Agg` figures,
-  /// which drop out entirely when nothing produced them or when they land
-  /// within noise of the average they belong to.
-  pub fn cells(&self, none: &str) -> Vec<(&'static str, String)> {
-    let [counts, speeds_and_totals] = self.cell_rows(none);
+  /// figure no request has supplied yet. The two `Agg` figures drop out entirely
+  /// when nothing produced them, and follow `agg` for the rest.
+  pub fn cells(&self, none: &str, agg: Aggregates) -> Vec<(&'static str, String)> {
+    let [counts, speeds_and_totals] = self.cell_rows(none, agg);
     counts.into_iter().chain(speeds_and_totals).collect()
   }
 
@@ -457,7 +468,7 @@ impl RequestSummary {
   /// (Live, hosts, counts) and how fast it went (speeds, latencies, token
   /// totals). Each row wraps on its own, so a narrow pane keeps the split rather
   /// than letting one row's tail push the other's figures around.
-  pub fn cell_rows(&self, none: &str) -> [Vec<(&'static str, String)>; 2] {
+  pub fn cell_rows(&self, none: &str, agg: Aggregates) -> [Vec<(&'static str, String)>; 2] {
     let ms = |v: Option<u64>| v.map(fmt_ms).unwrap_or_else(|| none.to_string());
     let tps = |v: Option<f64>| v.map(fmt_tps).unwrap_or_else(|| none.to_string());
     let num = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_else(|| none.to_string());
@@ -485,6 +496,7 @@ impl RequestSummary {
         self.tokens_per_second_aggregate,
         self.busy_ms,
         "Agg tok/s",
+        agg,
       ))
       .chain([("Avg PP tok/s", tps(self.prefill_tokens_per_second))])
       .chain(Self::aggregate_cell(
@@ -492,6 +504,7 @@ impl RequestSummary {
         self.prefill_tokens_per_second_aggregate,
         self.prefill_busy_ms,
         "Agg PP tok/s",
+        agg,
       ))
       .chain([
         ("Avg total", ms(self.avg_duration_ms)),
@@ -511,23 +524,25 @@ impl RequestSummary {
   }
 
   /// The `X over <wall>` cell of an aggregate figure: absent when nothing
-  /// produced it, and absent when it lands within a few percent of the average
-  /// it belongs to, because with nothing running together the two are the same
-  /// figure and the cells the aggregate costs are better spent on the ones that
-  /// differ.
+  /// produced it, and otherwise subject to `agg`.
   fn aggregate_cell(
     avg: Option<f64>,
     aggregate: Option<f64>,
     busy_ms: Option<u64>,
     label: &'static str,
+    agg: Aggregates,
   ) -> Option<(&'static str, String)> {
     let (Some(value), Some(busy_ms)) = (aggregate, busy_ms) else {
       return None;
     };
+    let printed = fmt_tps(value);
+    let text = || format!("{printed} over {}", fmt_ms(busy_ms));
+    if agg == Aggregates::Always {
+      return Some((label, text()));
+    }
     // Speeds this close read as one number at a glance: a lone stream lands
     // here, and so does a hair of overlap between two.
     const NOISE: f64 = 0.05;
-    let printed = fmt_tps(value);
     // An average that never landed prints the placeholder, so it is not the
     // same number and the aggregate stands on its own.
     let differs = match avg {
@@ -537,7 +552,7 @@ impl RequestSummary {
       Some(avg) if avg > 0.0 => printed != fmt_tps(avg) && (value - avg).abs() / avg > NOISE,
       _ => true,
     };
-    differs.then(|| (label, format!("{printed} over {}", fmt_ms(busy_ms))))
+    differs.then(|| (label, text()))
   }
 
   /// The in-flight pair as one cell: `Live N` when every host in flight is on
@@ -1694,7 +1709,7 @@ mod tests {
     // With nothing in flight the live pair is not displayed at all.
     assert!(!idle
       .summary
-      .cells("—")
+      .cells("—", Aggregates::WhenTheyDiffer)
       .iter()
       .any(|(label, _)| *label == "Live"));
   }
@@ -1706,7 +1721,7 @@ mod tests {
     let old: RequestSummary = serde_json::from_str(r#"{"requests": 2}"#).unwrap();
     assert_eq!((old.hosts, old.connections), (None, None));
     assert_eq!((old.live_hosts, old.live_connections), (None, None));
-    let cells = old.cells("—");
+    let cells = old.cells("—", Aggregates::WhenTheyDiffer);
     assert_eq!(cells[0], ("Hosts", "—".to_string()));
     assert!(!cells.iter().any(|(label, _)| *label == "Live"));
   }
@@ -1719,7 +1734,7 @@ mod tests {
         live_connections: Some(connections),
         ..RequestSummary::default()
       }
-      .cells("—")
+      .cells("—", Aggregates::WhenTheyDiffer)
     };
     assert_eq!(
       cells(2, 2).iter().find(|c| c.0 == "Live").unwrap().1,
@@ -2070,7 +2085,7 @@ mod tests {
     assert_eq!(together.prefill_tokens_per_second_aggregate, Some(1_000.0));
     assert!(
       together
-        .cells("—")
+        .cells("—", Aggregates::WhenTheyDiffer)
         .iter()
         .any(|(label, text)| *label == "Agg PP tok/s" && text == "1000 over 2.0s"),
       "{together:?}"
@@ -2082,11 +2097,11 @@ mod tests {
     assert_eq!(apart.prefill_tokens_per_second_aggregate, Some(500.0));
     assert!(
       !apart
-        .cells("—")
+        .cells("—", Aggregates::WhenTheyDiffer)
         .iter()
         .any(|(label, _)| *label == "Agg PP tok/s"),
       "{:?}",
-      apart.cells("—")
+      apart.cells("—", Aggregates::WhenTheyDiffer)
     );
   }
 
@@ -2246,14 +2261,19 @@ mod tests {
   fn an_aggregate_within_noise_of_its_average_is_left_off_the_strip() {
     let agg_labels = |summary: &RequestSummary| -> Vec<&'static str> {
       summary
-        .cells("—")
+        .cells("—", Aggregates::WhenTheyDiffer)
         .into_iter()
         .filter(|(label, _)| label.starts_with("Agg "))
         .map(|(label, _)| label)
         .collect()
     };
-    let labels =
-      |summary: &RequestSummary| summary.cells("—").iter().map(|c| c.0).collect::<Vec<_>>();
+    let labels = |summary: &RequestSummary| {
+      summary
+        .cells("—", Aggregates::WhenTheyDiffer)
+        .iter()
+        .map(|c| c.0)
+        .collect::<Vec<_>>()
+    };
     // Both pair 1 and pair 2 round to the same printed number as their average,
     // so neither is worth the cells it costs.
     let same = RequestSummary {
@@ -2399,7 +2419,7 @@ mod tests {
       busy_ms: Some(214_000),
       ..RequestSummary::default()
     }
-    .cells("—");
+    .cells("—", Aggregates::WhenTheyDiffer);
     let at = cells.iter().position(|c| c.0 == "Avg tok/s").unwrap();
     assert_eq!(cells[at + 1], ("Agg tok/s", "50.3 over 3m34s".to_string()));
     // The prompt speed follows the two generation figures, and the token
@@ -2958,7 +2978,7 @@ mod tests {
     let text = |cells: &[(&'static str, String)], label: &str| {
       cells.iter().find(|c| c.0 == label).unwrap().1.clone()
     };
-    let cells = RequestSummary::default().cells("—");
+    let cells = RequestSummary::default().cells("—", Aggregates::WhenTheyDiffer);
     // The counts lead, one row, and the speeds and token totals follow on the
     // second.
     assert_eq!(cells[0], ("Hosts", "—".to_string()));
@@ -2978,7 +2998,7 @@ mod tests {
       cache_hit_ratio: Some(0.9756),
       ..RequestSummary::default()
     };
-    let filled_cells = filled.cells("—");
+    let filled_cells = filled.cells("—", Aggregates::WhenTheyDiffer);
     assert_eq!(text(&filled_cells, "Avg total"), "1.2s");
     assert_eq!(text(&filled_cells, "Avg tok/s"), "39.6");
     // A speed from 1000 up loses the decimal here too.
@@ -2994,7 +3014,7 @@ mod tests {
   fn each_summary_row_holds_its_figures_in_order() {
     let labels = |cells: &[(&'static str, String)]| cells.iter().map(|c| c.0).collect::<Vec<_>>();
     let summary = RequestSummary::default();
-    let [counts, speeds_and_totals] = summary.cell_rows("—");
+    let [counts, speeds_and_totals] = summary.cell_rows("—", Aggregates::WhenTheyDiffer);
     assert_eq!(
       labels(&counts),
       [
@@ -3020,7 +3040,7 @@ mod tests {
     );
     // `cells` is the two rows end to end, which is the order `requests` prints.
     assert_eq!(
-      summary.cells("—"),
+      summary.cells("—", Aggregates::WhenTheyDiffer),
       counts
         .into_iter()
         .chain(speeds_and_totals)
@@ -3033,7 +3053,7 @@ mod tests {
       tokens_per_second_session: Some(40.0),
       ..RequestSummary::default()
     }
-    .cell_rows("—");
+    .cell_rows("—", Aggregates::WhenTheyDiffer);
     assert_eq!(labels(&live_counts)[0], "Live");
     assert_eq!(labels(&live_speeds)[1], "Tok/s session");
   }
@@ -3277,7 +3297,7 @@ mod tests {
     );
     // The strip shows the figure only when there is one, so an old daemon
     // (no key in the JSON) renders exactly as before.
-    let with = model.cells("-");
+    let with = model.cells("-", Aggregates::WhenTheyDiffer);
     assert!(with.iter().any(|(k, _)| *k == "Tok/s session"));
     assert_eq!(
       with[with
@@ -3288,7 +3308,7 @@ mod tests {
       "20.0"
     );
     assert!(!RequestSummary::default()
-      .cells("-")
+      .cells("-", Aggregates::WhenTheyDiffer)
       .iter()
       .any(|(k, _)| *k == "Tok/s session"));
   }

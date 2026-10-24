@@ -17,7 +17,7 @@ use crate::cli::resolve::{
 };
 use crate::cli::{colors, format};
 use crate::config::Config;
-use crate::proxy::request_log::{RequestRow, Tail};
+use crate::proxy::request_log::{Aggregates, RequestRow, Tail};
 use crate::util::wrap::wrap_cells;
 
 /// Cell text for a value the log does not have.
@@ -74,7 +74,7 @@ fn requests_human(body: &Value, one_model: bool) -> String {
 
   let mut out = String::new();
   if console::colors_enabled() {
-    let cells = summary.cells(NONE);
+    let cells = summary.cells(NONE, Aggregates::Always);
     let items: Vec<(&str, String)> = cells.iter().map(|(k, v)| (*k, v.clone())).collect();
     out.push_str(&format::kv_block(&items));
     out.push('\n');
@@ -589,7 +589,7 @@ mod tests {
   }
 
   #[test]
-  fn the_summary_block_prints_the_prompt_aggregate_beyond_the_mean() {
+  fn the_summary_block_prints_every_aggregate_the_data_supports() {
     let strip = summary_on_terminal(RequestSummary {
       prefill_tokens_per_second: Some(500.0),
       prefill_tokens_per_second_aggregate: Some(1_000.0),
@@ -597,14 +597,13 @@ mod tests {
       ..RequestSummary::default()
     });
     assert!(strip.contains("Agg PP tok/s  1000 over 2.0s"), "{strip}");
-    // The same speed as the mean is the same figure twice, so it is not printed.
     let alone = summary_on_terminal(RequestSummary {
       prefill_tokens_per_second: Some(500.0),
       prefill_tokens_per_second_aggregate: Some(500.0),
       prefill_busy_ms: Some(4_000),
       ..RequestSummary::default()
     });
-    assert!(!alone.contains("Agg PP tok/s"), "{alone}");
+    assert!(alone.contains("Agg PP tok/s  500.0 over 4.0s"), "{alone}");
   }
 
   #[test]

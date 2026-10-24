@@ -11,6 +11,7 @@
 ### Changed
 
 - `/v1/models` reports the media mode a generic entry declares, so an entry with `modes: [stt]` lists as `stt` instead of `chat` and a client can pick the endpoint from the listing.
+- The TUI Requests strip folds each aggregate speed into the average it belongs to — `Avg tok/s 48.4 (Agg 56.1 over 12.0s)` — instead of spending a cell of its own, and keeps the wall it averages over in the label colour. `llamastash requests` now prints every aggregate the data supports, including one that matches its own average.
 
 ### Fixed
 
