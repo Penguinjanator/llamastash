@@ -320,12 +320,16 @@ pub enum ModeHint {
   Chat,
   Embedding,
   Rerank,
+  Image,
+  Tts,
+  Stt,
   Unknown,
 }
 
 impl ModeHint {
   /// Stable lowercase label matching the CLI / IPC wire
-  /// (`--mode chat|embedding|rerank`). `Unknown` returns `None` so
+  /// (`--mode chat|embedding|rerank`) plus the routing-only media modes a
+  /// generic entry can declare. `Unknown` returns `None` so
   /// callers can branch on "no signal" without comparing against a
   /// magic string.
   pub fn as_label(&self) -> Option<&'static str> {
@@ -333,6 +337,9 @@ impl ModeHint {
       ModeHint::Chat => Some("chat"),
       ModeHint::Embedding => Some("embedding"),
       ModeHint::Rerank => Some("rerank"),
+      ModeHint::Image => Some("image"),
+      ModeHint::Tts => Some("tts"),
+      ModeHint::Stt => Some("stt"),
       ModeHint::Unknown => None,
     }
   }

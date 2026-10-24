@@ -123,6 +123,31 @@ servers:
     args: [--port, "{{port}}", -m, "{{name}}", --print-argv]
     ready: /health
     rewrite_model: true
+    routes: [/rw/pinned]
+  - name: gen-stt
+    binary: {bin}
+    args: [--port, "{{port}}"]
+    ready: /health
+    memory_gib: 1.0
+    modes: [stt]
+  - name: gen-tts-a
+    binary: {bin}
+    args: [--port, "{{port}}"]
+    ready: /health
+    memory_gib: 1.0
+    modes: [tts]
+  - name: gen-tts-b
+    binary: {bin}
+    args: [--port, "{{port}}"]
+    ready: /health
+    memory_gib: 1.0
+    modes: [tts]
+  - name: gen-routes
+    binary: {bin}
+    args: [--port, "{{port}}"]
+    ready: /health
+    memory_gib: 1.0
+    routes: [/inference, /internal, /internal/deep]
 "#,
       bin = fake()
     );
@@ -264,6 +289,60 @@ servers:
   ) {
     let _ = client.call("shutdown", None).await;
     let _ = tokio::time::timeout(Duration::from_secs(30), daemon).await;
+  }
+
+  /// Wait until the proxy can see an entry's catalog row.
+  async fn wait_listed(client: &mut Client, entry: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !client
+      .call("list_models", None)
+      .await
+      .unwrap()
+      .to_string()
+      .contains(&format!("generic://{entry}"))
+    {
+      assert!(Instant::now() < deadline, "{entry} never listed");
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+  }
+
+  /// A whisper.cpp-shaped upload: a file part and a `model` field.
+  /// A `GET` written straight onto the socket, so nothing resolves dot segments on
+  /// the way: `reqwest` normalizes the path before it leaves, which is exactly the
+  /// step a client trying to walk sideways skips. Returns the status and the body.
+  async fn raw_get(port: u16, target: &str) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+      .await
+      .expect("connect");
+    let request = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.expect("write");
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut buf))
+      .await
+      .expect("read")
+      .expect("body");
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let status = text
+      .split_whitespace()
+      .nth(1)
+      .and_then(|code| code.parse::<u16>().ok())
+      .unwrap_or_else(|| panic!("no status line in {text:?}"));
+    (status, text)
+  }
+
+  fn transcription_body(model: &str) -> (Vec<u8>, String) {
+    let b = "----lsTestBoundary";
+    let body = format!(
+      "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\
+       Content-Type: audio/wav\r\n\r\nRIFFdata\r\n\
+       --{b}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
+       --{b}--\r\n"
+    );
+    (
+      body.into_bytes(),
+      format!("multipart/form-data; boundary={b}"),
+    )
   }
 
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -603,6 +682,399 @@ servers:
     shutdown(client, daemon).await;
   }
 
+  /// The image and audio endpoints forward like any other `/v1` route: the body
+  /// names the entry, and a multipart upload reaches the engine untouched.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn the_media_routes_forward_and_auto_start_the_named_entry() {
+    let proxy_port = std::net::TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .port();
+    let (mut client, daemon) = boot(opts(unique_temp("media"), Some(proxy_port))).await;
+    let http = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{proxy_port}");
+    wait_listed(&mut client, "gen-stt").await;
+    wait_listed(&mut client, "gen-tts-a").await;
+
+    let (body, content_type) = transcription_body("gen-stt");
+    let resp = http
+      .post(format!("{base}/v1/audio/transcriptions"))
+      .header(reqwest::header::CONTENT_TYPE, content_type)
+      .body(body)
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("proxy request");
+    let status = resp.status();
+    let served_by = resp.headers().get("x-llamastash-served-by").cloned();
+    let echoed: Value = resp.json().await.unwrap();
+    assert!(status.is_success(), "status {status}: {echoed}");
+    assert_eq!(echoed["model"], "gen-stt", "{echoed}");
+    assert!(
+      echoed["received_body"]
+        .as_str()
+        .is_some_and(|b| b.contains("RIFFdata") && b.contains("name=\"model\"")),
+      "the upload and its fields reach the engine: {echoed}"
+    );
+    assert_eq!(served_by, None, "routing by name is not a fallback");
+
+    let resp = http
+      .post(format!("{base}/v1/audio/speech"))
+      .json(&json!({"model": "gen-tts-a", "input": "hi", "voice": "alloy"}))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("proxy request");
+    let status = resp.status();
+    let echoed: Value = resp.json().await.unwrap();
+    assert!(status.is_success(), "status {status}: {echoed}");
+    assert_eq!(echoed["model"], "gen-tts-a", "{echoed}");
+
+    let status = client.call("status", None).await.unwrap();
+    let running = status["models"].as_array().unwrap();
+    assert!(
+      running
+        .iter()
+        .any(|m| m["id"]["path"] == "generic://gen-stt" && state_of(m) == "ready"),
+      "the media route auto-started the entry it named: {status}"
+    );
+    shutdown(client, daemon).await;
+  }
+
+  /// A client that hardcodes `whisper-1` still reaches the one entry that
+  /// declares `stt`: the body reaches it untouched, so an engine that maps
+  /// `whisper-1` itself still can, the response says which entry answered, and
+  /// the log row keeps it. Two entries for one mode leaves nothing
+  /// to pick, so that answer stays `model_not_found` and says how to fix it.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn an_unknown_media_model_falls_back_to_the_entry_that_declares_the_mode() {
+    let proxy_port = std::net::TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .port();
+    let (mut client, daemon) = boot(opts(unique_temp("modefb"), Some(proxy_port))).await;
+    let http = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{proxy_port}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    wait_listed(&mut client, "gen-stt").await;
+    wait_listed(&mut client, "gen-tts-a").await;
+
+    // Nothing has started, and the listing already publishes the mode each entry
+    // declared, so a client can pick the endpoint from `/v1/models` first.
+    let listed: Value = http
+      .get(format!("{base}/v1/models"))
+      .send()
+      .await
+      .expect("model list")
+      .json()
+      .await
+      .expect("model list body");
+    let mode_of = |name: &str| {
+      listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == name)
+        .and_then(|row| row["mode"].as_str())
+        .unwrap_or_else(|| panic!("{name} is not listed: {listed}"))
+        .to_string()
+    };
+    assert_eq!(mode_of("gen-stt"), "stt");
+    assert_eq!(mode_of("gen-tts-a"), "tts");
+
+    let (body, content_type) = transcription_body("whisper-1");
+    let resp = http
+      .post(format!("{base}/v1/audio/transcriptions"))
+      .header(reqwest::header::CONTENT_TYPE, content_type)
+      .body(body)
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("proxy request");
+    let status = resp.status();
+    let served_by = resp
+      .headers()
+      .get("x-llamastash-served-by")
+      .and_then(|v| v.to_str().ok())
+      .map(str::to_string);
+    let reason = resp
+      .headers()
+      .get("x-llamastash-fallback-reason")
+      .and_then(|v| v.to_str().ok())
+      .map(str::to_string);
+    let echoed: Value = resp.json().await.unwrap();
+    assert!(status.is_success(), "status {status}: {echoed}");
+    assert_eq!(served_by.as_deref(), Some("gen-stt"), "{echoed}");
+    assert_eq!(reason.as_deref(), Some("mode_match"));
+    assert_eq!(
+      echoed["model"], "whisper-1",
+      "the body is not rewritten: {echoed}"
+    );
+    assert!(
+      echoed["received_body"]
+        .as_str()
+        .is_some_and(|b| b.contains("RIFFdata")),
+      "the upload arrives as sent: {echoed}"
+    );
+
+    // The entry is running now, so this one takes the Ready path instead of the
+    // auto-start one, and it keeps the client's name too.
+    let (body, content_type) = transcription_body("whisper-1");
+    let echoed: Value = http
+      .post(format!("{base}/v1/audio/transcriptions"))
+      .header(reqwest::header::CONTENT_TYPE, content_type)
+      .body(body)
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("second proxy request")
+      .json()
+      .await
+      .unwrap();
+    assert_eq!(
+      echoed["model"], "whisper-1",
+      "a Ready launch keeps the name too: {echoed}"
+    );
+
+    // A media route picks its row by mode alone, so a request that names no model
+    // at all is routed rather than refused for a missing model.
+    let resp = http
+      .post(format!("{base}/v1/audio/transcriptions"))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("model-less media request");
+    let code = resp.status().as_u16();
+    let text = resp.text().await.unwrap();
+    assert_eq!(code, 200, "mode alone picks the row: {text}");
+
+    let row = loop {
+      let tail = client
+        .call("requests_tail", Some(json!({"limit": 50})))
+        .await
+        .unwrap();
+      if let Some(r) = tail["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["requested_model"] == "whisper-1")
+      {
+        break r.clone();
+      }
+      assert!(
+        Instant::now() < deadline,
+        "the request was never logged: {tail}"
+      );
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(row["route"], "/v1/audio/transcriptions", "{row}");
+    assert_eq!(row["fallback"], "mode_match", "{row}");
+    assert_eq!(row["model"], "gen-stt", "{row}");
+
+    // A row that does not declare the route's mode is refused, and a row that is
+    // not even running is refused before the launch: naming it cannot start
+    // something that has no endpoint for the request.
+    for (name, path) in [("gen-routes", "/v1/audio/transcriptions")] {
+      let resp = http
+        .post(format!("{base}{path}"))
+        .json(&json!({"model": name, "input": "hi"}))
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .expect("mode mismatch");
+      let status = resp.status();
+      let body: Value = resp.json().await.unwrap();
+      assert_eq!(
+        body["error"]["type"].as_str().unwrap_or("ok"),
+        "unsupported_endpoint",
+        "{name} on {path}: {status} {body}"
+      );
+    }
+    // The refusal came before the launch: the chat entry nobody asked for never
+    // started.
+    let status = client.call("status", None).await.unwrap();
+    assert!(
+      !status["models"]
+        .to_string()
+        .contains("generic://gen-routes"),
+      "a mode mismatch started a launch: {status}"
+    );
+
+    // A mode no entry declares is refused as such, not as a name to add.
+    let resp = http
+      .post(format!("{base}/v1/images/generations"))
+      .json(&json!({"model": "sdxl-turbo", "prompt": "hi"}))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("proxy request");
+    assert_eq!(resp.status().as_u16(), 404);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "model_not_found", "{body}");
+    assert!(
+      body["error"]["message"]
+        .as_str()
+        .is_some_and(|m| m.contains("no entry declares")),
+      "the refusal says nothing declares the mode: {body}"
+    );
+
+    // Two entries declare `tts` and neither is Ready: no single answer.
+    let resp = http
+      .post(format!("{base}/v1/audio/speech"))
+      .json(&json!({"model": "tts-1", "input": "hi"}))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("proxy request");
+    assert_eq!(resp.status().as_u16(), 404);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "model_not_found", "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+      message.contains("2 entries declare this endpoint's mode")
+        && message.contains("proxy.aliases"),
+      "the refusal says who declares the mode and how to make the name work: {body}"
+    );
+    let status = client.call("status", None).await.unwrap();
+    assert!(
+      !status["models"].to_string().contains("generic://gen-tts"),
+      "an ambiguous mode fallback starts nothing: {status}"
+    );
+
+    // Name one of the two and the ambiguity goes away: the entry that is up is the
+    // one the mode picks for a name it cannot place.
+    let resp = http
+      .post(format!("{base}/v1/audio/speech"))
+      .json(&json!({"model": "gen-tts-a", "input": "hi"}))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("named tts launch");
+    assert_eq!(resp.status().as_u16(), 200);
+    let resp = http
+      .post(format!("{base}/v1/audio/speech"))
+      .json(&json!({"model": "tts-1", "input": "hi"}))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("proxy request");
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+      resp
+        .headers()
+        .get("x-llamastash-served-by")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default(),
+      "gen-tts-a"
+    );
+    shutdown(client, daemon).await;
+  }
+
+  /// A declared prefix covers its own paths and nothing a client can spell with dot
+  /// segments: `/internal/../metrics` would ask the engine for `/metrics`, which
+  /// nobody declared, so the proxy refuses it instead of forwarding it.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_declared_prefix_does_not_open_the_rest_of_the_engine() {
+    let proxy_port = std::net::TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .port();
+    let (mut client, daemon) = boot(opts(unique_temp("dots"), Some(proxy_port))).await;
+    wait_listed(&mut client, "gen-routes").await;
+
+    for (target, want) in [
+      ("/internal", 200u16),
+      ("/internal/./x", 200),
+      ("/internal/../internal", 200),
+      ("/internal/../metrics", 404),
+      ("/internal/../props", 404),
+      ("/internal/x/../../slots", 404),
+      ("/internal/%2e%2e/metrics", 404),
+      ("/internal/%2E%2E/props", 404),
+      ("/internal/x\\..\\..\\metrics", 404),
+      ("/../metrics", 404),
+      ("/slots", 404),
+    ] {
+      let (status, _) = raw_get(proxy_port, target).await;
+      assert_eq!(status, want, "{target}");
+    }
+
+    // What the engine is asked for is the resolved path, not the one written. A
+    // backslash splits here because the URL parser reads it as a separator.
+    for (target, want) in [
+      ("/internal/x/../deep/y", "/internal/deep/y"),
+      ("/internal/x\\..\\metrics", "/internal/metrics"),
+      ("/internal/x\\deep", "/internal/x/deep"),
+    ] {
+      let (status, text) = raw_get(proxy_port, target).await;
+      assert_eq!(status, 200, "{target}");
+      let want = format!("\"target\":\"{want}\"");
+      assert!(text.contains(&want), "the engine saw {want}: {text}");
+    }
+
+    // An escape inside a segment stays an escape: only the `%2e` spelling is read, to
+    // spot a dot segment, so nothing else about the path is decoded on the way.
+    let (status, text) = raw_get(proxy_port, "/internal/%2e%2e%2fmetrics").await;
+    assert_eq!(status, 200);
+    assert!(
+      text
+        .to_ascii_uppercase()
+        .contains("\"TARGET\":\"/INTERNAL/%2E%2E%2FMETRICS\""),
+      "the escape reaches the engine as written: {text}"
+    );
+    shutdown(client, daemon).await;
+  }
+
+  /// A launch that pins its request-model name pins it on the OpenAI routes, not on
+  /// a path its entry declared: the engine owns its own API and the body arrives as
+  /// the client wrote it.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_declared_path_keeps_the_body_of_an_entry_that_pins_its_name() {
+    let proxy_port = std::net::TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .port();
+    let (mut client, daemon) = boot(opts(unique_temp("pin"), Some(proxy_port))).await;
+    let http = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{proxy_port}");
+    wait_listed(&mut client, "gen-rw").await;
+
+    let resp = http
+      .post(format!("{base}/rw/pinned"))
+      .json(&json!({"model": "keep-me", "other": 1}))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("declared POST");
+    assert_eq!(resp.status().as_u16(), 200);
+    let echoed: Value = resp.json().await.unwrap();
+    assert_eq!(echoed["target"], "/rw/pinned", "{echoed}");
+    assert_eq!(
+      echoed["model"], "keep-me",
+      "the pin is not applied: {echoed}"
+    );
+
+    // Again with the launch up: a Ready forward pins nothing either.
+    let resp = http
+      .post(format!("{base}/rw/pinned"))
+      .json(&json!({"model": "keep-me-again", "other": 2}))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("declared POST to a running launch");
+    assert_eq!(resp.status().as_u16(), 200);
+    let echoed: Value = resp.json().await.unwrap();
+    assert_eq!(
+      echoed["model"], "keep-me-again",
+      "the pin is not applied to a running launch: {echoed}"
+    );
+    shutdown(client, daemon).await;
+  }
+
   /// An entry with `model` is a server option on the catalog rows it matches,
   /// not a row of its own; picking it runs the GGUF through the entry.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -848,6 +1320,137 @@ servers:
     let r = wait_state(&mut client, &id, "ready").await;
     assert_eq!(r["backend"], "llamacpp", "{r}");
     assert!(r["params"]["server"].is_null(), "{r}");
+    shutdown(client, daemon).await;
+  }
+
+  /// A declared prefix is the engine's own API: the row that publishes it answers,
+  /// the proxy's own surfaces stay the proxy's, the log files the row under the
+  /// declared prefix, and a path nobody declares is a 404.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_declared_path_reaches_the_engine_that_publishes_it() {
+    let proxy_port = std::net::TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .port();
+    let (mut client, daemon) = boot(opts(unique_temp("routes"), Some(proxy_port))).await;
+    let http = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{proxy_port}");
+    let deadline = Instant::now() + Duration::from_secs(40);
+    wait_listed(&mut client, "gen-routes").await;
+
+    // An upload naming a model no row answers still reaches the entry that
+    // publishes the path, and keeps the name the client sent: an engine that owns
+    // the path owns the name inside it too.
+    let (body, content_type) = transcription_body("whisper-client");
+    let resp = http
+      .post(format!("{base}/inference"))
+      .header(reqwest::header::CONTENT_TYPE, content_type)
+      .body(body)
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("declared upload");
+    assert_eq!(resp.status().as_u16(), 200);
+    let echoed: Value = resp.json().await.unwrap();
+    assert_eq!(echoed["target"], "/inference", "{echoed}");
+    assert_eq!(echoed["model"], "whisper-client", "name kept: {echoed}");
+    assert!(
+      echoed["received_body"]
+        .as_str()
+        .is_some_and(|b| b.contains("RIFFdata")),
+      "the file part is untouched: {echoed}"
+    );
+
+    // A prefix covers what hangs below it, keeps the query, and never matches a
+    // longer name. A trailing slash survives, because engines route `/x/` and `/x`
+    // apart; matching is still on the slash-less form.
+    for (path, want) in [
+      ("/internal", 200u16),
+      ("/internal?x=1", 200),
+      ("/internal/extra", 200),
+      ("/internal/", 200),
+      ("/internal/deep/x", 200),
+      ("/internalsuffix", 404),
+      ("/nonsense", 404),
+    ] {
+      let resp = http
+        .get(format!("{base}{path}"))
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .expect("declared GET");
+      assert_eq!(resp.status().as_u16(), want, "{path}");
+      if want == 200 {
+        let echoed: Value = resp.json().await.unwrap();
+        assert_eq!(echoed["target"], path, "{path}");
+      }
+    }
+    // A body the proxy cannot read is the engine's business, not a refusal: the
+    // declared path forwards it as it arrived.
+    let resp = http
+      .post(format!("{base}/internal"))
+      .header(reqwest::header::CONTENT_TYPE, "text/plain")
+      .body("not json at all")
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("declared POST");
+    assert_eq!(resp.status().as_u16(), 200);
+    let echoed: Value = resp.json().await.unwrap();
+    assert_eq!(echoed["received_body"], "not json at all", "{echoed}");
+    assert!(echoed["model"].is_null(), "nothing to read: {echoed}");
+
+    // The client normalizes `..` before sending, so what has to be declared is the
+    // path that arrives.
+    let resp = http
+      .get(format!("{base}/internal/../nonsense"))
+      .send()
+      .await
+      .expect("dotted GET");
+    assert_eq!(resp.status().as_u16(), 404);
+
+    // The proxy keeps its own surfaces: `/api/tags` is the catalog's Ollama list
+    // and `/ui` is the built-in page, whatever an entry declares.
+    let resp = http
+      .get(format!("{base}/api/tags"))
+      .send()
+      .await
+      .expect("tags");
+    assert!(
+      resp.json::<Value>().await.unwrap().get("models").is_some(),
+      "the curated route answered"
+    );
+    let resp = http.get(format!("{base}/ui")).send().await.expect("ui");
+    assert_ne!(resp.status().as_u16(), 404, "the built-in page answered");
+
+    let rows = loop {
+      let tail = client
+        .call("requests_tail", Some(json!({"limit": 50})))
+        .await
+        .unwrap();
+      let rows = tail["requests"].as_array().unwrap().clone();
+      if rows.iter().any(|r| r["route"] == "/internal/deep") {
+        break rows;
+      }
+      assert!(
+        Instant::now() < deadline,
+        "the declared routes were never logged: {rows:?}"
+      );
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let row_for = |route: &str| {
+      rows
+        .iter()
+        .find(|r| r["route"] == route)
+        .cloned()
+        .unwrap_or_else(|| panic!("no row for {route}: {rows:?}"))
+    };
+    // Filed under the declared prefix, never under whatever the client sent.
+    assert_eq!(row_for("/inference")["model"], "gen-routes");
+    assert_eq!(row_for("/inference")["requested_model"], "whisper-client");
+    assert_eq!(row_for("/internal")["route"], "/internal");
+    assert_eq!(row_for("/internal/deep")["route"], "/internal/deep");
     shutdown(client, daemon).await;
   }
 }

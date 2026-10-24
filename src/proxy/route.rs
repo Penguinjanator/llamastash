@@ -39,6 +39,7 @@ use super::mru::{pick_fallback, FallbackCandidate};
 use super::request_log::RequestRecord;
 use super::router::ProxyResponse;
 use super::state::ProxyState;
+use crate::launch::mode::LaunchMode;
 
 /// Default inbound body size cap. 16 MiB lets vision payloads through
 /// (a base64 phone photo is ~4–11 MiB; base64 inflates the source file
@@ -46,6 +47,10 @@ use super::state::ProxyState;
 /// uploads. Anything larger surfaces as HTTP 413 (a `BodyError::TooLarge`
 /// from the `Limited` adapter). `proxy.max_body_size` overrides per daemon.
 pub const DEFAULT_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
+/// The `x-llamastash-fallback-reason` of a request that reached a model by way
+/// of the endpoint's mode rather than by name.
+pub(crate) const MODE_MATCH: &str = "mode_match";
 
 /// Forwarding plan produced by [`decide`]. Keep this `pub(crate)` —
 /// the router pattern-matches on variants but no external module
@@ -147,18 +152,23 @@ pub(crate) struct ParsedBody {
 /// Drain the inbound body under `cap`, then peek the `model` field
 /// with a single tolerant parse. The body bytes are kept as-is for
 /// verbatim forwarding.
+///
+/// `content_type` decides which shape to read: a `multipart/form-data` body
+/// names its model in a form field, and parsing it as JSON would refuse a
+/// legitimate upload with "not valid JSON".
 pub(crate) async fn buffer_and_extract(
   body: Incoming,
   cap: usize,
+  content_type: Option<&str>,
 ) -> Result<ParsedBody, BodyError> {
   let bytes = buffer_body(body, cap).await?;
 
   // An empty body is allowed in principle — `model` extraction
   // then returns None and the caller emits `model_required`.
-  let model = if bytes.is_empty() {
-    None
-  } else {
-    match serde_json::from_slice::<JustModel>(&bytes) {
+  let model = match content_type {
+    Some(ct) if crate::util::multipart_body::is_multipart(ct) => multipart_model(&bytes, ct),
+    _ if bytes.is_empty() => None,
+    _ => match serde_json::from_slice::<JustModel>(&bytes) {
       Ok(parsed) => parsed
         .model
         .map(|s| s.trim().to_string())
@@ -168,10 +178,40 @@ pub(crate) async fn buffer_and_extract(
           message: format!("request body is not valid JSON: {err}"),
         });
       }
-    }
+    },
   };
 
   Ok(ParsedBody { bytes, model })
+}
+
+/// [`buffer_and_extract`] for a path a row declared as its own API. The body is
+/// forwarded as it arrived, so a shape the proxy cannot read names no model
+/// rather than refusing the request: an engine that owns the path decides what a
+/// body means. Only the size cap can fail here.
+pub(crate) async fn buffer_and_extract_tolerant(
+  body: Incoming,
+  cap: usize,
+  content_type: Option<&str>,
+) -> Result<ParsedBody, BodyError> {
+  let bytes = buffer_body(body, cap).await?;
+  let model = match content_type {
+    Some(ct) if crate::util::multipart_body::is_multipart(ct) => multipart_model(&bytes, ct),
+    _ => serde_json::from_slice::<JustModel>(&bytes)
+      .ok()
+      .and_then(|parsed| parsed.model)
+      .map(|s| s.trim().to_string())
+      .filter(|s| !s.is_empty()),
+  };
+  Ok(ParsedBody { bytes, model })
+}
+
+/// The `model` form field of a `multipart/form-data` body, trimmed, `None` when
+/// the body names none. An upload's file part is never read.
+fn multipart_model(bytes: &[u8], content_type: &str) -> Option<String> {
+  crate::util::multipart_body::field_value(bytes, content_type, "model")
+    .and_then(|raw| std::str::from_utf8(raw).ok())
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
 }
 
 /// The `model` a buffered body names, or `None` for a body that is empty, is
@@ -373,6 +413,189 @@ pub(crate) async fn decide(state: &Arc<ProxyState>, body_model: Option<String>) 
     name,
     alias,
   }
+}
+
+/// The row a media endpoint falls back to when the client's name settled
+/// nothing: the only catalog row whose entry declares the endpoint's mode, or,
+/// when several declare it, the only one of those that is Ready. A miss says what
+/// was found, so the caller's refusal can name it.
+///
+/// This exists because clients hardcode names (`whisper-1`, `tts-1`) that no
+/// model of ours answers to, and one declared entry per mode leaves no real
+/// ambiguity. A row that declares no mode is not a candidate: it would answer
+/// anything, so picking it is a guess at what the client meant.
+pub(crate) async fn decide_by_mode(state: &Arc<ProxyState>, mode: LaunchMode) -> ModePick {
+  use crate::backend::Backend as _;
+  let rows = state.ctx.catalog.shared_rows().await;
+  let mut declared: Vec<CatalogRow> = Vec::new();
+  for row in rows.iter() {
+    let Some(backend) = would_route_backend(state, row).await else {
+      continue;
+    };
+    if backend.declares_mode(std::path::Path::new(&row.path), None, mode) {
+      declared.push(row.clone());
+    }
+  }
+  if declared.is_empty() {
+    return ModePick::Miss(ModeMiss::NoDeclarer);
+  }
+  let sup_snap = state.ctx.supervisors.snapshot().await;
+  let mut ready: Vec<usize> = Vec::new();
+  for (i, row) in declared.iter().enumerate() {
+    if ready_launch(&sup_snap, &row.path).await.is_some() {
+      ready.push(i);
+    }
+  }
+  let pick = match (declared.len(), ready.len()) {
+    (1, _) => 0,
+    (_, 1) => ready[0],
+    (n, 0) => return ModePick::Miss(ModeMiss::NoneRunning(n)),
+    (n, r) => {
+      return ModePick::Miss(ModeMiss::SeveralReady {
+        declarers: n,
+        ready: r,
+      })
+    }
+  };
+  let row = declared.remove(pick);
+  let served_model_id = served_name_for_row(&row);
+  ModePick::Hit(match ready_launch(&sup_snap, &row.path).await {
+    Some((port, served_model_key)) => RouteDecision::ReadyAt {
+      port,
+      served_model_id,
+      served_model_key,
+      model_path: row.path.clone(),
+      alias: false,
+      fallback: true,
+      fallback_reason: Some(MODE_MATCH.to_string()),
+    },
+    None => RouteDecision::NotRunning {
+      requested_model: served_model_id,
+      resolved_row: Box::new(row),
+      name: None,
+      alias: false,
+    },
+  })
+}
+
+/// What the mode fallback settled on, or why it could not.
+pub(crate) enum ModePick {
+  Hit(RouteDecision),
+  Miss(ModeMiss),
+}
+
+/// Why the mode fallback left the proxy's own refusal standing, so the refusal
+/// can say what was found instead of guessing.
+pub(crate) enum ModeMiss {
+  /// Nothing claims the route's mode at all.
+  NoDeclarer,
+  /// `declarers` entries claim it and every one is stopped.
+  NoneRunning(usize),
+  /// `ready` of `declarers` entries claim it are running, so the name has to
+  /// choose and the client named none that matches.
+  SeveralReady { declarers: usize, ready: usize },
+}
+
+/// The prefix a catalog row declares for `request_path`, or `None` when no row
+/// publishes it. The proxy logs this instead of the client's path, so what lands
+/// in the request log is a name the config chose. The proxy asks it before
+/// answering 404, so an unlisted path costs one row scan and nothing more.
+pub(crate) async fn declared_prefix(state: &Arc<ProxyState>, request_path: &str) -> Option<String> {
+  declaring_rows(state, request_path)
+    .await
+    .into_iter()
+    .map(|(prefix, _)| prefix)
+    .max_by_key(|p| p.len())
+}
+
+/// The rows that declare `request_path`, each with the prefix of its own that
+/// covers it. Config load refuses two entries claiming one path, so everything
+/// here belongs to one entry.
+async fn declaring_rows(state: &Arc<ProxyState>, request_path: &str) -> Vec<(String, CatalogRow)> {
+  use crate::backend::Backend as _;
+  // Only a backend that can declare paths is asked, and no row is resolved to a
+  // backend first: a request for a path nobody declared costs a config flag and a
+  // row scan, not an identity probe per row. Unlisted paths are what scanners and
+  // mistyped URLs send.
+  let declarers = crate::backend::Backends::path_declarers();
+  if declarers.is_empty() {
+    return Vec::new();
+  }
+  let rows = state.ctx.catalog.shared_rows().await;
+  let mut hits = Vec::new();
+  for row in rows.iter() {
+    let path = std::path::Path::new(&row.path);
+    if let Some(prefix) = declarers
+      .iter()
+      .find_map(|b| b.declared_path_prefix(path, None, request_path))
+    {
+      hits.push((prefix, row.clone()));
+    }
+  }
+  hits
+}
+
+/// A request on a path a row declares for itself. This is not a model route: the
+/// body's name settles nothing on its own, so the answer is the entry that
+/// published the path — a Ready launch of it when one is up, its one row when it
+/// has exactly one, and its row list as `ambiguous_model` when it has several and
+/// none is up. `None` is the proxy's own 404: nothing publishes the path. The
+/// body is forwarded as it arrived — an engine that owns the path owns the name
+/// inside it too.
+pub(crate) async fn decide_declared(
+  state: &Arc<ProxyState>,
+  request_path: &str,
+) -> Option<RouteDecision> {
+  let mut hits = declaring_rows(state, request_path).await;
+  if hits.is_empty() {
+    return None;
+  }
+  let sup_snap = state.ctx.supervisors.snapshot().await;
+  for (_, row) in hits.iter() {
+    if let Some((port, served_model_key)) = ready_launch(&sup_snap, &row.path).await {
+      return Some(RouteDecision::ReadyAt {
+        port,
+        served_model_id: served_name_for_row(row),
+        served_model_key,
+        model_path: row.path.clone(),
+        alias: false,
+        fallback: false,
+        fallback_reason: None,
+      });
+    }
+  }
+  if hits.len() == 1 {
+    let (_, row) = hits.remove(0);
+    let served_model_id = served_name_for_row(&row);
+    return Some(RouteDecision::NotRunning {
+      requested_model: served_model_id,
+      resolved_row: Box::new(row),
+      name: None,
+      alias: false,
+    });
+  }
+  Some(RouteDecision::Ambiguous {
+    requested_model: request_path.to_string(),
+    candidates: hits.iter().map(|(_, r)| served_name_for_row(r)).collect(),
+  })
+}
+
+/// The Ready launch that serves the catalog row at `path`, newest first. Named
+/// launches of the row are not singled out: a media client sends no `@<name>`.
+async fn ready_launch(
+  snap: &[(LaunchId, crate::daemon::supervisor::ManagedModel)],
+  path: &str,
+) -> Option<(u16, ModelId)> {
+  let mut candidates: Vec<(LaunchId, u16, ModelId)> = Vec::new();
+  for (launch_id, model) in snap {
+    if same_path(&model.id().path, path) && matches!(model.state().await, ManagedState::Ready) {
+      candidates.push((launch_id.clone(), model.port(), model.id().clone()));
+    }
+  }
+  candidates
+    .into_iter()
+    .max_by_key(|(launch_id, _, _)| launch_id.counter().unwrap_or(0))
+    .map(|(_, port, key)| (port, key))
 }
 
 /// What [`resolve_client_reference`] could not settle, left in a shape the
@@ -607,8 +830,11 @@ pub(crate) async fn running_model_backend(
 
 /// The backend an `Auto` launch of `row` would land on — resolved through the
 /// same [`crate::backend::resolve_backend_for_launch`] seam the daemon's
-/// `start_model` uses, with the catalog mode hint as the launch mode. Used by
-/// the not-running arm of the mode guard: a compatible model launched for a
+/// `start_model` uses, with the catalog mode hint as the launch mode. A row a
+/// backend mints its own identity for (a declared server entry) keeps that
+/// identity: forcing every row through the GGUF shape routed a `stt`-only entry
+/// to the default engine, which then answered for a mode it never declared. Used
+/// by the not-running arm of the mode guard: a compatible model launched for a
 /// `/v1/embeddings` request would auto-start in chat mode on its routed backend,
 /// then that backend's own error surfaces after the load — the guard refuses
 /// first (see [`Backend::serves_mode`]). Names no backend.
@@ -619,16 +845,20 @@ pub(crate) async fn would_route_backend(
   let cat = state.ctx.catalog.shared_view().await;
   let m = cat.iter().find(|m| same_path(&m.path, &row.path))?;
   let launch_mode = match row.mode_hint.as_deref() {
-    Some("embedding") => crate::launch::mode::LaunchMode::Embedding,
-    Some("rerank") => crate::launch::mode::LaunchMode::Rerank,
-    _ => crate::launch::mode::LaunchMode::Chat,
+    Some("embedding") => LaunchMode::Embedding,
+    Some("rerank") => LaunchMode::Rerank,
+    _ => LaunchMode::Chat,
   };
-  // A GGUF identity: the fallback is the default backend, and the priority-
-  // ordered supported list drives the auto pick — exactly the daemon's rule.
-  let identity = crate::backend::identity::ModelIdentity::Gguf(crate::gguf::identity::ModelId {
-    path: m.path.clone(),
-    header_blake3: [0u8; 32],
-  });
+  // A GGUF identity is the fallback, whose default is the default backend and
+  // whose priority-ordered supported list drives the auto pick — the daemon's rule.
+  let identity = crate::backend::synthetic_identity_for_path(&m.path)
+    .map(|(id, _)| id)
+    .unwrap_or_else(|| {
+      crate::backend::identity::ModelIdentity::Gguf(crate::gguf::identity::ModelId {
+        path: m.path.clone(),
+        header_blake3: [0u8; 32],
+      })
+    });
   Some(crate::backend::resolve_backend_for_launch(
     &identity,
     &m.path,
@@ -646,6 +876,22 @@ pub(crate) async fn would_route_backend(
 /// equality is exact in production.
 fn same_path(model_id_path: &std::path::Path, row_path: &str) -> bool {
   model_id_path.to_string_lossy() == row_path
+}
+
+/// The [`RouteDecision::NotRunning`] payload, as the auto-start path needs it.
+pub(crate) struct NotRunningPlan {
+  pub requested_model: String,
+  /// Resolved catalog entry consumed by the launch path to build `StartParams`
+  /// for `compose_and_spawn` without re-running the resolver.
+  pub resolved_row: CatalogRow,
+  /// The `@<name>` half of the client's reference, `None` for unnamed launches.
+  pub name: Option<String>,
+  /// The endpoint's mode picked this row rather than the client's name, so the
+  /// forward carries the `mode_match` header.
+  pub mode_fallback: bool,
+  /// `false` when the request arrived on a path the engine declared for itself,
+  /// where nothing in the body is rewritten.
+  pub pin_request_model: bool,
 }
 
 /// Auto-start entry point — invoked from `router.rs` when a request
@@ -671,12 +917,17 @@ fn same_path(model_id_path: &std::path::Path, row_path: &str) -> bool {
 pub(crate) async fn handle_not_running(
   state: &Arc<ProxyState>,
   inbound: super::forward::InboundRequest,
-  requested_model: String,
-  resolved_row: CatalogRow,
   endpoint_mode: Option<crate::launch::mode::LaunchMode>,
-  name: Option<String>,
+  plan: NotRunningPlan,
   mut record: RequestRecord,
 ) -> ProxyResponse {
+  let NotRunningPlan {
+    requested_model,
+    resolved_row,
+    name,
+    mode_fallback,
+    pin_request_model,
+  } = plan;
   let outcome = launch::auto_start(state, &resolved_row, endpoint_mode, name, &mut record).await;
   match outcome {
     LaunchOutcome::Ready { port, model_id } => {
@@ -685,6 +936,9 @@ pub(crate) async fn handle_not_running(
       // is the requested model name — no fallback, no surprise.
       state.mru.touch(&model_id).await;
       let served = served_name_for_row(&resolved_row);
+      if mode_fallback {
+        record.set_fallback(MODE_MATCH);
+      }
       super::forward::forward_to_upstream(
         state,
         inbound,
@@ -692,8 +946,9 @@ pub(crate) async fn handle_not_running(
           port,
           served_model_id: &served,
           served_model_key: &model_id,
-          fallback: false,
-          fallback_reason: None,
+          fallback: mode_fallback,
+          fallback_reason: mode_fallback.then_some(MODE_MATCH),
+          pin_request_model,
         },
         Some(record),
       )
@@ -732,6 +987,7 @@ pub(crate) async fn handle_not_running(
             served_model_key: &pick.model_id,
             fallback: true,
             fallback_reason: Some(reason),
+            pin_request_model,
           },
           Some(record),
         )

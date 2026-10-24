@@ -458,13 +458,47 @@ pub trait Backend {
     false
   }
 
-  /// Whether a launch of `path` on `server` serves `mode`. Default `true` —
-  /// serves chat / embedding / rerank alike. A backend that serves only some
-  /// modes overrides this; an `Auto` launch in an unserved mode falls back to
+  /// Whether a launch of `path` on `server` serves `mode`. Default serves the
+  /// modes every engine is composed for — chat / embedding / rerank alike — and
+  /// refuses the media modes, which no built-in engine answers yet; a backend
+  /// that serves one overrides this. A backend that serves only some modes
+  /// overrides it; an `Auto` launch in an unserved mode falls back to
   /// the identity default, a routing input, not an error. The proxy refuses an
   /// embeddings or rerank request bound for a launch that does not serve it.
-  fn serves_mode(&self, _path: &Path, _server: Option<&str>, _mode: LaunchMode) -> bool {
-    true
+  fn serves_mode(&self, _path: &Path, _server: Option<&str>, mode: LaunchMode) -> bool {
+    !mode.is_declared_only()
+  }
+
+  /// Whether this row's own declaration names `mode` among the modes it serves,
+  /// as opposed to serving every mode by default. The proxy's media-route
+  /// fallback picks only a row that answers yes here: a row that declares no
+  /// mode would match any request, which is a guess at what the client meant.
+  /// Default `false` — a declared mode list is a registry-entry feature.
+  fn declares_mode(&self, _path: &Path, _server: Option<&str>, _mode: LaunchMode) -> bool {
+    false
+  }
+
+  /// Whether any entry of this backend declares path prefixes of its own API
+  /// through `declared_path_prefix`. The proxy asks this before it walks the
+  /// catalog for a declared path, so an unlisted request costs nothing when
+  /// nothing is declared. Default `false`.
+  fn declares_any_paths(&self) -> bool {
+    false
+  }
+
+  /// The longest path prefix the engine behind `path` / `server` declares for its
+  /// own API that covers `request_path`, or `None` when it declares none. A
+  /// declared prefix is forwarded to that row and to nothing else, and the proxy
+  /// logs the prefix rather than the client's path; `/ui` and the curated `/v1`
+  /// routes stay the proxy's. Default `None`: a row forwards only the curated
+  /// routes.
+  fn declared_path_prefix(
+    &self,
+    _path: &Path,
+    _server: Option<&str>,
+    _request_path: &str,
+  ) -> Option<String> {
+    None
   }
 
   /// A pre-spawn refusal for a model this backend recognizes but cannot launch,
@@ -961,6 +995,16 @@ impl Backends {
     ]
   }
 
+  /// The backends that can declare path prefixes at all, so a request for a path
+  /// nobody declared is refused without a catalog walk. Rebuilt per call: backend
+  /// objects are stateless handles over the installed config.
+  pub fn path_declarers() -> Vec<Backends> {
+    Self::all()
+      .into_iter()
+      .filter(|b| for_each_backend!(b, x => x.declares_any_paths()))
+      .collect()
+  }
+
   /// The backend whose [`Backend::id`] is `id`, or `None` for an unknown id.
   /// For a recorded id string (a launch's `resolved_backend`, a status row).
   pub fn from_id(id: &str) -> Option<Backends> {
@@ -1099,6 +1143,19 @@ impl Backend for Backends {
 
   fn serves_mode(&self, path: &Path, server: Option<&str>, mode: LaunchMode) -> bool {
     for_each_backend!(self, b => b.serves_mode(path, server, mode))
+  }
+
+  fn declares_mode(&self, path: &Path, server: Option<&str>, mode: LaunchMode) -> bool {
+    for_each_backend!(self, b => b.declares_mode(path, server, mode))
+  }
+
+  fn declared_path_prefix(
+    &self,
+    path: &Path,
+    server: Option<&str>,
+    request_path: &str,
+  ) -> Option<String> {
+    for_each_backend!(self, b => b.declared_path_prefix(path, server, request_path))
   }
 
   fn refuses(&self, arch: Option<&str>, path: &Path) -> Option<String> {

@@ -148,7 +148,6 @@ fn row(
   ctx: Option<u64>,
   memory_gib: Option<f64>,
 ) -> DiscoveredModel {
-  use crate::launch::mode::LaunchMode::{Embedding, Rerank};
   let gib = memory_gib.or(server.memory_gib).filter(|g| *g > 0.0);
   DiscoveredModel {
     path: PathBuf::from(format!("{GENERIC_PATH_SCHEME}{}/{tag}", server.name)),
@@ -164,11 +163,11 @@ fn row(
       chat_template: None,
       tokenizer_kind: None,
       reasoning_hint: !server.reasoning_effort.is_empty(),
-      mode_hint: match server.modes.first() {
-        Some(Embedding) => ModeHint::Embedding,
-        Some(Rerank) => ModeHint::Rerank,
-        _ => ModeHint::Chat,
-      },
+      mode_hint: server
+        .modes
+        .first()
+        .map(crate::launch::mode::LaunchMode::mode_hint)
+        .unwrap_or(ModeHint::Chat),
       weights_bytes: gib.map(gib_to_bytes),
       lazy_tensor_bytes: Vec::new(),
       mtp: None,

@@ -2254,11 +2254,7 @@ pub fn encode_writer_cmd(cmd: WriterCmd) -> (&'static str, Value) {
         name,
         preset,
       } = *args;
-      let mode_str = mode.map(|m| match m {
-        crate::launch::mode::LaunchMode::Chat => "chat",
-        crate::launch::mode::LaunchMode::Embedding => "embedding",
-        crate::launch::mode::LaunchMode::Rerank => "rerank",
-      });
+      let mode_str = mode.map(|m| m.label());
       (
         "start_model",
         json!({

@@ -49,6 +49,14 @@ struct Entry {
   scope: &'static str,
 }
 
+/// Whether any installed entry declares `routes`, so a request for a path nobody
+/// declared costs one atomic load instead of a catalog walk.
+fn any_routes_declared() -> bool {
+  ANY_ROUTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static ANY_ROUTES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn entries() -> &'static RwLock<BTreeMap<String, Arc<Entry>>> {
   static ENTRIES: OnceLock<RwLock<BTreeMap<String, Arc<Entry>>>> = OnceLock::new();
   ENTRIES.get_or_init(Default::default)
@@ -151,11 +159,11 @@ impl GenericBackend {
         chat_template: None,
         tokenizer_kind: None,
         reasoning_hint: !server.reasoning_effort.is_empty(),
-        mode_hint: match server.modes.first() {
-          Some(LaunchMode::Embedding) => ModeHint::Embedding,
-          Some(LaunchMode::Rerank) => ModeHint::Rerank,
-          _ => ModeHint::Chat,
-        },
+        mode_hint: server
+          .modes
+          .first()
+          .map(LaunchMode::mode_hint)
+          .unwrap_or(ModeHint::Chat),
         // The declared figure is the launch's whole resident demand: it feeds
         // the size column, the probe budget and the admission gate alike.
         weights_bytes: server.memory_gib.map(gib_to_bytes),
@@ -291,6 +299,7 @@ impl Backend for GenericBackend {
   fn install_config(&self, config: &super::BackendConfig) -> Result<(), String> {
     let generic = &config.generic;
     generic.validate(&|id| crate::launch::knobs::registry::resolve_static_id(id).is_some())?;
+    generic.validate_routes(&crate::proxy::router::proxy_owned_paths())?;
     let mut table = entries().write().unwrap_or_else(|e| e.into_inner());
     // Merge rather than replace: a process loads config once, and replacing
     // would let an unrelated load (a test, a migration re-read) drop entries
@@ -313,6 +322,12 @@ impl Backend for GenericBackend {
         }),
       );
     }
+    // Read back the merged table: entries survive a load that does not carry them,
+    // so the flag has to describe all of them and not the last block installed.
+    ANY_ROUTES.store(
+      table.values().any(|e| !e.server.routes.is_empty()),
+      std::sync::atomic::Ordering::Relaxed,
+    );
     Ok(())
   }
 
@@ -328,6 +343,33 @@ impl Backend for GenericBackend {
   ) -> bool {
     entry_for_launch(path, server)
       .is_none_or(|e| e.server.modes.is_empty() || e.server.modes.contains(&mode))
+  }
+
+  fn declares_mode(
+    &self,
+    path: &Path,
+    server: Option<&str>,
+    mode: crate::launch::mode::LaunchMode,
+  ) -> bool {
+    entry_for_launch(path, server).is_some_and(|e| e.server.modes.contains(&mode))
+  }
+
+  fn declares_any_paths(&self) -> bool {
+    any_routes_declared()
+  }
+
+  fn declared_path_prefix(
+    &self,
+    path: &Path,
+    server: Option<&str>,
+    request_path: &str,
+  ) -> Option<String> {
+    if !any_routes_declared() {
+      return None;
+    }
+    entry_for_launch(path, server)?
+      .server
+      .declared_prefix(request_path)
   }
 
   fn config_effort(&self, path: &Path) -> super::DeclaredEffort {
@@ -648,12 +690,16 @@ mod tests {
   #[test]
   fn modes_limit_what_an_entry_serves() {
     use crate::backend::Backend;
+    use crate::gguf::metadata::ModeHint;
     use crate::launch::mode::LaunchMode;
     install(
       "servers:\n  \
        - {name: md-chat, binary: /b, ready: /h, modes: [chat]}\n  \
        - {name: md-embed, binary: /b, ready: /h, modes: [embedding]}\n  \
-       - {name: md-any, binary: /b, ready: /h}\n",
+       - {name: md-any, binary: /b, ready: /h}\n  \
+       - {name: md-stt, binary: /b, ready: /h, modes: [stt]}\n  \
+       - {name: md-tts, binary: /b, ready: /h, modes: [tts]}\n  \
+       - {name: md-image, binary: /b, ready: /h, modes: [image]}\n",
     );
     let serves = |name: &str, mode| {
       GenericBackend::new().serves_mode(Path::new(&format!("generic://{name}")), None, mode)
@@ -663,12 +709,41 @@ mod tests {
     assert!(!serves("md-chat", LaunchMode::Rerank));
     assert!(serves("md-embed", LaunchMode::Embedding));
     assert!(serves("md-any", LaunchMode::Rerank));
-    let embed = entry_named("md-embed").unwrap();
-    let row = GenericBackend::catalog_row(&embed.server);
-    assert_eq!(
-      row.metadata.unwrap().mode_hint,
-      crate::gguf::metadata::ModeHint::Embedding
+    assert!(serves("md-stt", LaunchMode::Stt));
+    assert!(!serves("md-stt", LaunchMode::Chat));
+    for (name, want) in [
+      ("md-embed", ModeHint::Embedding),
+      ("md-stt", ModeHint::Stt),
+      ("md-tts", ModeHint::Tts),
+      ("md-image", ModeHint::Image),
+      ("md-chat", ModeHint::Chat),
+      ("md-any", ModeHint::Chat),
+    ] {
+      let row = GenericBackend::catalog_row(&entry_named(name).unwrap().server);
+      assert_eq!(row.metadata.unwrap().mode_hint, want, "{name}");
+    }
+  }
+
+  /// Only a mode the entry lists counts as declared, which is what lets the
+  /// proxy's media-route fallback pick it. An entry that lists no mode serves
+  /// everything, so choosing it for a request would be a guess.
+  #[test]
+  fn only_a_listed_mode_is_declared() {
+    use crate::backend::Backend;
+    use crate::launch::mode::LaunchMode::{Stt, Tts};
+    install(
+      "servers:\n  \
+       - {name: dc-stt, binary: /b, ready: /h, modes: [stt]}\n  \
+       - {name: dc-any, binary: /b, ready: /h}\n",
     );
+    let row = |name: &str| std::path::PathBuf::from(format!("generic://{name}"));
+    let b = GenericBackend::new();
+    assert!(b.declares_mode(&row("dc-stt"), None, Stt));
+    assert!(!b.declares_mode(&row("dc-stt"), None, Tts));
+    assert!(!b.declares_mode(&row("dc-any"), None, Stt));
+    assert!(!b.declares_mode(&row("md-none"), None, Stt));
+    // An entry with no mode list still serves the mode: the engine answers.
+    assert!(b.serves_mode(&row("dc-any"), None, Stt));
   }
 
   /// Declared row info fills the list columns verbatim; Ctx falls back to the

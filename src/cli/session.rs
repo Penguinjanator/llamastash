@@ -439,6 +439,9 @@ fn not_chat(row: &CatalogRow, id: &str) -> Option<&'static str> {
   }
   match row.mode_hint.as_deref() {
     Some("rerank") => Some("a rerank"),
+    Some("image") => Some("an image"),
+    Some("tts") => Some("a text-to-speech"),
+    Some("stt") => Some("a speech-to-text"),
     _ => None,
   }
 }
@@ -943,6 +946,13 @@ mod tests {
       non_chat_mode(&gated(Some("rerank"), None)),
       Some("a rerank")
     );
+    for (hint, label) in [
+      ("image", "an image"),
+      ("tts", "a text-to-speech"),
+      ("stt", "a speech-to-text"),
+    ] {
+      assert_eq!(non_chat_mode(&gated(Some(hint), None)), Some(label));
+    }
     assert_eq!(non_chat_mode(&gated(None, None)), None);
     assert_eq!(non_chat_mode(&gated(Some("chat"), None)), None);
     // A GGUF with no mode hint is called embedding by the patchers' own id rule,
