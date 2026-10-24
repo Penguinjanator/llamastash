@@ -44,6 +44,7 @@ use crate::daemon::state_store::RunningSnapshot;
 use crate::daemon::supervisor::ManagedState;
 use crate::discovery::DiscoveredModel;
 use crate::gguf::metadata::{ModeHint, ModelMetadata};
+use crate::launch::mode::LaunchMode;
 use crate::launch::resolve::CatalogRow;
 
 /// The error type our `BoxBody` carries. Forwarding streams upstream
@@ -69,7 +70,26 @@ pub(crate) struct ClientAddr(pub std::net::SocketAddr);
 /// keeps a row for. The `/ui` surface matches its stripped paths against this
 /// list, so a chat sent from a web page is filed under the same path an API
 /// client sends — the row's `ui` flag is what tells them apart.
-pub(crate) const GENERATION_ROUTES: [&str; 8] = [
+///
+/// This is the whole forwarded surface: nothing else reaches an engine unless a
+/// generic entry declares the path (see `routes` in `docs/usage.md`), so engine
+/// admin and metrics paths stay unreachable through the proxy.
+/// Paths the proxy answers itself besides the forwarded routes in
+/// [`GENERATION_ROUTES`]: the ones it builds rather than pipes. The two together
+/// are what a generic entry may not claim as a declared `routes` prefix; the list
+/// is handed to generic config validation so that module names no route itself.
+pub(crate) const PROXY_OWNED_PATHS: [&str; 5] =
+  ["/health", "/metrics", "/ui", "/api", "/v1/models"];
+
+/// Every path the proxy owns: [`PROXY_OWNED_PATHS`] plus every forwarded route.
+pub(crate) fn proxy_owned_paths() -> Vec<&'static str> {
+  PROXY_OWNED_PATHS
+    .into_iter()
+    .chain(GENERATION_ROUTES)
+    .collect()
+}
+
+pub(crate) const GENERATION_ROUTES: [&str; 14] = [
   "/v1/chat/completions",
   "/v1/completions",
   "/v1/embeddings",
@@ -78,7 +98,29 @@ pub(crate) const GENERATION_ROUTES: [&str; 8] = [
   "/v1/messages/count_tokens",
   "/v1/responses",
   "/v1/responses/input_tokens",
+  "/v1/images/generations",
+  "/v1/images/edits",
+  "/v1/images/variations",
+  "/v1/audio/speech",
+  "/v1/audio/transcriptions",
+  "/v1/audio/translations",
 ];
+
+/// The launch mode an endpoint implies, or `None` when any launch answers it.
+/// The media modes are the ones only a declared entry serves, which is what lets
+/// an unknown name still reach the one entry that claims the mode.
+fn endpoint_mode(path: &str) -> Option<LaunchMode> {
+  match path {
+    "/v1/embeddings" => Some(LaunchMode::Embedding),
+    "/v1/rerank" => Some(LaunchMode::Rerank),
+    "/v1/images/generations" | "/v1/images/edits" | "/v1/images/variations" => {
+      Some(LaunchMode::Image)
+    }
+    "/v1/audio/speech" => Some(LaunchMode::Tts),
+    "/v1/audio/transcriptions" | "/v1/audio/translations" => Some(LaunchMode::Stt),
+    _ => None,
+  }
+}
 
 /// Entry point invoked by the `service_fn` closure. Returns a fully
 /// constructed `Response`; the caller hands it back to hyper.
@@ -139,7 +181,7 @@ pub async fn route(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyRespo
     // so the proxy byte-pipes it like any other `/v1` route (same body-`model`
     // resolution, same streaming). Agents that prefer the Responses surface
     // attach through the one stable proxy URL.
-    (&Method::POST, p) if GENERATION_ROUTES.contains(&p) => forward_request(state, req).await,
+    (&Method::POST, p) if GENERATION_ROUTES.contains(&p) => forward_request(state, req, None).await,
     // Ollama-compat Tier 1: discovery-only endpoints.
     (&Method::GET, "/api/tags") => ollama_tags(state).await,
     (&Method::GET, "/api/version") => ollama_version(),
@@ -159,8 +201,41 @@ pub async fn route(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyRespo
     // the chosen backend. See docs/plans/2026-06-15-001-...-plan.md.
     (&Method::GET, "/ui") => super::ui::redirect_to_ui_slash(),
     (_, p) if p.starts_with("/ui/") => super::ui::serve(state, req).await,
-    _ => not_found(),
+    // A row's own API paths, declared by its entry rather than by this table, and
+    // forwarded to that row alone. Everything above is the proxy's own surface, so
+    // a declared prefix only ever sees what the table left over.
+    _ => declared_or_not_found(state, req).await,
   }
+}
+
+/// A path this table did not answer: the proxy's own 404, unless a catalog row
+/// declares it as part of that engine's API. Nothing is forwarded before the path
+/// is settled, so a request for a path nobody declared costs a row scan at most.
+async fn declared_or_not_found(
+  state: Arc<ProxyState>,
+  mut req: Request<Incoming>,
+) -> ProxyResponse {
+  // Dot segments resolve to the path the engine would actually be asked for, so a
+  // declared prefix can never be walked sideways into a path beside it. A `..`
+  // that climbs past the root names no path at all and is refused outright.
+  let Some(resolved) = crate::util::http_path::resolve_path(req.uri().path()) else {
+    return not_found();
+  };
+  let Some(prefix) = route::declared_prefix(&state, &resolved.matched).await else {
+    return not_found();
+  };
+  if req.uri().path() != resolved.forwarded {
+    // What the engine is sent is what was matched on, not what the client wrote.
+    let target = match req.uri().query() {
+      Some(query) => format!("{}?{query}", resolved.forwarded),
+      None => resolved.forwarded.clone(),
+    };
+    let Ok(uri) = target.parse() else {
+      return not_found();
+    };
+    *req.uri_mut() = uri;
+  }
+  forward_request(state, req, Some(prefix)).await
 }
 
 /// `GET / | HEAD /` — server-identity probe. Returns `200 OK` with a
@@ -195,24 +270,70 @@ fn text_response(status: StatusCode, body: &'static str) -> Response<BoxBody<Byt
 
 /// Forwarding pipeline: buffer the body under the daemon's cap,
 /// extract `body.model`, run the resolver, pick a Ready supervisor,
-/// forward.
-async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyResponse {
+/// forward. `declared` marks a path a row declared for its own engine: the
+/// routing question is then which row published the path, not which model the
+/// body names.
+async fn forward_request(
+  state: Arc<ProxyState>,
+  req: Request<Incoming>,
+  declared: Option<String>,
+) -> ProxyResponse {
   let client = req.extensions().get::<ClientAddr>().map(|c| c.0);
+  let content_type = forward::content_type_of(req.headers()).map(str::to_string);
   let (method, uri, headers, body) = forward::deconstruct(req);
   let cap = state.max_body_size;
   // The log row for this request. A request that reaches a model hands it
   // to the forward path; an answer the proxy builds itself finishes it
   // through `answered`. A return that did neither drops it, which logs
-  // the request as closed by the client.
-  let mut record = state.ctx.requests.begin(uri.path(), client);
+  // the request as closed by the client. A declared route is filed under the
+  // prefix the config declared, never under whatever path the client sent.
+  let mut record = state
+    .ctx
+    .requests
+    .begin(declared.as_deref().unwrap_or_else(|| uri.path()), client);
 
-  let parsed = match route::buffer_and_extract(body, cap).await {
+  let parsed = match if declared.is_some() {
+    // A declared path is the engine's own API: whatever it was sent is forwarded,
+    // and a body the proxy cannot read simply names no model.
+    route::buffer_and_extract_tolerant(body, cap, content_type.as_deref()).await
+  } else {
+    route::buffer_and_extract(body, cap, content_type.as_deref()).await
+  } {
     Ok(p) => p,
     Err(e) => return answered(record, route::body_error_response(e, cap)),
   };
   record.set_requested_model(parsed.model.as_deref());
 
-  let decision = route::decide(&state, parsed.model).await;
+  let req_mode = endpoint_mode(uri.path());
+  // A media endpoint the client's name does not settle gets one chance at the
+  // entry that declares the mode; clients hardcode `whisper-1` and `tts-1`, and
+  // the hint below is what tells an operator who has no such entry how to fix it.
+  let media_route = req_mode.is_some_and(|m| m.is_declared_only());
+  let mut decision = if declared.is_some() {
+    match route::decide_declared(&state, uri.path()).await {
+      Some(d) => d,
+      // The row let go of the path between the lookup here and the one there.
+      None => return answered(record, not_found()),
+    }
+  } else {
+    route::decide(&state, parsed.model).await
+  };
+  let mut mode_fallback = false;
+  let mut mode_miss: Option<route::ModeMiss> = None;
+  if media_route
+    && matches!(
+      decision,
+      RouteDecision::NotFound { .. } | RouteDecision::ModelRequired
+    )
+  {
+    match route::decide_by_mode(&state, req_mode.unwrap_or(LaunchMode::Chat)).await {
+      route::ModePick::Hit(picked) => {
+        decision = picked;
+        mode_fallback = true;
+      }
+      route::ModePick::Miss(miss) => mode_miss = Some(miss),
+    }
+  }
   match &decision {
     RouteDecision::ReadyAt {
       served_model_id,
@@ -248,11 +369,6 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
   // auto-start (its would-be backend). Registry-driven via `serves_mode`.
   use crate::backend::Backend;
   let req_path = uri.path().to_string();
-  let req_mode = match req_path.as_str() {
-    "/v1/embeddings" => Some(crate::launch::mode::LaunchMode::Embedding),
-    "/v1/rerank" => Some(crate::launch::mode::LaunchMode::Rerank),
-    _ => None,
-  };
   if let Some(mode) = req_mode {
     let target = match &decision {
       RouteDecision::ReadyAt {
@@ -281,7 +397,16 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
       _ => None,
     };
     if let Some((b, path, server)) = target {
-      if !b.serves_mode(&path, server.as_deref(), mode) {
+      // A media route is answered only by a row that *declares* the mode. The
+      // looser `serves_mode` treats an entry with no `modes:` as an OpenAI server
+      // for everything, which would let a plain chat entry take an upload it has
+      // no endpoint for.
+      let serves = if mode.is_declared_only() {
+        b.declares_mode(&path, server.as_deref(), mode)
+      } else {
+        b.serves_mode(&path, server.as_deref(), mode)
+      };
+      if !serves {
         // Name the actual backend for the user (dynamic, so the code names none).
         let msg = format!(
           "this model on the {} backend does not serve {req_path}; \
@@ -321,6 +446,10 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
       // timestamp. Direct touch by ModelId avoids the second
       // supervisor snapshot the port-only path used to take.
       state.mru.touch(&served_model_key).await;
+      let mode_match = fallback_reason.as_deref() == Some(route::MODE_MATCH);
+      if mode_match {
+        record.set_fallback(route::MODE_MATCH);
+      }
       return forward::forward_to_upstream(
         &state,
         inbound,
@@ -330,6 +459,7 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
           served_model_key: &served_model_key,
           fallback,
           fallback_reason: fallback_reason.as_deref(),
+          pin_request_model: declared.is_none(),
         },
         Some(record),
       )
@@ -344,10 +474,14 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
       return route::handle_not_running(
         &state,
         inbound,
-        requested_model,
-        *resolved_row,
         req_mode,
-        name,
+        route::NotRunningPlan {
+          requested_model,
+          resolved_row: *resolved_row,
+          name,
+          mode_fallback,
+          pin_request_model: declared.is_none(),
+        },
         record,
       )
       .await;
@@ -355,7 +489,10 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
     RouteDecision::NotFound { requested_model } => error_with_matches(
       StatusCode::NOT_FOUND,
       "model_not_found",
-      &format!("{requested_model} not found"),
+      &format!(
+        "{requested_model} not found{}",
+        mode_hint(media_route, mode_miss.as_ref())
+      ),
       Vec::<String>::new(),
     ),
     RouteDecision::Ambiguous {
@@ -376,12 +513,35 @@ async fn forward_request(state: Arc<ProxyState>, req: Request<Incoming>) -> Prox
     RouteDecision::ModelRequired => error_with_code(
       StatusCode::BAD_REQUEST,
       "invalid_request",
-      "the `model` field is required",
+      &format!(
+        "the `model` field is required{}",
+        mode_hint(media_route, mode_miss.as_ref())
+      ),
       "model_required",
       Some("model"),
     ),
   };
   answered(record, response)
+}
+
+/// What a media endpoint's refusal adds to its message: what was found, and the
+/// two ways to make a name the proxy cannot settle work.
+fn mode_hint(media_route: bool, miss: Option<&route::ModeMiss>) -> String {
+  if !media_route {
+    return String::new();
+  }
+  let found = match miss {
+    Some(route::ModeMiss::NoneRunning(n)) => {
+      format!("{n} entries declare this endpoint's mode and none is running")
+    }
+    Some(route::ModeMiss::SeveralReady { declarers, ready }) => {
+      format!("{declarers} entries declare this endpoint's mode and {ready} are running")
+    }
+    // Nothing claims the mode. `None` is the same answer: the fallback never ran
+    // because the client named a row of ours, and no row of ours serves the route.
+    Some(route::ModeMiss::NoDeclarer) | None => "no entry declares this endpoint's mode".into(),
+  };
+  format!("; {found}, so name a model that serves it or add a `proxy.aliases` entry")
 }
 
 async fn health(state: Arc<ProxyState>) -> ProxyResponse {
@@ -686,7 +846,7 @@ async fn ollama_ps(state: Arc<ProxyState>) -> ProxyResponse {
 async fn ollama_show(state: Arc<ProxyState>, req: Request<Incoming>) -> ProxyResponse {
   let (_method, _uri, _headers, body) = forward::deconstruct(req);
   let cap = state.max_body_size;
-  let parsed = match route::buffer_and_extract(body, cap).await {
+  let parsed = match route::buffer_and_extract(body, cap, None).await {
     Ok(p) => p,
     Err(e) => return route::body_error_response(e, cap),
   };
@@ -879,6 +1039,8 @@ fn build_model_info(
 ///   - `Embedding` → `["embedding"]`
 ///   - `Rerank` → `["rerank"]` (Ollama doesn't define this; emitted
 ///     for parity with our own `/v1/rerank` surface)
+///   - `Image` / `Tts` / `Stt` → empty (the media routes are not Ollama
+///     capabilities, so a media row claims none)
 ///   - `Unknown` → empty (catalog has no hint)
 fn capabilities_for(discovered: Option<&DiscoveredModel>) -> Vec<&'static str> {
   let mode = discovered
@@ -889,7 +1051,7 @@ fn capabilities_for(discovered: Option<&DiscoveredModel>) -> Vec<&'static str> {
     ModeHint::Chat => vec!["completion"],
     ModeHint::Embedding => vec!["embedding"],
     ModeHint::Rerank => vec!["rerank"],
-    ModeHint::Unknown => Vec::new(),
+    ModeHint::Image | ModeHint::Tts | ModeHint::Stt | ModeHint::Unknown => Vec::new(),
   }
 }
 
@@ -1046,6 +1208,39 @@ mod tests {
   use super::*;
   use crate::discovery::{DiscoveredModel, ModelSource};
   use crate::gguf::metadata::{ModeHint, ModelMetadata, Quant};
+
+  #[test]
+  fn each_endpoint_names_the_mode_it_implies() {
+    // The media routes are the ones only a declared entry serves, which is what
+    // lets an unknown name still reach the entry that claims the mode. Every one
+    // of them is also a logged route, or `/ui` and the request log would miss it.
+    let media = [
+      ("/v1/images/generations", LaunchMode::Image),
+      ("/v1/images/edits", LaunchMode::Image),
+      ("/v1/images/variations", LaunchMode::Image),
+      ("/v1/audio/speech", LaunchMode::Tts),
+      ("/v1/audio/transcriptions", LaunchMode::Stt),
+      ("/v1/audio/translations", LaunchMode::Stt),
+    ];
+    for (path, mode) in media {
+      assert_eq!(endpoint_mode(path), Some(mode), "{path}");
+      assert!(
+        GENERATION_ROUTES.contains(&path),
+        "{path} must be a logged route"
+      );
+    }
+    assert_eq!(endpoint_mode("/v1/embeddings"), Some(LaunchMode::Embedding));
+    assert_eq!(endpoint_mode("/v1/rerank"), Some(LaunchMode::Rerank));
+    // Any launch answers these, so they take no mode and no fallback.
+    for path in [
+      "/v1/chat/completions",
+      "/v1/completions",
+      "/v1/messages",
+      "/v1/responses",
+    ] {
+      assert_eq!(endpoint_mode(path), None, "{path}");
+    }
+  }
 
   fn discovered_with_mode(mode: ModeHint) -> DiscoveredModel {
     DiscoveredModel {

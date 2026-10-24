@@ -54,7 +54,9 @@ pub(crate) fn compose(params: &LaunchParams, allocated_port: u16) -> Vec<OsStrin
     argv.push(mmproj.clone().into());
   }
   match params.mode {
-    LaunchMode::Chat => {}
+    // The media modes reach a launch only through a declared entry, which composes
+    // its own argv; llama.cpp adds no flag for them.
+    LaunchMode::Chat | LaunchMode::Image | LaunchMode::Tts | LaunchMode::Stt => {}
     LaunchMode::Embedding => argv.push("--embeddings".into()),
     LaunchMode::Rerank => argv.push("--reranking".into()),
   }

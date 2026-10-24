@@ -12,12 +12,18 @@ use serde::{Deserialize, Serialize};
 /// [`ModeHint`] (which describes what discovery *thinks* the model is)
 /// — the user can override, and the supervisor records the resolved
 /// choice for IPC and `state.json`.
+///
+/// `Image`, `Tts` and `Stt` are routing-only: an endpoint names one, a
+/// declared server entry can claim one, and no launch argv changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LaunchMode {
   Chat,
   Embedding,
   Rerank,
+  Image,
+  Tts,
+  Stt,
 }
 
 impl LaunchMode {
@@ -28,6 +34,9 @@ impl LaunchMode {
       "chat" => Some(LaunchMode::Chat),
       "embedding" => Some(LaunchMode::Embedding),
       "rerank" => Some(LaunchMode::Rerank),
+      "image" => Some(LaunchMode::Image),
+      "tts" => Some(LaunchMode::Tts),
+      "stt" => Some(LaunchMode::Stt),
       _ => None,
     }
   }
@@ -37,6 +46,30 @@ impl LaunchMode {
       LaunchMode::Chat => "chat",
       LaunchMode::Embedding => "embedding",
       LaunchMode::Rerank => "rerank",
+      LaunchMode::Image => "image",
+      LaunchMode::Tts => "tts",
+      LaunchMode::Stt => "stt",
+    }
+  }
+
+  /// Whether only a declared entry can serve this mode, so the proxy may
+  /// route an unnamed request to the one entry that claims it. Chat,
+  /// embedding and rerank are what every engine launch is composed for, so
+  /// guessing one would substitute a model the client never named.
+  pub fn is_declared_only(&self) -> bool {
+    matches!(self, LaunchMode::Image | LaunchMode::Tts | LaunchMode::Stt)
+  }
+
+  /// The mode to publish for a row that declares this one first, so `/v1/models`
+  /// and the MODE column name what the entry actually answers.
+  pub fn mode_hint(&self) -> ModeHint {
+    match self {
+      LaunchMode::Chat => ModeHint::Chat,
+      LaunchMode::Embedding => ModeHint::Embedding,
+      LaunchMode::Rerank => ModeHint::Rerank,
+      LaunchMode::Image => ModeHint::Image,
+      LaunchMode::Tts => ModeHint::Tts,
+      LaunchMode::Stt => ModeHint::Stt,
     }
   }
 
@@ -53,6 +86,10 @@ impl LaunchMode {
       ModeHint::Chat => Some(LaunchMode::Chat),
       ModeHint::Embedding => Some(LaunchMode::Embedding),
       ModeHint::Rerank => Some(LaunchMode::Rerank),
+      // A media hint says which route the row answers, not how to launch it: a
+      // row declaring only `stt` still starts as a plain chat launch, and the
+      // media mode arrives with the request's endpoint.
+      ModeHint::Image | ModeHint::Tts | ModeHint::Stt => Some(LaunchMode::Chat),
       ModeHint::Unknown => None,
     }
   }
@@ -83,6 +120,31 @@ mod tests {
   #[test]
   fn unknown_hint_with_no_override_returns_none() {
     assert!(LaunchMode::resolve(None, ModeHint::Unknown).is_none());
+  }
+
+  #[test]
+  fn every_label_round_trips() {
+    for m in [
+      LaunchMode::Chat,
+      LaunchMode::Embedding,
+      LaunchMode::Rerank,
+      LaunchMode::Image,
+      LaunchMode::Tts,
+      LaunchMode::Stt,
+    ] {
+      assert_eq!(LaunchMode::from_label(m.label()), Some(m), "{}", m.label());
+    }
+    assert_eq!(LaunchMode::from_label("video"), None);
+  }
+
+  #[test]
+  fn media_modes_are_the_declared_only_ones() {
+    assert!(LaunchMode::Image.is_declared_only());
+    assert!(LaunchMode::Tts.is_declared_only());
+    assert!(LaunchMode::Stt.is_declared_only());
+    assert!(!LaunchMode::Chat.is_declared_only());
+    assert!(!LaunchMode::Embedding.is_declared_only());
+    assert!(!LaunchMode::Rerank.is_declared_only());
   }
 
   #[test]

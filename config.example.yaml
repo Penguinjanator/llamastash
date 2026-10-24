@@ -716,6 +716,14 @@ backend:
         ready_timeout_secs: 600
         # rewrite_model: true              # proxy sets body.model to {name}
         # modes: [chat]                    # refuse /v1/embeddings and /v1/rerank
+        #   Add `stt` / `tts` / `image` to answer the proxy's audio and image
+        #   routes (an ASR or TTS server is `[stt]` / `[tts]`). Those three are
+        #   opt-in: an entry that does not list one is never picked for such a
+        #   request, and a request that names no model gets no guess.
+        # routes: [/inference]             # forward this engine's own paths too
+        #   Prefix match on a slash boundary, any method, body forwarded as sent
+        #   and logged under the prefix. Refused if a path the proxy answers
+        #   itself, or another entry, already covers it.
         # Row info for the Arch / Params / Quant / Ctx columns. Only
         # without `model`. Ctx defaults to the `ctx: true`
         # knob's default; Size comes from memory_gib, Mode from modes.

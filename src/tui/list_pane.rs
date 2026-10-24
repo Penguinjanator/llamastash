@@ -466,6 +466,9 @@ fn mode_hint_label(hint: crate::gguf::metadata::ModeHint) -> String {
     ModeHint::Chat => "chat".into(),
     ModeHint::Embedding => "embedding".into(),
     ModeHint::Rerank => "rerank".into(),
+    ModeHint::Image => "image".into(),
+    ModeHint::Tts => "tts".into(),
+    ModeHint::Stt => "stt".into(),
     ModeHint::Unknown => "unknown".into(),
   }
 }

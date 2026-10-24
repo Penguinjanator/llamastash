@@ -426,7 +426,8 @@ fn resolve_auto_start_mode(
       match m {
         LaunchMode::Embedding => return Some(LaunchModeWire::Embedding),
         LaunchMode::Rerank => return Some(LaunchModeWire::Rerank),
-        LaunchMode::Chat => {}
+        // The media modes ask for no launch flag, so they choose nothing.
+        LaunchMode::Chat | LaunchMode::Image | LaunchMode::Tts | LaunchMode::Stt => {}
       }
     }
   }

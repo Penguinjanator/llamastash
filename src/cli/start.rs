@@ -548,7 +548,7 @@ fn resolve_mode(
   }
   match row.mode_hint.as_deref() {
     // A hint the daemon will read for itself.
-    Some("chat") | Some("embedding") | Some("rerank") => Ok(None),
+    Some("chat" | "embedding" | "rerank" | "image" | "tts" | "stt") => Ok(None),
     Some("unknown") | None => Err(CliExit::new(
       USAGE,
       format!(
@@ -1002,6 +1002,13 @@ mod tests {
       resolve_mode(&r, Some(CliLaunchMode::Embedding), None).unwrap(),
       Some("embedding")
     );
+  }
+
+  #[test]
+  fn a_media_hint_starts_without_a_mode_flag() {
+    for hint in ["image", "tts", "stt"] {
+      assert_eq!(resolve_mode(&row(Some(hint)), None, None).unwrap(), None);
+    }
   }
 
   /// Every field a preset can carry has to survive the launch-file route too.

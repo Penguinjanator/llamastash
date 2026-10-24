@@ -2,8 +2,17 @@
 
 ### Added
 
+- A `backend.generic` entry can declare `routes:` — path prefixes of its own API to forward through the proxy, matched on a slash boundary after dot segments resolve in any spelling and logged under the prefix, body forwarded as it arrived — so an engine whose API is not the OpenAI shape (whisper.cpp's `/inference`) answers through the proxy port too.
+- The proxy forwards the image and audio routes (`/v1/images/generations` `edits` `variations`, `/v1/audio/speech`, `/v1/audio/transcriptions` `translations`) to a generic server that declares `image`, `tts` or `stt` in its `modes`, so an ASR or TTS engine answers through the proxy port instead of only its own. A request naming `whisper-1` or `tts-1` goes to the one server that declares the mode and says which one served it. Plan: [`docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md`](docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md).
 - Each request row now reports its own KV-cache hit: a `Cache` column between `In` and `Out` in the TUI and the `llamastash requests` table, and `cache_hit_ratio` on the row JSON. It drops before both token counts when the pane narrows.
 
+### Changed
+
+- `/v1/models` reports the media mode a generic entry declares, so an entry with `modes: [stt]` lists as `stt` instead of `chat` and a client can pick the endpoint from the listing.
+
+### Fixed
+
+- A request naming a media endpoint that no entry declares says so, and one that several entries declare but none has started says how many there are. Before, both read as a name to add to `proxy.aliases`.
 
 ## [0.9.1] — 2026-10-19
 

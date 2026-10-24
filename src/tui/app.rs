@@ -2538,6 +2538,9 @@ fn parse_mode_hint(label: Option<&str>) -> crate::gguf::metadata::ModeHint {
     Some("chat") => ModeHint::Chat,
     Some("embedding") => ModeHint::Embedding,
     Some("rerank") => ModeHint::Rerank,
+    Some("image") => ModeHint::Image,
+    Some("tts") => ModeHint::Tts,
+    Some("stt") => ModeHint::Stt,
     _ => ModeHint::Unknown,
   }
 }
