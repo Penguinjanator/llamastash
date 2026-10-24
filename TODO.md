@@ -544,6 +544,7 @@ _Shared context: Alias resolution in the proxy, the `/v1/models` and `/api/tags`
 _Shared context: `test_support` listener helpers, `util::test_temp`, the per-binary `unique_temp` wrappers._
 
 - [ ] `fast_probe` exists in 8 test files with two different timeouts (5 s and 15 s). Move it to `test_support` beside the listener helpers.
+- [ ] `alias_rows_degrade_to_empty_when_the_daemon_cannot_answer` (`src/cli/resolve.rs`) proves nothing is listening by binding an ephemeral port and dropping it, so a port reused in the gap would make the pass a false one. Hold a listener that refuses connections instead of dropping the port.
 - [ ] the temp-dir helper is in twice (`test_support::unique_temp_dir(prefix, label)` for the integration tests, `util::test_temp::unique_temp_dir(label)` for `src/` unit tests), and 24 `tests/*.rs` binaries wrap the first in the same one-line `fn unique_temp`. One helper with the prefix folded into the label retires all 24.
 - [ ] **Unit tests write to the real system clipboard.** `u_c_p_yanks_work_from_settings_tab` ([`events.rs`](src/tui/events.rs) ~5032) presses `p`/`u`/`c`, which call the real [`clipboard::write`](src/util/clipboard.rs) (arboard Wayland backend). Every `cargo test` on a desktop replaces the user's clipboard and pushes `/m/qwen.gguf` and `http://127.0.0.1:41100/v1` into clipboard history (seen in DMS 2026-10-14). Fix: return early from `clipboard::write` under `cfg(test)` (e.g. `Ok("test")`); the test already accepts the `copied …` toast, and the shell-out tests call `write_via` directly.
 

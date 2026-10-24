@@ -508,11 +508,15 @@ fn model_object(id: String, m: &DiscoveredModel) -> ModelObject {
 /// The `proxy.aliases` names a client can send, paired with the catalog row each
 /// one answers. One rule for both listings, the way [`named_launch_ids`] is.
 ///
-/// An alias that cannot route is exactly the one
+/// An alias that cannot route is one
 /// [`crate::launch::resolve::resolve_exact_reference`] refuses — a target that
 /// names no model, one two models answer to, or another alias name — so nothing
 /// here repeats resolution, and nothing here spends the once-per-name warnings
-/// [`super::alias::AliasTable`] keeps for real requests. The same call on the
+/// [`super::alias::AliasTable`] keeps for real requests. The audit states a
+/// narrower thing than this listing does: [`super::alias::AliasTable::verdict`]
+/// also asks the looser rungs, so a value only some longer file name contains is
+/// `dead` there with the reason a request would get, while here it simply has no
+/// row. The same call on the
 /// *name* drops an alias a real model owns: model references fold case, so a
 /// `qwen3` alias beside a `Qwen3` model would otherwise publish a row that
 /// dresses one model and answers another.

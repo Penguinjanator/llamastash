@@ -47,11 +47,21 @@ like the `cors` seed there, so a config flip takes effect on the next launch.
 **D4: one audit function, two readers.**
 Add `AliasTable::audit(&self, cat: &[CatalogRow]) -> Vec<AliasIssue>` in
 `src/proxy/alias.rs`, with `AliasIssue { name, target, state }` and
-`state: ok | shadowed | dead | ambiguous | chain`. Decide each state with the same
-calls `src/proxy/router.rs::alias_rows` already makes (`resolve_exact_reference`
-on the name, then on the target, plus `target(target)` for a chain), so the
-listing, `list --json` and the log lines all agree about what is broken. No new
-resolution logic.
+`state: ok | shadowed | dead | ambiguous | chain`. Decide each state the way a
+request decides, so the listing, `list --json` and the log lines all agree about
+what is broken.
+
+Written 2026-10-23 as "the same calls `alias_rows` already makes (exact reference
+only), no new resolution logic", and widened the same day in review: judging a
+value only by the exact rung labelled it `dead` where a client sending that name
+was handed `ambiguous_model` with two candidates, which sends the operator hunting
+a typo instead of naming one of two models. So the ladder now lives in
+`AliasTable::verdict` (exact reference, then chain, then the looser rungs that
+decide *why* nothing answered) and is read by the audit *and* by
+`src/proxy/route.rs::resolve_aliased_reference`, which used to carry its own copy.
+`alias_rows` keeps publishing on the exact rung: that one answers what can route,
+not what is wrong. A loose match on one row stays `dead`, because an alias may not
+be answered with a guess.
 
 **D5: the startup pass runs once, when the catalog first has a row.**
 At daemon start the catalog is empty and every target would look dead. Wait for
