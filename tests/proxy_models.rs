@@ -35,6 +35,7 @@ use llamastash::daemon::context::MethodContext;
 use llamastash::daemon::shutdown::ShutdownToken;
 use llamastash::daemon::{run_foreground, DaemonOptions};
 use llamastash::discovery::{DiscoveredModel, ModelCatalog, ModelSource};
+use llamastash::gguf::metadata::ModeHint;
 use llamastash::gguf::test_fixtures::build_minimal_gguf;
 use llamastash::ipc::Client;
 use llamastash::proxy::state::ProxyState;
@@ -93,7 +94,7 @@ async fn proxy_state_with_models(models: Vec<DiscoveredModel>) -> Arc<ProxyState
 }
 
 /// Like [`proxy_state_with_models`] with a `proxy.aliases` table, the way the
-/// daemon hands it to `from_context_with_auth`.
+/// daemon hands it to the context behind `from_context_with_auth`.
 async fn proxy_state_with_aliases(
   models: Vec<DiscoveredModel>,
   aliases: &[(&str, &str)],
@@ -108,7 +109,13 @@ async fn proxy_state_with_aliases(
       .iter()
       .map(|(name, target)| (name.to_string(), target.to_string())),
   );
-  ProxyState::from_context_with_auth(&ctx, false, true, None, DEFAULT_BODY_LIMIT_BYTES, &aliases)
+  ProxyState::from_context_with_auth(
+    &ctx.with_aliases(&aliases),
+    false,
+    true,
+    None,
+    DEFAULT_BODY_LIMIT_BYTES,
+  )
 }
 
 // --- direct-listener tests ----------------------------------------------
@@ -179,6 +186,84 @@ async fn a_name_a_real_model_owns_is_not_published_as_an_alias() {
     ids,
     ["Qwen3", "llama"],
     "a model's own name is never published twice: {v}"
+  );
+
+  shutdown_listener(shutdown, listener_handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_alias_two_models_answer_to_is_not_published() {
+  // The refusal is the resolver's, not the listing's: two models answer to
+  // `a/dup`, so the alias names neither of them and every request under it comes
+  // back `ambiguous_model`. A row for it would be a published id that cannot
+  // serve a client.
+  let models = vec![
+    make_model("/m/qwen3.gguf", Some("qwen3")),
+    make_model("/one/a/dup.gguf", None),
+    make_model("/two/a/dup.gguf", None),
+  ];
+  let state =
+    proxy_state_with_aliases(models, &[("gpt-4o-mini", "a/dup"), ("routable", "qwen3")]).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
+
+  let (status, body) = http_get(addr, "/v1/models").await;
+  assert_eq!(status, 200);
+  let v: Value = serde_json::from_slice(&body).expect("json body");
+  let ids: Vec<&str> = v["data"]
+    .as_array()
+    .expect("data array")
+    .iter()
+    .map(|r| r["id"].as_str().unwrap())
+    .collect();
+  assert!(
+    ids.contains(&"routable"),
+    "the alias that names one model is still a row: {v}"
+  );
+  assert!(
+    !ids.contains(&"gpt-4o-mini"),
+    "an alias two models answer to is not a row: {v}"
+  );
+
+  shutdown_listener(shutdown, listener_handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_alias_row_carries_the_mode_of_the_model_it_names() {
+  // The alias row is not a bare id: a client that reads `mode` to pick an
+  // endpoint has to read the same answer for the alias as for the model, or it
+  // sends embeddings for a chat model because it found the row by its own name.
+  let mut embed = make_model("/m/bge.gguf", Some("bge"));
+  if let Some(md) = embed.metadata.as_mut() {
+    md.mode_hint = ModeHint::Embedding;
+  }
+  let models = vec![embed, make_model("/m/qwen3.gguf", Some("qwen3"))];
+  let state =
+    proxy_state_with_aliases(models, &[("embed-name", "bge"), ("chat-name", "qwen3")]).await;
+  let (addr, shutdown, listener_handle) = spawn_listener(state).await;
+
+  let (status, body) = http_get(addr, "/v1/models").await;
+  assert_eq!(status, 200);
+  let v: Value = serde_json::from_slice(&body).expect("json body");
+  let data = v["data"].as_array().expect("data array");
+  let mode_of = |id: &str| {
+    data
+      .iter()
+      .find(|row| row["id"] == id)
+      .unwrap_or_else(|| panic!("`{id}` listed: {v}"))["mode"]
+      .as_str()
+      .unwrap_or_default()
+      .to_string()
+  };
+  assert_eq!(
+    mode_of("embed-name"),
+    mode_of("bge"),
+    "an alias row dresses the model it names: {v}"
+  );
+  assert_eq!(mode_of("chat-name"), mode_of("qwen3"), "{v}");
+  assert_eq!(
+    mode_of("embed-name"),
+    "embedding",
+    "the fixture is an embedding model: {v}"
   );
 
   shutdown_listener(shutdown, listener_handle).await;

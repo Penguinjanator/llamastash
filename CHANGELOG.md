@@ -5,6 +5,8 @@
 - A `backend.generic` entry can declare `routes:` — path prefixes of its own API to forward through the proxy, matched on a slash boundary after dot segments resolve in any spelling and logged under the prefix, body forwarded as it arrived — so an engine whose API is not the OpenAI shape (whisper.cpp's `/inference`) answers through the proxy port too.
 - The proxy forwards the image and audio routes (`/v1/images/generations` `edits` `variations`, `/v1/audio/speech`, `/v1/audio/transcriptions` `translations`) to a generic server that declares `image`, `tts` or `stt` in its `modes`, so an ASR or TTS engine answers through the proxy port instead of only its own. A request naming `whisper-1` or `tts-1` goes to the one server that declares the mode and says which one served it. Plan: [`docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md`](docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md).
 - Each request row now reports its own KV-cache hit: a `Cache` column between `In` and `Out` in the TUI and the `llamastash requests` table, and `cache_hit_ratio` on the row JSON. It drops before both token counts when the pane narrows.
+- `backend.vllm.rewrite_model` answers a vLLM launch with the name it was served, so a `proxy.aliases` name for a vLLM model reaches the model instead of vLLM's `404`.
+- `llamastash list --json` carries the `proxy.aliases` table under `aliases`, every entry read `ok` or the reason it cannot route, so a dead alias shows up without a client having to send it.
 
 ### Changed
 

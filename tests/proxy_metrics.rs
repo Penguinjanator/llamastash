@@ -143,14 +143,7 @@ async fn build_state(
   }
   let ctx =
     MethodContext::with_catalog(ShutdownToken::new(), catalog).with_supervisors(supervisors);
-  ProxyState::from_context_with_auth(
-    &ctx,
-    false,
-    true,
-    None,
-    DEFAULT_BODY_LIMIT_BYTES,
-    &Default::default(),
-  )
+  ProxyState::from_context_with_auth(&ctx, false, true, None, DEFAULT_BODY_LIMIT_BYTES)
 }
 
 /// One forwarded chat request, so the request log has a real row behind the

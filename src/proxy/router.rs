@@ -668,11 +668,15 @@ fn model_object(id: String, m: &DiscoveredModel) -> ModelObject {
 /// The `proxy.aliases` names a client can send, paired with the catalog row each
 /// one answers. One rule for both listings, the way [`named_launch_ids`] is.
 ///
-/// An alias that cannot route is exactly the one
+/// An alias that cannot route is one
 /// [`crate::launch::resolve::resolve_exact_reference`] refuses — a target that
 /// names no model, one two models answer to, or another alias name — so nothing
 /// here repeats resolution, and nothing here spends the once-per-name warnings
-/// [`super::alias::AliasTable`] keeps for real requests. The same call on the
+/// [`super::alias::AliasTable`] keeps for real requests. The audit states a
+/// narrower thing than this listing does: [`super::alias::AliasTable::verdict`]
+/// also asks the looser rungs, so a value only some longer file name contains is
+/// `dead` there with the reason a request would get, while here it simply has no
+/// row. The same call on the
 /// *name* drops an alias a real model owns: model references fold case, so a
 /// `qwen3` alias beside a `Qwen3` model would otherwise publish a row that
 /// dresses one model and answers another.
@@ -682,7 +686,7 @@ fn alias_rows<'a>(
   snap: &'a [DiscoveredModel],
 ) -> Vec<(String, &'a DiscoveredModel)> {
   let mut out: Vec<(String, &DiscoveredModel)> = Vec::new();
-  for (name, target) in state.aliases.pairs() {
+  for (name, target) in state.ctx.aliases.pairs() {
     if crate::launch::resolve::resolve_exact_reference(cat, name).is_ok() {
       continue;
     }
@@ -1346,6 +1350,63 @@ mod tests {
       named.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
       vec!["qwen3@coder"],
       "unnamed rows publish nothing and a repeated name emits once"
+    );
+  }
+
+  /// Reading either listing must not spend the reports a real request owes. Both
+  /// `/v1/models` and `/api/tags` skip every alias that cannot route, and each
+  /// skip is the same problem the once-per-name warnings say out loud: if listing
+  /// the table collected the line, the client that finally sent the name would
+  /// get silence and nobody would ever hear about the alias.
+  #[tokio::test]
+  async fn the_listings_spend_no_alias_reports() {
+    let catalog = crate::discovery::ModelCatalog::new();
+    for path in ["/m/qwen3.gguf", "/one/a/dup.gguf", "/two/a/dup.gguf"] {
+      catalog.upsert(discovered_at(path)).await;
+    }
+    let ctx = crate::daemon::context::MethodContext::with_catalog(
+      crate::daemon::shutdown::ShutdownToken::new(),
+      catalog,
+    )
+    .with_aliases(&crate::config::ProxyAliases::from_pairs(vec![
+      ("nowhere".to_string(), "no-such-model".to_string()),
+      ("hardwired".to_string(), "nowhere".to_string()),
+      ("dual".to_string(), "a/dup".to_string()),
+    ]));
+    let state = Arc::new(ProxyState::from_context(
+      &ctx,
+      false,
+      true,
+      crate::proxy::DEFAULT_BODY_LIMIT_BYTES,
+    ));
+
+    let _ = list_models(Arc::clone(&state)).await;
+    let _ = ollama_tags(Arc::clone(&state)).await;
+
+    assert!(
+      state
+        .ctx
+        .aliases
+        .warn_dead_target("nowhere", "no-such-model"),
+      "the listings left the dead-target line for the first request"
+    );
+    assert!(
+      state.ctx.aliases.warn_ambiguous_target("dual", "a/dup"),
+      "and the ambiguous-target line"
+    );
+    assert!(
+      state
+        .ctx
+        .aliases
+        .warn_points_at_alias("hardwired", "nowhere"),
+      "and the chain line"
+    );
+    assert!(
+      !state
+        .ctx
+        .aliases
+        .warn_dead_target("nowhere", "no-such-model"),
+      "one request says it, the next one stays quiet"
     );
   }
 

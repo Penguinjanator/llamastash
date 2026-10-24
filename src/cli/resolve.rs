@@ -140,6 +140,20 @@ pub async fn fetch_catalog(client: &mut Client) -> Result<Vec<CatalogRow>, CliEx
   )
 }
 
+/// The `proxy.aliases` table as the daemon audits it: one `{name, target, state}`
+/// row per entry, in the order the config lists them. Best-effort like
+/// [`fetch_status`] — a daemon that cannot answer leaves the list empty rather
+/// than failing the listing, and one with no `proxy.aliases` configured answers
+/// `[]`.
+pub async fn fetch_alias_rows(client: &mut Client) -> Vec<Value> {
+  client
+    .call("proxy_aliases", None)
+    .await
+    .ok()
+    .and_then(|body| body.get("aliases").and_then(Value::as_array).cloned())
+    .unwrap_or_default()
+}
+
 /// Find a catalog row that matches `reference`. Disambiguation rules
 /// (in order):
 /// 1. exact canonical-path match,
@@ -726,6 +740,85 @@ fn single_or_error(matches: Vec<&RunningRow>, reference: &str) -> Result<Running
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A canned HTTP reply, served twice so a test can prove the stub was reached
+  /// before asserting on what the client does with it.
+  fn stub_ipc(reply: &'static str) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stub bind");
+    let addr = listener.local_addr().expect("stub addr");
+    let handle = std::thread::spawn(move || {
+      use std::io::{Read, Write};
+      for stream in listener.incoming().take(2) {
+        let Ok(mut socket) = stream else { continue };
+        let mut buf = [0u8; 4096];
+        let _ = socket.read(&mut buf);
+        let _ = socket.write_all(
+          format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{reply}",
+            reply.len()
+          )
+          .as_bytes(),
+        );
+      }
+    });
+    (addr, handle)
+  }
+
+  /// A daemon that cannot produce the alias table leaves that half of
+  /// `list --json` empty rather than failing the listing: the models are already
+  /// in hand and the audit is the bonus. Three ways that happens — no daemon
+  /// listening, a daemon that has never heard of the method, and a reply with no
+  /// `aliases` key — and each has to read as "no aliases", not as a broken list.
+  #[tokio::test]
+  async fn alias_rows_degrade_to_empty_when_the_daemon_cannot_answer() {
+    let closed = {
+      let l = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
+      let port = l.local_addr().expect("addr").port();
+      drop(l);
+      port
+    };
+    let mut unreachable =
+      Client::with_url_and_token(&format!("http://127.0.0.1:{closed}"), "test").expect("client");
+    assert!(
+      unreachable.call("proxy_aliases", None).await.is_err(),
+      "nothing is listening, so the call must fail"
+    );
+    assert_eq!(
+      fetch_alias_rows(&mut unreachable).await,
+      Vec::<Value>::new(),
+      "a daemon that never answers is no aliases"
+    );
+
+    let (missing_addr, _missing) =
+      stub_ipc(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"unknown method"}}"#);
+    let mut old_daemon =
+      Client::with_url_and_token(&format!("http://{missing_addr}"), "test").expect("client");
+    assert!(
+      matches!(
+        old_daemon.call("proxy_aliases", None).await,
+        Err(crate::ipc::ClientError::Remote(_))
+      ),
+      "the stub answered; this is a daemon from before the method existed"
+    );
+    assert_eq!(
+      fetch_alias_rows(&mut old_daemon).await,
+      Vec::<Value>::new(),
+      "a daemon that has never heard of the method is no aliases"
+    );
+
+    let (blank_addr, _blank) = stub_ipc(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+    let mut no_table =
+      Client::with_url_and_token(&format!("http://{blank_addr}"), "test").expect("client");
+    assert!(
+      no_table.call("proxy_aliases", None).await.is_ok(),
+      "the stub answered with a result"
+    );
+    assert_eq!(
+      fetch_alias_rows(&mut no_table).await,
+      Vec::<Value>::new(),
+      "a reply with no `aliases` key is no aliases"
+    );
+  }
 
   /// `status.servers` shaped as the daemon emits it, one entry per
   /// `(id, device-count)` pair.

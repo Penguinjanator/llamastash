@@ -69,6 +69,21 @@ async fn http_post(addr: SocketAddr, path: &str, body: &str) -> (u16, Vec<u8>) {
   (status, body)
 }
 
+/// The `capabilities` an `/api/show` reply reports for one name — the Ollama
+/// spelling of the model's mode.
+async fn show_capabilities(addr: SocketAddr, model: &str) -> Vec<String> {
+  let (status, body) = http_post(addr, "/api/show", &format!(r#"{{"model":"{model}"}}"#)).await;
+  assert_eq!(status, 200, "{model}");
+  let v: Value = serde_json::from_slice(&body).expect("show body");
+  v["capabilities"]
+    .as_array()
+    .unwrap_or_else(|| panic!("capabilities for {model}: {v}"))
+    .iter()
+    .filter_map(Value::as_str)
+    .map(str::to_string)
+    .collect()
+}
+
 /// `HEAD` plus the body length the server would have sent.
 async fn http_head(addr: SocketAddr, path: &str) -> (u16, usize) {
   let (status, _, body) = llamastash::test_support::http_head(addr, path, &[]).await;
@@ -138,8 +153,8 @@ async fn proxy_state_with_models(models: Vec<DiscoveredModel>) -> Arc<ProxyState
 
 /// One build seam for every state in this file: the catalog, the optional
 /// supervisor registry, Ollama drop-in mode, and the `proxy.aliases` table the
-/// daemon hands `from_context_with_auth` in production. The wrappers below are
-/// what the tests call.
+/// daemon puts on the context behind `from_context_with_auth`. The wrappers
+/// below are what the tests call.
 async fn build_state(
   models: Vec<DiscoveredModel>,
   registry: Option<SupervisorRegistry>,
@@ -161,12 +176,11 @@ async fn build_state(
       .map(|(name, target)| (name.to_string(), target.to_string())),
   );
   ProxyState::from_context_with_auth(
-    &ctx,
+    &ctx.with_aliases(&aliases),
     ollama_compat,
     true,
     None,
     DEFAULT_BODY_LIMIT_BYTES,
-    &aliases,
   )
 }
 
@@ -315,6 +329,93 @@ async fn api_tags_lists_an_alias_with_the_row_it_names() {
     "an alias row describes the model it names"
   );
   assert_eq!(alias["details"]["family"], "qwen3");
+
+  shutdown_listener(shutdown, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_tags_leaves_out_an_alias_two_models_answer_to() {
+  // The listing refuses to publish a name the resolver cannot settle: two models
+  // answer to `a/dup`, so the alias names neither and every request under it
+  // comes back `ambiguous_model`. The alias that does name one model stays.
+  let models = vec![
+    make_model("/m/qwen3.gguf", Some("qwen3"), "qwen3", ModeHint::Chat),
+    make_model("/one/a/dup.gguf", None, "llama", ModeHint::Chat),
+    make_model("/two/a/dup.gguf", None, "llama", ModeHint::Chat),
+  ];
+  let state = proxy_state_with_aliases(
+    models,
+    vec![("gpt-4o-mini", "a/dup"), ("routable", "qwen3")],
+  )
+  .await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+
+  let (status, body) = http_get(addr, "/api/tags").await;
+  assert_eq!(status, 200);
+  let v: Value = serde_json::from_slice(&body).expect("json body");
+  let names: Vec<&str> = v["models"]
+    .as_array()
+    .expect("models array")
+    .iter()
+    .map(|r| r["name"].as_str().unwrap())
+    .collect();
+  assert!(
+    names.contains(&"routable"),
+    "the alias that names one model is still a row: {v}"
+  );
+  assert!(
+    !names.contains(&"gpt-4o-mini"),
+    "an alias two models answer to is not a row: {v}"
+  );
+
+  shutdown_listener(shutdown, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_alias_row_carries_the_mode_of_the_model_it_names() {
+  // A client that reads the Ollama shape's `capabilities` to decide which
+  // endpoint to call has to read the model's own answer through the alias name,
+  // or it sends embeddings to a chat model because it found the row by its own
+  // hard-wired name. `/api/tags` publishes the alias row; `/api/show` is where
+  // that row's mode is spelled out.
+  let models = vec![
+    make_model("/m/bge.gguf", Some("bge"), "bert", ModeHint::Embedding),
+    make_model("/m/qwen3.gguf", Some("qwen3"), "qwen3", ModeHint::Chat),
+  ];
+  let state =
+    proxy_state_with_aliases(models, vec![("embed-name", "bge"), ("chat-name", "qwen3")]).await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+
+  let tags: Value =
+    serde_json::from_slice(&http_get(addr, "/api/tags").await.1).expect("tags body");
+  let names: Vec<&str> = tags["models"]
+    .as_array()
+    .expect("models array")
+    .iter()
+    .map(|r| r["name"].as_str().unwrap())
+    .collect();
+  assert!(
+    names.contains(&"embed-name") && names.contains(&"chat-name"),
+    "both aliases list: {tags}"
+  );
+
+  // `/api/tags` has no mode of its own; the Ollama shape spells it out as
+  // `capabilities` on `/api/show`, resolved through the same alias.
+  assert_eq!(
+    show_capabilities(addr, "embed-name").await,
+    show_capabilities(addr, "bge").await,
+    "the alias answers with the mode of the model it names"
+  );
+  assert_eq!(
+    show_capabilities(addr, "chat-name").await,
+    show_capabilities(addr, "qwen3").await,
+    "and so does the chat one"
+  );
+  assert_eq!(
+    show_capabilities(addr, "embed-name").await,
+    vec!["embedding".to_string()],
+    "the fixture really is an embedding model"
+  );
 
   shutdown_listener(shutdown, handle).await;
 }

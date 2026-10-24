@@ -205,7 +205,8 @@ channel where it is labelled for what it is.
   `/v1/models` and your requests use `owner/name`, not the cache path. vLLM
   answers to that name only, and the proxy forwards the `model` a client sent,
   so a `proxy.aliases` name for a vLLM model gets vLLM's own `404`
-  (`NotFoundError`).
+  (`NotFoundError`) — unless `backend.vllm.rewrite_model: true` makes the proxy
+  send the served name instead.
 - **The request log gets less from vLLM than from llama.cpp.** On vLLM
   0.27.1:
   - vLLM sends no speed of its own, so every `TOK/S` is the proxy's `~`

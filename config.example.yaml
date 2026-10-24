@@ -605,6 +605,18 @@ backend:
     # Sources — CLI: (none) · Env: (none). Config-only.
     cors: true
 
+    # Send vLLM the name it was served with instead of what the client sent.
+    # vLLM answers only to its `--served-model-name` list, so a `proxy.aliases`
+    # name (or any other spelling the proxy resolved) reaches a running model
+    # and gets vLLM's own `404`. With this on the proxy replaces `body.model`
+    # with the repo id on the way out.
+    #
+    # Off by default, because it overwrites what the client asked for.
+    # Applies to launches started after the flip; needs no argv change.
+    #
+    # Sources — CLI: (none) · Env: (none). Config-only.
+    rewrite_model: false
+
   # SGLang — serves the same safetensors HuggingFace repos as vLLM, through
   # `sglang serve`. You supply the launcher; llamastash never installs it.
   # Zero footprint when it's absent. See docs/sglang-setup.md.
