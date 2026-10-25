@@ -4,6 +4,8 @@ Working `config.yaml` blocks for engines and models. Each one names the engine v
 
 What each field means is in [`docs/usage.md`](docs/usage.md): § [Generic backend](docs/usage.md#generic-backend) for `backend.generic.servers`, § [`presets`](docs/usage.md#llamastash-presets-model-ref-action) for preset keys and precedence. [`config.example.yaml`](config.example.yaml) has every key with a comment.
 
+Every block is loaded as written by `tests/recipes_load.rs`. [`scripts/recipe-e2e.md`](scripts/recipe-e2e.md) covers the harness that starts each engine from these blocks and sends one real request through the proxy.
+
 ## Index
 
 Recipes are grouped by what the model does, most used type first. An engine that serves several types is listed under each one and links to its one recipe.
