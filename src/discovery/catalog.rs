@@ -39,6 +39,10 @@ use crate::launch::resolve::{CatalogRow, MtpCapability};
 #[derive(Debug, Clone, Default)]
 pub struct ModelCatalog {
   inner: Arc<RwLock<CatalogSlot>>,
+  /// Wakes the discovery task for a rescan outside the watcher's view: HF
+  /// roots are watched shallow, so a file removed deep in a repo would
+  /// otherwise stay listed until the periodic backstop.
+  rescan: Arc<tokio::sync::Notify>,
 }
 
 /// The map plus the read views handed out to proxy readers.
@@ -97,6 +101,30 @@ impl ModelCatalog {
       slot.models.insert(m.path.clone(), m);
     }
     slot.rebuild();
+  }
+
+  /// Drop every row at or under one of `paths` whose file is gone from disk,
+  /// in one rebuild, and ask the discovery task to rescan for the rest. A row
+  /// whose file still exists is kept, so a client cannot hide a live model.
+  /// Returns how many rows were dropped.
+  pub async fn forget_missing(&self, paths: &[PathBuf]) -> usize {
+    let mut slot = self.inner.write().await;
+    let before = slot.models.len();
+    slot
+      .models
+      .retain(|path, _| !paths.iter().any(|p| path.starts_with(p)) || path.exists());
+    let dropped = before - slot.models.len();
+    if dropped > 0 {
+      slot.rebuild();
+    }
+    drop(slot);
+    self.rescan.notify_one();
+    dropped
+  }
+
+  /// Resolves once [`Self::forget_missing`] has asked for a rescan.
+  pub async fn rescan_requested(&self) {
+    self.rescan.notified().await;
   }
 
   /// Number of models currently surfaced.
@@ -350,6 +378,35 @@ mod tests {
     let snap = cat.snapshot().await;
     assert_eq!(snap.len(), 1);
     assert_eq!(snap[0].path, PathBuf::from("/m/b.gguf"));
+  }
+
+  #[tokio::test]
+  async fn forget_missing_drops_only_gone_rows_and_requests_a_rescan() {
+    let dir = std::env::temp_dir().join(format!("llamastash-forget-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("repo")).unwrap();
+    let live = dir.join("repo/live.gguf");
+    std::fs::write(&live, b"GGUF").unwrap();
+    let cat = ModelCatalog::new();
+    for p in [
+      &live,
+      &dir.join("repo/gone.gguf"),
+      &dir.join("other/gone.gguf"),
+    ] {
+      cat
+        .upsert(fake_model(p.to_str().unwrap(), ModelSource::HuggingFace))
+        .await;
+    }
+    let rescan = cat.clone();
+    let woken = tokio::spawn(async move { rescan.rescan_requested().await });
+
+    assert_eq!(cat.forget_missing(&[dir.join("repo")]).await, 1);
+    let left: Vec<PathBuf> = cat.snapshot().await.into_iter().map(|m| m.path).collect();
+    assert_eq!(left, vec![dir.join("other/gone.gguf"), live]);
+    tokio::time::timeout(std::time::Duration::from_secs(1), woken)
+      .await
+      .expect("rescan must be requested")
+      .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
   }
 
   #[tokio::test]

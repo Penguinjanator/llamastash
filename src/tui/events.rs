@@ -127,6 +127,9 @@ pub enum WriterCmd {
   /// `presets_all` refresh reflects it. Boxed (like `StartModel`) so the
   /// large `crate::launch::knobs::KnobSet` doesn't bloat the other tiny variants.
   SavePreset(Box<SavePresetCmd>),
+  /// `forget_models` — after a delete, so the next `list_models` refresh
+  /// does not bring the deleted rows back before the daemon rescans.
+  ForgetModels(Vec<PathBuf>),
 }
 
 /// Payload for [`WriterCmd::SavePreset`].
@@ -1414,10 +1417,16 @@ fn apply_confirmed(app: &mut App, action: ConfirmAction, writer: Option<&mpsc::S
     ConfirmAction::DeleteModel { plan, display_name } => {
       match crate::tui::delete::execute(&plan) {
         Ok(_summary) => {
-          // Drop every row the plan removed from the cached model list so
-          // the next render doesn't flash a stale entry — a whole-repo
-          // delete takes other revisions of the same repo with it. A real
-          // refresh re-discovers on the next tick.
+          // A whole-repo delete takes other revisions of the same repo with it.
+          let removed: Vec<PathBuf> = plan
+            .files()
+            .into_iter()
+            .map(Path::to_path_buf)
+            .chain(plan.hf_repo_dir.clone())
+            .collect();
+          if let Some(tx) = writer {
+            let _ = tx.try_send(WriterCmd::ForgetModels(removed));
+          }
           app.models.retain(|m| {
             m.path != plan.primary
               && plan
@@ -2319,6 +2328,7 @@ pub fn encode_writer_cmd(cmd: WriterCmd) -> (&'static str, Value) {
       }
       ("presets_save", payload)
     }
+    WriterCmd::ForgetModels(paths) => ("forget_models", json!({ "paths": paths })),
   }
 }
 
