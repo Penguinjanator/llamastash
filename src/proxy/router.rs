@@ -89,7 +89,7 @@ pub(crate) fn proxy_owned_paths() -> Vec<&'static str> {
     .collect()
 }
 
-pub(crate) const GENERATION_ROUTES: [&str; 14] = [
+pub(crate) const GENERATION_ROUTES: [&str; 15] = [
   "/v1/chat/completions",
   "/v1/completions",
   "/v1/embeddings",
@@ -104,6 +104,7 @@ pub(crate) const GENERATION_ROUTES: [&str; 14] = [
   "/v1/audio/speech",
   "/v1/audio/transcriptions",
   "/v1/audio/translations",
+  "/v1/systemone",
 ];
 
 /// The launch mode an endpoint implies, or `None` when any launch answers it.
@@ -1241,6 +1242,7 @@ mod tests {
       "/v1/completions",
       "/v1/messages",
       "/v1/responses",
+      "/v1/systemone",
     ] {
       assert_eq!(endpoint_mode(path), None, "{path}");
     }
