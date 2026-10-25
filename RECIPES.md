@@ -22,6 +22,8 @@ What each field means is in [`docs/usage.md`](docs/usage.md): § [Generic backen
 | Whisper, Kokoro, SD (STT, TTS, image) | LocalAI | [LocalAI](#localai) |
 | Piper voices (TTS) | Piper | [Piper](#piper) |
 | Chatterbox (TTS) | Chatterbox TTS API | [Chatterbox TTS API](#chatterbox-tts-api) |
+| Kev-0.8B, Laya (decision models) | llama.cpp on CPU, own port | [Decision models (Kev, Laya)](#decision-models-kev-laya) |
+| LANCET Nano (shell command risk) | `classify.py` in Docker | [LANCET](#lancet) |
 | SD 1.5 and other ComfyUI workflows | ComfyUI | [ComfyUI](#comfyui) |
 
 ## llama.cpp builds
@@ -884,3 +886,71 @@ backend:
 ```
 
 The loaded model took 3.2 GB of the 4 GB card; with another engine already on the GPU it failed with `CUDA out of memory`. `/health` answers 200 while the model is still loading (`"model_loaded": false`), so llamastash marks the launch ready early and a request in that window gets `500 Model not loaded`; retry once `model_loaded` is `true`. After that, `{"model":"chatterbox","input":"...","voice":"alloy"}` returned a 24 kHz WAV that transcribed back to its input.
+
+### Decision models (Kev, Laya)
+
+[Kev-0.8B](https://huggingface.co/jaredpalmer/kev-0.8b) and [Laya typed-decisions](https://huggingface.co/convaiinnovations/laya-typed-decisions) are decision models: llama-server answers typed yes/no, choice and score questions with them on `POST /v1/systemone`, which needs a llama.cpp build from October 2, 2026 or later ([#29818](https://github.com/ggml-org/llama.cpp/pull/29818)). [pi-automode-classifier](https://github.com/deepu105/pi-automode-classifier) uses them to score shell commands. Written for LlamaStash 0.6.1 and llama.cpp `5ad1c5da0`. Both run on a CPU-only llama-server, with a preset per model:
+
+```yaml
+backend:
+  llamacpp:
+    servers:
+      - binary: /path/to/llama.cpp/build-gpu/bin/llama-server   # the default stays first
+      - name: cpu
+        binary: /path/to/llama.cpp/build-cpu/bin/llama-server
+presets:
+  Kev-0.8B-Q8_0.gguf:
+    default: automode
+    entries:
+      automode:
+        server: llamacpp-cpu
+        knobs:
+          threads: 8
+          parallel: 1
+          ctx_size: 1024
+        extras: ["--sleep-idle-seconds", "300"]
+  laya-typed-decisions-Q8_0.gguf:
+    default: automode
+    entries:
+      automode:
+        server: llamacpp-cpu
+        knobs:
+          mode: embedding
+          threads: 8
+          parallel: 1
+          ctx_size: 512
+        extras: ["--sleep-idle-seconds", "300"]
+```
+
+- The proxy forwards `/v1/systemone` by `model` and auto-starts the model with its default preset, so a client sends its questions to the proxy port. A client that calls the launch directly starts it on a fixed port instead: `llamastash start Kev-0.8B-Q8_0.gguf --preset automode --port 11438 --wait`.
+- Keep `--preset automode` in the command. Without it the model starts on the default server, which is usually the GPU one.
+- LlamaStash reads the Laya GGUF as a chat model, so the preset pins `mode: embedding`. The community Laya GGUF does not load in llama.cpp; convert the checkpoint with `convert_hf_to_gguf.py --outtype q8_0` and put the file in a folder LlamaStash scans.
+- On 8 threads of a Ryzen AI Max+ 395, Kev-0.8B Q8_0 (a 774 MB GGUF) answered in 174 ms at the median and used 1.1 GB. Laya typed-decisions uses about half that memory.
+
+### LANCET
+
+[LANCET Nano](https://github.com/TannerMidd/LANCET-model) 0.4.3 is a 111M-parameter classifier that scores how risky a shell command is, from 0 to 1, on CPU. It ships as a command-line program, so [pi-automode-classifier](https://github.com/deepu105/pi-automode-classifier) has a Docker image in `lancet/` that serves it on llama.cpp's decision-model endpoint, `POST /v1/systemone`, and on `GET /health`. The image downloads the release bundle and checks its SHA-256. Its scores matched LANCET's own `classify.py` on all 793 commands of [lancet-bench-1](https://github.com/TannerMidd/LANCET-model/tree/main/benchmarks/lancet-bench-1).
+
+```bash
+git clone https://github.com/deepu105/pi-automode-classifier /path/to/pi-automode-classifier
+docker build -t pi-automode-lancet:0.4.3 /path/to/pi-automode-classifier/lancet
+```
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: lancet
+        binary: /path/to/pi-automode-classifier/lancet/lancet-serve.sh
+        args: ["{port}"]
+        ready: /health
+        memory_gib: 0.5
+        stop_grace_secs: 10
+```
+
+`lancet-serve.sh` follows the [Halogen wrapper](#halogen): `docker run -d` with the container named after the port, `docker stop` on SIGTERM, and `docker wait` in the foreground. It publishes the port on `127.0.0.1` only, with a read-only filesystem and every capability dropped.
+
+- On an i9-11900H the container answered 0.7 s after start and used 233 MB. Through the proxy, the first request took 1.07 s including the start, and `llamastash requests` showed 12 to 20 ms per request after that. With `proxy.idle_ttl_secs: 0` it then stays up.
+- The entry has no `modes`, so `llamastash list` shows it as a `chat` row and `/v1/models` lists `lancet`. A chat request to it gets a 404 from the server.
+- `/v1/systemone` answers one yes/no question, `risky`, as `{"type": "noul", "noul": <score>}`. LANCET reads only `state.command`, so the question text is not used. A request with more questions, or a `score` question, gets a 400.
+- The proxy wants the API key on `/v1/systemone` like on every data route. pi-automode-classifier sends the key of the Pi provider it is pointed at: `"classifier": {"provider": "<the Pi provider for this proxy>", "model": "lancet"}`.

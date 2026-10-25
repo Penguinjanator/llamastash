@@ -742,6 +742,41 @@ servers:
     shutdown(client, daemon).await;
   }
 
+  /// `/v1/systemone` takes no mode, so a chat entry answers it by name.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn systemone_forwards_to_the_named_entry() {
+    let proxy_port = std::net::TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .port();
+    let (mut client, daemon) = boot(opts(unique_temp("systemone"), Some(proxy_port))).await;
+    wait_listed(&mut client, "gen-chat").await;
+
+    let resp = reqwest::Client::new()
+      .post(format!("http://127.0.0.1:{proxy_port}/v1/systemone"))
+      .json(&json!({
+        "model": "gen-chat",
+        "state": "rm -rf /",
+        "questions": {"risky": {"type": "noul", "instructions": "Is it risky?"}},
+      }))
+      .timeout(Duration::from_secs(60))
+      .send()
+      .await
+      .expect("proxy request");
+    let status = resp.status();
+    let echoed: Value = resp.json().await.unwrap();
+    assert!(status.is_success(), "status {status}: {echoed}");
+    assert_eq!(echoed["model"], "gen-chat", "{echoed}");
+    assert!(
+      echoed["received_body"]
+        .as_str()
+        .is_some_and(|b| b.contains("\"questions\"")),
+      "the body reaches the engine: {echoed}"
+    );
+    shutdown(client, daemon).await;
+  }
+
   /// A client that hardcodes `whisper-1` still reaches the one entry that
   /// declares `stt`: the body reaches it untouched, so an engine that maps
   /// `whisper-1` itself still can, the response says which entry answered, and

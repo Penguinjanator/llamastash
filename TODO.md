@@ -527,6 +527,7 @@ _Shared context: `src/cli/` and `src/ipc/methods.rs` for the start and wait-for-
   - [x] ~~**The proxy has no route for audio, so an ASR engine is launch-managed only.**~~ — done: `/v1/audio/transcriptions` and `/v1/audio/translations` are routes, `stt` / `tts` / `image` are declared-only launch modes, and a generic entry that lists one in `modes` answers them with its upload forwarded as sent. Seen 2026-10-17. Plan: [`docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md`](docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md).
   - [x] **Media recipes still to run on an NVIDIA card.** Tested on the XPS (RTX 3050 Ti, 4 GB) on 2026-10-23: whisper.cpp CPU and CUDA, Kokoro-FastAPI, sd.cpp, Speaches, LocalAI, Piper, ComfyUI, Lemonade's media models and the `tts-1: kokoro` alias. Tested on the Z13 (Radeon 8060S, gfx1151) on 2026-10-24: FastFlowLM's ASR entry (`flm serve --asr 1`, `modes: [stt]`) by name, as `whisper-1` and through the mode fallback, plus Krea 2 Base and MOSS-Image SFT on the sd.cpp HIP build ([run log](docs/testing/2026-10-24-media-z13-sdcpp-flm.md)).
 - [x] agg numbers in brackets with avg numbers in requestys TUI
+- [x] ~~add /v1/systemone endpoint to the proxy for system-one models~~ — done: forwarded by `model` like the chat routes.
 
 ### Batch 4: `proxy.aliases` visibility and coverage
 
