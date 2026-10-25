@@ -8,7 +8,7 @@ What each field means is in [`docs/usage.md`](docs/usage.md): § [Generic backen
 |---|---|---|
 | any GGUF | llama.cpp, several builds side by side | [llama.cpp builds](#llamacpp-builds) |
 | safetensors repos | vLLM, SGLang | [vLLM and SGLang](#vllm-and-sglang) |
-| Qwen3.8 Flash-Next | gufo, Halogen, CIRU | [Qwen3.8 Flash-Next](#qwen38-flash-next) |
+| Qwen3.8 Flash-Next | gufo, Halogen, CIRU, Strata | [Qwen3.8 Flash-Next](#qwen38-flash-next) |
 | Qwen3.8 27B | gufo with a DFlash2 draft | [Qwen3.8 27B](#qwen38-27b) |
 | DeepSeek V4 Flash / PRO | ds4, llama.cpp | [DeepSeek V4](#deepseek-v4) |
 | GLM 4.x, Gemma 4 | llama.cpp with MTP | [MTP models on llama.cpp](#mtp-models-on-llamacpp-glm-gemma-4) |
@@ -126,7 +126,7 @@ llamastash start Qwen/Qwen2.5-0.5B-Instruct --preset vllm-16g
 
 ## Qwen3.8 Flash-Next
 
-Three engines besides llama.cpp: gufo (commit `d9a84f1`), Halogen (`0.17.0` Docker image) and CIRU (commit `3cf984c`). Each takes 80-100 GB, so run one at a time.
+Four engines besides llama.cpp: gufo (commit `d9a84f1`), Halogen (`0.17.0` Docker image), CIRU (commit `3cf984c`) and Strata (engine 0.1.50). Each takes 80 GB or more of a 128 GB box, so run one at a time.
 
 ### gufo
 
@@ -367,6 +367,45 @@ exec /path/to/ciru/scripts/ciru/run-server.sh "$@"
 
 - `exec` hands the PID to llama-server, so llamastash's one SIGTERM reaches the engine directly.
 - CIRU answers under its own alias (`Qwen3.8-Flash-CIRU-STRIX-IU4`) and does not check the request's `model` field. Loads in about 115 s.
+
+### Strata
+
+[Strata](https://github.com/Niko1221/Strata) runs Qwen3.8 Flash-Next with part of the experts on the GPU and the rest in RAM. Tested with release 0.2.5 (Terminal and engine 0.1.50, engine package `hip-halo`) on a Flow Z13 (Strix Halo, 128 GB) with Unsloth's UD-Q4_K_XL GGUF. The Terminal installs into your home folder, and its setup writes a run config that `strata serve` takes, so the entry needs no wrapper.
+
+```bash
+curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
+strata install -- --family unsloth --model UD-Q4_K_XL \
+  --gguf-dir /path/to/huggingface/hub/models--unsloth--Qwen3.8-Flash-Next-GGUF/snapshots/<rev>/UD-Q4_K_XL \
+  --data-dir /path/to/strata-data --context 65536 --vision no --no-browser --no-start --yes
+strata update        # the engine for this GPU, checked and test-started
+```
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: flash-next-strata
+        binary: ~/.local/bin/strata
+        args: [serve, --profile, /home/you/.local/share/strata/install/strata-unsloth-ud-q4_k_xl.json,
+               --host, "{host}", --port, "{port}", --shutdown-timeout, "30", --quiet]
+        arch: qwen4exp
+        params: 177B
+        quant: UD-Q4_K_XL
+        ctx: 65536
+        ready: /health
+        stop_grace_secs: 90
+        ready_timeout_secs: 900
+```
+
+```bash
+llamastash start flash-next-strata
+```
+
+- `--gguf-dir` uses a GGUF you already have, so setup only downloads the 5.2 GB MTP draft layer and prepares a small pack. Unsloth quants need `--family unsloth`; `--family qwen` refuses UD-Q4_K_XL. Setup recommends UD-IQ4_XS on Strix Halo.
+- The context and every engine flag live in the run config, not on argv, so the entry has no knobs. Run setup again with `--setup` to change them, or edit the JSON's `args`.
+- `strata serve` binds its port only after the model is loaded, so `/health` is a real ready check: 87 s on the first start, 59 s on the next. It does not check the request's `model` field. `llamastash stop` took 2 s and left no process behind.
+- Speed through the proxy, one request at a time, 256 output tokens, MTP on: 155 t/s prompt processing and 24.8 t/s decode at 758 prompt tokens, 375 and 28.5 at 5,307, 394 and 25.0 at 21,073.
+- Memory: setup keeps 71 GiB of experts in RAM by default (`--resident-budget-gib`) plus the 29 GB n-gram table (`--ple-io ram`). With the model loaded, `free` showed 4 GB available out of 124, and the engine logged `conversation cache off: not enough free RAM` and that it reads 30 GiB of experts from the GGUF files. Don't run another large model next to it.
 
 ## Qwen3.8 27B
 

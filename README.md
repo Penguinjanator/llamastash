@@ -195,7 +195,7 @@ backend:
 | [Lemonade](https://github.com/lemonade-sdk/lemonade) (`lemond`) | NPU and multi-engine inference behind one server                                    | [Lemonade](RECIPES.md#lemonade)                    |
 | [FastFlowLM](https://github.com/FastFlowLM/FastFlowLM) (`flm`)  | LLMs and Whisper on the AMD XDNA2 NPU                                               | [FastFlowLM](RECIPES.md#fastflowlm-amd-npu)        |
 | [ds4](https://github.com/antirez/ds4) (`ds4-server`)            | DeepSeek-V4 Flash / PRO, with MTP, DSpark, SSD streaming and disk KV cache as knobs | [DeepSeek V4](RECIPES.md#deepseek-v4)              |
-| gufo, Halogen (Docker), CIRU                                    | Qwen3.8 Flash-Next                                                                  | [Qwen3.8 Flash-Next](RECIPES.md#qwen38-flash-next) |
+| Strata, Halogen (Docker), gufo, CIRU                            | Qwen3.8 Flash-Next                                                                  | [Strata](RECIPES.md#strata), [Halogen](RECIPES.md#halogen), [gufo](RECIPES.md#gufo), [CIRU](RECIPES.md#ciru) |
 | whisper.cpp                                                     | speech to text                                                                      | [whisper.cpp](RECIPES.md#whispercpp)               |
 
 Field reference: [`docs/usage.md` § Generic backend](docs/usage.md#generic-backend). ds4 and Lemonade used to be dedicated backends; a generic entry now does the same job with the same argv and speed ([why](docs/plans/2026-10-17-002-refactor-drop-lemonade-backend-plan.md)).
