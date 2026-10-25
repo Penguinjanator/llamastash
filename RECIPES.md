@@ -4,29 +4,68 @@ Working `config.yaml` blocks for engines and models. Each one names the engine v
 
 What each field means is in [`docs/usage.md`](docs/usage.md): § [Generic backend](docs/usage.md#generic-backend) for `backend.generic.servers`, § [`presets`](docs/usage.md#llamastash-presets-model-ref-action) for preset keys and precedence. [`config.example.yaml`](config.example.yaml) has every key with a comment.
 
-| Model | Engine | Recipe |
-|---|---|---|
-| any GGUF | llama.cpp, several builds side by side | [llama.cpp builds](#llamacpp-builds) |
-| safetensors repos | vLLM, SGLang | [vLLM and SGLang](#vllm-and-sglang) |
-| Qwen3.8 Flash-Next | gufo, Halogen, CIRU, Strata | [Qwen3.8 Flash-Next](#qwen38-flash-next) |
-| Qwen3.8 27B | gufo with a DFlash2 draft | [Qwen3.8 27B](#qwen38-27b) |
-| DeepSeek V4 Flash / PRO | ds4, llama.cpp | [DeepSeek V4](#deepseek-v4) |
-| GLM 4.x, Gemma 4 | llama.cpp with MTP | [MTP models on llama.cpp](#mtp-models-on-llamacpp-glm-gemma-4) |
-| Qwen3.5 4B vision | llama.cpp on a 4 GB GPU | [Small GPU: Qwen3.5 4B vision](#small-gpu-qwen35-4b-vision) |
-| any Lemonade model | Lemonade (`lemond`) | [Lemonade](#lemonade) |
-| NPU LLMs, Whisper | FastFlowLM | [FastFlowLM (AMD NPU)](#fastflowlm-amd-npu) |
-| Whisper | whisper.cpp | [whisper.cpp](#whispercpp) |
-| Kokoro 82M (TTS) | Kokoro-FastAPI | [Kokoro-FastAPI](#kokoro-fastapi) |
-| MOSS-Image, other diffusion GGUFs | stable-diffusion.cpp (`sd-server`) | [stable-diffusion.cpp](#stable-diffusioncpp) |
-| faster-whisper + Kokoro (STT and TTS) | Speaches | [Speaches](#speaches) |
-| Whisper, Kokoro, SD (STT, TTS, image) | LocalAI | [LocalAI](#localai) |
-| Piper voices (TTS) | Piper | [Piper](#piper) |
-| Chatterbox (TTS) | Chatterbox TTS API | [Chatterbox TTS API](#chatterbox-tts-api) |
-| Kev-0.8B, Laya (decision models) | llama.cpp on CPU, own port | [Decision models (Kev, Laya)](#decision-models-kev-laya) |
-| LANCET Nano (shell command risk) | `classify.py` in Docker | [LANCET](#lancet) |
-| SD 1.5 and other ComfyUI workflows | ComfyUI | [ComfyUI](#comfyui) |
+## Index
 
-## llama.cpp builds
+Recipes are grouped by what the model does, most used type first. Inside a group, engines are ordered by GitHub stars (checked 2026-10-25). An engine that serves several types is listed under each one and links to its one recipe.
+
+**[Chat](#chat)**
+
+| Recipe | Engine | Models |
+|---|---|---|
+| [llama.cpp builds](#llamacpp-builds) | llama.cpp, several builds side by side | any GGUF |
+| [MTP models on llama.cpp](#mtp-models-on-llamacpp-glm-gemma-4) | llama.cpp with MTP | GLM 4.x, Gemma 4 |
+| [Small GPU: Qwen3.5 4B vision](#small-gpu-qwen35-4b-vision) | llama.cpp on a 4 GB GPU | Qwen3.5 4B vision |
+| [vLLM and SGLang](#vllm-and-sglang) | vLLM, SGLang | safetensors repos |
+| [Strata](#strata) | Strata | Qwen3.8 Flash-Next |
+| [DeepSeek V4](#deepseek-v4) | ds4, llama.cpp | DeepSeek V4 Flash / PRO |
+| [Lemonade](#lemonade) | Lemonade (`lemond`) | any Lemonade model |
+| [FastFlowLM (AMD NPU)](#fastflowlm-amd-npu) | FastFlowLM | NPU LLMs |
+| [Halogen](#halogen) | Halogen (Docker) | Qwen3.8 Flash-Next |
+| [gufo](#gufo) | gufo | Qwen3.8 Flash-Next, Qwen3.8 27B with a DFlash2 draft |
+| [CIRU](#ciru) | CIRU | Qwen3.8 Flash-Next |
+
+**[Image generation](#image-generation)**
+
+| Recipe | Engine | Models |
+|---|---|---|
+| [ComfyUI](#comfyui) | ComfyUI | SD 1.5 and other ComfyUI workflows |
+| [LocalAI](#localai) | LocalAI | SD 1.5 (also Whisper, Kokoro) |
+| [stable-diffusion.cpp](#stable-diffusioncpp) | `sd-server` | MOSS-Image, Krea 2, other diffusion GGUFs |
+| [Lemonade](#lemonade) | Lemonade | SD-Turbo |
+
+**[Speech to text](#speech-to-text)**
+
+| Recipe | Engine | Models |
+|---|---|---|
+| [whisper.cpp](#whispercpp) | whisper.cpp | Whisper |
+| [LocalAI](#localai) | LocalAI | Whisper |
+| [Lemonade](#lemonade) | Lemonade | Whisper |
+| [Speaches](#speaches) | Speaches | faster-whisper (also Kokoro TTS) |
+| [FastFlowLM (AMD NPU)](#fastflowlm-amd-npu) | FastFlowLM | Whisper on the NPU |
+
+**[Text to speech](#text-to-speech)**
+
+| Recipe | Engine | Models |
+|---|---|---|
+| [LocalAI](#localai) | LocalAI | Kokoro |
+| [Piper](#piper) | Piper | Piper voices |
+| [Lemonade](#lemonade) | Lemonade | Kokoro |
+| [Kokoro-FastAPI](#kokoro-fastapi) | Kokoro-FastAPI | Kokoro 82M |
+| [Speaches](#speaches) | Speaches | Kokoro |
+| [Chatterbox TTS API](#chatterbox-tts-api) | Chatterbox TTS API | Chatterbox |
+
+**[Classifiers and decision models](#classifiers-and-decision-models)**
+
+| Recipe | Engine | Models |
+|---|---|---|
+| [Decision models (Kev, Laya)](#decision-models-kev-laya) | llama.cpp on CPU, own port | Kev-0.8B, Laya |
+| [LANCET](#lancet) | `classify.py` in Docker | LANCET Nano (shell command risk) |
+
+## Chat
+
+Qwen3.8 Flash-Next runs on four engines besides llama.cpp: Strata (engine 0.1.50), Halogen (`0.17.0` Docker image), gufo (commit `d9a84f1`) and CIRU (commit `3cf984c`). Each takes 80 GB or more of a 128 GB box, so run one at a time.
+
+### llama.cpp builds
 
 llama.cpp runs every GGUF by default. List each `llama-server` build you have; the first one is the default. LlamaStash runs each with `--list-devices` at daemon start and names it after its compute type (`llamacpp-rocm`, `llamacpp-vulkan`, `llamacpp-cuda`), or `llamacpp-<name>` when you set `name:`.
 
@@ -80,7 +119,54 @@ The CPU build suits a small helper model next to a big GPU model, since it leave
 
 A Vulkan build on a host that probes as AMD or NVIDIA works. It changes the binary, not the detected host, so `init`, host metrics and UAT preflight still report `amd` / `nvidia` while the launch runs the Vulkan build.
 
-## vLLM and SGLang
+### MTP models on llama.cpp (GLM, Gemma 4)
+
+LlamaStash turns MTP on by itself on llama.cpp for a model with a draft head: an embedded one (GLM 4.x, Qwen3.5/3.6, DeepSeek) or a separate `mtp-*.gguf` next to the model (Gemma 4; `llamastash pull` fetches it with the model). See [MTP speculative decoding](docs/usage.md#mtp-speculative-decoding). Presets let you turn it off or tune the draft length per launch, which is worth measuring: on some models speculation costs more than it saves.
+
+```yaml
+presets:
+  glm4moe:                   # arch key: every GLM 4.x MoE GGUF
+    entries:
+      no-mtp:
+        knobs:
+          mtp: off
+  gemma-4-31B-*:             # glob key: every quant of Gemma 4 31B
+    entries:
+      no-mtp:
+        knobs:
+          mtp: off
+      draft-5:
+        knobs:
+          mtp-draft-n: 5     # tokens drafted per step
+```
+
+```bash
+llamastash start <gemma-4-31B model> --preset no-mtp
+```
+
+A key that names no model is read as a GGUF architecture id, so `glm4moe` covers every GGUF converted from a `Glm4MoeForCausalLM` checkpoint (the arch id comes from llama.cpp's converter, `conversion/glm.py`). The `Arch` column of `llamastash list` shows the id for your files. The GLM block has not been run on a GLM model yet.
+
+### Small GPU: Qwen3.5 4B vision
+
+Screenshot reading on a 4 GB laptop GPU (RTX 3050 Ti Laptop, CUDA build of llama.cpp). The knob values are tuned for that card.
+
+```yaml
+presets:
+  Qwen3.5-4B-Q4_K_S.gguf:
+    default: vision
+    entries:
+      vision:
+        idle_ttl_secs: 600              # unload after 10 idle minutes (proxy auto-starts only)
+        knobs:
+          ctx-size: 4096                # what fits beside the weights
+          n-gpu-layers: 99
+          cache-type-k: q8_0            # K only: a quantized V cache needs flash-attn
+          flash-attn: false             # flash-attn corrupts Qwen3.5 image embeddings
+          parallel: 1
+        extras: ["--no-mmproj-offload"] # the vision encoder wants ~4.6 GB, so it stays on the CPU
+```
+
+### vLLM and SGLang
 
 Both serve safetensors HuggingFace repos; a GGUF still runs on llama.cpp. Install steps, the container route and distro caveats are in [vLLM setup](docs/vllm-setup.md) and [SGLang setup](docs/sglang-setup.md).
 
@@ -124,55 +210,252 @@ presets:
 llamastash start Qwen/Qwen2.5-0.5B-Instruct --preset vllm-16g
 ```
 
-## Qwen3.8 Flash-Next
+### Strata
 
-Four engines besides llama.cpp: gufo (commit `d9a84f1`), Halogen (`0.17.0` Docker image), CIRU (commit `3cf984c`) and Strata (engine 0.1.50). Each takes 80 GB or more of a 128 GB box, so run one at a time.
+[Strata](https://github.com/Niko1221/Strata) runs Qwen3.8 Flash-Next with part of the experts on the GPU and the rest in RAM. Tested with release 0.2.5 (Terminal and engine 0.1.50, engine package `hip-halo`) on a Flow Z13 (Strix Halo, 128 GB) with Unsloth's UD-Q4_K_XL GGUF. The Terminal installs into your home folder, and its setup writes a run config that `strata serve` takes, so the entry needs no wrapper.
 
-### gufo
-
-A native binary that runs a catalog GGUF directly, so it uses `model` and needs no wrapper. It checks the request's `model` field, hence `--served-model-name "{name}"`, and `rewrite_model` sets that field so a request for the plain model id still reaches a named launch. Loads in about 22 s; `/ready` returns 503 until then.
+```bash
+curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
+strata install -- --family unsloth --model UD-Q4_K_XL \
+  --gguf-dir /path/to/huggingface/hub/models--unsloth--Qwen3.8-Flash-Next-GGUF/snapshots/<rev>/UD-Q4_K_XL \
+  --data-dir /path/to/strata-data --context 65536 --vision no --no-browser --no-start --yes
+strata update        # the engine for this GPU, checked and test-started
+```
 
 ```yaml
 backend:
   generic:
     servers:
-      - name: gufo                                  # server id: generic-gufo
-        model: Qwen3.8-Flash-Next-UD-Q4_K_XL        # a model id; globs work too
-        binary: /path/to/gufo/build/release/gufo
-        args: [serve, --host, "{host}", --port, "{port}", --sessions, "1", llm,
-               --served-model-name, "{name}", --model, "{model}",
-               --mtp-model, /path/to/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf,
-               --top-p, "0.95", --top-k, "20"]
-        knobs:
-          - {flag: --context, ctx: true, default: "131072"}
-          - {flag: --speculative, default: mtp}
-          - {flag: --temperature, default: "1.0"}
-          - --seed
-        ready: /ready
-        stop_grace_secs: 60
-        rewrite_model: true
-
-presets:
-  Qwen3.8-Flash-Next-*:
-    entries:
-      gufo-128k:
-        server: generic-gufo       # the preset picks the engine
-        knobs:
-          context: 131072
-          speculative: mtp
-          temperature: '1.0'
-      gufo-256k:
-        server: generic-gufo
-        knobs:
-          context: 262144
+      - name: flash-next-strata
+        binary: ~/.local/bin/strata
+        args: [serve, --profile, /home/you/.local/share/strata/install/strata-unsloth-ud-q4_k_xl.json,
+               --host, "{host}", --port, "{port}", --shutdown-timeout, "30", --quiet]
+        arch: qwen4exp
+        params: 177B
+        quant: UD-Q4_K_XL
+        ctx: 65536
+        ready: /health
+        stop_grace_secs: 90
+        ready_timeout_secs: 900
 ```
 
 ```bash
-llamastash start Qwen3.8-Flash-Next-UD-Q4_K_XL --preset gufo-256k
-llamastash start Qwen3.8-Flash-Next-UD-Q4_K_XL --server generic-gufo -- --seed 7
+llamastash start flash-next-strata
 ```
 
-llama.cpp stays the default server for the GGUF. Add `default: gufo-128k` under the preset key to run gufo on a plain `start` and on proxy requests too.
+- `--gguf-dir` uses a GGUF you already have, so setup only downloads the 5.2 GB MTP draft layer and prepares a small pack. Unsloth quants need `--family unsloth`; `--family qwen` refuses UD-Q4_K_XL. Setup recommends UD-IQ4_XS on Strix Halo.
+- The context and every engine flag live in the run config, not on argv, so the entry has no knobs. Run setup again with `--setup` to change them, or edit the JSON's `args`.
+- `strata serve` binds its port only after the model is loaded, so `/health` is a real ready check: 87 s on the first start, 59 s on the next. It does not check the request's `model` field. `llamastash stop` took 2 s and left no process behind.
+- Speed through the proxy, one request at a time, 256 output tokens, MTP on: 155 t/s prompt processing and 24.8 t/s decode at 758 prompt tokens, 375 and 28.5 at 5,307, 394 and 25.0 at 21,073.
+- Memory: setup keeps 71 GiB of experts in RAM by default (`--resident-budget-gib`) plus the 29 GB n-gram table (`--ple-io ram`). With the model loaded, `free` showed 4 GB available out of 124, and the engine logged `conversation cache off: not enough free RAM` and that it reads 30 GiB of experts from the GGUF files. Don't run another large model next to it.
+
+### DeepSeek V4
+
+[ds4](https://github.com/antirez/ds4) (antirez's DwarfStar) runs the DeepSeek-V4 Flash/PRO GGUFs from [huggingface.co/antirez/deepseek-v4-gguf](https://huggingface.co/antirez/deepseek-v4-gguf) through its `ds4-server` binary. It was a dedicated backend up to 0.4.0. It's now a generic server entry, which gives the same argv, readiness and speed (13.2 t/s both ways with ds4 `0aaea5a` and the Flash IQ2_XXS `0731` GGUF). You build `ds4-server` yourself (`git clone https://github.com/antirez/ds4 && cd ds4 && make`). llama.cpp runs these GGUFs too, from **b9840** on, and stays their default server.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: ds4                                   # server id: generic-ds4
+        model: "DeepSeek-V4-*"
+        binary: /path/to/ds4/ds4-server
+        args: [-m, "{model}", --host, "{host}", --port, "{port}"]
+        ready: /v1/models            # ds4-server binds its port only after the load
+        knobs:
+          - {flag: --ctx, id: ds4-ctx, ctx: true}
+          - --power
+          - --tokens
+          - {flag: --threads, id: ds4-threads}
+          - --kv-disk-dir
+          - --kv-disk-space-mb
+          - {flag: --ssd-streaming, switch: true}
+          - --ssd-streaming-cache-experts
+          - --ssd-streaming-preload-experts
+          - {flag: --ssd-streaming-cold, switch: true}
+          - {flag: --warm-weights, switch: true}
+          - {flag: --quality, switch: true}
+          - {flag: --mtp, id: mtp-model}
+          - {flag: --mtp-draft, id: ds4-mtp-draft}
+          - --mtp-margin
+          - {flag: --dspark, switch: true}
+          - --dspark-confidence
+          - {flag: --dspark-strict, switch: true}
+
+presets:
+  DeepSeek-V4-Flash-*-0731.gguf:
+    default: ds4-mtp
+    entries:
+      ds4:
+        server: generic-ds4
+      ds4-mtp:
+        server: generic-ds4
+        knobs:
+          mtp-model: /path/to/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
+      ds4-dspark:
+        server: generic-ds4
+        knobs:
+          dspark: true
+          mtp-model: /path/to/DeepSeek-V4-Flash-DSpark-support-0731.gguf
+```
+
+```bash
+llamastash start DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731 --ctx 32768
+llamastash start DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731 --preset ds4-dspark
+```
+
+The knob ids match the old backend's, so presets keep working. The exceptions are `ds4-ctx`, `ds4-threads` and `ds4-mtp-draft`, because `ctx`, `threads` and `mtp-draft-n` are built-in llama.cpp ids. `--ctx` still sets the context window. Any other `ds4-server` flag goes in the extras tail after `--`. `ds4-dspark` needs both `dspark` and `mtp-model`; read the caveats in [DSpark speculative decoding](docs/usage.md#dspark-speculative-decoding) before you rely on it.
+
+**Migrating from the ds4 backend.** A config that still has `backend.ds4:` is rejected at load, and the error points here.
+
+1. Stop every running ds4 model (`llamastash stop <model>`) **before** you upgrade. The new daemon can't re-adopt a `ds4-server` the old backend started: it keeps running and holds its port and memory, but `status` doesn't list it and `stop` can't reach it. If one is left over, find it with `pgrep -a ds4-server` and `kill` its PID.
+2. Delete the `backend.ds4:` block, and drop `--ds4` / `LLAMASTASH_DS4` from your scripts.
+3. Add the `generic` entry above, with `binary` set to your `ds4-server`.
+4. In your ds4 presets, replace `backend: ds4` with `server: generic-ds4`. llama.cpp is now the default server for these GGUFs, so a preset or `--server generic-ds4` picks ds4. A leftover `backend: ds4` with no `server:` doesn't fail: it runs the model on llama.cpp. The same goes for the remembered last launch of a ds4 model, until you launch it once with `--server generic-ds4`.
+5. Set `mtp-model` in a preset to pair a draft head. The old backend found the MTP or DSpark file next to the model on its own; a generic entry doesn't.
+6. Run `llamastash daemon restart`.
+
+What the dedicated backend did that the generic entry doesn't:
+
+- **No automatic routing or fallback.** A DeepSeek-V4 GGUF defaults to llama.cpp. llama.cpp runs these files from **b9840** on ([ggml-org/llama.cpp#24162](https://github.com/ggml-org/llama.cpp/pull/24162)); an older `llama-server` fails with `unknown model architecture: 'deepseek4'`.
+- **No automatic SSD streaming.** Set `ssd-streaming: true` yourself on a box below the memory floor (about 128 GB on CUDA/ROCm, 96 GB on Metal). The admission check still sizes the launch from the GGUF, so a streaming launch that doesn't fit needs `start --force`.
+- **No MTP and streaming reconciliation.** `ds4-server` refuses `--ssd-streaming` together with `--mtp` after the full model load, so don't set both.
+- **No split-half guard.** The PRO `*-Layers00-30.gguf` / `*-Layers-31-output.gguf` halves are for ds4's distributed mode; launch a single-file GGUF instead.
+
+Two `ds4-server` behaviors to know about. Its `/v1/models` always lists both `deepseek-v4-flash` and `deepseek-v4-pro`, whatever is loaded; chat requests echo back the `model` you send, so no `rewrite_model` is needed. And `--kv-disk-dir` is ds4's own persistent cache: it holds conversation data under ds4's permissions at exactly the path you give, so point it at a private directory.
+
+### Lemonade
+
+[Lemonade](https://github.com/lemonade-sdk/lemonade) runs one long-lived `lemond` that serves every model it has downloaded and loads each one on the first request that names it. Written for `lemond` 2026.42.1 with its `llamacpp:rocm` backend (b11395) and `unsloth/Qwen3-0.6B-GGUF`.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: lemonade                              # server id: generic-lemonade
+        binary: /usr/bin/lemond
+        args: ["--port", "{port}", "--host", "{host}", "--no-broadcast",
+               "--log-file", "disabled"]
+        ready: /live
+        ready_timeout_secs: 90
+        stop_grace_secs: 20                         # lemond needs ~6 s to exit on SIGTERM
+        memory_gib: 1
+
+proxy:
+  aliases:
+    Qwen3-0.6B-GGUF: lemonade                      # one alias per Lemonade model you name
+```
+
+`lemond` picks its own port for nothing and takes the one llamastash reserves, so it publishes one row (`lemonade`) no client can send as `body.model`. The alias is what clients use, and the alias string survives into the forwarded body, which is how `lemond` finds the model: `curl :11435/v1/chat/completions -d '{"model":"Qwen3-0.6B-GGUF",...}'` came back in 1.9 s (cold, including Lemonade's own model load) at 103 t/s, and auto-start through the alias works. `GET http://127.0.0.1:13305/api/v1/models?show_all=true` lists every name the engine will accept (179 on 2026.42.1). `stop_grace_secs` is not decoration: `lemond` takes about 6 s to exit, over the 5 s default grace.
+
+What one entry does not do:
+
+- **The model list is not the catalog.** LlamaStash shows one `lemonade` row, not Lemonade's models. Each name a client should use needs its own `proxy.aliases` line, and nothing warns you when an alias names a model Lemonade does not have.
+- **One launch, one umbrella, every model inside it.** `stop` takes the umbrella down (about 4.7 s), not one model. Two launched models means two `lemond` processes at about 38 MB each idle, and no shared residency.
+- **No context control.** `lemond` takes context as the `ctx_size` field of its `POST /api/v1/load`, which argv cannot reach. You get whatever `~/.config/lemonade/config.json` says, and `--ctx` on a generic entry does nothing here.
+- **`lemond`'s own children show up as `external`.** The `llama-server` it spawns appears in `status` as an unmanaged row.
+
+**Audio and image models.** `lemond` also serves `/v1/audio/transcriptions`, `/v1/audio/speech` and `/v1/images/generations`. Tested with the embeddable `lemond` 2026.43.3 (`lemonade-embeddable-2026.43.3-ubuntu-x64.tar.gz`) on an RTX 3050 Ti, after `lemonade backends install whispercpp:cpu kokoro:cpu sd-cpp:cuda` (one per command) and `lemonade pull Whisper-Tiny`, `kokoro-v1`, `SD-Turbo-GGUF`. List the media modes next to `chat`, since `modes` replaces the default list:
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: lemonade
+        binary: /path/to/lemonade-embeddable-2026.43.3-ubuntu-x64/lemond
+        args: ["--port", "{port}", "--host", "{host}", "--no-broadcast", "--log-file", "disabled"]
+        env: {HF_HOME: /path/to/huggingface}   # where lemonade pull put the models
+        ready: /live
+        ready_timeout_secs: 90
+        stop_grace_secs: 20
+        modes: [chat, stt, tts, image]
+        memory_gib: 1
+
+proxy:
+  aliases:
+    Whisper-Tiny: lemonade
+    kokoro-v1: lemonade
+    SD-Turbo-GGUF: lemonade
+```
+
+`Whisper-Tiny` returned the JFK sample's text, `kokoro-v1` returned a WAV that transcribed back to its input, and `SD-Turbo-GGUF` returned a 512x512 PNG, each auto-starting `lemond` through its alias. Two things to know: llamastash removes `HF_*` variables from every engine's environment, so `lemond` looks in `~/.cache/huggingface` unless the entry sets `HF_HOME`; and an entry whose name matches an alias with different case (`whisper-tiny` next to `Whisper-Tiny: lemonade`) takes the request, because names win over aliases.
+
+### FastFlowLM (AMD NPU)
+
+[FastFlowLM](https://github.com/ROCm/FastFlowLM) (`flm`) runs LLMs, Whisper ASR and embedding models on AMD XDNA2 NPUs. It speaks the OpenAI shape, so it needs no dedicated backend. Written for `flm` v1.0.9 (portable `fastflowlm_1.0.9_linux.tar.gz`) on Linux 7.2.10 with the in-tree `amdxdna` driver, NPU firmware 1.1.2.65 and `xrt` + `xrt-plugin-amdxdna`. `flm validate` should pass before you add the entry.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: "qwen3:0.6b"                          # the name must be flm's own model tag
+        binary: ~/.local/opt/fastflowlm/flm
+        args: [serve, "{name}", --host, "{host}", -p, "{port}", --cors, "0"]
+        ready: /v1/version          # flm serves no /health; it loads before it binds
+        ready_timeout_secs: 180
+        stop_grace_secs: 20
+        memory_gib: 2
+        arch: qwen3
+        params: 0.6B
+        quant: q4nx
+        ctx: 32768
+        modes: [chat]
+        knobs:
+          - {flag: --ctx-len, id: ctx-len, ctx: true, default: "32768"}
+          - {flag: --pmode, default: performance}    # powersaver | balanced | performance | turbo
+```
+
+The `name` is the load-bearing line. FLM switches models on the `model` field of a request and the proxy forwards that field unchanged, so the row id has to be the engine's tag: an entry called `flm-qwen3-06b` got `{"error":"Failed to load flm-qwen3-06b model!"}`, and naming it `qwen3:0.6b` (with `{name}` in `args`, so the tag is written once) works. Verified: 82.9 t/s decode for `qwen3:0.6b` on the NPU through the proxy, 0.66 s round trip, `--ctx 8192` reaching the child as `--ctx-len 8192` through the `ctx: true` knob.
+
+To carry every tag you have downloaded rather than one, mint the rows from FLM's own store and drop the per-model blocks:
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: flm
+        binary: ~/.local/opt/fastflowlm/flm
+        args: [serve, "{name}", --host, "{host}", -p, "{port}", --cors, "0"]
+        ready: /v1/version
+        ready_timeout_secs: 180
+        stop_grace_secs: 20
+        modes: [chat]
+        rows_from:
+          command: [~/.local/opt/fastflowlm/flm, list, --filter, installed, --json]
+          items: models
+          name: model
+          when: {path: label, contains: reasoning}   # reasoning LLMs; see the note below
+          arch: details.family
+          params: details.parameter_size
+          quant: details.quantization_level
+          ctx: default_context_length
+          memory_gib: footprint
+        knobs:
+          - {flag: --ctx-len, id: ctx-len, ctx: true}
+          - {flag: --pmode, default: performance}    # powersaver | balanced | performance | turbo
+```
+
+After `llamastash daemon restart` the catalog lists `qwen3:0.6b` and every other installed tag FLM labels `reasoning`, each with its own arch, params, quant, context and footprint, and each one starts and answers by name with no `proxy.aliases` line. The `--ctx-len` knob declares no default, so each model starts with the context FLM's listing gives it (`default_context_length`, 32768 for `qwen3:0.6b`), and `--ctx` reaches FLM because that knob carries `ctx: true`; drop the knob and `--ctx` is accepted but goes nowhere (the launch's `params.ctx` never changes), the minted context is only a display value. Pick the filter by what FLM actually labels: on v1.0.9 the reasoning filter keeps the reasoning models and drops audio, but it also drops every LLM FLM labels something else or nothing at all (on v1.0.9: gemma3:4b, qwen3-it:4b, qwen3vl-it:4b and 6 more labelled tags, plus gemma3:1b, llama3.1, llama3.2, lfm2, phi4-mini and qwen2.5-it which carry no label), while `when: installed` keeps everything installed including whisper. There is no "not" filter, so a filter that means "LLMs only" has to name what you want. See [Minting rows from an engine's own listing](docs/usage.md#minting-rows-from-an-engines-own-listing).
+
+ASR and embedding are separate processes, one NPU model per type: `flm serve --asr 1` (or `-e 1`) takes no model tag and answers `POST /v1/audio/transcriptions`. Give that entry `modes: [stt]` (an embedding one `modes: [embedding]`) and the proxy forwards the route to it, upload included, so its clients post to the proxy rather than the launch port `llamastash status` shows. FLM also answers the Ollama shapes (`/api/tags`, `/api/chat`, `/api/generate`, `/api/ps`, `/api/npu/status`) on the same port.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: whisper-npu
+        binary: ~/.local/opt/fastflowlm/flm
+        args: [serve, --asr, "1", --host, "{host}", -p, "{port}", --cors, "0"]
+        ready: /v1/version
+        ready_timeout_secs: 180
+        stop_grace_secs: 20
+        memory_gib: 2
+        modes: [stt]
+```
+
+Verified on `flm` v1.0.10 with `Whisper-V3-Turbo-NPU2` on the NPU: an 11 s speech clip posted to the proxy came back with the right words in 2.8 s TTFB (3.8 s total), addressed by the entry name, by a `proxy.aliases` name (`whisper-1: whisper-npu`, logged as `alias` in `requests`), and by a name nothing answers to, which the mode fallback stamps `x-llamastash-served-by: whisper-npu` and `x-llamastash-fallback-reason: mode_match`. FLM echoes whatever `model` the request sent. `/v1/audio/translations` is a 404 from FLM itself: it serves transcriptions only.
+
+Three FLM notes: `/v1/models` lists FLM's whole model list, not what you downloaded; a request for a tag you do not have makes FLM try to download it; and its speed lands in `usage.decoding_speed_tps` and `usage.prefill_speed_tps`, which the request log reads, so `llamastash requests` shows FLM's own numbers rather than an estimate.
 
 ### Halogen
 
@@ -330,6 +613,85 @@ proxy:
 - An alias names a model, so all the aliases above reach the one running Halogen launch.
 - Optional wrapper lines: `-e HALOGEN_CACHE_DIR=/cache` with a mounted directory keeps the prompt cache across restarts (needs a filesystem that accepts direct I/O, so not tmpfs), and `-e HALOGEN_FORK=1 -e HALOGEN_FORK_MAP=auto` starts each next turn from where the reply ended instead of reading the reply back in (0.18.3+). `-e HALOGEN_VISION_TOWER=1` loads `qwen38-flash-next-vision.hgn` from beside the checkpoint; add `vision: true` to the entry with it.
 
+### gufo
+
+A native binary that runs a catalog GGUF directly, so it uses `model` and needs no wrapper. It checks the request's `model` field, hence `--served-model-name "{name}"`, and `rewrite_model` sets that field so a request for the plain model id still reaches a named launch. Loads in about 22 s; `/ready` returns 503 until then.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: gufo                                  # server id: generic-gufo
+        model: Qwen3.8-Flash-Next-UD-Q4_K_XL        # a model id; globs work too
+        binary: /path/to/gufo/build/release/gufo
+        args: [serve, --host, "{host}", --port, "{port}", --sessions, "1", llm,
+               --served-model-name, "{name}", --model, "{model}",
+               --mtp-model, /path/to/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf,
+               --top-p, "0.95", --top-k, "20"]
+        knobs:
+          - {flag: --context, ctx: true, default: "131072"}
+          - {flag: --speculative, default: mtp}
+          - {flag: --temperature, default: "1.0"}
+          - --seed
+        ready: /ready
+        stop_grace_secs: 60
+        rewrite_model: true
+
+presets:
+  Qwen3.8-Flash-Next-*:
+    entries:
+      gufo-128k:
+        server: generic-gufo       # the preset picks the engine
+        knobs:
+          context: 131072
+          speculative: mtp
+          temperature: '1.0'
+      gufo-256k:
+        server: generic-gufo
+        knobs:
+          context: 262144
+```
+
+```bash
+llamastash start Qwen3.8-Flash-Next-UD-Q4_K_XL --preset gufo-256k
+llamastash start Qwen3.8-Flash-Next-UD-Q4_K_XL --server generic-gufo -- --seed 7
+```
+
+llama.cpp stays the default server for the GGUF. Add `default: gufo-128k` under the preset key to run gufo on a plain `start` and on proxy requests too.
+
+#### Qwen3.8 27B
+
+A ROCm build of gufo runs the 27B GGUF with z-lab's DFlash2 draft model. Without `default:` in the preset, llama.cpp stays the default server for this GGUF.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: gufo-27b                              # server id: generic-gufo-27b
+        model: Qwen3.8-27B-UD-Q6_K
+        binary: /path/to/gufo/build/release/gufo
+        args: [serve, --host, "{host}", --port, "{port}", --sessions, "1", llm,
+               --served-model-name, "{name}", --model, "{model}",
+               --speculative, dflash2,
+               --dflash-model, /path/to/Qwen3.8-27B-DFlash2-Q4_K_M.gguf,
+               --top-p, "0.95", --top-k, "20"]
+        knobs:
+          - {flag: --context, ctx: true, default: "131072"}
+          - {flag: --temperature, default: "1.0"}
+          - --seed
+        ready: /ready
+        stop_grace_secs: 60
+        rewrite_model: true
+
+presets:
+  Qwen3.8-27B-UD-Q6_K.gguf:
+    entries:
+      gufo-256k:
+        server: generic-gufo-27b
+        knobs:
+          context: 262144
+```
+
 ### CIRU
 
 A `run-server.sh` launcher configured by env vars that `exec`s its own llama-server build and passes extra args through. The wrapper exports the fixed variables; per-launch values go in the entry's `env`.
@@ -368,408 +730,46 @@ exec /path/to/ciru/scripts/ciru/run-server.sh "$@"
 - `exec` hands the PID to llama-server, so llamastash's one SIGTERM reaches the engine directly.
 - CIRU answers under its own alias (`Qwen3.8-Flash-CIRU-STRIX-IU4`) and does not check the request's `model` field. Loads in about 115 s.
 
-### Strata
+## Image generation
 
-[Strata](https://github.com/Niko1221/Strata) runs Qwen3.8 Flash-Next with part of the experts on the GPU and the rest in RAM. Tested with release 0.2.5 (Terminal and engine 0.1.50, engine package `hip-halo`) on a Flow Z13 (Strix Halo, 128 GB) with Unsloth's UD-Q4_K_XL GGUF. The Terminal installs into your home folder, and its setup writes a run config that `strata serve` takes, so the entry needs no wrapper.
+### ComfyUI
 
-```bash
-curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
-strata install -- --family unsloth --model UD-Q4_K_XL \
-  --gguf-dir /path/to/huggingface/hub/models--unsloth--Qwen3.8-Flash-Next-GGUF/snapshots/<rev>/UD-Q4_K_XL \
-  --data-dir /path/to/strata-data --context 65536 --vision no --no-browser --no-start --yes
-strata update        # the engine for this GPU, checked and test-started
-```
+[ComfyUI](https://github.com/Comfy-Org/ComfyUI) v0.42.1 has its own API: a workflow is posted to `/prompt`, its result read from `/history/<id>`, and the image fetched from `/view`. Tested on an RTX 3050 Ti with SD 1.5 (`v1-5-pruned-emaonly-fp16.safetensors` in `models/checkpoints`), installed into a venv with the CUDA 12.8 torch wheels and `requirements.txt`.
 
 ```yaml
 backend:
   generic:
     servers:
-      - name: flash-next-strata
-        binary: ~/.local/bin/strata
-        args: [serve, --profile, /home/you/.local/share/strata/install/strata-unsloth-ud-q4_k_xl.json,
-               --host, "{host}", --port, "{port}", --shutdown-timeout, "30", --quiet]
-        arch: qwen4exp
-        params: 177B
-        quant: UD-Q4_K_XL
-        ctx: 65536
-        ready: /health
-        stop_grace_secs: 90
-        ready_timeout_secs: 900
+      - name: comfyui
+        binary: /path/to/ComfyUI/.venv/bin/python
+        args: [/path/to/ComfyUI/main.py, --listen, "{host}", --port, "{port}"]
+        ready: /system_stats
+        routes: [/prompt, /history, /view, /upload, /object_info, /queue, /system_stats]
+        memory_gib: 4
+        ready_timeout_secs: 300
 ```
 
-```bash
-llamastash start flash-next-strata
-```
+`GET :11435/system_stats` auto-started it, and a 20-step SD 1.5 workflow posted to `/prompt` finished in 15 s, with the PNG fetched through `/view`. Paths that are not declared (`/extensions`, `/internal/logs`) get the proxy's 404, and so does ComfyUI's `/api/...` spelling, because `/api` belongs to the proxy's Ollama surface. ComfyUI's progress WebSocket (`/ws`) cannot ride the proxy; poll `/history` instead.
 
-- `--gguf-dir` uses a GGUF you already have, so setup only downloads the 5.2 GB MTP draft layer and prepares a small pack. Unsloth quants need `--family unsloth`; `--family qwen` refuses UD-Q4_K_XL. Setup recommends UD-IQ4_XS on Strix Halo.
-- The context and every engine flag live in the run config, not on argv, so the entry has no knobs. Run setup again with `--setup` to change them, or edit the JSON's `args`.
-- `strata serve` binds its port only after the model is loaded, so `/health` is a real ready check: 87 s on the first start, 59 s on the next. It does not check the request's `model` field. `llamastash stop` took 2 s and left no process behind.
-- Speed through the proxy, one request at a time, 256 output tokens, MTP on: 155 t/s prompt processing and 24.8 t/s decode at 758 prompt tokens, 375 and 28.5 at 5,307, 394 and 25.0 at 21,073.
-- Memory: setup keeps 71 GiB of experts in RAM by default (`--resident-budget-gib`) plus the 29 GB n-gram table (`--ple-io ram`). With the model loaded, `free` showed 4 GB available out of 124, and the engine logged `conversation cache off: not enough free RAM` and that it reads 30 GiB of experts from the GGUF files. Don't run another large model next to it.
+### LocalAI
 
-## Qwen3.8 27B
-
-A ROCm build of gufo runs the 27B GGUF with z-lab's DFlash2 draft model. Without `default:` in the preset, llama.cpp stays the default server for this GGUF.
+[LocalAI](https://github.com/mudler/LocalAI) is itself a model manager: one binary that loads many models on demand. Under llamastash it is one entry with every model inside it, so llamastash cannot account for what LocalAI loads. Tested with the `local-ai-v4.12.1-linux-amd64` release binary on an RTX 3050 Ti, which LocalAI treated as CPU-only (`VRAM is less than 4GB, defaulting to CPU`), after `mkdir backends` and `local-ai models install localai@whisper-base-q5_1` (and `localai@kokoro`, `localai@sd-1.5-ggml`).
 
 ```yaml
 backend:
   generic:
     servers:
-      - name: gufo-27b                              # server id: generic-gufo-27b
-        model: Qwen3.8-27B-UD-Q6_K
-        binary: /path/to/gufo/build/release/gufo
-        args: [serve, --host, "{host}", --port, "{port}", --sessions, "1", llm,
-               --served-model-name, "{name}", --model, "{model}",
-               --speculative, dflash2,
-               --dflash-model, /path/to/Qwen3.8-27B-DFlash2-Q4_K_M.gguf,
-               --top-p, "0.95", --top-k, "20"]
-        knobs:
-          - {flag: --context, ctx: true, default: "131072"}
-          - {flag: --temperature, default: "1.0"}
-          - --seed
-        ready: /ready
-        stop_grace_secs: 60
-        rewrite_model: true
-
-presets:
-  Qwen3.8-27B-UD-Q6_K.gguf:
-    entries:
-      gufo-256k:
-        server: generic-gufo-27b
-        knobs:
-          context: 262144
-```
-
-## DeepSeek V4
-
-[ds4](https://github.com/antirez/ds4) (antirez's DwarfStar) runs the DeepSeek-V4 Flash/PRO GGUFs from [huggingface.co/antirez/deepseek-v4-gguf](https://huggingface.co/antirez/deepseek-v4-gguf) through its `ds4-server` binary. It was a dedicated backend up to 0.4.0. It's now a generic server entry, which gives the same argv, readiness and speed (13.2 t/s both ways with ds4 `0aaea5a` and the Flash IQ2_XXS `0731` GGUF). You build `ds4-server` yourself (`git clone https://github.com/antirez/ds4 && cd ds4 && make`). llama.cpp runs these GGUFs too, from **b9840** on, and stays their default server.
-
-```yaml
-backend:
-  generic:
-    servers:
-      - name: ds4                                   # server id: generic-ds4
-        model: "DeepSeek-V4-*"
-        binary: /path/to/ds4/ds4-server
-        args: [-m, "{model}", --host, "{host}", --port, "{port}"]
-        ready: /v1/models            # ds4-server binds its port only after the load
-        knobs:
-          - {flag: --ctx, id: ds4-ctx, ctx: true}
-          - --power
-          - --tokens
-          - {flag: --threads, id: ds4-threads}
-          - --kv-disk-dir
-          - --kv-disk-space-mb
-          - {flag: --ssd-streaming, switch: true}
-          - --ssd-streaming-cache-experts
-          - --ssd-streaming-preload-experts
-          - {flag: --ssd-streaming-cold, switch: true}
-          - {flag: --warm-weights, switch: true}
-          - {flag: --quality, switch: true}
-          - {flag: --mtp, id: mtp-model}
-          - {flag: --mtp-draft, id: ds4-mtp-draft}
-          - --mtp-margin
-          - {flag: --dspark, switch: true}
-          - --dspark-confidence
-          - {flag: --dspark-strict, switch: true}
-
-presets:
-  DeepSeek-V4-Flash-*-0731.gguf:
-    default: ds4-mtp
-    entries:
-      ds4:
-        server: generic-ds4
-      ds4-mtp:
-        server: generic-ds4
-        knobs:
-          mtp-model: /path/to/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
-      ds4-dspark:
-        server: generic-ds4
-        knobs:
-          dspark: true
-          mtp-model: /path/to/DeepSeek-V4-Flash-DSpark-support-0731.gguf
-```
-
-```bash
-llamastash start DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731 --ctx 32768
-llamastash start DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731 --preset ds4-dspark
-```
-
-The knob ids match the old backend's, so presets keep working. The exceptions are `ds4-ctx`, `ds4-threads` and `ds4-mtp-draft`, because `ctx`, `threads` and `mtp-draft-n` are built-in llama.cpp ids. `--ctx` still sets the context window. Any other `ds4-server` flag goes in the extras tail after `--`. `ds4-dspark` needs both `dspark` and `mtp-model`; read the caveats in [DSpark speculative decoding](docs/usage.md#dspark-speculative-decoding) before you rely on it.
-
-**Migrating from the ds4 backend.** A config that still has `backend.ds4:` is rejected at load, and the error points here.
-
-1. Stop every running ds4 model (`llamastash stop <model>`) **before** you upgrade. The new daemon can't re-adopt a `ds4-server` the old backend started: it keeps running and holds its port and memory, but `status` doesn't list it and `stop` can't reach it. If one is left over, find it with `pgrep -a ds4-server` and `kill` its PID.
-2. Delete the `backend.ds4:` block, and drop `--ds4` / `LLAMASTASH_DS4` from your scripts.
-3. Add the `generic` entry above, with `binary` set to your `ds4-server`.
-4. In your ds4 presets, replace `backend: ds4` with `server: generic-ds4`. llama.cpp is now the default server for these GGUFs, so a preset or `--server generic-ds4` picks ds4. A leftover `backend: ds4` with no `server:` doesn't fail: it runs the model on llama.cpp. The same goes for the remembered last launch of a ds4 model, until you launch it once with `--server generic-ds4`.
-5. Set `mtp-model` in a preset to pair a draft head. The old backend found the MTP or DSpark file next to the model on its own; a generic entry doesn't.
-6. Run `llamastash daemon restart`.
-
-What the dedicated backend did that the generic entry doesn't:
-
-- **No automatic routing or fallback.** A DeepSeek-V4 GGUF defaults to llama.cpp. llama.cpp runs these files from **b9840** on ([ggml-org/llama.cpp#24162](https://github.com/ggml-org/llama.cpp/pull/24162)); an older `llama-server` fails with `unknown model architecture: 'deepseek4'`.
-- **No automatic SSD streaming.** Set `ssd-streaming: true` yourself on a box below the memory floor (about 128 GB on CUDA/ROCm, 96 GB on Metal). The admission check still sizes the launch from the GGUF, so a streaming launch that doesn't fit needs `start --force`.
-- **No MTP and streaming reconciliation.** `ds4-server` refuses `--ssd-streaming` together with `--mtp` after the full model load, so don't set both.
-- **No split-half guard.** The PRO `*-Layers00-30.gguf` / `*-Layers-31-output.gguf` halves are for ds4's distributed mode; launch a single-file GGUF instead.
-
-Two `ds4-server` behaviors to know about. Its `/v1/models` always lists both `deepseek-v4-flash` and `deepseek-v4-pro`, whatever is loaded; chat requests echo back the `model` you send, so no `rewrite_model` is needed. And `--kv-disk-dir` is ds4's own persistent cache: it holds conversation data under ds4's permissions at exactly the path you give, so point it at a private directory.
-
-## MTP models on llama.cpp (GLM, Gemma 4)
-
-LlamaStash turns MTP on by itself on llama.cpp for a model with a draft head: an embedded one (GLM 4.x, Qwen3.5/3.6, DeepSeek) or a separate `mtp-*.gguf` next to the model (Gemma 4; `llamastash pull` fetches it with the model). See [MTP speculative decoding](docs/usage.md#mtp-speculative-decoding). Presets let you turn it off or tune the draft length per launch, which is worth measuring: on some models speculation costs more than it saves.
-
-```yaml
-presets:
-  glm4moe:                   # arch key: every GLM 4.x MoE GGUF
-    entries:
-      no-mtp:
-        knobs:
-          mtp: off
-  gemma-4-31B-*:             # glob key: every quant of Gemma 4 31B
-    entries:
-      no-mtp:
-        knobs:
-          mtp: off
-      draft-5:
-        knobs:
-          mtp-draft-n: 5     # tokens drafted per step
-```
-
-```bash
-llamastash start <gemma-4-31B model> --preset no-mtp
-```
-
-A key that names no model is read as a GGUF architecture id, so `glm4moe` covers every GGUF converted from a `Glm4MoeForCausalLM` checkpoint (the arch id comes from llama.cpp's converter, `conversion/glm.py`). The `Arch` column of `llamastash list` shows the id for your files. The GLM block has not been run on a GLM model yet.
-
-## Small GPU: Qwen3.5 4B vision
-
-Screenshot reading on a 4 GB laptop GPU (RTX 3050 Ti Laptop, CUDA build of llama.cpp). The knob values are tuned for that card.
-
-```yaml
-presets:
-  Qwen3.5-4B-Q4_K_S.gguf:
-    default: vision
-    entries:
-      vision:
-        idle_ttl_secs: 600              # unload after 10 idle minutes (proxy auto-starts only)
-        knobs:
-          ctx-size: 4096                # what fits beside the weights
-          n-gpu-layers: 99
-          cache-type-k: q8_0            # K only: a quantized V cache needs flash-attn
-          flash-attn: false             # flash-attn corrupts Qwen3.5 image embeddings
-          parallel: 1
-        extras: ["--no-mmproj-offload"] # the vision encoder wants ~4.6 GB, so it stays on the CPU
-```
-
-## Other engines
-
-### Lemonade
-
-[Lemonade](https://github.com/lemonade-sdk/lemonade) runs one long-lived `lemond` that serves every model it has downloaded and loads each one on the first request that names it. Written for `lemond` 2026.42.1 with its `llamacpp:rocm` backend (b11395) and `unsloth/Qwen3-0.6B-GGUF`.
-
-```yaml
-backend:
-  generic:
-    servers:
-      - name: lemonade                              # server id: generic-lemonade
-        binary: /usr/bin/lemond
-        args: ["--port", "{port}", "--host", "{host}", "--no-broadcast",
-               "--log-file", "disabled"]
-        ready: /live
-        ready_timeout_secs: 90
-        stop_grace_secs: 20                         # lemond needs ~6 s to exit on SIGTERM
-        memory_gib: 1
-
-proxy:
-  aliases:
-    Qwen3-0.6B-GGUF: lemonade                      # one alias per Lemonade model you name
-```
-
-`lemond` picks its own port for nothing and takes the one llamastash reserves, so it publishes one row (`lemonade`) no client can send as `body.model`. The alias is what clients use, and the alias string survives into the forwarded body, which is how `lemond` finds the model: `curl :11435/v1/chat/completions -d '{"model":"Qwen3-0.6B-GGUF",...}'` came back in 1.9 s (cold, including Lemonade's own model load) at 103 t/s, and auto-start through the alias works. `GET http://127.0.0.1:13305/api/v1/models?show_all=true` lists every name the engine will accept (179 on 2026.42.1). `stop_grace_secs` is not decoration: `lemond` takes about 6 s to exit, over the 5 s default grace.
-
-What one entry does not do:
-
-- **The model list is not the catalog.** LlamaStash shows one `lemonade` row, not Lemonade's models. Each name a client should use needs its own `proxy.aliases` line, and nothing warns you when an alias names a model Lemonade does not have.
-- **One launch, one umbrella, every model inside it.** `stop` takes the umbrella down (about 4.7 s), not one model. Two launched models means two `lemond` processes at about 38 MB each idle, and no shared residency.
-- **No context control.** `lemond` takes context as the `ctx_size` field of its `POST /api/v1/load`, which argv cannot reach. You get whatever `~/.config/lemonade/config.json` says, and `--ctx` on a generic entry does nothing here.
-- **`lemond`'s own children show up as `external`.** The `llama-server` it spawns appears in `status` as an unmanaged row.
-
-**Audio and image models.** `lemond` also serves `/v1/audio/transcriptions`, `/v1/audio/speech` and `/v1/images/generations`. Tested with the embeddable `lemond` 2026.43.3 (`lemonade-embeddable-2026.43.3-ubuntu-x64.tar.gz`) on an RTX 3050 Ti, after `lemonade backends install whispercpp:cpu kokoro:cpu sd-cpp:cuda` (one per command) and `lemonade pull Whisper-Tiny`, `kokoro-v1`, `SD-Turbo-GGUF`. List the media modes next to `chat`, since `modes` replaces the default list:
-
-```yaml
-backend:
-  generic:
-    servers:
-      - name: lemonade
-        binary: /path/to/lemonade-embeddable-2026.43.3-ubuntu-x64/lemond
-        args: ["--port", "{port}", "--host", "{host}", "--no-broadcast", "--log-file", "disabled"]
-        env: {HF_HOME: /path/to/huggingface}   # where lemonade pull put the models
-        ready: /live
-        ready_timeout_secs: 90
-        stop_grace_secs: 20
-        modes: [chat, stt, tts, image]
-        memory_gib: 1
-
-proxy:
-  aliases:
-    Whisper-Tiny: lemonade
-    kokoro-v1: lemonade
-    SD-Turbo-GGUF: lemonade
-```
-
-`Whisper-Tiny` returned the JFK sample's text, `kokoro-v1` returned a WAV that transcribed back to its input, and `SD-Turbo-GGUF` returned a 512x512 PNG, each auto-starting `lemond` through its alias. Two things to know: llamastash removes `HF_*` variables from every engine's environment, so `lemond` looks in `~/.cache/huggingface` unless the entry sets `HF_HOME`; and an entry whose name matches an alias with different case (`whisper-tiny` next to `Whisper-Tiny: lemonade`) takes the request, because names win over aliases.
-
-### FastFlowLM (AMD NPU)
-
-[FastFlowLM](https://github.com/ROCm/FastFlowLM) (`flm`) runs LLMs, Whisper ASR and embedding models on AMD XDNA2 NPUs. It speaks the OpenAI shape, so it needs no dedicated backend. Written for `flm` v1.0.9 (portable `fastflowlm_1.0.9_linux.tar.gz`) on Linux 7.2.10 with the in-tree `amdxdna` driver, NPU firmware 1.1.2.65 and `xrt` + `xrt-plugin-amdxdna`. `flm validate` should pass before you add the entry.
-
-```yaml
-backend:
-  generic:
-    servers:
-      - name: "qwen3:0.6b"                          # the name must be flm's own model tag
-        binary: ~/.local/opt/fastflowlm/flm
-        args: [serve, "{name}", --host, "{host}", -p, "{port}", --cors, "0"]
-        ready: /v1/version          # flm serves no /health; it loads before it binds
+      - name: localai
+        binary: /path/to/local-ai-v4.12.1-linux-amd64
+        args: [run, --address, "{host}:{port}", --models-path, /path/to/localai/models,
+               --backends-path, /path/to/localai/backends, --data-path, /path/to/localai/data]
+        ready: /readyz
+        modes: [stt, tts, image]
+        memory_gib: 4
         ready_timeout_secs: 180
-        stop_grace_secs: 20
-        memory_gib: 2
-        arch: qwen3
-        params: 0.6B
-        quant: q4nx
-        ctx: 32768
-        modes: [chat]
-        knobs:
-          - {flag: --ctx-len, id: ctx-len, ctx: true, default: "32768"}
-          - {flag: --pmode, default: performance}    # powersaver | balanced | performance | turbo
 ```
 
-The `name` is the load-bearing line. FLM switches models on the `model` field of a request and the proxy forwards that field unchanged, so the row id has to be the engine's tag: an entry called `flm-qwen3-06b` got `{"error":"Failed to load flm-qwen3-06b model!"}`, and naming it `qwen3:0.6b` (with `{name}` in `args`, so the tag is written once) works. Verified: 82.9 t/s decode for `qwen3:0.6b` on the NPU through the proxy, 0.66 s round trip, `--ctx 8192` reaching the child as `--ctx-len 8192` through the `ctx: true` knob.
-
-To carry every tag you have downloaded rather than one, mint the rows from FLM's own store and drop the per-model blocks:
-
-```yaml
-backend:
-  generic:
-    servers:
-      - name: flm
-        binary: ~/.local/opt/fastflowlm/flm
-        args: [serve, "{name}", --host, "{host}", -p, "{port}", --cors, "0"]
-        ready: /v1/version
-        ready_timeout_secs: 180
-        stop_grace_secs: 20
-        modes: [chat]
-        rows_from:
-          command: [~/.local/opt/fastflowlm/flm, list, --filter, installed, --json]
-          items: models
-          name: model
-          when: {path: label, contains: reasoning}   # reasoning LLMs; see the note below
-          arch: details.family
-          params: details.parameter_size
-          quant: details.quantization_level
-          ctx: default_context_length
-          memory_gib: footprint
-        knobs:
-          - {flag: --ctx-len, id: ctx-len, ctx: true}
-          - {flag: --pmode, default: performance}    # powersaver | balanced | performance | turbo
-```
-
-After `llamastash daemon restart` the catalog lists `qwen3:0.6b` and every other installed tag FLM labels `reasoning`, each with its own arch, params, quant, context and footprint, and each one starts and answers by name with no `proxy.aliases` line. The `--ctx-len` knob declares no default, so each model starts with the context FLM's listing gives it (`default_context_length`, 32768 for `qwen3:0.6b`), and `--ctx` reaches FLM because that knob carries `ctx: true`; drop the knob and `--ctx` is accepted but goes nowhere (the launch's `params.ctx` never changes), the minted context is only a display value. Pick the filter by what FLM actually labels: on v1.0.9 the reasoning filter keeps the reasoning models and drops audio, but it also drops every LLM FLM labels something else or nothing at all (on v1.0.9: gemma3:4b, qwen3-it:4b, qwen3vl-it:4b and 6 more labelled tags, plus gemma3:1b, llama3.1, llama3.2, lfm2, phi4-mini and qwen2.5-it which carry no label), while `when: installed` keeps everything installed including whisper. There is no "not" filter, so a filter that means "LLMs only" has to name what you want. See [Minting rows from an engine's own listing](docs/usage.md#minting-rows-from-an-engines-own-listing).
-
-ASR and embedding are separate processes, one NPU model per type: `flm serve --asr 1` (or `-e 1`) takes no model tag and answers `POST /v1/audio/transcriptions`. Give that entry `modes: [stt]` (an embedding one `modes: [embedding]`) and the proxy forwards the route to it, upload included, so its clients post to the proxy rather than the launch port `llamastash status` shows. FLM also answers the Ollama shapes (`/api/tags`, `/api/chat`, `/api/generate`, `/api/ps`, `/api/npu/status`) on the same port.
-
-```yaml
-backend:
-  generic:
-    servers:
-      - name: whisper-npu
-        binary: ~/.local/opt/fastflowlm/flm
-        args: [serve, --asr, "1", --host, "{host}", -p, "{port}", --cors, "0"]
-        ready: /v1/version
-        ready_timeout_secs: 180
-        stop_grace_secs: 20
-        memory_gib: 2
-        modes: [stt]
-```
-
-Verified on `flm` v1.0.10 with `Whisper-V3-Turbo-NPU2` on the NPU: an 11 s speech clip posted to the proxy came back with the right words in 2.8 s TTFB (3.8 s total), addressed by the entry name, by a `proxy.aliases` name (`whisper-1: whisper-npu`, logged as `alias` in `requests`), and by a name nothing answers to, which the mode fallback stamps `x-llamastash-served-by: whisper-npu` and `x-llamastash-fallback-reason: mode_match`. FLM echoes whatever `model` the request sent. `/v1/audio/translations` is a 404 from FLM itself: it serves transcriptions only.
-
-Three FLM notes: `/v1/models` lists FLM's whole model list, not what you downloaded; a request for a tag you do not have makes FLM try to download it; and its speed lands in `usage.decoding_speed_tps` and `usage.prefill_speed_tps`, which the request log reads, so `llamastash requests` shows FLM's own numbers rather than an estimate.
-
-### whisper.cpp
-
-`whisper-server` (whisper.cpp v1.8.4, from `lemonade backends install whispercpp:cpu`; tested through the proxy with Lemonade 2026.43.3's copy and `ggml-tiny.bin`) serves two routes: `GET /health` and `POST /inference` (multipart `file=@clip.wav`, replies `{"text": ...}`). It has no `/v1/models`. Two flags rename its own routes onto the OpenAI transcription shape: `--request-path /v1/audio --inference-path /transcriptions` answers `POST /v1/audio/transcriptions` with 200 and `{"text": ...}`, and the plain `/inference` then 404s. With `modes: [stt]` the llamastash proxy forwards that route to this entry, so an ASR client posts its file to the proxy instead of the launch port `llamastash status` shows; the upload is forwarded as sent and the engine answers it.
-
-```yaml
-backend:
-  generic:
-    servers:
-      - name: whisper-tiny
-        binary: ~/.cache/lemonade/bin/whispercpp/cpu/whisper-server
-        args: [-m, /path/to/huggingface/hub/models--ggerganov--whisper.cpp/snapshots/<rev>/ggml-tiny.bin,
-               --host, "{host}", --port, "{port}",
-               --request-path, /v1/audio, --inference-path, /transcriptions]
-        env:
-          LD_LIBRARY_PATH: ~/.cache/lemonade/bin/whispercpp/cpu   # the binary's own dir
-        ready: /v1/audio/health
-        modes: [stt]
-        memory_gib: 1
-```
-
-Leave the two path flags out and whisper answers `/inference` instead; `routes: [/inference]` on the entry then forwards that path to it, upload included, and the request logs under `/inference`.
-
-`ready` moves with the request path: `--request-path /v1/audio` puts health at `/v1/audio/health` and `/health` answers 404. Two gotchas: the binary needs `LD_LIBRARY_PATH` set to its own directory or it dies with `libwhisper.so.1: cannot open shared object file` (exit 127), and a leading `~/` in an `env` value resolves to your home directory the way `binary` does (the rest of the value is passed through, so a `~` in the middle of a path list is literal). Its weights are `ggml-*.bin`, which the model scanner does not list, so the path lives in the entry.
-
-Also tested with whisper.cpp v1.9.5 built with CUDA (`build-cuda/bin/whisper-server`) and `ggml-large-v3-turbo-q5_0.bin` on an RTX 3050 Ti (4 GB), with both entries below in one config. A client that sends OpenAI's own name, `model=whisper-1`, reaches `whisper-turbo` because it is the only entry declaring `stt`; the reply carries `x-llamastash-served-by: whisper-turbo` and `x-llamastash-fallback-reason: mode_match`. `POST /v1/audio/translations` is forwarded to the same entry, but whisper-server answers only the one inference path it was given, so it returns its own 404 there.
-
-```yaml
-backend:
-  generic:
-    servers:
-      - name: whisper-turbo
-        binary: /path/to/whisper.cpp/build-cuda/bin/whisper-server
-        args: [-m, /path/to/ggml-large-v3-turbo-q5_0.bin, --host, "{host}", --port, "{port}",
-               --request-path, /v1/audio, --inference-path, /transcriptions]
-        env: {LD_LIBRARY_PATH: /path/to/whisper.cpp/build-cuda/bin}
-        ready: /v1/audio/health
-        modes: [stt]
-        memory_gib: 2
-      - name: whisper-native   # whisper's own API through the proxy
-        binary: /path/to/whisper.cpp/build-cuda/bin/whisper-server
-        args: [-m, /path/to/ggml-large-v3-turbo-q5_0.bin, --host, "{host}", --port, "{port}"]
-        env: {LD_LIBRARY_PATH: /path/to/whisper.cpp/build-cuda/bin}
-        ready: /health
-        routes: [/inference]
-        memory_gib: 2
-```
-
-`POST :11435/inference` reaches `whisper-native`; its other paths (`/load`, `/health`) stay closed on the proxy, and so do spellings that try to climb out of the prefix (`/inference/../health`, `/inference/%2e%2e/health`, `/inference\..\health` all get the proxy's 404).
-
-### Kokoro-FastAPI
-
-[Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) v0.9.0 serves the Kokoro 82M text-to-speech model on OpenAI's `POST /v1/audio/speech`. Tested from a source checkout (`uv sync --extra gpu`, then `python docker/scripts/download_model.py --output api/src/models/v1_0` for the weights) on an RTX 3050 Ti. Its config defaults are the Docker image's absolute paths (`/app/api/src/...`), so a launch outside the container needs `MODEL_DIR`, `VOICES_DIR`, `WEB_PLAYER_PATH` and `PYTHONPATH` pointed at the checkout.
-
-```yaml
-backend:
-  generic:
-    servers:
-      - name: kokoro
-        binary: /path/to/Kokoro-FastAPI/.venv/bin/uvicorn
-        args: [api.src.main:app, --host, "{host}", --port, "{port}"]
-        env:
-          USE_GPU: "true"
-          PYTHONPATH: /path/to/Kokoro-FastAPI:/path/to/Kokoro-FastAPI/api
-          MODEL_DIR: /path/to/Kokoro-FastAPI/api/src/models
-          VOICES_DIR: /path/to/Kokoro-FastAPI/api/src/voices/v1_0
-          WEB_PLAYER_PATH: /path/to/Kokoro-FastAPI/web
-        ready: /v1/models
-        modes: [tts]
-        memory_gib: 2
-        ready_timeout_secs: 180   # first start loads torch and the model
-```
-
-`{"model":"kokoro","input":"...","voice":"af_heart","response_format":"wav"}` returns 24 kHz mono WAV, `mp3` and streamed `pcm` work too, and `model: tts-1` reaches the entry through the mode fallback. With two `tts` entries configured, `tts-1` goes to whichever one is running; with neither running it is a 404 that says `2 entries declare this endpoint's mode and none is running`, and a `proxy.aliases` entry (`tts-1: kokoro`) settles it.
+Requests that name a LocalAI model (`whisper-base-q5_1`, `sd-1.5-ggml`) reach it through the mode fallback with the name unchanged. LocalAI has no `whisper-1`, `tts-1` or `dall-e-3` by default and answers those with its own 404. A `proxy.aliases` line does not help, because the alias name stays in the body; copy the model's YAML under `models/` with `name: whisper-1` (and `tts-1`, `dall-e-3`) instead, which made all three work. A LocalAI model whose name matches a llamastash entry (its `kokoro` next to a Kokoro-FastAPI entry named `kokoro`) is never reached by that name.
 
 ### stable-diffusion.cpp
 
@@ -820,6 +820,57 @@ MOSS needs the external `tokenizer.json`: its Qwen3.5 vocabulary is not the Qwen
 
 sd-server prints `listening on` before it binds and exits 0 when the bind fails, so a launch that loses its port to a process that is still shutting down shows up as `launch_failed` with a clean exit. Starting it again works.
 
+## Speech to text
+
+### whisper.cpp
+
+`whisper-server` (whisper.cpp v1.8.4, from `lemonade backends install whispercpp:cpu`; tested through the proxy with Lemonade 2026.43.3's copy and `ggml-tiny.bin`) serves two routes: `GET /health` and `POST /inference` (multipart `file=@clip.wav`, replies `{"text": ...}`). It has no `/v1/models`. Two flags rename its own routes onto the OpenAI transcription shape: `--request-path /v1/audio --inference-path /transcriptions` answers `POST /v1/audio/transcriptions` with 200 and `{"text": ...}`, and the plain `/inference` then 404s. With `modes: [stt]` the llamastash proxy forwards that route to this entry, so an ASR client posts its file to the proxy instead of the launch port `llamastash status` shows; the upload is forwarded as sent and the engine answers it.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: whisper-tiny
+        binary: ~/.cache/lemonade/bin/whispercpp/cpu/whisper-server
+        args: [-m, /path/to/huggingface/hub/models--ggerganov--whisper.cpp/snapshots/<rev>/ggml-tiny.bin,
+               --host, "{host}", --port, "{port}",
+               --request-path, /v1/audio, --inference-path, /transcriptions]
+        env:
+          LD_LIBRARY_PATH: ~/.cache/lemonade/bin/whispercpp/cpu   # the binary's own dir
+        ready: /v1/audio/health
+        modes: [stt]
+        memory_gib: 1
+```
+
+Leave the two path flags out and whisper answers `/inference` instead; `routes: [/inference]` on the entry then forwards that path to it, upload included, and the request logs under `/inference`.
+
+`ready` moves with the request path: `--request-path /v1/audio` puts health at `/v1/audio/health` and `/health` answers 404. Two gotchas: the binary needs `LD_LIBRARY_PATH` set to its own directory or it dies with `libwhisper.so.1: cannot open shared object file` (exit 127), and a leading `~/` in an `env` value resolves to your home directory the way `binary` does (the rest of the value is passed through, so a `~` in the middle of a path list is literal). Its weights are `ggml-*.bin`, which the model scanner does not list, so the path lives in the entry.
+
+Also tested with whisper.cpp v1.9.5 built with CUDA (`build-cuda/bin/whisper-server`) and `ggml-large-v3-turbo-q5_0.bin` on an RTX 3050 Ti (4 GB), with both entries below in one config. A client that sends OpenAI's own name, `model=whisper-1`, reaches `whisper-turbo` because it is the only entry declaring `stt`; the reply carries `x-llamastash-served-by: whisper-turbo` and `x-llamastash-fallback-reason: mode_match`. `POST /v1/audio/translations` is forwarded to the same entry, but whisper-server answers only the one inference path it was given, so it returns its own 404 there.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: whisper-turbo
+        binary: /path/to/whisper.cpp/build-cuda/bin/whisper-server
+        args: [-m, /path/to/ggml-large-v3-turbo-q5_0.bin, --host, "{host}", --port, "{port}",
+               --request-path, /v1/audio, --inference-path, /transcriptions]
+        env: {LD_LIBRARY_PATH: /path/to/whisper.cpp/build-cuda/bin}
+        ready: /v1/audio/health
+        modes: [stt]
+        memory_gib: 2
+      - name: whisper-native   # whisper's own API through the proxy
+        binary: /path/to/whisper.cpp/build-cuda/bin/whisper-server
+        args: [-m, /path/to/ggml-large-v3-turbo-q5_0.bin, --host, "{host}", --port, "{port}"]
+        env: {LD_LIBRARY_PATH: /path/to/whisper.cpp/build-cuda/bin}
+        ready: /health
+        routes: [/inference]
+        memory_gib: 2
+```
+
+`POST :11435/inference` reaches `whisper-native`; its other paths (`/load`, `/health`) stay closed on the proxy, and so do spellings that try to climb out of the prefix (`/inference/../health`, `/inference/%2e%2e/health`, `/inference\..\health` all get the proxy's 404).
+
 ### Speaches
 
 [Speaches](https://github.com/speaches-ai/speaches) serves faster-whisper for STT and Kokoro or Piper for TTS behind one OpenAI-shaped server, so one entry declares both modes. Tested from a `main` checkout (`993994f`, after v0.9.0-rc.3) on an RTX 3050 Ti, installed with `uv sync`, then upgraded with `uv pip install ctranslate2==4.8.3`: the 4.5.0 wheel in its lockfile asks for an executable stack, which glibc 2.44 refused here (`cannot enable executable stack`). Models are downloaded through Speaches itself, once, with the server running on its own (`curl -X POST localhost:8000/v1/models/Systran/faster-whisper-small`, then `speaches-ai/Kokoro-82M-v1.0-ONNX`).
@@ -841,25 +892,7 @@ backend:
 
 Clients send Speaches' own model ids (`Systran/faster-whisper-small`, `speaches-ai/Kokoro-82M-v1.0-ONNX`) or OpenAI's names, and the proxy forwards them unchanged to the one entry that declares the mode. Speaches maps `tts-1` to Kokoro, which worked, and `whisper-1` to `Systran/faster-whisper-large-v3` through `model_aliases.json` in the checkout; download that model or edit the file. Started without `cd`, it exits with `Directory 'realtime-console/dist' does not exist`.
 
-### LocalAI
-
-[LocalAI](https://github.com/mudler/LocalAI) is itself a model manager: one binary that loads many models on demand. Under llamastash it is one entry with every model inside it, so llamastash cannot account for what LocalAI loads. Tested with the `local-ai-v4.12.1-linux-amd64` release binary on an RTX 3050 Ti, which LocalAI treated as CPU-only (`VRAM is less than 4GB, defaulting to CPU`), after `mkdir backends` and `local-ai models install localai@whisper-base-q5_1` (and `localai@kokoro`, `localai@sd-1.5-ggml`).
-
-```yaml
-backend:
-  generic:
-    servers:
-      - name: localai
-        binary: /path/to/local-ai-v4.12.1-linux-amd64
-        args: [run, --address, "{host}:{port}", --models-path, /path/to/localai/models,
-               --backends-path, /path/to/localai/backends, --data-path, /path/to/localai/data]
-        ready: /readyz
-        modes: [stt, tts, image]
-        memory_gib: 4
-        ready_timeout_secs: 180
-```
-
-Requests that name a LocalAI model (`whisper-base-q5_1`, `sd-1.5-ggml`) reach it through the mode fallback with the name unchanged. LocalAI has no `whisper-1`, `tts-1` or `dall-e-3` by default and answers those with its own 404. A `proxy.aliases` line does not help, because the alias name stays in the body; copy the model's YAML under `models/` with `name: whisper-1` (and `tts-1`, `dall-e-3`) instead, which made all three work. A LocalAI model whose name matches a llamastash entry (its `kokoro` next to a Kokoro-FastAPI entry named `kokoro`) is never reached by that name.
+## Text to speech
 
 ### Piper
 
@@ -880,24 +913,30 @@ backend:
 
 `POST :11435/synthesize` returned a 22 kHz WAV that transcribed back to its input. Piper's `/download` (fetch a voice) and `/info` stay closed on the proxy because they are not declared.
 
-### ComfyUI
+### Kokoro-FastAPI
 
-[ComfyUI](https://github.com/Comfy-Org/ComfyUI) v0.42.1 has its own API: a workflow is posted to `/prompt`, its result read from `/history/<id>`, and the image fetched from `/view`. Tested on an RTX 3050 Ti with SD 1.5 (`v1-5-pruned-emaonly-fp16.safetensors` in `models/checkpoints`), installed into a venv with the CUDA 12.8 torch wheels and `requirements.txt`.
+[Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) v0.9.0 serves the Kokoro 82M text-to-speech model on OpenAI's `POST /v1/audio/speech`. Tested from a source checkout (`uv sync --extra gpu`, then `python docker/scripts/download_model.py --output api/src/models/v1_0` for the weights) on an RTX 3050 Ti. Its config defaults are the Docker image's absolute paths (`/app/api/src/...`), so a launch outside the container needs `MODEL_DIR`, `VOICES_DIR`, `WEB_PLAYER_PATH` and `PYTHONPATH` pointed at the checkout.
 
 ```yaml
 backend:
   generic:
     servers:
-      - name: comfyui
-        binary: /path/to/ComfyUI/.venv/bin/python
-        args: [/path/to/ComfyUI/main.py, --listen, "{host}", --port, "{port}"]
-        ready: /system_stats
-        routes: [/prompt, /history, /view, /upload, /object_info, /queue, /system_stats]
-        memory_gib: 4
-        ready_timeout_secs: 300
+      - name: kokoro
+        binary: /path/to/Kokoro-FastAPI/.venv/bin/uvicorn
+        args: [api.src.main:app, --host, "{host}", --port, "{port}"]
+        env:
+          USE_GPU: "true"
+          PYTHONPATH: /path/to/Kokoro-FastAPI:/path/to/Kokoro-FastAPI/api
+          MODEL_DIR: /path/to/Kokoro-FastAPI/api/src/models
+          VOICES_DIR: /path/to/Kokoro-FastAPI/api/src/voices/v1_0
+          WEB_PLAYER_PATH: /path/to/Kokoro-FastAPI/web
+        ready: /v1/models
+        modes: [tts]
+        memory_gib: 2
+        ready_timeout_secs: 180   # first start loads torch and the model
 ```
 
-`GET :11435/system_stats` auto-started it, and a 20-step SD 1.5 workflow posted to `/prompt` finished in 15 s, with the PNG fetched through `/view`. Paths that are not declared (`/extensions`, `/internal/logs`) get the proxy's 404, and so does ComfyUI's `/api/...` spelling, because `/api` belongs to the proxy's Ollama surface. ComfyUI's progress WebSocket (`/ws`) cannot ride the proxy; poll `/history` instead.
+`{"model":"kokoro","input":"...","voice":"af_heart","response_format":"wav"}` returns 24 kHz mono WAV, `mp3` and streamed `pcm` work too, and `model: tts-1` reaches the entry through the mode fallback. With two `tts` entries configured, `tts-1` goes to whichever one is running; with neither running it is a 404 that says `2 entries declare this endpoint's mode and none is running`, and a `proxy.aliases` entry (`tts-1: kokoro`) settles it.
 
 ### Chatterbox TTS API
 
@@ -925,6 +964,8 @@ backend:
 ```
 
 The loaded model took 3.2 GB of the 4 GB card; with another engine already on the GPU it failed with `CUDA out of memory`. `/health` answers 200 while the model is still loading (`"model_loaded": false`), so llamastash marks the launch ready early and a request in that window gets `500 Model not loaded`; retry once `model_loaded` is `true`. After that, `{"model":"chatterbox","input":"...","voice":"alloy"}` returned a 24 kHz WAV that transcribed back to its input.
+
+## Classifiers and decision models
 
 ### Decision models (Kev, Laya)
 
