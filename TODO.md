@@ -539,6 +539,8 @@ _Shared context: Alias resolution in the proxy, the `/v1/models` and `/api/tags`
 
 ## Next
 
+- [ ] support defining servers in yaml file so that a self contained yaml can define and run a model.
+
 ### Batch 12: media-route follow-ups from the Z13 run
 
 _Shared context: the launch table in `src/tui/` and `src/cli/status.rs`, the mode a generic launch records, and the boot scan that runs when the daemon starts._
