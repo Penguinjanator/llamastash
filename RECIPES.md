@@ -6,7 +6,7 @@ What each field means is in [`docs/usage.md`](docs/usage.md): § [Generic backen
 
 ## Index
 
-Recipes are grouped by what the model does, most used type first. Inside a group, engines are ordered by GitHub stars (checked 2026-10-25). An engine that serves several types is listed under each one and links to its one recipe.
+Recipes are grouped by what the model does, most used type first. An engine that serves several types is listed under each one and links to its one recipe.
 
 **[Chat](#chat)**
 
