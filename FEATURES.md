@@ -54,7 +54,7 @@ Vision and audio models ship a separate mmproj projector GGUF alongside the weig
 
 ### Smart deduplication
 
-Symlinks dedupe to their target. Split GGUFs (`*-00001-of-00003.gguf`) collapse into one logical entry. Ollama's content-addressed blobs surface under their human-readable name rather than as raw hashes. The catalog reflects what you'd reasonably call distinct models, not what the filesystem happens to have.
+Symlinks dedupe to their target within the cache repo they sit in. Split GGUFs (`*-00001-of-00003.gguf`) collapse into one logical entry. Ollama's content-addressed blobs surface under their human-readable name rather than as raw hashes. The catalog reflects what you'd reasonably call distinct models, not what the filesystem happens to have.
 
 ### Live filesystem watching
 

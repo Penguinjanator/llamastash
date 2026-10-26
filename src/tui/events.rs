@@ -1243,6 +1243,20 @@ fn delete_refusal_reason(app: &App) -> Option<&'static str> {
   None
 }
 
+/// True when `confirmed` would unlink or remove anything `staged` did not name.
+/// A confirm re-plan may come back smaller than the popup described; anything
+/// bigger is a delete the user was never shown.
+fn plan_removes_more_than(
+  staged: &crate::tui::delete::DeletePlan,
+  confirmed: &crate::tui::delete::DeletePlan,
+) -> bool {
+  if confirmed.hf_repo_dir.is_some() && staged.hf_repo_dir.is_none() {
+    return true;
+  }
+  let named: std::collections::HashSet<&std::path::Path> = staged.files().into_iter().collect();
+  confirmed.files().into_iter().any(|f| !named.contains(f))
+}
+
 /// True when a queued or active pull names the cache repo of the focused row. A
 /// pull writes into `models--<owner>--<repo>`, the very directory a whole-repo
 /// delete removes, and the model being pulled has no catalog row yet, so the
@@ -1444,9 +1458,9 @@ fn apply_confirmed(app: &mut App, action: ConfirmAction, writer: Option<&mpsc::S
       // The plan was built when the key went down. A rescan can have listed
       // another model in the repo since, and the frozen whole-repo answer would
       // unlink that model's files with it, so re-plan the same row against the
-      // catalog as it stands now — it can only come back smaller. The refusals
-      // are re-asked for the same reason: a launch or a pull can have started
-      // while the popup was open.
+      // catalog as it stands now and run only what came back no bigger than what
+      // the popup named. The refusals are re-asked for the same reason: a launch
+      // or a pull can have started while the popup was open.
       let primary = plan.primary.clone();
       let cache_root = plan.cache_root.clone();
       if let Some(reason) = delete_refusal_reason(app) {
@@ -1455,6 +1469,16 @@ fn apply_confirmed(app: &mut App, action: ConfirmAction, writer: Option<&mpsc::S
       }
       let confirmed =
         crate::tui::delete::plan_for_path_in(&primary, &app.models, cache_root.as_deref());
+      // Growing is the one direction a re-plan must not go: the popup described
+      // the staged plan, so a bigger answer — the repo's other model left the
+      // catalog and whole-repo came back, or a projector lost the neighbour that
+      // paired it — is something the user never saw. Nothing goes; ask again.
+      if plan_removes_more_than(&plan, &confirmed) {
+        app.show_toast(
+          "the model set changed under this popup — nothing was deleted, press Ctrl+D again",
+        );
+        return;
+      }
       match crate::tui::delete::execute(&confirmed) {
         Ok(_summary) => {
           // A whole-repo delete takes other revisions of the same repo with it.
@@ -3015,6 +3039,54 @@ mod tests {
     assert!(
       repo.exists(),
       "the repo survives while another model is listed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// The other direction: the live catalog now asks for *more* than the popup
+  /// named, because the repo's other model left the catalog. That answer was never
+  /// shown, so the confirm refuses and nothing goes.
+  #[test]
+  fn a_confirmed_delete_refuses_a_plan_that_came_back_bigger() {
+    use crate::tui::app::ConfirmAction;
+    use crate::tui::delete::DeletePlan;
+    let dir = crate::util::test_temp::unique_temp_dir("delete-grew");
+    let repo = dir.join("models--o--r");
+    let a = repo.join("snapshots/rev-a/a.gguf");
+    let b = repo.join("snapshots/rev-b/b.gguf");
+    std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(b.parent().unwrap()).unwrap();
+    std::fs::write(&a, b"weights").unwrap();
+    std::fs::write(&b, b"weights").unwrap();
+    let mut app = App::new(Default::default());
+    // The popup was staged while `b` was still listed, so it named one file. The
+    // catalog now holds only `a`, whose live answer is the whole repo directory.
+    app.models = vec![fake_model_for_events(
+      &a.to_string_lossy(),
+      &repo.to_string_lossy(),
+    )];
+    let mut staged = DeletePlan::single(a.clone());
+    staged.cache_root = Some(dir.clone());
+    apply_confirmed(
+      &mut app,
+      ConfirmAction::DeleteModel {
+        plan: Box::new(staged),
+        display_name: "m".into(),
+      },
+      None,
+    );
+    assert!(
+      a.exists(),
+      "a plan that came back bigger is refused, not run"
+    );
+    assert!(b.exists(), "and nothing else goes either");
+    assert!(repo.exists(), "and the repo keeps everything");
+    assert!(
+      app
+        .toast_message()
+        .unwrap_or_default()
+        .contains("press Ctrl+D again"),
+      "the refusal has to say what to do instead"
     );
     let _ = std::fs::remove_dir_all(&dir);
   }

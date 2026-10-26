@@ -1948,7 +1948,7 @@ The row leaves the list as soon as the delete finishes: the TUI tells the daemon
 
 An HF-shaped tree that is *not* under the configured cache root (an rsynced backup, a restored archive) never gets the recursive removal — it falls back to per-file unlinking. Neither does a cache root that is itself named `models--…`: there the whole-repo answer would be the entire cache, so it is refused.
 
-What the popup names is decided when you press `Ctrl+D`, and the last-model-in-repo question is asked again when you confirm, so a model that a rescan listed in that repo while the popup was open keeps its files.
+What the popup names is decided when you press `Ctrl+D`, and the last-model-in-repo question is asked again when you confirm, so a model that a rescan listed in that repo while the popup was open keeps its files. A confirm that would remove *more* than the popup named — the repo's other model disappeared in the meantime, so whole-repo came back — refuses and asks you to press `Ctrl+D` again against the new state instead of deleting quietly.
 
 Refusals: a running, loading or errored launch (stop it first), a row with no local file to unlink (a `backend.generic` entry or a backend registry row), and a row whose cache repo a download is still writing — that tree is mid-write, so wait for the pull or cancel it (`Ctrl+X`) first.
 

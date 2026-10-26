@@ -7,8 +7,10 @@
 //! `blobs/` file. Unlinking just the launch path leaves the rest behind and
 //! the freed space never shows up.
 //!
-//! The plan is resolved before the confirm prompt so the popup can say what
-//! is about to go and the confirm handler does no fresh discovery.
+//! The plan is resolved before the confirm prompt so the popup can say what is
+//! about to go, and resolved again when the user confirms, against whatever the
+//! catalog holds by then. A confirm only ever deletes less than the popup
+//! described: a re-plan that comes back bigger is refused instead of run.
 
 use std::cell::Cell;
 use std::fs;
@@ -635,28 +637,16 @@ fn lock_blob(lock: &fs::File, until: Instant) -> bool {
   }
 }
 
-/// The `models--<owner>--<repo>` directory `path` sits under by directory
-/// shape alone, with no cache-root gate and no canonicalisation. Pure path
-/// arithmetic, so two paths from the same discovery pass compare reliably —
-/// that is all the "is anything else still in this repo" question needs.
-///
-/// Three row shapes resolve to the same repo: a GGUF **file**
-/// (`models--*/snapshots/<rev>/<file>`), the same file nested in a quant
-/// **subdirectory** (`.../snapshots/<rev>/Q4_K_M/<file>`, which the recursive
-/// GGUF scanner emits as its own row), and a whole-snapshot **directory**
-/// (`models--*/snapshots/<rev>`), which is what a safetensors row carries.
-/// All must land on the same answer or the "last model in this repo" check
-/// would treat a mixed catalog as unrelated repos — and a nested GGUF that
-/// resolved to `None` used to be invisible to that check, so deleting the
-/// directory row planned a whole-repo `remove_dir_all` straight over it.
 /// [`crate::util::model_caches::hf_repo_dir`] used as the "is anything else still
-/// in this repo" key. Three row shapes resolve to the same repo — a GGUF file,
-/// the same file nested in a quant subdirectory (which the recursive GGUF scanner
-/// emits as its own row), and a whole-snapshot directory (what a safetensors row
-/// carries) — and all must land on the same answer or a mixed catalog reads as
-/// unrelated repos. A nested GGUF that resolved to `None` used to be invisible to
-/// that check, so deleting the directory row planned a whole-repo `remove_dir_all`
-/// straight over it.
+/// in this repo" key: pure path arithmetic, with no cache-root gate and no
+/// canonicalisation, so two paths from the same discovery pass compare reliably.
+/// Three row shapes resolve to the same repo — a GGUF file, the same file nested
+/// in a quant subdirectory (which the recursive GGUF scanner emits as its own
+/// row), and a whole-snapshot directory (what a safetensors row carries) — and all
+/// must land on the same answer or a mixed catalog reads as unrelated repos. A
+/// nested GGUF that resolved to `None` used to be invisible to that check, so
+/// deleting the directory row planned a whole-repo `remove_dir_all` straight over
+/// it.
 fn hf_repo_dir_shape(path: &Path) -> Option<&Path> {
   crate::util::model_caches::hf_repo_dir(path)
 }
