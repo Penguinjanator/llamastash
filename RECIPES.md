@@ -773,6 +773,8 @@ backend:
 
 Requests that name a LocalAI model (`whisper-base-q5_1`, `sd-1.5-ggml`) reach it through the mode fallback with the name unchanged. LocalAI has no `whisper-1`, `tts-1` or `dall-e-3` by default and answers those with its own 404. A `proxy.aliases` line does not help, because the alias name stays in the body; copy the model's YAML under `models/` with `name: whisper-1` (and `tts-1`, `dall-e-3`) instead, which made all three work. A LocalAI model whose name matches a llamastash entry (its `kokoro` next to a Kokoro-FastAPI entry named `kokoro`) is never reached by that name.
 
+`/readyz` answers before LocalAI has loaded its per-model backends, so a `tts` or `image` request in that window gets a 500 and succeeds on a retry (the first SD 1.5 request waited 58 s for its gallery warm). Kokoro wants a Kokoro voice: `"voice": "af_heart"` produced a 24 kHz WAV, while OpenAI's `alloy` made the backend fetch `voices/alloy.pt` and fail with a 404. `/v1/images/generations` answers with `data[0].url` on LocalAI's own port instead of `b64_json`.
+
 ### stable-diffusion.cpp
 
 `sd-server` from [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) serves OpenAI's `POST /v1/images/generations` and `/v1/images/edits` plus the A1111 API under `/sdapi/v1`. Two builds and two models are verified:
