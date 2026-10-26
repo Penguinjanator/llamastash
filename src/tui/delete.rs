@@ -42,8 +42,9 @@ pub struct DeletePlan {
   /// its bytes.
   pub hf_repo_dir: Option<PathBuf>,
   /// Resolved HF cache root, carried so [`execute`] can decide whether a
-  /// snapshot symlink's blob is ours to unlink.
-  cache_root: Option<PathBuf>,
+  /// snapshot symlink's blob is ours to unlink, and so a confirm can re-plan the
+  /// same row against the root the popup was drawn from.
+  pub cache_root: Option<PathBuf>,
   /// Whether the files sit in the HF cache, so [`DeletePlan::describe`] only
   /// promises reclaimed blobs where there are blobs to reclaim.
   in_hf_cache: bool,
@@ -216,11 +217,22 @@ pub fn plan(
 /// degrades to a single-file plan rather than refusing.
 pub fn plan_for_path(path: &Path, catalog: &[DiscoveredModel]) -> DeletePlan {
   let cache_root = crate::init::download::hf_cache_dir().ok();
+  plan_for_path_in(path, catalog, cache_root.as_deref())
+}
+
+/// [`plan_for_path`] with the cache root handed in. The confirm path re-plans
+/// through this so it reuses the root the popup was drawn from instead of
+/// re-reading the environment.
+pub fn plan_for_path_in(
+  path: &Path,
+  catalog: &[DiscoveredModel],
+  cache_root: Option<&Path>,
+) -> DeletePlan {
   match catalog.iter().find(|m| m.path == path) {
-    Some(target) => plan(target, catalog, cache_root.as_deref()),
+    Some(target) => plan(target, catalog, cache_root),
     None => DeletePlan {
       primary: path.to_path_buf(),
-      cache_root,
+      cache_root: cache_root.map(Path::to_path_buf),
       ..DeletePlan::default()
     },
   }
@@ -637,27 +649,24 @@ fn lock_blob(lock: &fs::File, until: Instant) -> bool {
 /// would treat a mixed catalog as unrelated repos — and a nested GGUF that
 /// resolved to `None` used to be invisible to that check, so deleting the
 /// directory row planned a whole-repo `remove_dir_all` straight over it.
+/// [`crate::util::model_caches::hf_repo_dir`] used as the "is anything else still
+/// in this repo" key. Three row shapes resolve to the same repo — a GGUF file,
+/// the same file nested in a quant subdirectory (which the recursive GGUF scanner
+/// emits as its own row), and a whole-snapshot directory (what a safetensors row
+/// carries) — and all must land on the same answer or a mixed catalog reads as
+/// unrelated repos. A nested GGUF that resolved to `None` used to be invisible to
+/// that check, so deleting the directory row planned a whole-repo `remove_dir_all`
+/// straight over it.
 fn hf_repo_dir_shape(path: &Path) -> Option<&Path> {
-  // Walk up to `snapshots/` from any depth rather than testing fixed levels.
-  let mut cursor = path;
-  while let Some(parent) = cursor.parent() {
-    if parent.file_name().and_then(|n| n.to_str()) == Some("snapshots") {
-      let repo_dir = parent.parent()?;
-      return repo_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with("models--"))
-        .then_some(repo_dir);
-    }
-    cursor = parent;
-  }
-  None
+  crate::util::model_caches::hf_repo_dir(path)
 }
 
-/// [`hf_repo_dir_shape`] plus the gate that makes recursive removal safe: the
-/// resolved repo directory must live inside `cache_root`. An HF-shaped tree
-/// somewhere else — an rsynced backup, a restored archive, a surprise Docker
-/// volume — resolves to `None` and takes the per-file path instead.
+/// [`hf_repo_dir_shape`] plus the gates that make recursive removal safe: the
+/// resolved repo directory must live inside `cache_root`, and must not *be* it. An
+/// HF-shaped tree somewhere else — an rsynced backup, a restored archive, a
+/// surprise Docker volume — resolves to `None` and takes the per-file path, and
+/// so does a cache root that is itself named `models--…`, where the repo answer
+/// would be the whole cache.
 fn hf_repo_dir_in_cache(path: &Path, cache_root: Option<&Path>) -> Option<PathBuf> {
   let repo_dir = hf_repo_dir_shape(path)?;
   let cache_root = cache_root?;
@@ -667,6 +676,9 @@ fn hf_repo_dir_in_cache(path: &Path, cache_root: Option<&Path>) -> Option<PathBu
   let candidate = repo_dir
     .canonicalize()
     .unwrap_or_else(|_| repo_dir.to_path_buf());
+  if candidate == cache_root_canonical {
+    return None;
+  }
   candidate
     .starts_with(&cache_root_canonical)
     .then_some(candidate)
@@ -1566,6 +1578,24 @@ mod tests {
       "a manifest past the read bound keeps the payload"
     );
     let _ = fs::remove_dir_all(&cache_root);
+  }
+
+  /// A cache root that is itself named `models--…` resolves every row's repo to
+  /// the cache root, so the whole-repo answer would remove the whole cache.
+  #[test]
+  fn a_cache_root_named_like_a_repo_is_not_a_whole_repo_delete() {
+    let cache_root = tempdir("cache-root-shape").join("models--o--r");
+    let snap = cache_root.join("snapshots/rev");
+    fs::create_dir_all(&snap).unwrap();
+    let file = snap.join("m.gguf");
+    fs::write(&file, b"weights").unwrap();
+    let target = model(&file);
+    let plan = plan(&target, std::slice::from_ref(&target), Some(&cache_root));
+    assert!(
+      plan.hf_repo_dir.is_none(),
+      "the cache root itself is never the directory a delete removes wholesale"
+    );
+    let _ = fs::remove_dir_all(cache_root.parent().unwrap());
   }
 
   fn symlink_or_copy(target: &Path, link: &Path) {

@@ -1216,6 +1216,9 @@ fn delete_refusal_reason(app: &App) -> Option<&'static str> {
     if !app.has_local_file(&path) {
       return Some("model is declared in config.yaml — remove it there");
     }
+    if download_writes_focused_repo(app) {
+      return Some("a download is writing to this repo — wait for it or cancel it");
+    }
   }
   if let Some(managed) = app.focused_managed() {
     return Some(match managed.state {
@@ -1238,6 +1241,29 @@ fn delete_refusal_reason(app: &App) -> Option<&'static str> {
     return Some("model is open in an external process — close it first");
   }
   None
+}
+
+/// True when a queued or active pull names the cache repo of the focused row. A
+/// pull writes into `models--<owner>--<repo>`, the very directory a whole-repo
+/// delete removes, and the model being pulled has no catalog row yet, so the
+/// strip is the only thing that knows the tree is mid-write.
+fn download_writes_focused_repo(app: &App) -> bool {
+  let repo_id = app
+    .focused_path()
+    .as_ref()
+    .and_then(|path| crate::util::model_caches::hf_repo_dir(path))
+    .and_then(|repo| repo.file_name())
+    .and_then(|name| name.to_str())
+    .and_then(crate::util::model_caches::repo_id_from_cache_dir);
+  let Some(repo_id) = repo_id else {
+    return false;
+  };
+  let strip = &app.download_strip;
+  strip
+    .active
+    .as_ref()
+    .is_some_and(|pull| pull.repo_id == repo_id)
+    || strip.queue.iter().any(|pull| pull.repo_id == repo_id)
 }
 
 /// Route a key to the open save-preset dialog. Name stage: typing edits
@@ -1415,14 +1441,28 @@ fn apply_confirmed(app: &mut App, action: ConfirmAction, writer: Option<&mpsc::S
       );
     }
     ConfirmAction::DeleteModel { plan, display_name } => {
-      match crate::tui::delete::execute(&plan) {
+      // The plan was built when the key went down. A rescan can have listed
+      // another model in the repo since, and the frozen whole-repo answer would
+      // unlink that model's files with it, so re-plan the same row against the
+      // catalog as it stands now — it can only come back smaller. The refusals
+      // are re-asked for the same reason: a launch or a pull can have started
+      // while the popup was open.
+      let primary = plan.primary.clone();
+      let cache_root = plan.cache_root.clone();
+      if let Some(reason) = delete_refusal_reason(app) {
+        app.show_toast(reason);
+        return;
+      }
+      let confirmed =
+        crate::tui::delete::plan_for_path_in(&primary, &app.models, cache_root.as_deref());
+      match crate::tui::delete::execute(&confirmed) {
         Ok(_summary) => {
           // A whole-repo delete takes other revisions of the same repo with it.
-          let removed: Vec<PathBuf> = plan
+          let removed: Vec<PathBuf> = confirmed
             .files()
             .into_iter()
             .map(Path::to_path_buf)
-            .chain(plan.hf_repo_dir.clone())
+            .chain(confirmed.hf_repo_dir.clone())
             .collect();
           if let Some(tx) = writer {
             if let Err(e) = tx.try_send(WriterCmd::ForgetModels(removed)) {
@@ -1434,8 +1474,8 @@ fn apply_confirmed(app: &mut App, action: ConfirmAction, writer: Option<&mpsc::S
             log::debug!("tui: no writer attached, forget_models skipped");
           }
           app.models.retain(|m| {
-            m.path != plan.primary
-              && plan
+            m.path != confirmed.primary
+              && confirmed
                 .hf_repo_dir
                 .as_ref()
                 .is_none_or(|repo| !m.path.starts_with(repo))
@@ -2904,6 +2944,79 @@ mod tests {
       }
       other => panic!("expected DeleteModel confirm, got {other:?}"),
     }
+  }
+
+  /// A pull writes into `models--<owner>--<repo>`, the directory a whole-repo
+  /// delete removes, and the model being pulled has no row yet — so the strip is
+  /// the only thing that knows the tree is mid-write.
+  #[test]
+  fn ctrl_d_refuses_a_repo_a_download_is_still_writing() {
+    use crate::tui::download_strip::ActivePull;
+    let mut app = App::new(Default::default());
+    app.models = vec![fake_model_for_events(
+      "/cache/hub/models--o--r/snapshots/rev/m.gguf",
+      "/cache/hub",
+    )];
+    app.download_strip.active = Some(ActivePull {
+      repo_id: "o/r".into(),
+      friendly_name: "r".into(),
+      bytes_total: 10,
+      bytes_done: 1,
+      rate: Default::default(),
+    });
+    app.go_top();
+    pump_input(&mut app, key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert!(
+      app.confirm_dialog.is_none(),
+      "a repo mid-download must not stage a delete"
+    );
+    assert!(
+      app.toast_message().unwrap_or_default().contains("download"),
+      "the refusal has to say why"
+    );
+  }
+
+  /// The plan said "whole repo" when its row was the only one listed. A rescan put
+  /// a second model in that repo while the popup was open, so the confirmed delete
+  /// has to take one file and leave the repo alone.
+  #[test]
+  fn a_confirmed_delete_replans_the_whole_repo_answer() {
+    use crate::tui::app::ConfirmAction;
+    use crate::tui::delete::DeletePlan;
+    let dir = crate::util::test_temp::unique_temp_dir("delete-replan");
+    let repo = dir.join("models--o--r");
+    let a = repo.join("snapshots/rev-a/a.gguf");
+    let b = repo.join("snapshots/rev-b/b.gguf");
+    std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(b.parent().unwrap()).unwrap();
+    std::fs::write(&a, b"weights").unwrap();
+    std::fs::write(&b, b"weights").unwrap();
+    let mut app = App::new(Default::default());
+    app.models = vec![
+      fake_model_for_events(&a.to_string_lossy(), &repo.to_string_lossy()),
+      fake_model_for_events(&b.to_string_lossy(), &repo.to_string_lossy()),
+    ];
+    let mut stale = DeletePlan::single(a.clone());
+    stale.hf_repo_dir = Some(repo.clone());
+    stale.cache_root = Some(dir.clone());
+    apply_confirmed(
+      &mut app,
+      ConfirmAction::DeleteModel {
+        plan: Box::new(stale),
+        display_name: "m".into(),
+      },
+      None,
+    );
+    assert!(!a.exists(), "the focused model goes");
+    assert!(
+      b.exists(),
+      "a model listed after the plan froze keeps its file"
+    );
+    assert!(
+      repo.exists(),
+      "the repo survives while another model is listed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
   }
 
   #[test]

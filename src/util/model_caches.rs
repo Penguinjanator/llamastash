@@ -86,6 +86,27 @@ pub fn repo_folder_name(repo_id: &str) -> String {
   format!("models--{}", repo_id.replace('/', "--"))
 }
 
+/// The `models--<owner>--<repo>` directory an HF cache path sits under, by
+/// directory shape alone: the parent of any `snapshots/` directory inside a
+/// `models--` dir. Walked rather than counted because a row's path can be the
+/// snapshot file, that file inside a subdirectory, or the snapshot directory
+/// itself. No cache-root gate here — callers decide what to do with the answer.
+pub fn hf_repo_dir(path: &Path) -> Option<&Path> {
+  let mut cursor = path;
+  while let Some(parent) = cursor.parent() {
+    if parent.file_name().and_then(|n| n.to_str()) == Some("snapshots") {
+      let repo = parent.parent()?;
+      return repo
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("models--"))
+        .then_some(repo);
+    }
+    cursor = parent;
+  }
+  None
+}
+
 /// Decode an HF hub cache folder name back into its repo id:
 /// `models--owner--name` → `owner/name`. Inverse of [`repo_folder_name`].
 ///

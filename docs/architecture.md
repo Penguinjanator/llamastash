@@ -444,7 +444,7 @@ passed through as the child's argv. The daemon that comes up re-reads
 
 `(canonical absolute path, BLAKE3 of GGUF header bytes)`. The header is small (up to ~1 MB); hashing it gives an identity that survives renames but doesn't fingerprint the whole weight file.
 
-The discovery scanner emits one entry per canonical path — symlinks dedupe to their target — so the same model file doesn't appear twice. Split GGUFs (`model-00001-of-00003.gguf`) collapse into a single entry whose launch target is shard 1.
+The discovery scanner emits one entry per canonical path *within its cache repo* — symlinks dedupe to their target, so a real file and a link to it appear once — while two `models--…` repos whose snapshot symlinks land on one shared-store payload each keep a row. Keying on the target alone would collapse byte-identical files across repos into a single entry, leaving the other repo unlistable, unlaunchable by name and undeletable, with which one survived left to readdir order. Split GGUFs (`model-00001-of-00003.gguf`) collapse into a single entry whose launch target is shard 1.
 
 **Rescans.** The daemon rescans on a debounced filesystem event (500 ms) and every 5 minutes (`discovery::watcher`). Open and read-only close events are dropped, because the scan's own directory walk and header reads produce them; passing them on made each rescan trigger the next. A rescan re-reads a header only on a `metadata_cache` miss (changed mtime or size, or a changed split sibling list), and the header parser steps over the tokenizer tables (`tokenizer.ggml.tokens` keeps only its reasoning markers).
 

@@ -924,7 +924,8 @@ fn collect_gguf_paths(root: &Path, excludes: &[String]) -> Vec<PathBuf> {
   }
 
   let mut out = Vec::new();
-  let mut seen: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+  let mut seen: std::collections::BTreeSet<(Option<PathBuf>, PathBuf)> =
+    std::collections::BTreeSet::new();
   for result in builder.build() {
     match result {
       Ok(entry) => {
@@ -938,12 +939,23 @@ fn collect_gguf_paths(root: &Path, excludes: &[String]) -> Vec<PathBuf> {
           && !is_mtp_head_file(p)
         {
           // Canonicalise before dedup so a real file and a symlink to
-          // it collapse to a single row. Falling back to the raw path
-          // if canonicalisation fails (broken symlink, permission
-          // denied) keeps the row visible — the user can investigate.
+          // it collapse to a single row, keyed on the cache repo the
+          // link belongs to. A shared-store payload is one file however
+          // many repos link it, so the target alone would collapse two
+          // repos' byte-identical models into one row — the loser
+          // unlistable, unlaunchable by name and undeletable, and which
+          // one survives left to readdir order. Keying per repo still
+          // collapses a real file with a symlink to it, and two
+          // revisions of one repo sharing a blob. Falling back to the
+          // raw path if canonicalisation fails (broken symlink,
+          // permission denied) keeps the row visible — the user can
+          // investigate.
           let raw = p.to_path_buf();
           let canonical = crate::util::paths::canonicalize(p).unwrap_or_else(|_| raw.clone());
-          if seen.insert(canonical.clone()) {
+          let repo = crate::util::model_caches::hf_repo_dir(&raw).map(|repo| {
+            crate::util::paths::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf())
+          });
+          if seen.insert((repo, canonical.clone())) {
             // For most files we emit the canonical path so user-managed
             // aliases (e.g. `ln -s /big-disk/m.gguf ~/models/`) display
             // under their target name. The exception is HuggingFace's
@@ -1762,6 +1774,43 @@ mod tests {
       "emitted path must be the snapshot symlink (split-aware name), \
        not the canonical blob"
     );
+    fs::remove_dir_all(&dir).ok();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn two_repos_sharing_one_shared_store_payload_keep_their_rows() {
+    // The layout huggingface_hub writes when content is shared: every repo's
+    // snapshot symlink resolves to one payload under `<cache>/blobs`. Both repos
+    // hold a model the user can pick, launch and delete, so both need a row even
+    // though the file behind them is one file.
+    let dir = temp_dir("shared-store-rows");
+    let payload = dir.join("blobs/aa").join("a".repeat(64));
+    fs::create_dir_all(payload.parent().unwrap()).unwrap();
+    fs::write(&payload, build_minimal_gguf("llama")).unwrap();
+    for (repo, file) in [("models--o--a", "a.gguf"), ("models--o--b", "b.gguf")] {
+      let blobs = dir.join(repo).join("blobs");
+      let snap = dir.join(repo).join("snapshots").join("main");
+      fs::create_dir_all(&blobs).unwrap();
+      fs::create_dir_all(&snap).unwrap();
+      std::os::unix::fs::symlink(&payload, blobs.join("etag")).unwrap();
+      std::os::unix::fs::symlink(blobs.join("etag"), snap.join(file)).unwrap();
+    }
+
+    let paths = collect_gguf_paths(&dir, &[]);
+    assert_eq!(
+      paths.len(),
+      2,
+      "one shared payload across two repos is two rows, got {paths:?}"
+    );
+    for file in ["a.gguf", "b.gguf"] {
+      assert!(
+        paths
+          .iter()
+          .any(|p| p.file_name().and_then(|s| s.to_str()) == Some(file)),
+        "{file} must keep its own row, got {paths:?}"
+      );
+    }
     fs::remove_dir_all(&dir).ok();
   }
 
