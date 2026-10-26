@@ -1946,9 +1946,9 @@ These are the defaults. Override any binding via the `keybindings:` block in `co
 
 The delete runs on a background worker, so removing a multi-GB model does not freeze the UI. The row shows a muted `deleting…` marker until it finishes, `Ctrl+D` refuses a second delete meanwhile, and the first `q` asks again before quitting. The row then leaves the list at once: the TUI tells the daemon (`forget_models`), which drops it and asks for a rescan, instead of waiting for the 5-minute rescan that catches a change deep inside an HF repo.
 
-An HF-shaped tree that is *not* under the configured cache root (an rsynced backup, a restored archive) never gets the recursive removal — it falls back to per-file unlinking.
+An HF-shaped tree that is *not* under the configured cache root (an rsynced backup, a restored archive) never gets the recursive removal — it falls back to per-file unlinking. So does a cache root that is itself named `models--…`.
 
-Refusals: a running, loading or errored launch (stop it first) and a row with no local file to unlink (a `backend.generic` entry or a backend registry row). A repo with a half-written part under `blobs/` (a pull from this TUI or another client) is not removed wholesale; if a pull starts after the popup opens, the delete fails with a toast and removes nothing.
+Refusals: a running, loading or errored launch (stop it first) and a row with no local file to unlink (a `backend.generic` entry or a backend registry row). They are asked again when you confirm, for the model the popup named, so a launch that started while the popup was open still blocks. A repo with a half-written part under `blobs/` (a pull from this TUI or another client) is not removed wholesale; if a pull starts after the popup opens, the delete fails with a toast and removes nothing.
 
 ### Terminal bell (on by default)
 

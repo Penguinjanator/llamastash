@@ -553,10 +553,11 @@ fn hf_repo_dir_shape(path: &Path) -> Option<&Path> {
   crate::util::model_caches::hf_repo_dir(path)
 }
 
-/// [`hf_repo_dir_shape`] plus the gate that makes recursive removal safe: the
-/// resolved repo directory must live inside `cache_root`. An HF-shaped tree
-/// somewhere else — an rsynced backup, a restored archive, a surprise Docker
-/// volume — resolves to `None` and takes the per-file path instead.
+/// [`hf_repo_dir_shape`] plus the gates that make recursive removal safe: the
+/// resolved repo directory must live inside `cache_root`, and must not *be* it. An
+/// HF-shaped tree somewhere else — an rsynced backup, a restored archive, a
+/// surprise Docker volume — resolves to `None` and takes the per-file path, and so
+/// does a cache root that is itself named `models--…`.
 fn hf_repo_dir_in_cache(path: &Path, cache_root: Option<&Path>) -> Option<PathBuf> {
   let repo_dir = hf_repo_dir_shape(path)?;
   let cache_root = cache_root?;
@@ -566,6 +567,9 @@ fn hf_repo_dir_in_cache(path: &Path, cache_root: Option<&Path>) -> Option<PathBu
   let candidate = repo_dir
     .canonicalize()
     .unwrap_or_else(|_| repo_dir.to_path_buf());
+  if candidate == cache_root_canonical {
+    return None;
+  }
   candidate
     .starts_with(&cache_root_canonical)
     .then_some(candidate)
@@ -1437,6 +1441,24 @@ mod tests {
       "a reference climbing out of the cache keeps the payload"
     );
     let _ = fs::remove_dir_all(&cache_root);
+  }
+
+  /// A cache root that is itself named `models--…` resolves every row's repo to
+  /// the cache root, so the whole-repo answer would remove the whole cache.
+  #[test]
+  fn a_cache_root_named_like_a_repo_is_not_a_whole_repo_delete() {
+    let cache_root = tempdir("cache-root-shape").join("models--o--r");
+    let snap = cache_root.join("snapshots/rev");
+    fs::create_dir_all(&snap).unwrap();
+    let file = snap.join("m.gguf");
+    fs::write(&file, b"weights").unwrap();
+    let target = model(&file);
+    let planned = plan(&target, std::slice::from_ref(&target), Some(&cache_root));
+    assert!(
+      planned.hf_repo_dir.is_none(),
+      "the cache root itself is never the directory a delete removes wholesale"
+    );
+    let _ = fs::remove_dir_all(cache_root.parent().unwrap());
   }
 
   fn symlink_or_copy(target: &Path, link: &Path) {

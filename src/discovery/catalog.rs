@@ -108,11 +108,28 @@ impl ModelCatalog {
   /// whose file still exists is kept, so a client cannot hide a live model.
   /// Returns how many rows were dropped.
   pub async fn forget_missing(&self, paths: &[PathBuf]) -> usize {
+    // The stats run off the lock: a cache on a network mount would otherwise
+    // stall every proxy reader queued behind the write guard.
+    let candidates: Vec<PathBuf> = {
+      let slot = self.inner.read().await;
+      slot
+        .models
+        .keys()
+        .filter(|path| paths.iter().any(|p| path.starts_with(p)))
+        .cloned()
+        .collect()
+    };
+    let gone: std::collections::HashSet<PathBuf> = tokio::task::spawn_blocking(move || {
+      candidates
+        .into_iter()
+        .filter(|path| !path.exists())
+        .collect()
+    })
+    .await
+    .unwrap_or_default();
     let mut slot = self.inner.write().await;
     let before = slot.models.len();
-    slot
-      .models
-      .retain(|path, _| !paths.iter().any(|p| path.starts_with(p)) || path.exists());
+    slot.models.retain(|path, _| !gone.contains(path));
     let dropped = before - slot.models.len();
     if dropped > 0 {
       slot.rebuild();

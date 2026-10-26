@@ -1228,38 +1228,48 @@ fn apply_delete_model(app: &mut App) {
   app.confirm_dialog = Some(ConfirmAction::DeleteModel { plan, display_name });
 }
 
-/// Returns the toast message describing why a delete must refuse on
-/// the focused row, or `None` when the delete should be allowed.
-/// Mirrors the chip-rendering rule in `render::focused_row_is_deletable`
-/// so the hint and the keybinding stay in lock-step.
-fn delete_refusal_reason(app: &App) -> Option<&'static str> {
+/// Returns the toast message describing why a delete of `path` must refuse, or
+/// `None` when it should be allowed. Keyed by path, not by the row under the
+/// cursor, because the confirm asks again for the path the popup named and a
+/// status tick can restructure the list under the cursor (a launch that starts
+/// grows a `Running` section and pulls its path out of the folder group).
+///
+/// Mirrors the chip-rendering rule in `render::focused_row_is_deletable`, on the
+/// stricter side: every live launch of the file blocks, not only the focused one.
+fn delete_refusal_reason_for(app: &App, path: &Path) -> Option<&'static str> {
   use crate::tui::status_icons::SurfaceState;
-  if let Some(path) = app.focused_path() {
-    if !app.has_local_file(&path) {
-      return Some("model is declared in config.yaml — remove it there");
-    }
+  if !app.has_local_file(path) {
+    return Some("model is declared in config.yaml — remove it there");
   }
-  if let Some(managed) = app.focused_managed() {
-    return Some(match managed.state {
-      SurfaceState::Ready | SurfaceState::Loading | SurfaceState::Launching => {
-        "model is running — stop the launch first"
-      }
-      SurfaceState::Error => "launch is in error — stop it first, then delete",
-      // Stopped/NotLaunched routes through the managed-table but is
-      // free to delete; fall through.
-      _ => return None,
-    });
-  }
-  // External (read-only daemon-tracked process). Not in `managed`,
-  // so we walk `external` by path.
-  if app
-    .external
+  let mut states = app
+    .managed
     .iter()
-    .any(|e| Some(&e.path) == app.focused_path().as_ref())
-  {
+    .filter(|m| m.path == path)
+    .map(|m| m.state);
+  if states.clone().any(|s| {
+    matches!(
+      s,
+      SurfaceState::Ready | SurfaceState::Loading | SurfaceState::Launching
+    )
+  }) {
+    return Some("model is running — stop the launch first");
+  }
+  if states.any(|s| matches!(s, SurfaceState::Error)) {
+    return Some("launch is in error — stop it first, then delete");
+  }
+  // External (read-only daemon-tracked process). Not in `managed`.
+  if app.external.iter().any(|e| e.path == path) {
     return Some("model is open in an external process — close it first");
   }
   None
+}
+
+/// The focused row's answer, for the keystroke that opens the popup.
+fn delete_refusal_reason(app: &App) -> Option<&'static str> {
+  app
+    .focused_path()
+    .as_ref()
+    .and_then(|path| delete_refusal_reason_for(app, path))
 }
 
 /// Route a key to the open save-preset dialog. Name stage: typing edits
@@ -1437,6 +1447,12 @@ fn apply_confirmed(app: &mut App, action: ConfirmAction, writer: Option<&mpsc::S
       );
     }
     ConfirmAction::DeleteModel { plan, display_name } => {
+      // A launch can start while the popup is open, and the cursor may have moved
+      // off the row the popup was staged for.
+      if let Some(reason) = delete_refusal_reason_for(app, &plan.primary) {
+        app.show_toast(reason);
+        return;
+      }
       let Some(tx) = require_events_tx(app, "delete") else {
         return;
       };
@@ -2968,6 +2984,42 @@ mod tests {
       "the outcome clears the marker"
     );
     std::iter::from_fn(|| writer_rx.try_recv().ok()).collect()
+  }
+
+  /// The popup was staged for `a`, then `a` started and the list restructured, so
+  /// the cursor now sits on `b`. The refusal belongs to `a`, the model the popup
+  /// named.
+  #[test]
+  fn a_confirmed_delete_refuses_a_launch_that_started_under_the_popup() {
+    use crate::tui::delete::DeletePlan;
+    let dir = crate::util::test_temp::unique_temp_dir("delete-started");
+    let a = dir.join("a.gguf");
+    let b = dir.join("b.gguf");
+    for f in [&a, &b] {
+      std::fs::write(f, b"weights").unwrap();
+    }
+    let mut app = App::new(Default::default());
+    app.models = vec![
+      fake_model_for_events(&a.to_string_lossy(), &dir.to_string_lossy()),
+      fake_model_for_events(&b.to_string_lossy(), &dir.to_string_lossy()),
+    ];
+    app.managed = vec![ready_managed_for_events(&a.to_string_lossy(), 41234)];
+    app.list_cursor = row_index_of(&app, &b);
+    apply_confirmed(
+      &mut app,
+      ConfirmAction::DeleteModel {
+        plan: Box::new(DeletePlan::single(a.clone())),
+        display_name: "a".into(),
+      },
+      None,
+    );
+    assert!(a.exists(), "the model that started keeps its file");
+    assert!(app.delete_in_flight.is_none(), "and no worker was started");
+    assert_eq!(
+      app.toast_message(),
+      Some("model is running — stop the launch first")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
   }
 
   /// The row goes, its sibling quant stays, the toast is the summary as it is, and
