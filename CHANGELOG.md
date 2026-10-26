@@ -2,12 +2,13 @@
 
 ### Added
 
-- A `backend.generic` entry can declare `routes:` — path prefixes of its own API to forward through the proxy, matched on a slash boundary after dot segments resolve in any spelling and logged under the prefix, body forwarded as it arrived — so an engine whose API is not the OpenAI shape (whisper.cpp's `/inference`) answers through the proxy port too.
-- The proxy forwards the image and audio routes (`/v1/images/generations` `edits` `variations`, `/v1/audio/speech`, `/v1/audio/transcriptions` `translations`) to a generic server that declares `image`, `tts` or `stt` in its `modes`, so an ASR or TTS engine answers through the proxy port instead of only its own. A request naming `whisper-1` or `tts-1` goes to the one server that declares the mode and says which one served it. Plan: [`docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md`](docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md).
+- The proxy forwards the image and audio routes (`/v1/images/generations` `edits` `variations`, `/v1/audio/speech`, `/v1/audio/transcriptions` `translations`) to a generic server that declares `image`, `tts` or `stt` in its `modes`, so an ASR or TTS engine answers through the proxy port instead of only its own. A request naming `whisper-1` or `tts-1` goes to the one server that declares the mode and says which one served it ([#120](https://github.com/llamastash/llamastash/pull/120)). Plan: [`docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md`](docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md).
+- A `backend.generic` entry can declare `routes:` — path prefixes of its own API to forward through the proxy, matched on a slash boundary after dot segments resolve in any spelling and logged under the prefix, body forwarded as it arrived — so an engine whose API is not the OpenAI shape (whisper.cpp's `/inference`) answers through the proxy port too. A prefix that overlaps a route the proxy answers itself, or carries a wildcard, is refused at config load ([#120](https://github.com/llamastash/llamastash/pull/120)).
 - Each request row now reports its own KV-cache hit: a `Cache` column between `In` and `Out` in the TUI and the `llamastash requests` table, and `cache_hit_ratio` on the row JSON. It drops before both token counts when the pane narrows.
-- `backend.vllm.rewrite_model` answers a vLLM launch with the name it was served, so a `proxy.aliases` name for a vLLM model reaches the model instead of vLLM's `404`.
+- `backend.vllm.rewrite_model` answers a vLLM launch with the name it was served, so a `proxy.aliases` name for a vLLM model reaches the model instead of vLLM's `404` ([#121](https://github.com/llamastash/llamastash/pull/121)).
 - The proxy forwards `/v1/systemone` by `model`, so decision models (Kev, Laya) answer through the proxy port. A generic entry can no longer claim it in `routes`.
-- `llamastash list --json` carries the `proxy.aliases` table under `aliases`, every entry read `ok` or the reason it cannot route, so a dead alias shows up without a client having to send it.
+- `llamastash list --json` carries the `proxy.aliases` table under `aliases`, every entry read `ok` or the reason it cannot route, so a dead alias shows up without a client having to send it ([#121](https://github.com/llamastash/llamastash/pull/121)).
+- [`RECIPES.md`](RECIPES.md) is grouped by what the engine does (Chat, Image generation, Speech to text, Text to speech, Classifiers and decision models) behind an index, and gains tested entries for Strata, Fish Speech S2-Pro, Chatterbox TTS API, Speaches, LocalAI, Piper, Kokoro-FastAPI, ComfyUI, whisper.cpp on CUDA, Krea 2 and MOSS-Image on the sd.cpp HIP build, FastFlowLM's ASR model, decision models (Kev, Laya) and LANCET ([#120](https://github.com/llamastash/llamastash/pull/120), [#122](https://github.com/llamastash/llamastash/pull/122)).
 
 ### Changed
 
@@ -17,8 +18,17 @@
 ### Fixed
 
 - `llamastash init` installs the ROCm llama.cpp build again. The extraction size caps now follow the asset the GitHub API declared (16× its compressed bytes, floored at 2 GiB) instead of a flat 1 GiB per entry, which refused `libggml-hip.so` once it grew to 1.09 GiB; the free-space precheck budgets a ROCm download by what it actually unpacks to instead of 3x its size ([#119](https://github.com/llamastash/llamastash/issues/119)).
-- Deleting a model in the TUI frees its bytes when huggingface_hub keeps them in its shared blob store (`<cache>/blobs/<xx>/`). Before, only the links went and the space stayed used. The row also leaves the list right away instead of coming back until the next 5-minute rescan.
 - A request naming a media endpoint that no entry declares says so, and one that several entries declare but none has started says how many there are. Before, both read as a name to add to `proxy.aliases`.
+- `llamastash start` on a generic entry that declares a media mode failed with `unrecognised mode hint`, and `chat` opened a Chat tab for one. `start` launches it and `chat` refuses image, tts and stt rows the way it refuses embedding and rerank ([#120](https://github.com/llamastash/llamastash/pull/120)).
+- A request routed by media mode rewrote `body.model` to the entry's name, which broke a multi-model engine behind one entry (Speaches, LocalAI) and Kokoro-FastAPI under any entry name but `kokoro`. The client's name now survives; an engine that only answers to its own name already has `rewrite_model` ([#120](https://github.com/llamastash/llamastash/pull/120)).
+- Deleting a model in the TUI frees its bytes when huggingface_hub keeps them in its shared blob store (`<cache>/blobs/<xx>/`). Before, only the links went and the space stayed used. The row also leaves the list right away instead of coming back until the next 5-minute rescan. A `.refs` file the sweep cannot read keeps its payload rather than being treated as unreferenced, and one delete waits at most 2 s in total on the shared-blob lock, which it holds on the thread that draws the TUI.
+
+### Security
+
+- rustls-webpki 0.103.15 → 0.103.16, clearing [RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382): a certificate chain through a distrusted intermediate could be accepted. Transitive via rustls and reqwest.
+- webpki-roots 1.0.7 → 1.0.11, clearing [RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381): the bundled root set trusted the emSign intermediates. Transitive via reqwest.
+- tokio 1.52.3 → 1.54.1, clearing [RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386): `AsyncFd::new` violates I/O safety, patched in 1.53.3.
+- clipboard-win 5.4.1 → 5.4.3, because 5.4.1 is yanked. Windows-only, reached through `arboard` for the TUI's clipboard copy. ([#121](https://github.com/llamastash/llamastash/pull/121))
 
 ## [0.9.1] — 2026-10-19
 
