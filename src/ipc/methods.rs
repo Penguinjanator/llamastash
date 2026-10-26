@@ -1086,6 +1086,56 @@ mod tests {
     MethodContext::new(ShutdownToken::new())
   }
 
+  fn row(path: &std::path::Path) -> crate::discovery::DiscoveredModel {
+    crate::discovery::DiscoveredModel {
+      path: path.to_path_buf(),
+      parent: path.parent().unwrap().to_path_buf(),
+      source: crate::discovery::ModelSource::UserPath,
+      metadata: None,
+      parse_error: None,
+      split_siblings: Vec::new(),
+      display_label: None,
+      multimodal: None,
+      supported_backends: vec!["llamacpp".into()],
+      mtp_head: None,
+    }
+  }
+
+  /// The call a TUI delete makes so the row does not come back on the next
+  /// refresh: rows whose files are gone drop, a live row stays, and `dropped`
+  /// counts what left.
+  #[tokio::test]
+  async fn forget_models_drops_gone_rows_and_keeps_the_live_one() {
+    let dir = crate::test_support::unique_temp_dir("ls-ipc", "forget");
+    let live = dir.join("live.gguf");
+    std::fs::write(&live, b"GGUF").expect("write model");
+    let gone = dir.join("gone.gguf");
+    let ctx = ctx();
+    for path in [&live, &gone] {
+      ctx.catalog.upsert(row(path)).await;
+    }
+    assert_eq!(ctx.catalog.len().await, 2);
+
+    let value = forget_models_handler(&ctx, Some(json!({ "paths": [dir.clone()] })))
+      .await
+      .expect("drops the gone row");
+    assert_eq!(value, json!({ "dropped": 1 }));
+    let left: Vec<std::path::PathBuf> = ctx
+      .catalog
+      .snapshot()
+      .await
+      .into_iter()
+      .map(|m| m.path)
+      .collect();
+    assert_eq!(left, vec![live]);
+
+    let err = forget_models_handler(&ctx, None)
+      .await
+      .expect_err("paths are required");
+    assert_eq!(err.code, ErrorCode::InvalidParams.as_i32());
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
   /// A header read for a model the catalog has no row for went onto a blocking
   /// thread, so cover that it still answers, and answers with the same tuple the
   /// sync resolver produced.

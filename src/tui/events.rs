@@ -1425,7 +1425,13 @@ fn apply_confirmed(app: &mut App, action: ConfirmAction, writer: Option<&mpsc::S
             .chain(plan.hf_repo_dir.clone())
             .collect();
           if let Some(tx) = writer {
-            let _ = tx.try_send(WriterCmd::ForgetModels(removed));
+            if let Err(e) = tx.try_send(WriterCmd::ForgetModels(removed)) {
+              // Silent for the user (the row is already dropped locally), but the
+              // daemon keeps listing it until its next rescan.
+              log::debug!("tui: forget_models not sent ({e})");
+            }
+          } else {
+            log::debug!("tui: no writer attached, forget_models skipped");
           }
           app.models.retain(|m| {
             m.path != plan.primary

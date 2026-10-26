@@ -536,7 +536,7 @@ The daemon dispatches on `req.method`. Wire format: `{"jsonrpc": "2.0", "id": <i
 | `presets_list / save / delete / show` | Per-model named preset CRUD, backed by the config `presets:` store |
 | `presets_all` | Raw config `presets:` map (the TUI resolves each model's effective set client-side) |
 | `favorite_list / add / remove` | Favorites CRUD |
-| `forget_models` | `{paths}`: drop the catalog rows at or under these paths whose files are gone, then rescan. Rows whose files still exist stay. The TUI sends it after a delete, since HF roots are watched shallow and a deep delete would otherwise stay listed until the 5-minute rescan. Returns `{dropped}` |
+| `forget_models` | `{paths}`: drop the catalog rows at or under these paths whose files are gone and ask the discovery task to rescan; the reply goes out before that rescan runs. Rows whose files still exist stay. The TUI sends it after a delete, since HF roots are watched shallow and a deep delete would otherwise stay listed until the 5-minute rescan. Returns `{dropped}` |
 | `last_params_list` | Persisted last-successful-launch params per model |
 
 JSON-RPC error codes follow the spec (`-32601 Method not found`, `-32602 Invalid params`, etc.) plus `InternalError` for daemon-side faults. The `capabilities` method enumerates supported methods so clients can feature-detect.

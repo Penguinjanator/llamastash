@@ -36,13 +36,25 @@ use crate::launch::resolve::{CatalogRow, MtpCapability};
 /// in the map and in the view until the next rebuild: memory in proportion to how
 /// many models are on disk, never time on the request path. If that ever matters
 /// the fix is an `Arc` per row rather than a second `Vec`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ModelCatalog {
   inner: Arc<RwLock<CatalogSlot>>,
-  /// Wakes the discovery task for a rescan outside the watcher's view: HF
-  /// roots are watched shallow, so a file removed deep in a repo would
-  /// otherwise stay listed until the periodic backstop.
-  rescan: Arc<tokio::sync::Notify>,
+  /// Rescan requests from clients, bumped by [`Self::forget_missing`]: HF roots
+  /// are watched shallow, so a file removed deep in a repo would otherwise stay
+  /// listed until the periodic backstop. A version counter rather than a
+  /// `Notify`, because a reader that is busy mid-rescan must not lose a request
+  /// that lands while it is away.
+  rescan: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+impl Default for ModelCatalog {
+  fn default() -> Self {
+    let (rescan, _) = tokio::sync::watch::channel(0);
+    Self {
+      inner: Arc::default(),
+      rescan: Arc::new(rescan),
+    }
+  }
 }
 
 /// The map plus the read views handed out to proxy readers.
@@ -108,23 +120,46 @@ impl ModelCatalog {
   /// whose file still exists is kept, so a client cannot hide a live model.
   /// Returns how many rows were dropped.
   pub async fn forget_missing(&self, paths: &[PathBuf]) -> usize {
+    // The stats run off the lock: a slow root (a cache on a network mount)
+    // would otherwise stall every proxy reader queueing behind the write guard.
+    let candidates: Vec<PathBuf> = {
+      let slot = self.inner.read().await;
+      slot
+        .models
+        .keys()
+        .filter(|path| paths.iter().any(|p| path.starts_with(p)))
+        .cloned()
+        .collect()
+    };
+    let gone = match tokio::task::spawn_blocking(move || {
+      candidates
+        .into_iter()
+        .filter(|path| !path.exists())
+        .collect::<Vec<PathBuf>>()
+    })
+    .await
+    {
+      Ok(gone) => gone.into_iter().collect::<std::collections::HashSet<_>>(),
+      Err(_) => return 0,
+    };
     let mut slot = self.inner.write().await;
     let before = slot.models.len();
-    slot
-      .models
-      .retain(|path, _| !paths.iter().any(|p| path.starts_with(p)) || path.exists());
+    slot.models.retain(|path, _| !gone.contains(path));
     let dropped = before - slot.models.len();
     if dropped > 0 {
       slot.rebuild();
     }
     drop(slot);
-    self.rescan.notify_one();
+    self.rescan.send_modify(|seq| *seq += 1);
     dropped
   }
 
-  /// Resolves once [`Self::forget_missing`] has asked for a rescan.
-  pub async fn rescan_requested(&self) {
-    self.rescan.notified().await;
+  /// Watch for [`Self::forget_missing`] rescan requests. Subscribe once and keep
+  /// the receiver: `changed()` compares versions instead of consuming a permit,
+  /// so a request that lands while the reader is busy is still seen and dropping
+  /// a pending `changed()` inside a `select!` cannot swallow one.
+  pub fn rescan_requests(&self) -> tokio::sync::watch::Receiver<u64> {
+    self.rescan.subscribe()
   }
 
   /// Number of models currently surfaced.
@@ -251,6 +286,19 @@ mod tests {
 
   use crate::discovery::ModelSource;
   use crate::gguf::metadata::{ModelMetadata, Quant};
+
+  /// A fresh temp dir per test: removed first so an aborted run cannot leave
+  /// state behind for the next one.
+  fn tempdir(label: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+      "llamastash-catalog-{label}-{}-{:?}",
+      std::process::id(),
+      std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+  }
 
   fn fake_model(path: &str, source: ModelSource) -> DiscoveredModel {
     DiscoveredModel {
@@ -382,7 +430,7 @@ mod tests {
 
   #[tokio::test]
   async fn forget_missing_drops_only_gone_rows_and_requests_a_rescan() {
-    let dir = std::env::temp_dir().join(format!("llamastash-forget-{}", std::process::id()));
+    let dir = tempdir("forget");
     std::fs::create_dir_all(dir.join("repo")).unwrap();
     let live = dir.join("repo/live.gguf");
     std::fs::write(&live, b"GGUF").unwrap();
@@ -396,16 +444,15 @@ mod tests {
         .upsert(fake_model(p.to_str().unwrap(), ModelSource::HuggingFace))
         .await;
     }
-    let rescan = cat.clone();
-    let woken = tokio::spawn(async move { rescan.rescan_requested().await });
+    let mut requests = cat.rescan_requests();
 
     assert_eq!(cat.forget_missing(&[dir.join("repo")]).await, 1);
     let left: Vec<PathBuf> = cat.snapshot().await.into_iter().map(|m| m.path).collect();
     assert_eq!(left, vec![dir.join("other/gone.gguf"), live]);
-    tokio::time::timeout(std::time::Duration::from_secs(1), woken)
+    tokio::time::timeout(std::time::Duration::from_secs(1), requests.changed())
       .await
       .expect("rescan must be requested")
-      .unwrap();
+      .expect("rescan channel open");
     let _ = std::fs::remove_dir_all(&dir);
   }
 

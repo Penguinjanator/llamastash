@@ -1941,10 +1941,10 @@ These are the defaults. Override any binding via the `keybindings:` block in `co
 | The `mmproj-*.gguf` projector           | Only when no other model in the folder pairs with it. A shared projector stays. Extra precisions of the paired projector (an `mmproj-BF16.gguf` beside the paired `mmproj-F16.gguf`) go with it — nothing pairs with them on their own. |
 | The separate `mtp-*.gguf` draft head    | Same rule as the projector.                                                                                                                               |
 | The HuggingFace cache blob behind a file | When the file is a snapshot symlink into its own repo's `blobs/`. Without this the bytes stay and the delete frees nothing.                               |
-| The shared-store file behind that blob   | When huggingface_hub keeps one shared copy per file (`<cache>/blobs/<xx>/<hash>`, marked by `.huggingface-shared-blobs`) and the repo blob links to it. It goes once its `.refs` lists no other repo still linking it, under its `.lock`, as `hf` does; a missing `.refs` keeps it. |
+| The shared-store file behind that blob   | When huggingface_hub (1.32.0+) keeps one shared copy per file (`<cache>/blobs/<xx>/<hash>`, marked by `.huggingface-shared-blobs`) and the repo blob links to it. It goes once its `.refs` lists no other repo still linking it, under its `.lock`, as `hf` does. A `.refs` that is missing or unreadable, or that lists a reference the sweep cannot read, keeps the file: nothing gets freed on a check that could not be made. So does a `.lock` another process still holds after two seconds. |
 | The whole `models--<owner>--<repo>` dir | Only when the row is the **last** model in that repo — then every revision, ref and blob goes, shared-store files included under the rule above. A repo holding a second quant takes the per-file path instead, so the survivor keeps its bytes. |
 
-The row leaves the list as soon as the delete finishes: the TUI tells the daemon (`forget_models`), which drops it and rescans, instead of waiting for the 5-minute rescan that catches a change deep inside an HF repo.
+The row leaves the list as soon as the delete finishes: the TUI tells the daemon (`forget_models`), which drops it and asks for a rescan, instead of waiting for the 5-minute rescan that catches a change deep inside an HF repo.
 
 An HF-shaped tree that is *not* under the configured cache root (an rsynced backup, a restored archive) never gets the recursive removal — it falls back to per-file unlinking.
 

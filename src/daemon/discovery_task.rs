@@ -92,6 +92,9 @@ pub fn spawn(catalog: ModelCatalog, opts: DiscoveryOptions) -> tokio::task::Join
 }
 
 async fn run(catalog: ModelCatalog, opts: DiscoveryOptions) {
+  // Subscribe before the first scan so a request that lands during it is seen.
+  let mut rescan_requests = catalog.rescan_requests();
+
   // Initial scan: drain every scanner row into the catalog.
   full_rescan(&catalog, &opts).await;
 
@@ -129,7 +132,11 @@ async fn run(catalog: ModelCatalog, opts: DiscoveryOptions) {
         Some(event) => event,
         None => break,
       },
-      () = catalog.rescan_requested() => {
+      requested = rescan_requests.changed() => {
+        if requested.is_err() {
+          // The catalog is gone, so there is nothing left to update.
+          break;
+        }
         log::debug!("discovery: re-scanning on client request");
         full_rescan(&catalog, &opts).await;
         continue;
@@ -407,6 +414,58 @@ mod tests {
       tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(catalog.len().await, 2);
+    fs::remove_dir_all(&dir).ok();
+  }
+
+  /// A client's forget request is the only thing that re-walks an HF root before
+  /// the backstop: the shallow watch cannot see a change deep inside a repo, so
+  /// the periodic rescan is pushed out of reach here and the request alone has
+  /// to bring the new file in.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn rescan_request_re_walks_a_shallow_root() {
+    let dir = temp_dir("rescan-request");
+    let snap = dir.join("models--o--r").join("snapshots").join("rev");
+    fs::create_dir_all(&snap).unwrap();
+    fs::write(snap.join("a.gguf"), build_minimal_gguf("llama")).unwrap();
+    let catalog = ModelCatalog::new();
+    let opts = DiscoveryOptions {
+      scan_roots: vec![ScanRoot {
+        path: dir.clone(),
+        source: ModelSource::HuggingFace,
+      }],
+      scan: ScanOptions::default(),
+      watcher: WatcherOptions {
+        debounce: Duration::from_millis(50),
+        periodic_rescan: Duration::from_secs(3600),
+        channel_capacity: 16,
+      },
+      backend: Default::default(),
+      backend_force: Default::default(),
+    };
+    let _task = spawn(catalog.clone(), opts);
+
+    let initial_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while catalog.len().await < 1 {
+      if std::time::Instant::now() > initial_deadline {
+        panic!("initial scan never populated catalog");
+      }
+      tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Two levels below the watched root, and nothing matches the delete paths.
+    fs::write(snap.join("b.gguf"), build_minimal_gguf("llama")).unwrap();
+    assert_eq!(catalog.forget_missing(&[dir.join("nothing")]).await, 0);
+
+    let rescan_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while catalog.len().await < 2 {
+      if std::time::Instant::now() > rescan_deadline {
+        panic!(
+          "the requested rescan never ran; size = {}",
+          catalog.len().await
+        );
+      }
+      tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     fs::remove_dir_all(&dir).ok();
   }
 

@@ -13,6 +13,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::discovery::{scanner, DiscoveredModel};
 
@@ -326,56 +327,92 @@ fn remove_file_and_blob(file: &Path, cache_root: Option<&Path>) -> io::Result<()
 /// put the target outside the repo.
 fn hf_blob_target(file: &Path, cache_root: Option<&Path>) -> Option<PathBuf> {
   let repo_dir = hf_repo_dir_in_cache(file, cache_root)?;
-  let entry = link_target_one_hop(file)?;
+  let Ok(Some(entry)) = link_target_one_hop(file) else {
+    return None;
+  };
   (entry.parent()? == repo_dir.join("blobs")).then_some(entry)
 }
 
 /// Where the symlink `link` points, with the directory part canonicalised and
 /// the last component left as is, so a target that is itself a link stays put.
-fn link_target_one_hop(link: &Path) -> Option<PathBuf> {
-  if !fs::symlink_metadata(link).ok()?.file_type().is_symlink() {
-    return None;
-  }
-  let target = fs::read_link(link).ok()?;
-  let target = if target.is_absolute() {
-    target
-  } else {
-    link.parent()?.join(target)
+/// `Ok(None)` when `link` is not a symlink or is gone; `Err` for any other
+/// filesystem fault, so a caller about to free bytes can tell a reference that
+/// is gone from one it simply could not read.
+fn link_target_one_hop(link: &Path) -> io::Result<Option<PathBuf>> {
+  let meta = match fs::symlink_metadata(link) {
+    Ok(meta) => meta,
+    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+    Err(e) => return Err(e),
   };
-  Some(
-    target
-      .parent()?
-      .canonicalize()
-      .ok()?
-      .join(target.file_name()?),
-  )
+  if !meta.file_type().is_symlink() {
+    return Ok(None);
+  }
+  let raw = fs::read_link(link)?;
+  let joined = if raw.is_absolute() {
+    raw
+  } else {
+    link.parent().unwrap_or(link).join(raw)
+  };
+  let (dir, name) = match (joined.parent(), joined.file_name()) {
+    (Some(dir), Some(name)) => (dir, name),
+    _ => return Ok(None),
+  };
+  Ok(Some(dir.canonicalize()?.join(name)))
 }
 
 /// Marker huggingface_hub writes in `<cache>/blobs/` when it keeps one shared
-/// copy per file (`<cache>/blobs/<xx>/<xet_hash>`) and makes each repo's
-/// `blobs/<sha>` a symlink to it.
+/// copy per file (`<cache>/blobs/<xx>/<xet_hash>`, since huggingface_hub 1.32.0)
+/// and makes each repo's `blobs/<sha>` a symlink to it.
 const SHARED_BLOBS_MARKER: &str = ".huggingface-shared-blobs";
+
+/// How long a sweep waits for a blob's lock before skipping it. A sweep runs on
+/// whichever thread deleted the model, which for the TUI is its draw thread.
+const SHARED_BLOB_LOCK_WAIT: Duration = Duration::from_secs(2);
 
 /// The shared-store file a repo `blobs/<sha>` symlink points at, or `None` when
 /// `entry` is a regular blob or the target is not a well-formed store path.
 fn shared_store_target(entry: &Path, cache_root: Option<&Path>) -> Option<PathBuf> {
-  let store_dir = cache_root?.canonicalize().ok()?.join("blobs");
+  shared_store_target_checked(entry, cache_root?)
+    .ok()
+    .flatten()
+}
+
+/// [`shared_store_target`] with filesystem faults kept: a caller about to delete
+/// a payload has to treat "this reference is gone" and "I could not read this
+/// reference" differently.
+fn shared_store_target_checked(entry: &Path, cache_root: &Path) -> io::Result<Option<PathBuf>> {
+  let store_dir = cache_root.canonicalize()?.join("blobs");
   if !store_dir.join(SHARED_BLOBS_MARKER).is_file() {
-    return None;
+    return Ok(None);
   }
-  let target = link_target_one_hop(entry)?;
-  let name = target.file_name()?.to_str()?;
-  let prefix = target.parent()?;
-  let well_formed = prefix.parent()? == store_dir
-    && name.len() == 64
-    && name.bytes().all(|b| b.is_ascii_hexdigit())
-    && prefix.file_name()?.to_str()? == &name[..2];
-  well_formed.then_some(target)
+  let Some(target) = link_target_one_hop(entry)? else {
+    return Ok(None);
+  };
+  Ok(store_shape(&target, &store_dir).then_some(target))
+}
+
+/// `<cache>/blobs/<xx>/<hash>` with one lowercase 64-hex hash, huggingface_hub's
+/// store shape. Anything else is not ours to touch.
+fn store_shape(target: &Path, store_dir: &Path) -> bool {
+  let Some(name) = target.file_name().and_then(|n| n.to_str()) else {
+    return false;
+  };
+  let Some(prefix) = target.parent() else {
+    return false;
+  };
+  let hash = name.len() == 64
+    && name
+      .bytes()
+      .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+  hash
+    && prefix.parent() == Some(store_dir)
+    && prefix.file_name().and_then(|p| p.to_str()) == Some(&name[..2])
 }
 
 /// Remove a shared-store file once no repo links to it, the way huggingface_hub's
 /// own cache delete does: under its `.lock`, every `.refs` line is checked against
-/// the filesystem, and a missing or unreadable `.refs` keeps the file.
+/// the filesystem. Anything that cannot be checked keeps the file, so a cache
+/// problem never costs bytes another model still needs.
 fn sweep_shared_blob(store: &Path, cache_root: &Path) {
   let Some(name) = store.file_name().and_then(|n| n.to_str()) else {
     return;
@@ -395,7 +432,10 @@ fn sweep_shared_blob(store: &Path, cache_root: &Path) {
   else {
     return;
   };
-  if lock.lock().is_err() {
+  if !lock_blob(&lock) {
+    return;
+  }
+  if !fs::symlink_metadata(&refs_path).is_ok_and(|m| m.is_file()) {
     return;
   }
   let Ok(refs) = fs::read_to_string(&refs_path) else {
@@ -404,18 +444,49 @@ fn sweep_shared_blob(store: &Path, cache_root: &Path) {
   let Ok(cache_root) = cache_root.canonicalize() else {
     return;
   };
-  let still_linked = refs.lines().any(|line| {
+  for line in refs.lines() {
     let rel = Path::new(line);
-    !line.is_empty()
+    let usable = !line.is_empty()
       && rel.is_relative()
       && rel
         .components()
-        .all(|c| matches!(c, std::path::Component::Normal(_)))
-      && shared_store_target(&cache_root.join(rel), Some(&cache_root)).as_deref() == Some(store)
-  });
-  if !still_linked && fs::symlink_metadata(store).is_ok_and(|m| m.is_file()) {
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if !usable {
+      continue;
+    }
+    let still_links = match shared_store_target_checked(&cache_root.join(rel), &cache_root) {
+      Err(_) => return,
+      Ok(Some(target)) => target.as_path() == store,
+      Ok(None) => false,
+    };
+    if still_links {
+      return;
+    }
+  }
+  if fs::symlink_metadata(store).is_ok_and(|m| m.is_file()) {
     let _ = fs::remove_file(store);
     let _ = fs::remove_file(&refs_path);
+  }
+}
+
+/// Take the store's advisory lock, giving up once [`SHARED_BLOB_LOCK_WAIT`] runs
+/// out. `File::lock` waits forever, and the caller is whichever thread asked for
+/// the delete: for the TUI that is the thread drawing the screen.
+fn lock_blob(lock: &fs::File) -> bool {
+  let deadline = Instant::now() + SHARED_BLOB_LOCK_WAIT;
+  loop {
+    match lock.try_lock() {
+      Ok(()) => return true,
+      // Contended: worth another pass while the wait lasts.
+      Err(std::fs::TryLockError::WouldBlock) => {}
+      // A lock that cannot be taken at all is not worth waiting on.
+      Err(_) => return false,
+    }
+    if Instant::now() >= deadline {
+      log::debug!("delete: shared blob lock held, leaving the payload for now");
+      return false;
+    }
+    std::thread::sleep(Duration::from_millis(25));
   }
 }
 
@@ -1088,6 +1159,58 @@ mod tests {
     assert!(!cache_root.join("models--o--a").exists());
     assert!(payload.exists(), "repo b still links the payload");
     assert!(fs::read(&b).is_ok());
+    let _ = fs::remove_dir_all(&cache_root);
+  }
+
+  /// huggingface_hub's rule: metadata that cannot be checked is never grounds for
+  /// deletion. A `.refs` that is not a regular file says nothing usable.
+  #[cfg(unix)]
+  #[test]
+  fn a_shared_store_payload_with_an_unreadable_refs_survives() {
+    let cache_root = tempdir("shared-bad-refs");
+    let (file, payload) = shared_store_model(&cache_root, "models--o--r", "m.gguf", 'e');
+    let refs = payload.with_extension("refs");
+    fs::remove_file(&refs).unwrap();
+    fs::create_dir(&refs).unwrap();
+    let target = model(&file);
+    execute(&plan(
+      &target,
+      std::slice::from_ref(&target),
+      Some(&cache_root),
+    ))
+    .expect("delete must succeed");
+    assert!(!cache_root.join("models--o--r").exists());
+    assert!(payload.exists(), "an unreadable .refs keeps the payload");
+    let _ = fs::remove_dir_all(&cache_root);
+  }
+
+  /// A listed reference the sweep cannot read is not an absent one: a permission
+  /// or path fault on the *last* line must not free a payload another repo may
+  /// still link. Here the path runs through a regular file, so reading it fails
+  /// for every user, root included.
+  #[cfg(unix)]
+  #[test]
+  fn a_shared_store_ref_that_cannot_be_read_keeps_the_payload() {
+    let cache_root = tempdir("shared-ref-fault");
+    let (file, payload) = shared_store_model(&cache_root, "models--o--r", "m.gguf", 'f');
+    fs::write(cache_root.join("blocker"), b"x").unwrap();
+    fs::write(
+      payload.with_extension("refs"),
+      b"blocker/blobs/etag-m.gguf\n",
+    )
+    .unwrap();
+    let target = model(&file);
+    execute(&plan(
+      &target,
+      std::slice::from_ref(&target),
+      Some(&cache_root),
+    ))
+    .expect("delete must succeed");
+    assert!(!cache_root.join("models--o--r").exists());
+    assert!(
+      payload.exists(),
+      "a reference that could not be checked keeps the payload"
+    );
     let _ = fs::remove_dir_all(&cache_root);
   }
 
