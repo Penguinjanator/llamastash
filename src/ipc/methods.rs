@@ -141,6 +141,7 @@ pub async fn dispatch_request(ctx: &MethodContext, req: Request) -> Response {
     "presets_all" => Response::ok(id, presets_all_handler(ctx).await),
     "favorite_add" => respond(id, favorite_add_handler(ctx, req.params).await),
     "favorite_remove" => respond(id, favorite_remove_handler(ctx, req.params).await),
+    "forget_models" => respond(id, forget_models_handler(ctx, req.params).await),
     "favorite_list" => respond(id, favorite_list_handler(ctx).await),
     "last_params_list" => respond(id, last_params_list_handler(ctx).await),
     other => Response::err(
@@ -525,6 +526,7 @@ const PUBLIC_METHODS: &[&str] = &[
   "favorite_add",
   "favorite_remove",
   "favorite_list",
+  "forget_models",
   "last_params_list",
 ];
 
@@ -1015,6 +1017,22 @@ async fn favorite_remove_handler(
     "model_id": id,
     "removed": removed,
   }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ForgetModelsParams {
+  paths: Vec<PathBuf>,
+}
+
+/// A client that deleted model files tells the daemon, so `list_models` stops
+/// listing them now instead of after the next rescan.
+async fn forget_models_handler(
+  ctx: &MethodContext,
+  params: Option<Value>,
+) -> Result<Value, ErrorObject> {
+  let parsed: ForgetModelsParams = parse_params(params)?;
+  let dropped = ctx.catalog.forget_missing(&parsed.paths).await;
+  Ok(json!({ "dropped": dropped }))
 }
 
 async fn favorite_list_handler(ctx: &MethodContext) -> Result<Value, ErrorObject> {

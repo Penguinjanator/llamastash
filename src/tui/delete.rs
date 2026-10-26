@@ -228,7 +228,20 @@ pub fn plan_for_path(path: &Path, catalog: &[DiscoveredModel]) -> DeletePlan {
 /// was already gone would leave the rest on disk.
 pub fn execute(plan: &DeletePlan) -> io::Result<String> {
   if let Some(repo_dir) = &plan.hf_repo_dir {
+    // `remove_dir_all` unlinks the repo's shared-store symlinks without
+    // following them, so collect their targets first and sweep them after.
+    let store_blobs: Vec<PathBuf> = fs::read_dir(repo_dir.join("blobs"))
+      .into_iter()
+      .flatten()
+      .flatten()
+      .filter_map(|e| shared_store_target(&e.path(), plan.cache_root.as_deref()))
+      .collect();
     fs::remove_dir_all(repo_dir)?;
+    if let Some(cache_root) = plan.cache_root.as_deref() {
+      for store in &store_blobs {
+        sweep_shared_blob(store, cache_root);
+      }
+    }
     return Ok(format!(
       "deleted HF cache for {}",
       repo_dir
@@ -297,26 +310,113 @@ fn remove_file_and_blob(file: &Path, cache_root: Option<&Path>) -> io::Result<()
   let blob = hf_blob_target(file, cache_root);
   fs::remove_file(file)?;
   if let Some(blob) = blob {
-    let _ = fs::remove_file(blob);
+    let store = shared_store_target(&blob, cache_root);
+    let _ = fs::remove_file(&blob);
+    if let (Some(store), Some(cache_root)) = (store, cache_root) {
+      sweep_shared_blob(&store, cache_root);
+    }
   }
   Ok(())
 }
 
-/// The `blobs/<sha>` file backing an HF snapshot symlink, or `None` when
+/// The repo's `blobs/<sha>` entry behind an HF snapshot symlink, or `None` when
 /// `file` is a plain file, sits outside the cache, or links out of the repo.
+/// Resolves one hop only: under huggingface_hub's shared store the entry is
+/// itself a symlink into `<cache>/blobs/<xx>/`, and following it there would
+/// put the target outside the repo.
 fn hf_blob_target(file: &Path, cache_root: Option<&Path>) -> Option<PathBuf> {
   let repo_dir = hf_repo_dir_in_cache(file, cache_root)?;
-  if !fs::symlink_metadata(file).ok()?.file_type().is_symlink() {
+  let entry = link_target_one_hop(file)?;
+  (entry.parent()? == repo_dir.join("blobs")).then_some(entry)
+}
+
+/// Where the symlink `link` points, with the directory part canonicalised and
+/// the last component left as is, so a target that is itself a link stays put.
+fn link_target_one_hop(link: &Path) -> Option<PathBuf> {
+  if !fs::symlink_metadata(link).ok()?.file_type().is_symlink() {
     return None;
   }
-  let link = fs::read_link(file).ok()?;
-  let target = if link.is_absolute() {
-    link
+  let target = fs::read_link(link).ok()?;
+  let target = if target.is_absolute() {
+    target
   } else {
-    file.parent()?.join(link)
+    link.parent()?.join(target)
   };
-  let target = target.canonicalize().ok()?;
-  target.starts_with(repo_dir.join("blobs")).then_some(target)
+  Some(
+    target
+      .parent()?
+      .canonicalize()
+      .ok()?
+      .join(target.file_name()?),
+  )
+}
+
+/// Marker huggingface_hub writes in `<cache>/blobs/` when it keeps one shared
+/// copy per file (`<cache>/blobs/<xx>/<xet_hash>`) and makes each repo's
+/// `blobs/<sha>` a symlink to it.
+const SHARED_BLOBS_MARKER: &str = ".huggingface-shared-blobs";
+
+/// The shared-store file a repo `blobs/<sha>` symlink points at, or `None` when
+/// `entry` is a regular blob or the target is not a well-formed store path.
+fn shared_store_target(entry: &Path, cache_root: Option<&Path>) -> Option<PathBuf> {
+  let store_dir = cache_root?.canonicalize().ok()?.join("blobs");
+  if !store_dir.join(SHARED_BLOBS_MARKER).is_file() {
+    return None;
+  }
+  let target = link_target_one_hop(entry)?;
+  let name = target.file_name()?.to_str()?;
+  let prefix = target.parent()?;
+  let well_formed = prefix.parent()? == store_dir
+    && name.len() == 64
+    && name.bytes().all(|b| b.is_ascii_hexdigit())
+    && prefix.file_name()?.to_str()? == &name[..2];
+  well_formed.then_some(target)
+}
+
+/// Remove a shared-store file once no repo links to it, the way huggingface_hub's
+/// own cache delete does: under its `.lock`, every `.refs` line is checked against
+/// the filesystem, and a missing or unreadable `.refs` keeps the file.
+fn sweep_shared_blob(store: &Path, cache_root: &Path) {
+  let Some(name) = store.file_name().and_then(|n| n.to_str()) else {
+    return;
+  };
+  let lock_path = store.with_file_name(format!("{name}.lock"));
+  let refs_path = store.with_file_name(format!("{name}.refs"));
+  // A planted symlink as the lock would make us lock (and create) its target.
+  if fs::symlink_metadata(&lock_path).is_ok_and(|m| !m.is_file()) {
+    return;
+  }
+  let Ok(lock) = fs::OpenOptions::new()
+    .read(true)
+    .write(true)
+    .create(true)
+    .truncate(false)
+    .open(&lock_path)
+  else {
+    return;
+  };
+  if lock.lock().is_err() {
+    return;
+  }
+  let Ok(refs) = fs::read_to_string(&refs_path) else {
+    return;
+  };
+  let Ok(cache_root) = cache_root.canonicalize() else {
+    return;
+  };
+  let still_linked = refs.lines().any(|line| {
+    let rel = Path::new(line);
+    !line.is_empty()
+      && rel.is_relative()
+      && rel
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+      && shared_store_target(&cache_root.join(rel), Some(&cache_root)).as_deref() == Some(store)
+  });
+  if !still_linked && fs::symlink_metadata(store).is_ok_and(|m| m.is_file()) {
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(&refs_path);
+  }
 }
 
 /// The `models--<owner>--<repo>` directory `path` sits under by directory
@@ -894,6 +994,100 @@ mod tests {
       snapshot.exists(),
       "nothing may be removed on the refusal path"
     );
+    let _ = fs::remove_dir_all(&cache_root);
+  }
+
+  /// huggingface_hub's shared-store layout: the payload in
+  /// `<cache>/blobs/<xx>/<hash>` with a `.refs` listing each repo symlink to it,
+  /// `<repo>/blobs/<etag>` a relative link to that, and the snapshot file a
+  /// relative link to the repo entry. Returns (snapshot file, store payload).
+  #[cfg(unix)]
+  fn shared_store_model(
+    cache_root: &Path,
+    repo: &str,
+    file: &str,
+    hash_byte: char,
+  ) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::symlink;
+    let store_dir = cache_root.join("blobs");
+    fs::create_dir_all(&store_dir).unwrap();
+    fs::write(store_dir.join(SHARED_BLOBS_MARKER), b"1").unwrap();
+    let hash: String = std::iter::repeat_n(hash_byte, 64).collect();
+    let prefix = store_dir.join(&hash[..2]);
+    fs::create_dir_all(&prefix).unwrap();
+    let payload = prefix.join(&hash);
+    if !payload.exists() {
+      fs::write(&payload, b"weights").unwrap();
+    }
+    let etag = format!("etag-{file}");
+    let repo_blobs = cache_root.join(repo).join("blobs");
+    let snap = cache_root.join(repo).join("snapshots/rev");
+    fs::create_dir_all(&repo_blobs).unwrap();
+    fs::create_dir_all(&snap).unwrap();
+    symlink(
+      format!("../../blobs/{}/{hash}", &hash[..2]),
+      repo_blobs.join(&etag),
+    )
+    .unwrap();
+    let mut refs =
+      fs::read_to_string(payload.with_file_name(format!("{hash}.refs"))).unwrap_or_default();
+    refs.push_str(&format!("{repo}/blobs/{etag}\n"));
+    fs::write(payload.with_file_name(format!("{hash}.refs")), refs).unwrap();
+    let link = snap.join(file);
+    symlink(format!("../../blobs/{etag}"), &link).unwrap();
+    (link, payload)
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn last_model_in_repo_frees_its_shared_store_payload() {
+    let cache_root = tempdir("shared-last");
+    let (file, payload) = shared_store_model(&cache_root, "models--o--r", "m.gguf", 'a');
+    let target = model(&file);
+    let p = plan(&target, std::slice::from_ref(&target), Some(&cache_root));
+    assert!(p.hf_repo_dir.is_some());
+    execute(&p).expect("delete must succeed");
+    assert!(!cache_root.join("models--o--r").exists());
+    assert!(!payload.exists(), "the shared payload must be freed");
+    assert!(!payload.with_extension("refs").exists());
+    let _ = fs::remove_dir_all(&cache_root);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn one_quant_of_two_frees_only_its_shared_store_payload() {
+    let cache_root = tempdir("shared-two-quants");
+    let (q4, q4_payload) = shared_store_model(&cache_root, "models--o--r", "q4.gguf", 'b');
+    let (q8, q8_payload) = shared_store_model(&cache_root, "models--o--r", "q8.gguf", 'c');
+    let target = model(&q4);
+    let catalog = vec![target.clone(), model(&q8)];
+    let p = plan(&target, &catalog, Some(&cache_root));
+    assert_eq!(p.hf_repo_dir, None);
+    execute(&p).expect("delete must succeed");
+    assert!(
+      !q4_payload.exists(),
+      "the deleted quant's payload must be freed"
+    );
+    assert!(
+      q8_payload.exists(),
+      "the other quant's payload must survive"
+    );
+    assert!(fs::read(&q8).is_ok(), "the other quant must still resolve");
+    let _ = fs::remove_dir_all(&cache_root);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn shared_store_payload_linked_from_another_repo_survives() {
+    let cache_root = tempdir("shared-two-repos");
+    let (a, payload) = shared_store_model(&cache_root, "models--o--a", "m.gguf", 'd');
+    let (b, _) = shared_store_model(&cache_root, "models--o--b", "m.gguf", 'd');
+    let target = model(&a);
+    let catalog = vec![target.clone(), model(&b)];
+    execute(&plan(&target, &catalog, Some(&cache_root))).expect("delete must succeed");
+    assert!(!cache_root.join("models--o--a").exists());
+    assert!(payload.exists(), "repo b still links the payload");
+    assert!(fs::read(&b).is_ok());
     let _ = fs::remove_dir_all(&cache_root);
   }
 

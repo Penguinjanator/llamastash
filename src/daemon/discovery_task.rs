@@ -123,7 +123,18 @@ async fn run(catalog: ModelCatalog, opts: DiscoveryOptions) {
     }
   };
 
-  while let Some(event) = rx.recv().await {
+  loop {
+    let event = tokio::select! {
+      event = rx.recv() => match event {
+        Some(event) => event,
+        None => break,
+      },
+      () = catalog.rescan_requested() => {
+        log::debug!("discovery: re-scanning on client request");
+        full_rescan(&catalog, &opts).await;
+        continue;
+      }
+    };
     match event {
       WatchEvent::Changed { paths } => {
         // We could do surgical updates per-path, but the simplest
