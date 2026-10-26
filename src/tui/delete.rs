@@ -206,12 +206,33 @@ pub fn plan(
     let repo_still_populated = catalog
       .iter()
       .any(|m| m.path != target.path && hf_repo_dir_shape(&m.path) == shape);
-    if !repo_still_populated {
+    if !repo_still_populated && !download_in_flight(&repo_dir) {
       plan.hf_repo_dir = Some(repo_dir);
     }
   }
 
   plan
+}
+
+/// True when a pull is writing this repo right now, whoever started it.
+///
+/// A downloader never writes a blob in place: it lands a sibling part file and
+/// renames on completion — `.part` for the hf-hub client this tool pulls with
+/// (`.sync.part` on its async path), `.incomplete` for python's `huggingface_hub`
+/// — so a part under `blobs/` means the tree is mid-write. The download strip only
+/// sees pulls started in this process, so this is what covers a `llamastash pull`
+/// in another terminal or a `huggingface-cli` run. Per-file unlinking still goes;
+/// only the wholesale removal waits, and an abandoned part keeps it that way until
+/// someone cleans it.
+fn download_in_flight(repo_dir: &Path) -> bool {
+  let Ok(entries) = fs::read_dir(repo_dir.join("blobs")) else {
+    return false;
+  };
+  entries.flatten().any(|e| {
+    let name = e.file_name();
+    let name = name.to_string_lossy();
+    name.ends_with(".part") || name.ends_with(".incomplete")
+  })
 }
 
 /// [`plan`] against the live HF cache root, resolving `path` to its catalog
@@ -1520,6 +1541,48 @@ mod tests {
   /// A line that climbs out of the cache with `..` is as little a reference as an
   /// absolute one, and for the same reason: the sweep cannot check it.
   #[cfg(unix)]
+  /// A part under `blobs/` is a pull mid-write in that repo, whoever started it:
+  /// the hf-hub client this tool pulls with lands `*.part` / `*.sync.part` beside
+  /// the blob and renames on completion, `huggingface_hub` uses `.incomplete`. The
+  /// download strip only sees pulls started in this process, so this is the check
+  /// that covers a pull in another terminal.
+  #[test]
+  fn a_repo_with_a_download_in_flight_is_never_removed_wholesale() {
+    let cache = tempdir("inflight");
+    let repo = cache.join("models--o--r");
+    let snap = repo.join("snapshots/rev");
+    fs::create_dir_all(repo.join("blobs")).unwrap();
+    fs::create_dir_all(&snap).unwrap();
+    let file = snap.join("model.gguf");
+    fs::write(&file, b"weights").unwrap();
+    // What hf-hub's async client writes before renaming into `blobs/<hash>`.
+    let part = repo
+      .join("blobs")
+      .join(format!("{}.sync.part", "0".repeat(64)));
+    fs::write(&part, b"half a model").unwrap();
+
+    let plan = plan_for_path_in(&file, &[model(&file)], Some(&cache));
+    assert!(
+      plan.in_hf_cache,
+      "the row is still recognised as a cache row"
+    );
+    assert!(
+      plan.hf_repo_dir.is_none(),
+      "a repo being written to is never taken wholesale"
+    );
+
+    // The part is the gate, not the repo: once it lands, the whole repo is fair
+    // game again.
+    fs::remove_file(&part).unwrap();
+    assert!(
+      plan_for_path_in(&file, &[model(&file)], Some(&cache))
+        .hf_repo_dir
+        .is_some(),
+      "with nothing in flight the whole-repo answer comes back"
+    );
+    let _ = fs::remove_dir_all(&cache);
+  }
+
   #[test]
   fn a_parent_directory_shared_store_ref_keeps_the_payload() {
     let cache_root = tempdir("shared-ref-parent");

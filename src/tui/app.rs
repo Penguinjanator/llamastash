@@ -1571,7 +1571,7 @@ impl App {
     self.sync_pane_to_focus(before);
   }
 
-  fn clamp_cursor(&mut self) {
+  pub(crate) fn clamp_cursor(&mut self) {
     let rows = self.rendered_rows();
     if rows.is_empty() {
       self.list_cursor = 0;
