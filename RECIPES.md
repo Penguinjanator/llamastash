@@ -50,6 +50,7 @@ Recipes are grouped by what the model does, most used type first. An engine that
 | Recipe | Engine | Models |
 |---|---|---|
 | [LocalAI](#localai) | LocalAI | Kokoro |
+| [Fish Speech](#fish-speech) | Fish Speech (Docker, ROCm) | S2-Pro |
 | [Piper](#piper) | Piper | Piper voices |
 | [Lemonade](#lemonade) | Lemonade | Kokoro |
 | [Kokoro-FastAPI](#kokoro-fastapi) | Kokoro-FastAPI | Kokoro 82M |
@@ -897,6 +898,71 @@ backend:
 Clients send Speaches' own model ids (`Systran/faster-whisper-small`, `speaches-ai/Kokoro-82M-v1.0-ONNX`) or OpenAI's names, and the proxy forwards them unchanged to the one entry that declares the mode. Speaches maps `tts-1` to Kokoro, which worked, and `whisper-1` to `Systran/faster-whisper-large-v3` through `model_aliases.json` in the checkout; download that model or edit the file. Started without `cd`, it exits with `Directory 'realtime-console/dist' does not exist`.
 
 ## Text to speech
+
+### Fish Speech
+
+[Fish Speech](https://github.com/fishaudio/fish-speech) serves its own text-to-speech API: `POST /v1/tts` with `{"text": ...}` returns a WAV, and `/v1/references/*` manages reference voices for cloning. It is not OpenAI-shaped, so the entry declares those paths instead of a mode. Tested with release v3.0.0-beta and the [S2-Pro](https://huggingface.co/fishaudio/s2-pro) model (4B, 11 GB with its codec) on a Flow Z13 (Strix Halo, Radeon 8060S). The project publishes CUDA and CPU images only, so the ROCm image is built from the checkout. Drama 3, the newer model, needs an NVIDIA GPU with 48 GB.
+
+```bash
+git clone --depth 1 --branch v3.0.0-beta https://github.com/fishaudio/fish-speech.git /path/to/fish-speech
+docker build -f /path/to/fish-speech/docker/Dockerfile.rocm --target server \
+  -t fish-speech-server:rocm-v3.0.0-beta /path/to/fish-speech
+mkdir -p /path/to/fish-speech-data/checkpoints/s2-pro /path/to/fish-speech-data/references
+cd /path/to/fish-speech-data/checkpoints/s2-pro
+for f in config.json chat_template.jinja special_tokens_map.json tokenizer.json tokenizer_config.json \
+         model.safetensors.index.json codec.pth model-00001-of-00002.safetensors model-00002-of-00002.safetensors; do
+  curl -fLO "https://huggingface.co/fishaudio/s2-pro/resolve/main/$f"
+done
+```
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: fish-speech-s2-pro
+        binary: /path/to/fish-speech-data/fish-speech-serve.sh
+        args: ["{port}"]
+        env:
+          COMPILE: "0"
+        ready: /v1/health
+        routes: [/v1/tts, /v1/references]
+        memory_gib: 22
+        stop_grace_secs: 30
+        ready_timeout_secs: 900
+```
+
+`fish-speech-serve.sh` sits next to `checkpoints/` and follows the [LANCET wrapper](#lancet): the container is named after the port and published on `127.0.0.1` only, and SIGTERM from llamastash becomes `docker stop`. `COMPILE=1` turns on `torch.compile`.
+
+```sh
+#!/bin/sh
+port="$1"
+dir=$(dirname "$(readlink -f "$0")")
+name="llamastash-fish-speech-$port"
+docker rm -f "$name" >/dev/null 2>&1
+for _ in $(seq 60); do docker container inspect "$name" >/dev/null 2>&1 || break; sleep 1; done
+docker run -d --rm --name "$name" -p "127.0.0.1:$port:8080" \
+  --device /dev/kfd --device /dev/dri \
+  --group-add "$(getent group video | cut -d: -f3)" --group-add "$(getent group render | cut -d: -f3)" \
+  --shm-size 2g -e COMPILE="${COMPILE:-0}" \
+  -v "$dir/checkpoints:/app/checkpoints:ro" -v "$dir/references:/app/references" \
+  fish-speech-server:rocm-v3.0.0-beta >/dev/null || exit 1
+trap 'docker stop -t 20 "$name" >/dev/null 2>&1' TERM INT
+docker logs -f "$name" 2>&1 &
+docker wait "$name" >/dev/null &
+wait $!
+```
+
+```bash
+llamastash start fish-speech-s2-pro
+curl -s http://127.0.0.1:11435/v1/tts -H 'Content-Type: application/json' \
+  -d '{"text": "Hello from LlamaStash.", "format": "wav"}' -o hello.wav
+```
+
+- The image's PyTorch is 2.9.1 for ROCm 7.2.3 and includes gfx1151, so it runs on the 8060S with no override.
+- The server answers `/v1/health` only after the model and codec load and one warm-up generation finish. The first request after `start` waits for that.
+- S2-Pro generated about 6 tokens/s with `COMPILE=0` and reported 21 GB of GPU memory, hence `memory_gib: 22`. A 79-character sentence took 136 s for 5.3 s of 44.1 kHz audio; most of that time is the codec decoding the tokens to audio.
+- `/v1/vqgan/*` (encode and decode audio tokens) stays closed on the proxy because it is not declared: a request to it got a 404.
+- `llamastash stop` left no container behind.
 
 ### Piper
 
