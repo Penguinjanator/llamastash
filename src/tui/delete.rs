@@ -261,6 +261,15 @@ pub fn plan_for_path_in(
   }
 }
 
+/// What a backgrounded delete reported back to the event loop. Carries the plan's
+/// primary (the row to drop, identified by the frozen plan rather than the cursor)
+/// and either a free-form summary for the toast or the exception that killed it.
+#[derive(Debug)]
+pub struct DeleteOutcome {
+  pub primary: PathBuf,
+  pub result: Result<String, String>,
+}
+
 /// Carry out `plan`, returning a human-readable summary for the toast.
 ///
 /// A missing file is not an error: discovery can lag a delete that happened

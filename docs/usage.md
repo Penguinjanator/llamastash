@@ -1950,7 +1950,9 @@ An HF-shaped tree that is *not* under the configured cache root (an rsynced back
 
 What the popup names is decided when you press `Ctrl+D`, and the last-model-in-repo question is asked again when you confirm, so a model that a rescan listed in that repo while the popup was open keeps its files. A confirm that would remove *more* than the popup named — the repo's other model disappeared in the meantime, so whole-repo came back — refuses and asks you to press `Ctrl+D` again against the new state instead of deleting quietly.
 
-Refusals: a running, loading or errored launch (stop it first), a row with no local file to unlink (a `backend.generic` entry or a backend registry row), and a row whose cache repo a download is still writing — this TUI's own pull, or another client's, whose half-written part under `blobs/` holds the wholesale removal back until it lands or gets cleaned. Wait for the pull or cancel it (`Ctrl+X`) first. Each of these is asked of the model the popup named, not of whatever row the cursor reaches while the popup is open, so a launch started from another terminal still blocks its own delete.
+Refusals: a running, loading or errored launch (stop it first), a row with no local file to unlink (a `backend.generic` entry or a backend registry row), and a row whose cache repo a download is still writing — this TUI's own pull, or another client's, whose half-written part under `blobs/` holds the wholesale removal back until it lands or gets cleaned. Wait for the pull or cancel it (`Ctrl+X`) first. Each of these is asked of the model the popup named, not of whatever row the list cursor drifts to while the popup is open, so a launch started from another terminal still blocks its own delete.
+
+The delete now runs on a background worker, so removing a multi-GB model no longer freezes the UI: the confirm handler dispatches the work and the row shows a muted `deleting…` marker until it lands (or errors). While a delete is in flight, `Ctrl+D` refuses a second one, and `q` asks for the keystroke again rather than leaving a half-done delete behind — the next rescan reconciles the catalog either way.
 
 ### Terminal bell (on by default)
 

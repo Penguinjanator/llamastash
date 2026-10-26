@@ -774,6 +774,10 @@ pub struct RenderInputs<'a> {
   /// Whether more than one backend is in play. When `false` the Backend
   /// column is omitted (a single-backend host would show all `llamacpp`).
   pub show_backend: bool,
+  /// The path a delete is in flight on, if any. Rendered as a muted
+  /// `deleting…` marker on that row so the user can see the operation
+  /// is still running while the rest of the list stays scrollable.
+  pub deleting_path: Option<&'a std::path::Path>,
 }
 
 /// Render `rows` into the supplied area using the active palette.
@@ -795,7 +799,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, palette: &Palette, input: Rende
   let items: Vec<ListItem<'_>> = rows
     .iter()
     .enumerate()
-    .map(|(i, r)| render_row(r, palette, &layout, content_w, Some(i) == safe_selected))
+    .map(|(i, r)| {
+      render_row(
+        r,
+        palette,
+        &layout,
+        content_w,
+        Some(i) == safe_selected,
+        r.path() == input.deleting_path,
+      )
+    })
     .collect();
   let title_line = build_block_title(input.title, input.filter_chip_label, palette, input.focused);
   let legend = build_status_legend(palette);
@@ -1075,6 +1088,7 @@ fn render_row<'a>(
   layout: &ColumnLayout,
   content_w: usize,
   selected: bool,
+  deleting: bool,
 ) -> ListItem<'a> {
   let name_w = layout.name_w;
   let cols = layout.visible.as_slice();
@@ -1143,6 +1157,17 @@ fn render_row<'a>(
       let fg = row_fg(*state, palette);
       let mut spans: Vec<Span<'a>> = Vec::with_capacity(2 + cols.len() * 2);
       spans.push(marker_span(*state, *favorite, palette));
+      if deleting {
+        // A delete is running for this row. Muted so it reads as an
+        // annotation, not a launch state, and the name cell still
+        // inherits the row foreground (no explicit fg) so selection
+        // flips it with the rest of the strip.
+        spans.push(Span::styled(
+          crate::tui::glyphs::active().placeholder().to_string(),
+          palette.muted_style(),
+        ));
+        spans.push(Span::styled(" deleting… ", palette.muted_style()));
+      }
       // A named launch renders `<name>@<launch-name>` so the row reads the
       // same addressable string the `list` table and proxy use. The `@name`
       // suffix is muted so the model name stays the dominant token — but only
@@ -1360,6 +1385,7 @@ mod tests {
             focused: true,
             show_device: false,
             show_backend: false,
+            deleting_path: None,
           },
         )
       })

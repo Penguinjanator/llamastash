@@ -473,6 +473,7 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &Palette) 
           focused: list_focused,
           show_device: app.multi_device(),
           show_backend: app.multi_backend(),
+          deleting_path: app.delete_in_flight.as_deref(),
         },
       );
     }
