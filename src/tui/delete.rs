@@ -1538,9 +1538,6 @@ mod tests {
     let _ = fs::remove_dir_all(&cache_root);
   }
 
-  /// A line that climbs out of the cache with `..` is as little a reference as an
-  /// absolute one, and for the same reason: the sweep cannot check it.
-  #[cfg(unix)]
   /// A part under `blobs/` is a pull mid-write in that repo, whoever started it:
   /// the hf-hub client this tool pulls with lands `*.part` / `*.sync.part` beside
   /// the blob and renames on completion, `huggingface_hub` uses `.incomplete`. The
@@ -1583,6 +1580,8 @@ mod tests {
     let _ = fs::remove_dir_all(&cache);
   }
 
+  /// A line that climbs out of the cache with `..` is as little a reference as an
+  /// absolute one, and for the same reason: the sweep cannot check it.
   #[test]
   fn a_parent_directory_shared_store_ref_keeps_the_payload() {
     let cache_root = tempdir("shared-ref-parent");
