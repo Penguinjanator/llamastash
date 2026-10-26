@@ -6,8 +6,9 @@
 //!    don't surface through the regular `.gguf` extension filter.
 //! 3. Starts the filesystem watcher and re-scans whenever a watcher
 //!    event fires (debounced by `notify-debouncer-mini` at the
-//!    watcher layer) or whenever the 5-minute periodic backstop
-//!    ticks.
+//!    watcher layer), whenever the 5-minute periodic backstop
+//!    ticks, or whenever a client asks for one after a delete
+//!    ([`ModelCatalog::rescan_requests`]).
 //!
 //! The IPC layer's `list_models` handler reads from the same
 //! catalog, so changes on disk reflect in the `list_models` response
@@ -134,7 +135,8 @@ async fn run(catalog: ModelCatalog, opts: DiscoveryOptions) {
       },
       requested = rescan_requests.changed() => {
         if requested.is_err() {
-          // The catalog is gone, so there is nothing left to update.
+          // Only a dropped sender gets here, and this task holds a catalog clone
+          // for its whole life, so this is a guard and not a path.
           break;
         }
         log::debug!("discovery: re-scanning on client request");

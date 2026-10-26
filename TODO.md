@@ -540,6 +540,8 @@ _Shared context: Alias resolution in the proxy, the `/v1/models` and `/api/tags`
 ## Next
 
 - [ ] support defining servers in yaml file so that a self contained yaml can define and run a model.
+- [ ] **TUI delete runs on the draw thread.** `delete::execute` unlinks the files, removes a whole cache repo, and sweeps shared-store payloads synchronously from the confirm handler in `src/tui/events.rs`, so a multi-GB delete freezes the UI for its duration; the shared-blob lock wait is bounded (`SHARED_BLOB_LOCK_WAIT` in `src/tui/delete.rs`) only so a stuck lock cannot hang it forever. Move the delete onto a task and toast when it lands.
+- [ ] **A stale discovery scan can resurrect a deleted row.** `ModelCatalog::replace_all` overwrites wholesale and carries no scan id, so a `full_rescan` that walked the tree before a delete — the periodic one, a watcher-triggered one, or a client-requested one — can land its `replace_all` after `forget_missing` and put the deleted row back until the next scan. Stamp each scan and ignore a `replace_all` from an older one. (`src/discovery/catalog.rs`)
 
 ### Batch 12: media-route follow-ups from the Z13 run
 
