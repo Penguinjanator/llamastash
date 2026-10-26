@@ -774,9 +774,8 @@ pub struct RenderInputs<'a> {
   /// Whether more than one backend is in play. When `false` the Backend
   /// column is omitted (a single-backend host would show all `llamacpp`).
   pub show_backend: bool,
-  /// The path a delete is in flight on, if any. Rendered as a muted
-  /// `deleting…` marker on that row so the user can see the operation
-  /// is still running while the rest of the list stays scrollable.
+  /// The path a delete is running on, if any; its row shows a muted
+  /// `deleting…` marker.
   pub deleting_path: Option<&'a std::path::Path>,
 }
 
@@ -806,7 +805,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, palette: &Palette, input: Rende
         &layout,
         content_w,
         Some(i) == safe_selected,
-        r.path() == input.deleting_path,
+        input.deleting_path.is_some_and(|p| r.path() == Some(p)),
       )
     })
     .collect();

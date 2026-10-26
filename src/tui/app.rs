@@ -435,18 +435,13 @@ pub struct App {
   /// the launch picker's Server + Device rows, and the multi-GPU gates all
   /// derive from it. Populated by [`Self::ingest_status`].
   pub servers: Vec<crate::backend::Server>,
-  /// Set when the user presses `q` so the event loop can exit. When a delete
-  /// is running the first `q` lands a toast asking for a second one instead.
+  /// Set when the user presses `q` so the event loop can exit.
   pub should_exit: bool,
-  /// Set by the first `q` during a delete, cleared by a non-quit action; the
-  /// second `q` clears it and quits. Lets the user bail mid-delete without a
-  /// modal popup.
+  /// Set by the first `q` while a delete runs; the second `q` quits.
   pub quit_confirm: bool,
-  /// The path a delete is in flight on, set while the worker task runs. None
-  /// between deletes. A delete runs on a worker task so a multi-GB `remove_dir_all`
-  /// no longer freezes the draw thread; the row renders its `deleting...` marker
-  /// from this, the loop refuses a second `Ctrl+D` while it is set, and quit asks
-  /// before leaving a half-done delete behind.
+  /// The path a delete is running on. Set from the confirm until the worker's
+  /// outcome lands; drives the row's `deleting…` marker, refuses a second
+  /// `Ctrl+D`, and makes the first `q` ask again.
   pub delete_in_flight: Option<PathBuf>,
   /// Whether the modal help overlay is visible. Bound to `?`.
   pub show_help: bool,

@@ -8,7 +8,7 @@
 //!    event fires (debounced by `notify-debouncer-mini` at the
 //!    watcher layer), whenever the 5-minute periodic backstop
 //!    ticks, or whenever a client asks for one after a delete
-//!    ([`ModelCatalog::rescan_requests`]).
+//!    ([`ModelCatalog::rescan_requested`]).
 //!
 //! The IPC layer's `list_models` handler reads from the same
 //! catalog, so changes on disk reflect in the `list_models` response
@@ -93,9 +93,6 @@ pub fn spawn(catalog: ModelCatalog, opts: DiscoveryOptions) -> tokio::task::Join
 }
 
 async fn run(catalog: ModelCatalog, opts: DiscoveryOptions) {
-  // Subscribe before the first scan so a request that lands during it is seen.
-  let mut rescan_requests = catalog.rescan_requests();
-
   // Initial scan: drain every scanner row into the catalog.
   full_rescan(&catalog, &opts).await;
 
@@ -133,12 +130,7 @@ async fn run(catalog: ModelCatalog, opts: DiscoveryOptions) {
         Some(event) => event,
         None => break,
       },
-      requested = rescan_requests.changed() => {
-        if requested.is_err() {
-          // Only a dropped sender gets here, and this task holds a catalog clone
-          // for its whole life, so this is a guard and not a path.
-          break;
-        }
+      () = catalog.rescan_requested() => {
         log::debug!("discovery: re-scanning on client request");
         full_rescan(&catalog, &opts).await;
         continue;

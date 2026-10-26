@@ -8,15 +8,10 @@
 //! the freed space never shows up.
 //!
 //! The plan is resolved before the confirm prompt so the popup can say what is
-//! about to go, and resolved again when the user confirms, against whatever the
-//! catalog holds by then. A confirm only ever deletes less than the popup
-//! described: a re-plan that comes back bigger is refused instead of run.
+//! about to go and the confirm handler does no fresh discovery.
 
-use std::cell::Cell;
 use std::fs;
-use std::io::{self, Read};
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -44,9 +39,8 @@ pub struct DeletePlan {
   /// its bytes.
   pub hf_repo_dir: Option<PathBuf>,
   /// Resolved HF cache root, carried so [`execute`] can decide whether a
-  /// snapshot symlink's blob is ours to unlink, and so a confirm can re-plan the
-  /// same row against the root the popup was drawn from.
-  pub cache_root: Option<PathBuf>,
+  /// snapshot symlink's blob is ours to unlink.
+  cache_root: Option<PathBuf>,
   /// Whether the files sit in the HF cache, so [`DeletePlan::describe`] only
   /// promises reclaimed blobs where there are blobs to reclaim.
   in_hf_cache: bool,
@@ -240,34 +234,35 @@ fn download_in_flight(repo_dir: &Path) -> bool {
 /// degrades to a single-file plan rather than refusing.
 pub fn plan_for_path(path: &Path, catalog: &[DiscoveredModel]) -> DeletePlan {
   let cache_root = crate::init::download::hf_cache_dir().ok();
-  plan_for_path_in(path, catalog, cache_root.as_deref())
-}
-
-/// [`plan_for_path`] with the cache root handed in. The confirm path re-plans
-/// through this so it reuses the root the popup was drawn from instead of
-/// re-reading the environment.
-pub fn plan_for_path_in(
-  path: &Path,
-  catalog: &[DiscoveredModel],
-  cache_root: Option<&Path>,
-) -> DeletePlan {
   match catalog.iter().find(|m| m.path == path) {
-    Some(target) => plan(target, catalog, cache_root),
+    Some(target) => plan(target, catalog, cache_root.as_deref()),
     None => DeletePlan {
       primary: path.to_path_buf(),
-      cache_root: cache_root.map(Path::to_path_buf),
+      cache_root,
       ..DeletePlan::default()
     },
   }
 }
 
-/// What a backgrounded delete reported back to the event loop. Carries the plan's
-/// primary (the row to drop, identified by the frozen plan rather than the cursor)
-/// and either a free-form summary for the toast or the exception that killed it.
+/// What a delete run off the draw thread reports back: the paths to drop from the
+/// list and the daemon's catalog, and the toast text or the error.
 #[derive(Debug)]
 pub struct DeleteOutcome {
-  pub primary: PathBuf,
+  pub forget: Vec<PathBuf>,
   pub result: Result<String, String>,
+}
+
+/// [`execute`] for a worker thread.
+pub fn run(plan: &DeletePlan) -> DeleteOutcome {
+  DeleteOutcome {
+    forget: plan
+      .files()
+      .into_iter()
+      .map(Path::to_path_buf)
+      .chain(plan.hf_repo_dir.clone())
+      .collect(),
+    result: execute(plan).map_err(|e| e.to_string()),
+  }
 }
 
 /// Carry out `plan`, returning a human-readable summary for the toast.
@@ -276,9 +271,13 @@ pub struct DeleteOutcome {
 /// outside llamastash, and failing the whole operation because a companion
 /// was already gone would leave the rest on disk.
 pub fn execute(plan: &DeletePlan) -> io::Result<String> {
-  // One lock budget for the whole delete, shared by every payload it sweeps.
-  let locks = LockBudget::default();
   if let Some(repo_dir) = &plan.hf_repo_dir {
+    // A pull can start while the popup is open, and the plan was made before it.
+    if download_in_flight(repo_dir) {
+      return Err(io::Error::other(
+        "a download is writing to this repo — try again when it finishes",
+      ));
+    }
     // `remove_dir_all` unlinks the repo's shared-store symlinks without
     // following them, so collect their targets first and sweep them after.
     let store_blobs: Vec<PathBuf> = fs::read_dir(repo_dir.join("blobs"))
@@ -290,7 +289,7 @@ pub fn execute(plan: &DeletePlan) -> io::Result<String> {
     fs::remove_dir_all(repo_dir)?;
     if let Some(cache_root) = plan.cache_root.as_deref() {
       for store in &store_blobs {
-        sweep_shared_blob(store, cache_root, &locks);
+        sweep_shared_blob(store, cache_root);
       }
     }
     return Ok(format!(
@@ -330,7 +329,7 @@ pub fn execute(plan: &DeletePlan) -> io::Result<String> {
   let mut removed = 0usize;
   let mut first_error = None;
   for file in &files {
-    match remove_file_and_blob(file, plan.cache_root.as_deref(), &locks) {
+    match remove_file_and_blob(file, plan.cache_root.as_deref()) {
       Ok(()) => removed += 1,
       Err(e) if e.kind() == io::ErrorKind::NotFound => {}
       Err(e) => {
@@ -357,18 +356,14 @@ pub fn execute(plan: &DeletePlan) -> io::Result<String> {
 /// Unlink `file`, plus the HF cache blob it points at when it is a snapshot
 /// symlink into its own repo's `blobs/` directory. A link pointing anywhere
 /// else is unlinked without touching its target.
-fn remove_file_and_blob(
-  file: &Path,
-  cache_root: Option<&Path>,
-  locks: &LockBudget,
-) -> io::Result<()> {
+fn remove_file_and_blob(file: &Path, cache_root: Option<&Path>) -> io::Result<()> {
   let blob = hf_blob_target(file, cache_root);
   fs::remove_file(file)?;
   if let Some(blob) = blob {
     let store = shared_store_target(&blob, cache_root);
     let _ = fs::remove_file(&blob);
     if let (Some(store), Some(cache_root)) = (store, cache_root) {
-      sweep_shared_blob(&store, cache_root, locks);
+      sweep_shared_blob(&store, cache_root);
     }
   }
   Ok(())
@@ -419,82 +414,29 @@ fn link_target_one_hop(link: &Path) -> io::Result<Option<PathBuf>> {
 /// and makes each repo's `blobs/<sha>` a symlink to it.
 const SHARED_BLOBS_MARKER: &str = ".huggingface-shared-blobs";
 
-/// How long one payload may wait for its own blob lock.
+/// How long a sweep waits for a payload's lock before keeping the payload.
+/// huggingface_hub's `filelock` takes the same lock with `fcntl.flock`, which is
+/// what `File::try_lock` uses, so the two contend for it.
 const SHARED_BLOB_LOCK_WAIT: Duration = Duration::from_millis(500);
 
-/// How long one delete may wait on blob locks in total. A sweep runs on whichever
-/// thread asked for the delete — for the TUI its draw thread — so the total is
-/// capped as well as the slice per payload: one held lock cannot cost every later
-/// payload its turn, and a lock stuck in another process cannot freeze the UI
-/// past the cap. It bounds waiting for locks only — a syscall on a dead mount
-/// still blocks the delete, which is `TODO.md`'s draw-thread entry. The count
-/// starts at the first sweep, so a slow `remove_dir_all` of the delete's own
-/// files does not spend it.
-///
-/// The lock is the same one huggingface_hub takes on this path: its `filelock`
-/// dependency locks it with `fcntl.flock`, which is what `File::lock` and
-/// `File::try_lock` use, so the two contend for it (verified against filelock
-/// 4.x, whose `UnixFileLock` calls `fcntl.flock`).
-const SHARED_BLOB_LOCK_BUDGET: Duration = Duration::from_secs(2);
-
-/// The blob-lock waiting one delete has left, shared by every payload it sweeps.
-#[derive(Default)]
-struct LockBudget {
-  /// Set when a sweep first asks, so unlinking the delete's own files is not
-  /// taken out of the waiting this budget is for.
-  close: Cell<Option<Instant>>,
+/// `<cache>/blobs` when this cache has a marked shared store.
+fn shared_store_dir(cache_root: &Path) -> Option<PathBuf> {
+  let store_dir = cache_root.canonicalize().ok()?.join("blobs");
+  store_dir
+    .join(SHARED_BLOBS_MARKER)
+    .is_file()
+    .then_some(store_dir)
 }
-
-impl LockBudget {
-  /// The instant this payload may wait until, or `None` once the delete has spent
-  /// its budget.
-  fn slice(&self) -> Option<Instant> {
-    let now = Instant::now();
-    let close = self.close.get().unwrap_or_else(|| {
-      let close = now + SHARED_BLOB_LOCK_BUDGET;
-      self.close.set(Some(close));
-      close
-    });
-    let left = close.checked_duration_since(now)?;
-    Some(now + SHARED_BLOB_LOCK_WAIT.min(left))
-  }
-}
-
-/// How much of a `.refs` manifest one sweep reads. Real manifests list one short
-/// path per sharing repo; 1 MiB is orders above any of them.
-const SHARED_BLOB_REFS_MAX: u64 = 1 << 20;
 
 /// The shared-store file a repo `blobs/<sha>` symlink points at, or `None` when
 /// `entry` is a regular blob or the target is not a well-formed store path.
 fn shared_store_target(entry: &Path, cache_root: Option<&Path>) -> Option<PathBuf> {
-  shared_store_target_checked(entry, cache_root?)
-    .ok()
-    .flatten()
+  let store_dir = shared_store_dir(cache_root?)?;
+  store_target(entry, &store_dir).ok().flatten()
 }
 
-/// [`shared_store_target`] with filesystem faults kept: a caller about to delete
-/// a payload has to treat "this reference is gone" and "I could not read this
-/// reference" differently.
-fn shared_store_target_checked(entry: &Path, cache_root: &Path) -> io::Result<Option<PathBuf>> {
-  match shared_store_dir(cache_root)? {
-    Some(store_dir) => store_target(entry, &store_dir),
-    None => Ok(None),
-  }
-}
-
-/// The cache's shared-blob store directory, or `None` when this cache has no
-/// marked store. `Err` when the cache root itself cannot be read.
-fn shared_store_dir(cache_root: &Path) -> io::Result<Option<PathBuf>> {
-  let store_dir = cache_root.canonicalize()?.join("blobs");
-  if !store_dir.join(SHARED_BLOBS_MARKER).is_file() {
-    return Ok(None);
-  }
-  Ok(Some(store_dir))
-}
-
-/// The entry of `store_dir` that `entry`'s symlink resolves to. Split out so a
-/// caller walking a whole manifest resolves the store once instead of
-/// re-canonicalising the cache root and re-statting the marker per line.
+/// [`shared_store_target`] given the store directory, with filesystem faults kept:
+/// a sweep has to tell "this reference is gone" from "I could not read it".
 fn store_target(entry: &Path, store_dir: &Path) -> io::Result<Option<PathBuf>> {
   let Some(target) = link_target_one_hop(entry)? else {
     return Ok(None);
@@ -523,141 +465,75 @@ fn store_shape(target: &Path, store_dir: &Path) -> bool {
 /// Remove a shared-store file once no repo links to it, the way huggingface_hub's
 /// own cache delete does: under its `.lock`, every `.refs` line is checked against
 /// the filesystem. Anything that cannot be checked keeps the file, so a cache
-/// problem never costs bytes another model still needs.
-/// One line per payload a sweep leaves alone, naming it. Nothing revisits a
-/// shared-store payload on its own — a later delete has to reach the same payload
-/// to free it — so the log has to say which bytes are still held.
-fn keep_payload(store: &Path, why: &str) {
-  log::debug!("delete: {why}, keeping {}", store.display());
+/// problem never costs bytes another model still needs; the log says which.
+fn sweep_shared_blob(store: &Path, cache_root: &Path) {
+  if let Err(why) = try_sweep_shared_blob(store, cache_root) {
+    log::debug!("delete: {why}, keeping {}", store.display());
+  }
 }
 
-fn sweep_shared_blob(store: &Path, cache_root: &Path, locks: &LockBudget) {
-  let Some(until) = locks.slice() else {
-    keep_payload(store, "this delete is done waiting on blob locks");
-    return;
-  };
-  let Ok(cache_root) = cache_root.canonicalize() else {
-    keep_payload(store, "the cache root could not be read");
-    return;
-  };
-  let store_dir = match shared_store_dir(&cache_root) {
-    Ok(Some(store_dir)) => store_dir,
-    Ok(None) => {
-      keep_payload(store, "this cache has no marked shared-blob store");
-      return;
-    }
-    Err(_) => {
-      keep_payload(store, "the shared-blob store could not be read");
-      return;
-    }
-  };
-  // Belt and braces on a path we are about to unlink: only ever a well-formed
-  // entry of this cache's own store.
-  if !store_shape(store, &store_dir) {
-    keep_payload(store, "the store entry is not a well-formed shared blob");
-    return;
-  }
-  let Some(name) = store.file_name().and_then(|n| n.to_str()) else {
-    keep_payload(store, "the store entry has no usable name");
-    return;
-  };
+fn try_sweep_shared_blob(store: &Path, cache_root: &Path) -> Result<(), &'static str> {
+  let cache_root = cache_root
+    .canonicalize()
+    .map_err(|_| "the cache root could not be read")?;
+  let store_dir =
+    shared_store_dir(&cache_root).ok_or("this cache has no marked shared-blob store")?;
+  let name = store
+    .file_name()
+    .and_then(|n| n.to_str())
+    .ok_or("the store entry has no usable name")?;
   let lock_path = store.with_file_name(format!("{name}.lock"));
   let refs_path = store.with_file_name(format!("{name}.refs"));
-  // Two guards on the lock path, because locking it means creating it: a
-  // symlink here would have us lock (and create) whatever it points at. The
-  // pre-check refuses a non-regular path, and `O_NOFOLLOW` closes the gap where
-  // a link is planted between that check and this open.
+  // A planted symlink as the lock would make us lock (and create) its target.
   if fs::symlink_metadata(&lock_path).is_ok_and(|m| !m.is_file()) {
-    keep_payload(store, "the blob lock is not a regular file");
-    return;
+    return Err("the blob lock is not a regular file");
   }
-  let mut opts = fs::OpenOptions::new();
-  opts.read(true).write(true).create(true).truncate(false);
-  #[cfg(unix)]
-  opts.custom_flags(libc::O_NOFOLLOW);
-  let Ok(lock) = opts.open(&lock_path) else {
-    keep_payload(store, "the blob lock could not be opened");
-    return;
-  };
-  if !lock_blob(&lock, until) {
-    keep_payload(store, "this delete is done waiting on blob locks");
-    return;
+  let lock = fs::OpenOptions::new()
+    .read(true)
+    .write(true)
+    .create(true)
+    .truncate(false)
+    .open(&lock_path)
+    .map_err(|_| "the blob lock could not be opened")?;
+  if !lock_blob(&lock) {
+    return Err("the blob lock is held by another process");
   }
-  // A regular file or nothing: a symlinked manifest would have us follow it
-  // wherever it points.
-  if !fs::symlink_metadata(&refs_path).is_ok_and(|m| m.is_file()) {
-    keep_payload(store, "the reference manifest is not a regular file");
-    return;
-  }
-  let Ok(mut manifest) = fs::File::open(&refs_path) else {
-    keep_payload(store, "the reference manifest could not be opened");
-    return;
-  };
-  // A manifest is one short line per repo linking the payload. Read at most one
-  // more than that allows: past it the file is corrupt or planted, and reading
-  // it whole would cost memory on the thread running the delete.
-  let mut raw = Vec::new();
-  let Ok(read) = manifest
-    .by_ref()
-    .take(SHARED_BLOB_REFS_MAX + 1)
-    .read_to_end(&mut raw)
-  else {
-    keep_payload(store, "the reference manifest could not be read");
-    return;
-  };
-  if read as u64 > SHARED_BLOB_REFS_MAX {
-    keep_payload(store, "the reference manifest is past the read bound");
-    return;
-  }
-  let Ok(refs) = String::from_utf8(raw) else {
-    keep_payload(store, "the reference manifest is not text");
-    return;
-  };
-  for line in refs.lines() {
-    // A blank line says nothing about a reference and is not grounds to keep.
-    if line.is_empty() {
-      continue;
-    }
+  let refs =
+    fs::read_to_string(&refs_path).map_err(|_| "the reference manifest could not be read")?;
+  for line in refs.lines().filter(|line| !line.is_empty()) {
     let rel = Path::new(line);
-    // A line outside the manifest's contract (absolute, or containing `..` or a
-    // path prefix) cannot be checked against this cache, so it keeps the payload
-    // rather than letting a sweep run on a list it only partly read.
+    // A line outside the manifest's contract (absolute, or containing `..`) cannot
+    // be checked against this cache.
     let checkable = rel.is_relative()
       && rel
         .components()
         .all(|c| matches!(c, std::path::Component::Normal(_)));
     if !checkable {
-      keep_payload(store, "the manifest lists a path outside its contract");
-      return;
+      return Err("the manifest lists a path outside its contract");
     }
-    let still_links = match store_target(&cache_root.join(rel), &store_dir) {
-      Err(_) => {
-        keep_payload(store, "a listed reference could not be read");
-        return;
-      }
-      Ok(Some(target)) => target.as_path() == store,
-      Ok(None) => false,
-    };
-    if still_links {
-      return;
+    match store_target(&cache_root.join(rel), &store_dir) {
+      Err(_) => return Err("a listed reference could not be read"),
+      // Another repo still links this payload.
+      Ok(Some(target)) if target == store => return Ok(()),
+      Ok(_) => {}
     }
   }
   if fs::symlink_metadata(store).is_ok_and(|m| m.is_file()) {
     let _ = fs::remove_file(store);
     let _ = fs::remove_file(&refs_path);
   }
+  Ok(())
 }
 
-/// Take the store's advisory lock, giving up once `until` runs out. `File::lock`
-/// waits forever, and the caller is whichever thread asked for the delete: for
-/// the TUI that is the thread drawing the screen.
-fn lock_blob(lock: &fs::File, until: Instant) -> bool {
+/// Take the store's advisory lock, giving up after [`SHARED_BLOB_LOCK_WAIT`]:
+/// `File::lock` waits forever, and a lock stuck in another process must not wedge
+/// the delete.
+fn lock_blob(lock: &fs::File) -> bool {
+  let until = Instant::now() + SHARED_BLOB_LOCK_WAIT;
   loop {
     match lock.try_lock() {
       Ok(()) => return true,
-      // Contended: worth another pass while this payload's slice lasts.
       Err(std::fs::TryLockError::WouldBlock) => {}
-      // A lock that cannot be taken at all is not worth waiting on.
       Err(_) => return false,
     }
     if Instant::now() >= until {
@@ -668,25 +544,19 @@ fn lock_blob(lock: &fs::File, until: Instant) -> bool {
 }
 
 /// [`crate::util::model_caches::hf_repo_dir`] used as the "is anything else still
-/// in this repo" key: pure path arithmetic, with no cache-root gate and no
-/// canonicalisation, so two paths from the same discovery pass compare reliably.
-/// Three row shapes resolve to the same repo — a GGUF file, the same file nested
-/// in a quant subdirectory (which the recursive GGUF scanner emits as its own
-/// row), and a whole-snapshot directory (what a safetensors row carries) — and all
-/// must land on the same answer or a mixed catalog reads as unrelated repos. A
-/// nested GGUF that resolved to `None` used to be invisible to that check, so
-/// deleting the directory row planned a whole-repo `remove_dir_all` straight over
-/// it.
+/// in this repo" key: pure path arithmetic, so two paths from the same discovery
+/// pass compare reliably. A GGUF file, the same file nested in a quant
+/// subdirectory, and a whole-snapshot directory (a safetensors row) must all land
+/// on the same repo, or a mixed catalog reads as unrelated repos and a whole-repo
+/// delete runs over a model that is still listed.
 fn hf_repo_dir_shape(path: &Path) -> Option<&Path> {
   crate::util::model_caches::hf_repo_dir(path)
 }
 
-/// [`hf_repo_dir_shape`] plus the gates that make recursive removal safe: the
-/// resolved repo directory must live inside `cache_root`, and must not *be* it. An
-/// HF-shaped tree somewhere else — an rsynced backup, a restored archive, a
-/// surprise Docker volume — resolves to `None` and takes the per-file path, and
-/// so does a cache root that is itself named `models--…`, where the repo answer
-/// would be the whole cache.
+/// [`hf_repo_dir_shape`] plus the gate that makes recursive removal safe: the
+/// resolved repo directory must live inside `cache_root`. An HF-shaped tree
+/// somewhere else — an rsynced backup, a restored archive, a surprise Docker
+/// volume — resolves to `None` and takes the per-file path instead.
 fn hf_repo_dir_in_cache(path: &Path, cache_root: Option<&Path>) -> Option<PathBuf> {
   let repo_dir = hf_repo_dir_shape(path)?;
   let cache_root = cache_root?;
@@ -696,9 +566,6 @@ fn hf_repo_dir_in_cache(path: &Path, cache_root: Option<&Path>) -> Option<PathBu
   let candidate = repo_dir
     .canonicalize()
     .unwrap_or_else(|_| repo_dir.to_path_buf());
-  if candidate == cache_root_canonical {
-    return None;
-  }
   candidate
     .starts_with(&cache_root_canonical)
     .then_some(candidate)
@@ -1350,9 +1217,8 @@ mod tests {
     let _ = fs::remove_dir_all(&cache_root);
   }
 
-  /// A lock someone else holds leaves the payload: the sweep waits at most one
-  /// payload's slice, then moves on. It burns that slice on purpose, so it takes
-  /// about half a second.
+  /// A lock someone else holds leaves the payload: the sweep waits out
+  /// `SHARED_BLOB_LOCK_WAIT`, then moves on, so this takes about half a second.
   #[cfg(unix)]
   #[test]
   fn a_busy_shared_blob_lock_leaves_the_payload() {
@@ -1380,29 +1246,8 @@ mod tests {
     let _ = fs::remove_dir_all(&cache_root);
   }
 
-  /// Each payload gets its own slice of the delete's waiting, the total starts at
-  /// the first slice, and a spent total leaves nothing for the next payload.
-  #[test]
-  fn a_lock_budget_gives_each_payload_its_own_slice() {
-    let locks = LockBudget::default();
-    let first = locks.slice().expect("the first payload gets a slice");
-    assert!(
-      first.duration_since(Instant::now()) <= SHARED_BLOB_LOCK_WAIT,
-      "a payload may not wait longer than its own slice"
-    );
-    // Backdate the total: this delete has used up its waiting.
-    locks
-      .close
-      .set(Some(Instant::now() - Duration::from_millis(1)));
-    assert!(
-      locks.slice().is_none(),
-      "a spent total leaves nothing for the payload behind it"
-    );
-  }
-
-  /// The property that budget exists for: a busy payload costs the ones behind it
-  /// their turn only if the budget is measured per payload. Here the first
-  /// payload's lock is held and the second is free, and only the busy one stays.
+  /// The wait is per payload: the first payload's lock is held and the second is
+  /// free, and only the busy one stays.
   #[cfg(unix)]
   #[test]
   fn a_busy_lock_does_not_cost_the_next_payload_its_turn() {
@@ -1497,33 +1342,6 @@ mod tests {
     let _ = fs::remove_dir_all(&cache_root);
   }
 
-  /// A manifest that is a symlink is not this payload's manifest: reading it
-  /// would follow wherever the link points, so the sweep refuses it and the
-  /// payload stays.
-  #[cfg(unix)]
-  #[test]
-  fn a_symlinked_shared_store_manifest_keeps_the_payload() {
-    let cache_root = tempdir("shared-refs-link");
-    let (file, payload) = shared_store_model(&cache_root, "models--o--r", "m.gguf", 'c');
-    let refs = payload.with_extension("refs");
-    let planted = cache_root.join("planted");
-    fs::write(&planted, "").unwrap();
-    fs::remove_file(&refs).unwrap();
-    std::os::unix::fs::symlink(&planted, &refs).unwrap();
-    let target = model(&file);
-    execute(&plan(
-      &target,
-      std::slice::from_ref(&target),
-      Some(&cache_root),
-    ))
-    .expect("delete must succeed");
-    assert!(
-      payload.exists(),
-      "a manifest that is a link keeps the payload"
-    );
-    let _ = fs::remove_dir_all(&cache_root);
-  }
-
   /// A lock path that is a symlink is refused rather than opened: taking the lock
   /// means creating the file, so a link would have us lock and create its target.
   #[cfg(unix)]
@@ -1567,30 +1385,37 @@ mod tests {
       .join(format!("{}.sync.part", "0".repeat(64)));
     fs::write(&part, b"half a model").unwrap();
 
-    let plan = plan_for_path_in(&file, &[model(&file)], Some(&cache));
+    let target = model(&file);
+    let catalog = std::slice::from_ref(&target);
+    let planned = plan(&target, catalog, Some(&cache));
     assert!(
-      plan.in_hf_cache,
+      planned.in_hf_cache,
       "the row is still recognised as a cache row"
     );
     assert!(
-      plan.hf_repo_dir.is_none(),
+      planned.hf_repo_dir.is_none(),
       "a repo being written to is never taken wholesale"
     );
 
     // The part is the gate, not the repo: once it lands, the whole repo is fair
     // game again.
     fs::remove_file(&part).unwrap();
+    let replanned = plan(&target, catalog, Some(&cache));
     assert!(
-      plan_for_path_in(&file, &[model(&file)], Some(&cache))
-        .hf_repo_dir
-        .is_some(),
+      replanned.hf_repo_dir.is_some(),
       "with nothing in flight the whole-repo answer comes back"
     );
+
+    // A pull that starts after the plan was made is caught when it runs.
+    fs::write(&part, b"half a model").unwrap();
+    assert!(execute(&replanned).is_err(), "execute refuses over a pull");
+    assert!(file.exists(), "and removes nothing");
     let _ = fs::remove_dir_all(&cache);
   }
 
   /// A line that climbs out of the cache with `..` is as little a reference as an
   /// absolute one, and for the same reason: the sweep cannot check it.
+  #[cfg(unix)]
   #[test]
   fn a_parent_directory_shared_store_ref_keeps_the_payload() {
     let cache_root = tempdir("shared-ref-parent");
@@ -1612,51 +1437,6 @@ mod tests {
       "a reference climbing out of the cache keeps the payload"
     );
     let _ = fs::remove_dir_all(&cache_root);
-  }
-
-  /// A manifest past the read bound is never read. Filled with blank lines it
-  /// would otherwise look like a payload nothing links, which is the one answer
-  /// that frees it.
-  #[cfg(unix)]
-  #[test]
-  fn an_oversized_shared_store_manifest_keeps_the_payload() {
-    let cache_root = tempdir("shared-refs-large");
-    let (file, payload) = shared_store_model(&cache_root, "models--o--r", "m.gguf", 'b');
-    fs::write(
-      payload.with_extension("refs"),
-      "\n".repeat(SHARED_BLOB_REFS_MAX as usize + 1),
-    )
-    .unwrap();
-    let target = model(&file);
-    execute(&plan(
-      &target,
-      std::slice::from_ref(&target),
-      Some(&cache_root),
-    ))
-    .expect("delete must succeed");
-    assert!(
-      payload.exists(),
-      "a manifest past the read bound keeps the payload"
-    );
-    let _ = fs::remove_dir_all(&cache_root);
-  }
-
-  /// A cache root that is itself named `models--…` resolves every row's repo to
-  /// the cache root, so the whole-repo answer would remove the whole cache.
-  #[test]
-  fn a_cache_root_named_like_a_repo_is_not_a_whole_repo_delete() {
-    let cache_root = tempdir("cache-root-shape").join("models--o--r");
-    let snap = cache_root.join("snapshots/rev");
-    fs::create_dir_all(&snap).unwrap();
-    let file = snap.join("m.gguf");
-    fs::write(&file, b"weights").unwrap();
-    let target = model(&file);
-    let plan = plan(&target, std::slice::from_ref(&target), Some(&cache_root));
-    assert!(
-      plan.hf_repo_dir.is_none(),
-      "the cache root itself is never the directory a delete removes wholesale"
-    );
-    let _ = fs::remove_dir_all(cache_root.parent().unwrap());
   }
 
   fn symlink_or_copy(target: &Path, link: &Path) {

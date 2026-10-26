@@ -87,10 +87,7 @@ pub enum Event {
   /// HF download progress / completion. Pushed by
   /// `spawn_download_task`.
   Download(crate::tui::download_strip::DownloadEvent),
-  /// A delete that was spawned off the draw thread has finished. Pushed by the
-  /// worker task that `apply_confirmed` launches so the popup's delete does not
-  /// block rendering. Carries the plan's primary (so the row can be dropped even
-  /// if the cursor moved) and the human-readable summary/exception.
+  /// A delete that `apply_confirmed` moved onto a worker thread has finished.
   Delete(DeleteOutcome),
 }
 
@@ -156,50 +153,6 @@ pub struct SavePresetCmd {
 /// the loop to exit (the user pressed `q` / Ctrl+C). The `writer`
 /// channel is optional so unit tests and the inline test backend
 /// drive `pump_input` without spinning a daemon writer task.
-/// Confirm a staged delete synchronously from a `#[test]`, by running the worker
-/// task on a private runtime and draining its `Event::Delete`. Lets tests assert
-/// on on-disk results without adopting `#[tokio::test]`, which would change the
-/// harness for the whole module.
-#[cfg(test)]
-fn confirm_and_run(app: &mut App, plan: crate::tui::delete::DeletePlan, name: &str) {
-  let rt = tokio::runtime::Builder::new_multi_thread()
-    .worker_threads(2)
-    .enable_all()
-    .build()
-    .expect("test runtime");
-  let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::tui::events::Event>(16);
-  app.events_tx = Some(tx);
-  rt.block_on(async {
-    apply_confirmed(
-      app,
-      crate::tui::app::ConfirmAction::DeleteModel {
-        plan: Box::new(plan),
-        display_name: name.into(),
-      },
-      None,
-    );
-  });
-  // A refusal (grow, running model, missing file) returns before spawning, so
-  // no Delete event ever lands. Detect that via the in-flight flag so the
-  // refusal-only tests do not block forever.
-  if app.delete_in_flight.is_none() {
-    return;
-  }
-  rt.block_on(async {
-    loop {
-      match rx.recv().await {
-        Some(crate::tui::events::Event::Delete(outcome)) => {
-          let (writer_tx, _rx) = tokio::sync::mpsc::channel::<crate::tui::events::WriterCmd>(1);
-          crate::tui::events::apply_delete_done(app, outcome, &writer_tx);
-          return;
-        }
-        Some(_) => {}
-        None => panic!("delete worker ended without an outcome event"),
-      }
-    }
-  });
-}
-
 pub fn pump_input(app: &mut App, evt: TermEvent) -> bool {
   pump_input_with_writer(app, evt, None)
 }
@@ -1275,88 +1228,38 @@ fn apply_delete_model(app: &mut App) {
   app.confirm_dialog = Some(ConfirmAction::DeleteModel { plan, display_name });
 }
 
-/// Returns the toast message describing why a delete of `path` must refuse, or
-/// `None` when it should be allowed. Keyed by path, not by the row under the
-/// cursor: the confirm re-checks a frozen plan, and a status tick can restructure
-/// the list under the cursor (a launch that starts grows a `Running` section and
-/// pulls its path out of the folder group), so by then the cursor can name a
-/// different model than the popup was staged for.
-///
-/// Mirrors the chip-render rule in `render::focused_row_is_deletable` and is
-/// deliberately the stricter side of it: every live launch of the file blocks, not
-/// only the launch the cursor happens to sit on.
-fn delete_refusal_reason_for(app: &App, path: &Path) -> Option<&'static str> {
+/// Returns the toast message describing why a delete must refuse on
+/// the focused row, or `None` when the delete should be allowed.
+/// Mirrors the chip-rendering rule in `render::focused_row_is_deletable`
+/// so the hint and the keybinding stay in lock-step.
+fn delete_refusal_reason(app: &App) -> Option<&'static str> {
   use crate::tui::status_icons::SurfaceState;
-  if !app.has_local_file(path) {
-    return Some("model is declared in config.yaml — remove it there");
+  if let Some(path) = app.focused_path() {
+    if !app.has_local_file(&path) {
+      return Some("model is declared in config.yaml — remove it there");
+    }
   }
-  if download_writes_repo_of(app, path) {
-    return Some("a download is writing to this repo — wait for it or cancel it");
+  if let Some(managed) = app.focused_managed() {
+    return Some(match managed.state {
+      SurfaceState::Ready | SurfaceState::Loading | SurfaceState::Launching => {
+        "model is running — stop the launch first"
+      }
+      SurfaceState::Error => "launch is in error — stop it first, then delete",
+      // Stopped/NotLaunched routes through the managed-table but is
+      // free to delete; fall through.
+      _ => return None,
+    });
   }
-  let live: Vec<_> = app
-    .managed
+  // External (read-only daemon-tracked process). Not in `managed`,
+  // so we walk `external` by path.
+  if app
+    .external
     .iter()
-    .filter(|m| m.path == path)
-    .map(|m| m.state)
-    .collect();
-  if live.iter().any(|s| {
-    matches!(
-      s,
-      SurfaceState::Ready | SurfaceState::Loading | SurfaceState::Launching
-    )
-  }) {
-    return Some("model is running — stop the launch first");
-  }
-  if live.iter().any(|s| matches!(s, SurfaceState::Error)) {
-    return Some("launch is in error — stop it first, then delete");
-  }
-  // External (read-only daemon-tracked process). Not in `managed`.
-  if app.external.iter().any(|e| e.path == path) {
+    .any(|e| Some(&e.path) == app.focused_path().as_ref())
+  {
     return Some("model is open in an external process — close it first");
   }
   None
-}
-
-/// The focused row's answer, for the keystroke that opens the popup.
-fn delete_refusal_reason(app: &App) -> Option<&'static str> {
-  app
-    .focused_path()
-    .as_ref()
-    .and_then(|path| delete_refusal_reason_for(app, path))
-}
-
-/// True when `confirmed` would unlink or remove anything `staged` did not name.
-/// A confirm re-plan may come back smaller than the popup described; anything
-/// bigger is a delete the user was never shown.
-fn plan_removes_more_than(
-  staged: &crate::tui::delete::DeletePlan,
-  confirmed: &crate::tui::delete::DeletePlan,
-) -> bool {
-  if confirmed.hf_repo_dir.is_some() && staged.hf_repo_dir.is_none() {
-    return true;
-  }
-  let named: std::collections::HashSet<&std::path::Path> = staged.files().into_iter().collect();
-  confirmed.files().into_iter().any(|f| !named.contains(f))
-}
-
-/// True when a queued or active pull names the cache repo holding `path`. A pull
-/// writes into `models--<owner>--<repo>`, the very directory a whole-repo delete
-/// removes, and the model being pulled has no catalog row yet, so the strip is the
-/// only thing that knows the tree is mid-write.
-fn download_writes_repo_of(app: &App, path: &Path) -> bool {
-  let repo_id = crate::util::model_caches::hf_repo_dir(path)
-    .and_then(|repo| repo.file_name())
-    .and_then(|name| name.to_str())
-    .and_then(crate::util::model_caches::repo_id_from_cache_dir);
-  let Some(repo_id) = repo_id else {
-    return false;
-  };
-  let strip = &app.download_strip;
-  strip
-    .active
-    .as_ref()
-    .is_some_and(|pull| pull.repo_id == repo_id)
-    || strip.queue.iter().any(|pull| pull.repo_id == repo_id)
 }
 
 /// Route a key to the open save-preset dialog. Name stage: typing edits
@@ -1534,58 +1437,15 @@ fn apply_confirmed(app: &mut App, action: ConfirmAction, writer: Option<&mpsc::S
       );
     }
     ConfirmAction::DeleteModel { plan, display_name } => {
-      // The plan was built when the key went down. A rescan can have listed
-      // another model in the repo since, and the frozen whole-repo answer would
-      // unlink that model's files with it, so re-plan the same row against the
-      // catalog as it stands now and run only what came back no bigger than what
-      // the popup named. The refusals are re-asked for the same reason, against
-      // this same frozen path rather than the cursor: a launch or a pull can have
-      // started while the popup was open, and the cursor may no longer sit on the
-      // row the popup was staged for.
-      let primary = plan.primary.clone();
-      let cache_root = plan.cache_root.clone();
-      if let Some(reason) = delete_refusal_reason_for(app, &primary) {
-        app.show_toast(reason);
+      let Some(tx) = require_events_tx(app, "delete") else {
         return;
-      }
-      let confirmed =
-        crate::tui::delete::plan_for_path_in(&primary, &app.models, cache_root.as_deref());
-      // Growing is the one direction a re-plan must not go: the popup described
-      // the staged plan, so a bigger answer — the repo's other model left the
-      // catalog and whole-repo came back, or a projector lost the neighbour that
-      // paired it — is something the user never saw. Nothing goes; ask again.
-      if plan_removes_more_than(&plan, &confirmed) {
-        app.show_toast(
-          "the model set changed under this popup — nothing was deleted, press Ctrl+D again",
-        );
-        return;
-      }
-      // Spin the delete onto a worker task so a multi-GB remove_dir_all does
-      // not freeze the draw thread. The plan is fully resolved (refusals and
-      // the refuse-on-grow guard) before we hand off, so what runs is exactly
-      // what came back smaller than the popup named.
-      let tx = require_events_tx(app, "delete");
-      if tx.is_none() {
-        // `require_events_tx` panicked only when it found None where we always
-        // prime the channel in run(); this is belt-and-braces so the popup
-        // could still be dismissed without its toast.
-        log::error!("tui: no events channel to report delete completion");
-      }
-      app.delete_in_flight = Some(confirmed.primary.clone());
+      };
+      app.delete_in_flight = Some(plan.primary.clone());
       app.show_toast(format!("deleting {display_name}"));
-      drop(app.confirm_dialog.take());
-      let outcome_primary = confirmed.primary.clone();
-      if let Some(tx) = tx {
-        tokio::spawn(async move {
-          let result = crate::tui::delete::execute(&confirmed);
-          let _ = tx
-            .send(Event::Delete(DeleteOutcome {
-              primary: outcome_primary,
-              result: result.map_err(|e| e.to_string()),
-            }))
-            .await;
-        });
-      }
+      // A multi-GB removal blocks on the filesystem, so it stays off the draw thread.
+      tokio::task::spawn_blocking(move || {
+        let _ = tx.blocking_send(Event::Delete(crate::tui::delete::run(&plan)));
+      });
     }
     ConfirmAction::CancelDownload { .. } => {
       use crate::tui::download_strip::CancelOutcome;
@@ -3018,56 +2878,25 @@ fn tick_has_time_decay_ui(app: &App) -> bool {
   app.toast_message().is_some() || app.download_strip.last_error.is_some()
 }
 
-/// Apply the result of a delete that was spawned off the draw thread back
-/// onto the app state: drop the row for its primary, forget the files from the
-/// daemon, and hand the cursor back to a live row.
-///
-/// The outcome carries the frozen plan's primary, not whatever row the cursor
-/// rests on now — by the time a 10 GB delete finishes the list has scrolled, so
-/// re-identifying by path (not index) is the only correct drop. Only the
-/// in-flight flag is reset on an error; a failed delete leaves the row where
-/// it is so retry keeps the same target.
+/// Apply a finished delete: on success drop its rows from the list and tell the
+/// daemon to forget them; on failure leave the list alone so a retry hits the same
+/// target.
 fn apply_delete_done(app: &mut App, outcome: DeleteOutcome, writer: &mpsc::Sender<WriterCmd>) {
-  let primary = &outcome.primary;
+  app.delete_in_flight = None;
   match outcome.result {
     Ok(summary) => {
-      // A whole-repo delete took other revisions of the same repo with it.
-      let forget = forget_set_for(app, primary);
-      let _ = writer.try_send(WriterCmd::ForgetModels(forget.clone()));
-      app.models.retain(|m| !forget.iter().any(|f| &m.path == f));
-      app.clear_rows_cache();
-      app.clamp_cursor();
-      app.delete_in_flight = None;
-      app.show_toast(format!("deleted {summary}"));
-    }
-    Err(e) => {
-      app.delete_in_flight = None;
-      app.show_error_toast(format!("delete failed: {e}"));
-    }
-  }
-}
-
-/// Every row the delete of `primary` should take off the list: `primary` plus
-/// any sibling revision still resolving to the same cache repo right now, so a
-/// whole-repo delete retires the whole repo from the list rather than leaving
-/// a ghost row behind.
-fn forget_set_for(app: &App, primary: &Path) -> Vec<PathBuf> {
-  let mut set: Vec<PathBuf> = vec![primary.to_path_buf()];
-  if let Some(repo) = app
-    .models
-    .iter()
-    .find(|m| m.path == primary)
-    .and_then(|m| crate::util::model_caches::hf_repo_dir(&m.path))
-  {
-    set.extend(
       app
         .models
-        .iter()
-        .filter(|o| o.path != primary && o.path.starts_with(repo))
-        .map(|o| o.path.clone()),
-    );
+        .retain(|m| !outcome.forget.iter().any(|gone| m.path.starts_with(gone)));
+      app.clear_rows_cache();
+      app.clamp_cursor();
+      if let Err(e) = writer.try_send(WriterCmd::ForgetModels(outcome.forget)) {
+        log::debug!("tui: forget_models not sent ({e})");
+      }
+      app.show_toast(summary);
+    }
+    Err(e) => app.show_error_toast(format!("delete failed: {e}")),
   }
-  set
 }
 
 #[cfg(test)]
@@ -3100,123 +2929,58 @@ mod tests {
     }
   }
 
-  /// A pull writes into `models--<owner>--<repo>`, the directory a whole-repo
-  /// delete removes, and the model being pulled has no row yet — so the strip is
-  /// the only thing that knows the tree is mid-write.
-  #[test]
-  fn ctrl_d_refuses_a_repo_a_download_is_still_writing() {
-    use crate::tui::download_strip::ActivePull;
-    let mut app = App::new(Default::default());
-    app.models = vec![fake_model_for_events(
-      "/cache/hub/models--o--r/snapshots/rev/m.gguf",
-      "/cache/hub",
-    )];
-    app.download_strip.active = Some(ActivePull {
-      repo_id: "o/r".into(),
-      friendly_name: "r".into(),
-      bytes_total: 10,
-      bytes_done: 1,
-      rate: Default::default(),
+  /// Run a staged delete from a `#[test]`: the worker on a private runtime, then
+  /// its outcome through the same handler the event loop uses. Returns what the
+  /// handler sent to the daemon writer.
+  fn confirm_and_run(
+    app: &mut App,
+    plan: crate::tui::delete::DeletePlan,
+    name: &str,
+  ) -> Vec<WriterCmd> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+      .worker_threads(2)
+      .enable_all()
+      .build()
+      .expect("test runtime");
+    let (tx, mut rx) = mpsc::channel::<Event>(4);
+    let (writer_tx, mut writer_rx) = mpsc::channel::<WriterCmd>(4);
+    app.events_tx = Some(tx);
+    rt.block_on(async {
+      apply_confirmed(
+        app,
+        ConfirmAction::DeleteModel {
+          plan: Box::new(plan),
+          display_name: name.into(),
+        },
+        None,
+      );
+      assert!(
+        app.delete_in_flight.is_some(),
+        "the worker is marked running"
+      );
+      let Some(Event::Delete(outcome)) = rx.recv().await else {
+        panic!("the delete worker sent no outcome");
+      };
+      apply_delete_done(app, outcome, &writer_tx);
     });
-    app.go_top();
-    pump_input(&mut app, key(KeyCode::Char('d'), KeyModifiers::CONTROL));
     assert!(
-      app.confirm_dialog.is_none(),
-      "a repo mid-download must not stage a delete"
+      app.delete_in_flight.is_none(),
+      "the outcome clears the marker"
     );
-    assert!(
-      app.toast_message().unwrap_or_default().contains("download"),
-      "the refusal has to say why"
-    );
+    std::iter::from_fn(|| writer_rx.try_recv().ok()).collect()
   }
 
-  /// The plan said "whole repo" when its row was the only one listed. A rescan put
-  /// a second model in that repo while the popup was open, so the confirmed delete
-  /// has to take one file and leave the repo alone.
+  /// The row goes, its sibling quant stays, the toast is the summary as it is, and
+  /// the daemon is told about the file that went and nothing else.
   #[test]
-  fn a_confirmed_delete_replans_the_whole_repo_answer() {
+  fn a_confirmed_delete_drops_only_its_own_row() {
     use crate::tui::delete::DeletePlan;
-    let dir = crate::util::test_temp::unique_temp_dir("delete-replan");
-    let repo = dir.join("models--o--r");
-    let a = repo.join("snapshots/rev-a/a.gguf");
-    let b = repo.join("snapshots/rev-b/b.gguf");
-    std::fs::create_dir_all(a.parent().unwrap()).unwrap();
-    std::fs::create_dir_all(b.parent().unwrap()).unwrap();
-    std::fs::write(&a, b"weights").unwrap();
-    std::fs::write(&b, b"weights").unwrap();
-    let mut app = App::new(Default::default());
-    app.models = vec![
-      fake_model_for_events(&a.to_string_lossy(), &repo.to_string_lossy()),
-      fake_model_for_events(&b.to_string_lossy(), &repo.to_string_lossy()),
-    ];
-    let mut stale = DeletePlan::single(a.clone());
-    stale.hf_repo_dir = Some(repo.clone());
-    stale.cache_root = Some(dir.clone());
-    confirm_and_run(&mut app, stale, "m");
-    assert!(!a.exists(), "the focused model goes");
-    assert!(
-      b.exists(),
-      "a model listed after the plan froze keeps its file"
-    );
-    assert!(
-      repo.exists(),
-      "the repo survives while another model is listed"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-  }
-
-  /// The other direction: the live catalog now asks for *more* than the popup
-  /// named, because the repo's other model left the catalog. That answer was never
-  /// shown, so the confirm refuses and nothing goes.
-  #[test]
-  fn a_confirmed_delete_refuses_a_plan_that_came_back_bigger() {
-    use crate::tui::delete::DeletePlan;
-    let dir = crate::util::test_temp::unique_temp_dir("delete-grew");
-    let repo = dir.join("models--o--r");
-    let a = repo.join("snapshots/rev-a/a.gguf");
-    let b = repo.join("snapshots/rev-b/b.gguf");
-    std::fs::create_dir_all(a.parent().unwrap()).unwrap();
-    std::fs::create_dir_all(b.parent().unwrap()).unwrap();
-    std::fs::write(&a, b"weights").unwrap();
-    std::fs::write(&b, b"weights").unwrap();
-    let mut app = App::new(Default::default());
-    // The popup was staged while `b` was still listed, so it named one file. The
-    // catalog now holds only `a`, whose live answer is the whole repo directory.
-    app.models = vec![fake_model_for_events(
-      &a.to_string_lossy(),
-      &repo.to_string_lossy(),
-    )];
-    let mut staged = DeletePlan::single(a.clone());
-    staged.cache_root = Some(dir.clone());
-    confirm_and_run(&mut app, staged, "m");
-    assert!(
-      a.exists(),
-      "a plan that came back bigger is refused, not run"
-    );
-    assert!(b.exists(), "and nothing else goes either");
-    assert!(repo.exists(), "and the repo keeps everything");
-    assert!(
-      app
-        .toast_message()
-        .unwrap_or_default()
-        .contains("press Ctrl+D again"),
-      "the refusal has to say what to do instead"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-  }
-
-  /// A status tick restructures the list — a launch that starts grows a `Running`
-  /// section and pulls its path out of the folder group — so by confirm time the
-  /// cursor can name a different model than the popup was staged for. The refusals
-  /// belong to the model the popup named, not to whatever row the index lands on.
-  #[test]
-  fn a_confirmed_delete_refuses_the_model_it_named_not_the_row_under_the_cursor() {
-    use crate::tui::delete::DeletePlan;
-    let dir = crate::util::test_temp::unique_temp_dir("delete-focus");
-    let a = dir.join("models--o--r/snapshots/rev-a/a.gguf");
-    let b = dir.join("models--o--r/snapshots/rev-b/b.gguf");
+    let dir = crate::util::test_temp::unique_temp_dir("delete-own-row");
+    let repo = dir.join("models--o--r/snapshots/rev");
+    let a = repo.join("a-Q4.gguf");
+    let b = repo.join("b-Q8.gguf");
+    std::fs::create_dir_all(&repo).unwrap();
     for f in [&a, &b] {
-      std::fs::create_dir_all(f.parent().unwrap()).unwrap();
       std::fs::write(f, b"weights").unwrap();
     }
     let mut app = App::new(Default::default());
@@ -3224,85 +2988,51 @@ mod tests {
       fake_model_for_events(&a.to_string_lossy(), &dir.to_string_lossy()),
       fake_model_for_events(&b.to_string_lossy(), &dir.to_string_lossy()),
     ];
-    let staged = DeletePlan::single(a.clone());
-    // `a` started while the popup was open, so its row moved out of the folder
-    // group and the cursor index now names idle `b`.
-    app.managed = vec![ready_managed_for_events(&a.to_string_lossy(), 41234)];
-    app.list_cursor = row_index_of(&app, &b);
-    confirm_and_run(&mut app, staged, "a");
-    assert!(
-      a.exists(),
-      "the launch that started under the popup keeps its file"
-    );
+    let sent = confirm_and_run(&mut app, DeletePlan::single(a.clone()), "a");
+    assert!(!a.exists() && b.exists());
     assert_eq!(
-      app.toast_message().unwrap_or_default(),
-      "model is running — stop the launch first"
+      app
+        .models
+        .iter()
+        .map(|m| m.path.clone())
+        .collect::<Vec<_>>(),
+      vec![b.clone()]
+    );
+    assert_eq!(app.toast_message(), Some("deleted a-Q4.gguf"));
+    assert!(
+      matches!(sent.as_slice(), [WriterCmd::ForgetModels(paths)] if paths == &vec![a.clone()]),
+      "the daemon forgets the deleted file only, got {sent:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
   }
 
-  /// The same keying must not turn into a blanket refusal: a launch of some other
-  /// model leaves this delete free to run.
+  /// A failed delete keeps the row, clears the marker and says why.
   #[test]
-  fn a_confirmed_delete_runs_while_an_unrelated_model_is_running() {
+  fn a_failed_delete_keeps_the_row() {
     use crate::tui::delete::DeletePlan;
-    let dir = crate::util::test_temp::unique_temp_dir("delete-other-running");
-    let a = dir.join("models--o--r/snapshots/rev-a/a.gguf");
-    let b = dir.join("models--o--r/snapshots/rev-b/b.gguf");
-    for f in [&a, &b] {
-      std::fs::create_dir_all(f.parent().unwrap()).unwrap();
-      std::fs::write(f, b"weights").unwrap();
-    }
-    let mut app = App::new(Default::default());
-    app.models = vec![
-      fake_model_for_events(&a.to_string_lossy(), &dir.to_string_lossy()),
-      fake_model_for_events(&b.to_string_lossy(), &dir.to_string_lossy()),
-    ];
-    let staged = DeletePlan::single(b.clone());
-    app.managed = vec![ready_managed_for_events(&a.to_string_lossy(), 41235)];
-    app.list_cursor = row_index_of(&app, &a);
-    confirm_and_run(&mut app, staged, "b");
-    assert!(!b.exists(), "the model the popup named is gone");
-    assert!(a.exists(), "and the running one is untouched");
-    let _ = std::fs::remove_dir_all(&dir);
-  }
-
-  /// Stages a delete (no spawn) and confirms it never left the popup, for the
-  /// refusals that bail out before the worker.
-  fn stage_delete(app: &mut App, plan: crate::tui::delete::DeletePlan, name: &str) {
-    apply_confirmed(
-      app,
-      crate::tui::app::ConfirmAction::DeleteModel {
-        plan: Box::new(plan),
-        display_name: name.into(),
-      },
-      None,
-    );
-  }
-  /// After a delete the cursor indexes rows, and rows carry headers on top of the
-  /// models, so it has to land somewhere the user can act on again.
-  /// Refusals that bail before spawning never set the in-flight flag, so they
-  /// cannot leave a half-done delete behind if the user quits mid-popup.
-  #[test]
-  fn a_refused_delete_does_not_enter_in_flight() {
-    use crate::tui::delete::DeletePlan;
-    let dir = crate::util::test_temp::unique_temp_dir("delete-refused");
-    let a = dir.join("models--o--r/snapshots/rev-a/a.gguf");
+    let dir = crate::util::test_temp::unique_temp_dir("delete-failed");
+    let repo = dir.join("models--o--r");
+    let a = repo.join("snapshots/rev/a.gguf");
     std::fs::create_dir_all(a.parent().unwrap()).unwrap();
     std::fs::write(&a, b"weights").unwrap();
+    // A pull landed a part file after the popup was staged.
+    std::fs::create_dir_all(repo.join("blobs")).unwrap();
+    std::fs::write(repo.join("blobs").join("x.part"), b"half").unwrap();
+    let mut staged = DeletePlan::single(a.clone());
+    staged.hf_repo_dir = Some(repo.clone());
     let mut app = App::new(Default::default());
     app.models = vec![fake_model_for_events(
       &a.to_string_lossy(),
       &dir.to_string_lossy(),
     )];
-    app.managed = vec![ready_managed_for_events(&a.to_string_lossy(), 41111)];
-    app.go_top();
-    stage_delete(&mut app, DeletePlan::single(a.clone()), "a");
+    let sent = confirm_and_run(&mut app, staged, "a");
+    assert!(a.exists(), "nothing was removed under the download");
+    assert_eq!(app.models.len(), 1, "the row stays for a retry");
+    assert!(sent.is_empty(), "and the daemon is not told to forget it");
     assert!(
-      app.delete_in_flight.is_none(),
-      "a refused delete never starts the worker"
+      app.toast_message().unwrap_or_default().contains("download"),
+      "the toast says why"
     );
-    assert!(!app.should_exit, "and does not set the quit flag");
     let _ = std::fs::remove_dir_all(&dir);
   }
 
@@ -3339,6 +3069,8 @@ mod tests {
     assert!(app.delete_in_flight.is_none());
   }
 
+  /// After a delete the cursor indexes rows, and rows carry headers on top of the
+  /// models, so it has to land somewhere the user can act on again.
   #[test]
   fn a_delete_leaves_the_cursor_on_a_live_row() {
     use crate::tui::delete::DeletePlan;
