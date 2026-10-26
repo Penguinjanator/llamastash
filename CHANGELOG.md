@@ -1,5 +1,10 @@
 ## [Unreleased]
 
+## [0.10.0] — 2026-10-26
+
+This release puts more than chat behind the proxy port. A `backend.generic` entry that declares `modes: [stt]`, `[tts]` or `[image]` answers OpenAI's audio and image routes on the proxy, so a client sending `whisper-1`, `tts-1` or `dall-e-3` reaches a local whisper.cpp, Kokoro or sd.cpp with nothing changed on the client side, and the reply names the entry that served it. A `routes:` list on an entry forwards the engine's own path prefixes (whisper.cpp's `/inference`, sd.cpp's `/sdapi/v1`) through that same port, and `/v1/systemone` now rides the proxy for decision models. `llamastash list --json` reports every `proxy.aliases` entry with the reason a dead one cannot route, `backend.vllm.rewrite_model` stops vLLM's `404` for an aliased model, each request row carries its own KV-cache hit, and [`RECIPES.md`](RECIPES.md) is grouped by what the model does, with 11 new recipes tested against real engines.
+
+
 ### Added
 
 - The proxy forwards the image and audio routes (`/v1/images/generations` `edits` `variations`, `/v1/audio/speech`, `/v1/audio/transcriptions` `translations`) to a generic server that declares `image`, `tts` or `stt` in its `modes`, so an ASR or TTS engine answers through the proxy port instead of only its own. A request naming `whisper-1` or `tts-1` goes to the one server that declares the mode and says which one served it ([#120](https://github.com/llamastash/llamastash/pull/120)). Plan: [`docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md`](docs/plans/2026-10-23-001-feat-proxy-media-routes-plan.md).
@@ -26,10 +31,15 @@
 - Two HuggingFace repos holding byte-identical GGUFs now both appear in the list. Huggingface_hub keeps one shared copy of the content, and rows were deduped by the file they resolve to alone, so the second repo was unlistable, unlaunchable by name and undeletable, and which one survived was readdir order.
 
 ### Security
+
 - rustls-webpki 0.103.15 → 0.103.16, clearing [RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382): a certificate chain through a distrusted intermediate could be accepted. Transitive via rustls and reqwest.
 - webpki-roots 1.0.7 → 1.0.11, clearing [RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381): the bundled root set trusted the emSign intermediates. Transitive via reqwest.
 - tokio 1.52.3 → 1.54.1, clearing [RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386): `AsyncFd::new` violates I/O safety, patched in 1.53.3.
 - clipboard-win 5.4.1 → 5.4.3, because 5.4.1 is yanked. Windows-only, reached through `arboard` for the TUI's clipboard copy. ([#121](https://github.com/llamastash/llamastash/pull/121))
+
+### Contributors
+
+- [@deepu105](https://github.com/deepu105): everything
 
 ## [0.9.1] — 2026-10-19
 
