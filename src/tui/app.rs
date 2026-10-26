@@ -1589,8 +1589,18 @@ impl App {
       self.list_cursor = rows.len() - 1;
     }
     if !rows[self.list_cursor].is_selectable() {
-      // Snap to next selectable row.
-      self.go_top();
+      // Nearest model row below the cursor; with none below, the last one.
+      match rows[self.list_cursor..]
+        .iter()
+        .position(ListRow::is_selectable)
+      {
+        Some(offset) => {
+          let before = self.focused_row_key();
+          self.list_cursor += offset;
+          self.sync_pane_to_focus(before);
+        }
+        None => self.go_bottom(),
+      }
     }
   }
 
@@ -4405,6 +4415,26 @@ mod tests {
       RightTab::Requests,
       "the second launch opens on its own first tab"
     );
+  }
+
+  #[test]
+  fn clamp_cursor_moves_a_header_hit_to_the_model_below_it() {
+    // After a delete the row index can name the next group's header. That should
+    // land on the next group's first model, not jump to the top of the list.
+    let mut app = App::new(AppOptions::default());
+    app.models = vec![
+      fake("/a/one.gguf", "/a"),
+      fake("/a/two.gguf", "/a"),
+      fake("/b/three.gguf", "/b"),
+    ];
+    let header = app
+      .rendered_rows()
+      .iter()
+      .rposition(|r| matches!(r, ListRow::Header { .. }))
+      .unwrap();
+    app.list_cursor = header;
+    app.clamp_cursor();
+    assert_eq!(app.focused_name().as_deref(), Some("three"));
   }
 
   #[test]

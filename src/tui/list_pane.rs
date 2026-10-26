@@ -501,6 +501,9 @@ const COL_SEP_W: usize = 1; // space before each data column
 /// Hard floor — even a pane that's too narrow for any data column
 /// still gives the model name at least this much room.
 const MIN_NAME_W: usize = 8;
+/// Cells the `deleting…` marker takes ahead of the name: one glyph and `" deleting… "`.
+/// The Name cell gives them up so the row keeps the width the other rows have.
+const DELETE_MARKER_W: usize = 12;
 /// "Comfortable" Name budget: enough cells to display a typical
 /// model name (e.g. `qwen-7b-instruct-Q4_K_M.gguf`, ~30 chars)
 /// without the ellipsis truncation glyph. The layout reserves this
@@ -1089,7 +1092,9 @@ fn render_row<'a>(
   selected: bool,
   deleting: bool,
 ) -> ListItem<'a> {
-  let name_w = layout.name_w;
+  let name_w = layout
+    .name_w
+    .saturating_sub(if deleting { DELETE_MARKER_W } else { 0 });
   let cols = layout.visible.as_slice();
   match row {
     ListRow::TableHeader => {
@@ -1345,6 +1350,26 @@ mod tests {
       _ => panic!("expected model row at index 2"),
     };
     assert_eq!(first_model, a.path);
+  }
+
+  #[test]
+  fn a_deleting_row_is_as_wide_as_the_others() {
+    use crate::theme::{palette_for, ThemeName};
+    let m = fake("/m/a.gguf", "/m");
+    let rows = build_rows(RowInputs {
+      models: std::slice::from_ref(&m),
+      favorites: &[],
+      model_states: &BTreeMap::new(),
+      model_ports: &BTreeMap::new(),
+      running: &[],
+      recent_paths: &[],
+      backend_by_path: &BTreeMap::new(),
+    });
+    let row = rows.iter().find(|r| r.is_selectable()).unwrap();
+    let palette = palette_for(ThemeName::Macchiato);
+    let layout = layout_columns(100, false, false);
+    let width = |deleting| render_row(row, palette, &layout, 100, false, deleting).width();
+    assert_eq!(width(true), width(false));
   }
 
   #[test]

@@ -2894,24 +2894,25 @@ fn tick_has_time_decay_ui(app: &App) -> bool {
   app.toast_message().is_some() || app.download_strip.last_error.is_some()
 }
 
-/// Apply a finished delete: on success drop its rows from the list and tell the
-/// daemon to forget them; on failure leave the list alone so a retry hits the same
-/// target.
+/// Apply a finished delete: on success drop its rows from the list; on failure
+/// leave the list alone so a retry hits the same target. The daemon is told either
+/// way: `remove_dir_all` can fail partway with some files already gone, and it
+/// drops only the rows whose files are.
 fn apply_delete_done(app: &mut App, outcome: DeleteOutcome, writer: &mpsc::Sender<WriterCmd>) {
   app.delete_in_flight = None;
-  match outcome.result {
+  match &outcome.result {
     Ok(summary) => {
       app
         .models
         .retain(|m| !outcome.forget.iter().any(|gone| m.path.starts_with(gone)));
       app.clear_rows_cache();
       app.clamp_cursor();
-      if let Err(e) = writer.try_send(WriterCmd::ForgetModels(outcome.forget)) {
-        log::debug!("tui: forget_models not sent ({e})");
-      }
-      app.show_toast(summary);
+      app.show_toast(summary.as_str());
     }
     Err(e) => app.show_error_toast(format!("delete failed: {e}")),
+  }
+  if let Err(e) = writer.try_send(WriterCmd::ForgetModels(outcome.forget)) {
+    log::debug!("tui: forget_models not sent ({e})");
   }
 }
 
@@ -3080,7 +3081,10 @@ mod tests {
     let sent = confirm_and_run(&mut app, staged, "a");
     assert!(a.exists(), "nothing was removed under the download");
     assert_eq!(app.models.len(), 1, "the row stays for a retry");
-    assert!(sent.is_empty(), "and the daemon is not told to forget it");
+    assert!(
+      matches!(sent.as_slice(), [WriterCmd::ForgetModels(_)]),
+      "and the daemon is asked to re-check the files, got {sent:?}"
+    );
     assert!(
       app.toast_message().unwrap_or_default().contains("download"),
       "the toast says why"

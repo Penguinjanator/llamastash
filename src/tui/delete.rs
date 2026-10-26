@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::discovery::{scanner, DiscoveredModel};
+use crate::util::model_caches::hf_repo_dir;
 
 /// Files a confirmed delete will remove.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -196,10 +197,10 @@ pub fn plan(
   // nothing else in the repo is still listed.
   if let Some(repo_dir) = hf_repo_dir_in_cache(&target.path, cache_root) {
     plan.in_hf_cache = true;
-    let shape = hf_repo_dir_shape(&target.path);
+    let shape = hf_repo_dir(&target.path);
     let repo_still_populated = catalog
       .iter()
-      .any(|m| m.path != target.path && hf_repo_dir_shape(&m.path) == shape);
+      .any(|m| m.path != target.path && hf_repo_dir(&m.path) == shape);
     if !repo_still_populated && !download_in_flight(&repo_dir) {
       plan.hf_repo_dir = Some(repo_dir);
     }
@@ -543,23 +544,13 @@ fn lock_blob(lock: &fs::File) -> bool {
   }
 }
 
-/// [`crate::util::model_caches::hf_repo_dir`] used as the "is anything else still
-/// in this repo" key: pure path arithmetic, so two paths from the same discovery
-/// pass compare reliably. A GGUF file, the same file nested in a quant
-/// subdirectory, and a whole-snapshot directory (a safetensors row) must all land
-/// on the same repo, or a mixed catalog reads as unrelated repos and a whole-repo
-/// delete runs over a model that is still listed.
-fn hf_repo_dir_shape(path: &Path) -> Option<&Path> {
-  crate::util::model_caches::hf_repo_dir(path)
-}
-
-/// [`hf_repo_dir_shape`] plus the gates that make recursive removal safe: the
+/// [`hf_repo_dir`] plus the gates that make recursive removal safe: the
 /// resolved repo directory must live inside `cache_root`, and must not *be* it. An
 /// HF-shaped tree somewhere else — an rsynced backup, a restored archive, a
 /// surprise Docker volume — resolves to `None` and takes the per-file path, and so
 /// does a cache root that is itself named `models--…`.
 fn hf_repo_dir_in_cache(path: &Path, cache_root: Option<&Path>) -> Option<PathBuf> {
-  let repo_dir = hf_repo_dir_shape(path)?;
+  let repo_dir = hf_repo_dir(path)?;
   let cache_root = cache_root?;
   let cache_root_canonical = cache_root
     .canonicalize()
@@ -1037,7 +1028,7 @@ mod tests {
     fs::write(&nested, b"g").unwrap();
 
     assert_eq!(
-      hf_repo_dir_shape(&nested),
+      hf_repo_dir(&nested),
       Some(repo.as_path()),
       "a nested GGUF must resolve to the same repo as its snapshot dir"
     );
