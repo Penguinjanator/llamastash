@@ -21,6 +21,7 @@ Recipes are grouped by what the model does, most used type first. An engine that
 | [Strata](#strata) | Strata | Qwen3.8 Flash-Next |
 | [DeepSeek V4](#deepseek-v4) | ds4, llama.cpp | DeepSeek V4 Flash / PRO |
 | [Lemonade](#lemonade) | Lemonade (`lemond`) | any Lemonade model |
+| [MLX (mlx-lm and oMLX)](#mlx-mlx-lm-and-omlx) | mlx-lm, oMLX (Apple Silicon) | MLX safetensors repos |
 | [FastFlowLM (AMD NPU)](#fastflowlm-amd-npu) | FastFlowLM | NPU LLMs |
 | [Halogen](#halogen) | Halogen (Docker) | Qwen3.8 Flash-Next |
 | [gufo](#gufo) | gufo | Qwen3.8 Flash-Next, Qwen3.8 27B with a DFlash2 draft |
@@ -459,6 +460,119 @@ backend:
 Verified on `flm` v1.0.10 with `Whisper-V3-Turbo-NPU2` on the NPU: an 11 s speech clip posted to the proxy came back with the right words in 2.8 s TTFB (3.8 s total), addressed by the entry name, by a `proxy.aliases` name (`whisper-1: whisper-npu`, logged as `alias` in `requests`), and by a name nothing answers to, which the mode fallback stamps `x-llamastash-served-by: whisper-npu` and `x-llamastash-fallback-reason: mode_match`. FLM echoes whatever `model` the request sent. `/v1/audio/translations` is a 404 from FLM itself: it serves transcriptions only.
 
 Three FLM notes: `/v1/models` lists FLM's whole model list, not what you downloaded; a request for a tag you do not have makes FLM try to download it; and its speed lands in `usage.decoding_speed_tps` and `usage.prefill_speed_tps`, which the request log reads, so `llamastash requests` shows FLM's own numbers rather than an estimate.
+
+### MLX (mlx-lm and oMLX)
+
+Two engines for Apple Silicon, both reading MLX-format safetensors repos from the Hugging Face cache, so `llamastash pull mlx-community/<repo>` makes a model available to both. Written for `mlx-lm` 0.32.4 and oMLX 0.7.3 on macOS 26 (M-series, 16 GB) with `mlx-community/Qwen3-0.6B-4bit`. Install them with `uv tool install --python 3.12 mlx-lm` and `uv tool install --python 3.12 "omlx @ git+https://github.com/jundot/omlx"`.
+
+llamastash finds these repos in the cache, but no backend claims MLX-format weights yet (vLLM and SGLang claim safetensors repos, and an MLX one would fail on them), so both entries mint their rows with `rows_from` from one lister script, `~/bin/mlx-list.py`. It keeps repos whose safetensors header says `format: mlx` and prints them as JSON; an optional first argument prefixes each name. See [TODO.md](TODO.md) for the planned built-in support.
+
+```python
+#!/usr/bin/env python3
+# Lists MLX-format safetensors repos in the HF cache for llamastash `rows_from`.
+# Optional argv[1] prefixes each name. Names are owner--repo, the id oMLX reports.
+import glob, json, os, struct, sys
+prefix = sys.argv[1] if len(sys.argv) > 1 else ""
+hub = os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
+out = []
+for repo in sorted(glob.glob(os.path.join(hub, "models--*"))):
+  for snap in sorted(glob.glob(os.path.join(repo, "snapshots", "*"))):
+    st = glob.glob(os.path.join(snap, "*.safetensors"))
+    cfg = os.path.join(snap, "config.json")
+    if not st or not os.path.exists(cfg):
+      continue
+    with open(st[0], "rb") as f:
+      n = struct.unpack("<Q", f.read(8))[0]
+      meta = json.loads(f.read(n)).get("__metadata__") or {}
+    if meta.get("format") != "mlx":
+      continue
+    c = json.load(open(cfg))
+    bits = (c.get("quantization") or {}).get("bits")
+    out.append({
+      "name": prefix + os.path.basename(repo)[len("models--"):],
+      "arch": c.get("model_type"),
+      "quant": f"{bits}bit" if bits else None,
+      "ctx": c.get("max_position_embeddings"),
+      "gib": round(sum(os.path.getsize(p) for p in st) / 2**30, 2),
+    })
+    break
+print(json.dumps({"models": out}))
+```
+
+**oMLX** is one multi-model server: it serves every model under `--model-dir` from one process, so each minted row launches the same server with the same flags. Point `--model-dir` at a folder of symlinks to the snapshots, named like the rows (`ln -s ~/.cache/huggingface/hub/models--mlx-community--Qwen3-0.6B-4bit/snapshots/<revision> ~/.omlx/models/mlx-community--Qwen3-0.6B-4bit`). `args` does not expand `~/`, so write that path out.
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: omlx
+        binary: ~/.local/bin/omlx
+        args: ["serve", "--model-dir", "/Users/you/.omlx/models", "--host", "{host}", "--port", "{port}"]
+        ready: /v1/models
+        ready_timeout_secs: 120
+        memory_gib: 1
+        rows_from:
+          command: [~/bin/mlx-list.py]
+          items: models
+          name: name
+          arch: arch
+          quant: quant
+          ctx: ctx
+          memory_gib: gib
+```
+
+**mlx-lm** runs one process per model. `mlx_lm.server` answers only to `default_model` or a Hugging Face repo id, and treats any other `model` as a repo to download, so a row name would fail with a `401` from the Hub. `~/bin/mlx-serve.py` registers the row name as an alias for the local snapshot before starting the server. The `mlx-lm:` prefix keeps these rows apart from oMLX's.
+
+```python
+#!/path/to/uv/tools/mlx-lm/bin/python
+# Wrapper for mlx_lm.server: argv[1] is the llamastash row name (mlx-lm:owner--repo).
+# mlx_lm.server only maps "default_model" to --model; any other request model is
+# treated as a repo id and downloaded, so register the row name as an alias.
+import glob, os, sys
+name = sys.argv[1]
+repo = name.split(":", 1)[1]
+hub = os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
+snap = glob.glob(os.path.join(hub, "models--" + repo, "snapshots", "*"))[0]
+from mlx_lm import server
+init = server.ModelProvider.__init__
+def patched(self, cli_args):
+  init(self, cli_args)
+  self._model_map[name] = snap
+  self._adapter_map[name] = None
+  self._draft_model_map[name] = None
+server.ModelProvider.__init__ = patched
+sys.argv = ["mlx_lm.server", "--model", snap] + sys.argv[2:]
+server.main()
+```
+
+```yaml
+backend:
+  generic:
+    servers:
+      - name: mlx
+        binary: ~/bin/mlx-serve.py
+        args: ["{name}", "--host", "{host}", "--port", "{port}"]
+        ready: /v1/models
+        ready_timeout_secs: 120
+        memory_gib: 1
+        rows_from:
+          command: [~/bin/mlx-list.py, "mlx-lm:"]
+          items: models
+          name: name
+          arch: arch
+          quant: quant
+          ctx: ctx
+          memory_gib: gib
+```
+
+Both rows then show in `list` and answer by name, with no `proxy.aliases` line: `mlx-community--Qwen3-0.6B-4bit` (oMLX) and `mlx-lm:mlx-community--Qwen3-0.6B-4bit` (mlx-lm). A chat request through the proxy came back from each.
+
+- **`~/` in `args` is not expanded**, only in `binary` and `rows_from.command`. A path in `args` must be absolute.
+- **The `Params` column is `?`**: an MLX `config.json` carries no parameter count.
+- **`mlx-serve.py` patches `ModelProvider._model_map`**, a private attribute of `mlx_lm.server`, so an `mlx-lm` upgrade can break it. Pin the version if that matters.
+- **The `memory_gib` on the entry is only a fallback**; each row's size comes from its weights through the lister's `gib`.
+- **Both engines load the model on first launch**, about 10 s for a 0.6B 4-bit model here.
+- **New pulls show up after the 5-minute rescan**, or after `llamastash daemon restart`. oMLX also needs a symlink for the new model in its model dir.
 
 ### Halogen
 

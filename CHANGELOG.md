@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Added
+
+- RECIPES.md has an MLX recipe: mlx-lm and oMLX as generic entries on Apple Silicon, each minting a row per MLX repo in the HF cache.
+
 ## [0.10.0] — 2026-10-26
 
 This release puts more than chat behind the proxy port. A `backend.generic` entry that declares `modes: [stt]`, `[tts]` or `[image]` answers OpenAI's audio and image routes on the proxy, so a client sending `whisper-1`, `tts-1` or `dall-e-3` reaches a local whisper.cpp, Kokoro or sd.cpp with nothing changed on the client side, and the reply names the entry that served it. A `routes:` list on an entry forwards the engine's own path prefixes (whisper.cpp's `/inference`, sd.cpp's `/sdapi/v1`) through that same port, and `/v1/systemone` now rides the proxy for decision models. `llamastash list --json` reports every `proxy.aliases` entry with the reason a dead one cannot route, `backend.vllm.rewrite_model` stops vLLM's `404` for an aliased model, each request row carries its own KV-cache hit, and [`RECIPES.md`](RECIPES.md) is grouped by what the model does, with 11 new recipes tested against real engines.
