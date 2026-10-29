@@ -152,7 +152,8 @@ pub struct RunningSnapshot {
   /// (`start --preset`, TUI form), the preset a `<model>@<name>` auto-start
   /// address named, or the model's config `default:` on a no-selection
   /// launch. `None` when no preset was in play. Surfaced read-only by
-  /// `status` and `show` so the running row answers "what launched this".
+  /// `status`, `show` and the proxy's per-launch `/metrics` series, so the
+  /// running row answers "what launched this".
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub preset: Option<String>,
   pub params: LaunchParams,

@@ -1417,8 +1417,9 @@ every `model` field there is the display name, and `path` tells two same-named m
 
 The per-launch series are opt-in because they multiply every series above by the
 number of launches a model has had. Ask for them with `?launch=1`:
-`llamastash:launch_info{launch,model,port}` (gauge 1, one per live launch the scope
-keeps),
+`llamastash:launch_info{launch,model,port,preset}` (gauge 1, one per live launch the scope
+keeps; `preset` is the preset the launch resolved, empty when it started from none — the
+label is always there, because one metric name carries one label set),
 `llamastash:launch_requests_total{launch,model}`,
 `llamastash:launch_request_errors_total{launch,model}`,
 `llamastash:launch_prompt_tokens_total{launch,model}`,
@@ -1450,7 +1451,9 @@ names the launch ids to choose between. Both together have to agree: a
 
 The JSON form is the `requests --json` body with a couple of blocks added: `scope`,
 `summary`, `models`, `launches`, and `requests` (the same array
-`llamastash requests --json` returns, `?limit=` capped).
+`llamastash requests --json` returns, `?limit=` capped). A `launches` row carries `preset`,
+the preset that launch resolved, or `null` when it started from none; a retired launch reads
+`null` too, because its running row is gone.
 
 ```bash
 curl -s                              localhost:11435/metrics | head -20

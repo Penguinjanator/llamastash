@@ -2,6 +2,7 @@
 
 ### Added
 
+- `/metrics` says which preset a running launch came from: `llamastash:launch_info` gained a `preset` label (empty when the launch started from none) and the JSON `launches` rows a `preset` field.
 - RECIPES.md has an MLX recipe: mlx-lm and oMLX as generic entries on Apple Silicon, each minting a row per MLX repo in the HF cache.
 
 ## [0.10.0] — 2026-10-26

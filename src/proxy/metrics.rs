@@ -382,6 +382,9 @@ pub(crate) struct LiveLaunch {
   /// What the launch was started for. `/ui` needs it to tell a chat launch
   /// (which can be given a chat UI) from an embedding or rerank one.
   pub(crate) mode: crate::launch::mode::LaunchMode,
+  /// The preset this launch resolved, read off its persisted running row.
+  /// `None` when no preset was in play.
+  pub(crate) preset: Option<String>,
 }
 
 /// Every live launch that is a model, with its display name, identity and port,
@@ -391,6 +394,7 @@ pub(crate) struct LiveLaunch {
 pub(crate) async fn live_launches(state: &ProxyState) -> Vec<LiveLaunch> {
   let sup_snap = state.ctx.supervisors.snapshot().await;
   let cat_snap = state.ctx.catalog.shared_view().await;
+  let running = state.ctx.state.snapshot().await.running;
   let by_path = route::index_catalog_by_path(&cat_snap);
   let mut out = Vec::new();
   for (launch_id, model) in sup_snap {
@@ -398,6 +402,13 @@ pub(crate) async fn live_launches(state: &ProxyState) -> Vec<LiveLaunch> {
     let path = id.path.to_string_lossy().into_owned();
     let name = route::served_name_for_model(by_path.get(&path).copied(), &id.path);
     let ready = matches!(model.state().await, ManagedState::Ready);
+    // Keyed on the launch id, as `status` does: a port is reused the moment a
+    // launch stops, so matching on it would hand a fresh launch the previous
+    // one's preset.
+    let preset = running
+      .iter()
+      .find(|row| row.launch_id.as_ref() == Some(&launch_id))
+      .and_then(|row| row.preset.clone());
     out.push(LiveLaunch {
       id: launch_id.as_str().to_string(),
       model: name,
@@ -406,6 +417,7 @@ pub(crate) async fn live_launches(state: &ProxyState) -> Vec<LiveLaunch> {
       port: model.port(),
       ready,
       mode: model.mode(),
+      preset,
     });
   }
   out.sort_by(|a, b| launch_order(&a.id).cmp(&launch_order(&b.id)));
@@ -754,12 +766,16 @@ fn render(
     }
     doc.sample(
       "llamastash:launch_info",
-      "Live model launches, labelled by launch and model",
+      "Live model launches, labelled by launch, model and preset",
       "gauge",
       &[
         ("launch", &entry.id),
         ("model", &entry.model),
         ("port", &entry.port.to_string()),
+        // Empty, never absent: one metric name carries one label set, so a
+        // presetless launch still prints the label and the series stay
+        // comparable.
+        ("preset", entry.preset.as_deref().unwrap_or("")),
       ],
       1.0,
     );
@@ -1261,6 +1277,7 @@ fn json_body(
         ("launch", Value::String(entry.id.clone())),
         ("model", Value::String(entry.model.clone())),
         ("port", Value::from(entry.port)),
+        ("preset", value_opt(entry.preset.clone())),
         ("live", Value::Bool(true)),
       ],
       &RequestSummary::default(),
@@ -1281,11 +1298,15 @@ fn json_body(
       .label
       .clone()
       .or_else(|| live_entry.map(|l| l.model.clone()));
+    // A retired launch has no running row left to read a preset from, so its
+    // `preset` is null even when the launch had one while it lived.
+    let preset = live_entry.and_then(|l| l.preset.clone());
     let body = merged(
       &[
         ("launch", Value::String(id.clone())),
         ("model", value_opt(model)),
         ("port", value_opt(port)),
+        ("preset", value_opt(preset)),
         ("live", Value::Bool(live_entry.is_some())),
       ],
       &entry.totals.summary,
@@ -1635,6 +1656,7 @@ mod tests {
       port,
       ready: true,
       mode: crate::launch::mode::LaunchMode::Chat,
+      preset: None,
     }
   }
 
@@ -2185,13 +2207,79 @@ mod tests {
     render(&mut doc, &snap, &live, &scope, 1, 2);
     let text = doc.render();
     assert!(
-      text.contains("llamastash:launch_info{launch=\"L1\",model=\"m1\",port=\"1111\"} 1\n"),
+      text.contains(
+        "llamastash:launch_info{launch=\"L1\",model=\"m1\",port=\"1111\",preset=\"\"} 1\n"
+      ),
       "{text}"
     );
     assert!(
       !text.contains("launch=\"L2\""),
       "one model's scrape lists one launch:\n{text}"
     );
+  }
+
+  /// A launch that resolved a preset prints its name; a presetless launch
+  /// prints the empty label rather than dropping it, so one metric name keeps
+  /// one label set and the two series stay comparable.
+  #[test]
+  fn metrics_launch_info_carries_the_preset() {
+    let log = RequestLog::new();
+    request(&log, "/models/a.gguf", "L1", 10, 3);
+    let mut preset_row = live_row("L1", "m1", "/models/a.gguf", 1111);
+    preset_row.preset = Some("fast".into());
+    let live = [preset_row, live_row("L2", "m2", "/models/b.gguf", 1112)];
+    let snap = log.snapshot();
+    let scope = Scope {
+      per_launch: true,
+      ..Scope::default()
+    };
+    let mut doc = Document::new(true);
+    render(&mut doc, &snap, &live, &scope, 2, 2);
+    let text = doc.render();
+    assert!(
+      text.contains(
+        "llamastash:launch_info{launch=\"L1\",model=\"m1\",port=\"1111\",preset=\"fast\"} 1\n"
+      ),
+      "{text}"
+    );
+    assert!(
+      text.contains(
+        "llamastash:launch_info{launch=\"L2\",model=\"m2\",port=\"1112\",preset=\"\"} 1\n"
+      ),
+      "{text}"
+    );
+  }
+
+  /// The preset comes off the persisted running row, keyed on the launch id.
+  /// The decoy row shares the live launch's port, so a port match — the mistake
+  /// `status` had to fix — would read the wrong preset.
+  #[tokio::test]
+  async fn live_launches_reads_the_preset_off_the_running_row() {
+    let state = state_with(&[("L1", ManagedState::Ready, "/models/a.gguf", 1111)]).await;
+    state
+      .ctx
+      .state
+      .mutate(|s| {
+        s.running.push(
+          crate::test_support::running_row("/models/a.gguf")
+            .launch_id("L1")
+            .port(1111)
+            .preset("fast")
+            .build(),
+        );
+        s.running.push(
+          crate::test_support::running_row("/models/b.gguf")
+            .launch_id("L9")
+            .port(1111)
+            .preset("other")
+            .build(),
+        );
+      })
+      .await;
+    let live = live_launches(&state).await;
+    assert_eq!(live.len(), 1, "one live launch: {}", live.len());
+    assert_eq!(live[0].id, "L1");
+    assert_eq!(live[0].preset.as_deref(), Some("fast"));
   }
 
   #[test]
@@ -2308,7 +2396,7 @@ mod tests {
     for line in [
       "llamastash:requests_total{model=\"m1\"} 0\n",
       "llamastash:requests_in_flight{model=\"m1\"} 0\n",
-      "llamastash:launch_info{launch=\"L1\",model=\"m1\",port=\"1111\"} 1\n",
+      "llamastash:launch_info{launch=\"L1\",model=\"m1\",port=\"1111\",preset=\"\"} 1\n",
     ] {
       assert!(text.contains(line), "missing {line:?} in:\n{text}");
     }

@@ -20,10 +20,11 @@ use std::{
 };
 
 use llamastash::backend::llama_cpp::LlamaCppBackend;
-use llamastash::daemon::context::MethodContext;
+use llamastash::daemon::context::{MethodContext, PersistedState};
 use llamastash::daemon::probe::ProbeOptions;
 use llamastash::daemon::registry::SupervisorRegistry;
 use llamastash::daemon::shutdown::ShutdownToken;
+use llamastash::daemon::state_store::RunningSnapshot;
 use llamastash::daemon::supervisor::{spawn as supervisor_spawn, ManagedSpawn, ManagedState};
 use llamastash::discovery::{DiscoveredModel, ModelCatalog, ModelSource};
 use llamastash::gguf::identity::ModelId;
@@ -32,7 +33,7 @@ use llamastash::launch::params::LaunchParams;
 use llamastash::proxy::state::ProxyState;
 use llamastash::proxy::DEFAULT_BODY_LIMIT_BYTES;
 use llamastash::test_support::{
-  fake_metadata, header_value, http_get, http_post, shutdown_listener, spawn_listener,
+  fake_metadata, header_value, http_get, http_post, running_row, shutdown_listener, spawn_listener,
 };
 use serde_json::Value;
 use tokio::time::sleep;
@@ -137,12 +138,25 @@ async fn build_state(
   models: Vec<DiscoveredModel>,
   supervisors: SupervisorRegistry,
 ) -> Arc<ProxyState> {
+  build_state_with_running(models, supervisors, Vec::new()).await
+}
+
+/// As [`build_state`], with persisted `running` rows. The preset a launch
+/// resolved lives on the persisted row, not on the supervisor.
+async fn build_state_with_running(
+  models: Vec<DiscoveredModel>,
+  supervisors: SupervisorRegistry,
+  running: Vec<RunningSnapshot>,
+) -> Arc<ProxyState> {
   let catalog = ModelCatalog::new();
   for m in models {
     catalog.upsert(m).await;
   }
-  let ctx =
-    MethodContext::with_catalog(ShutdownToken::new(), catalog).with_supervisors(supervisors);
+  let persisted = PersistedState::ephemeral();
+  persisted.mutate(|s| s.running = running).await;
+  let ctx = MethodContext::with_catalog(ShutdownToken::new(), catalog)
+    .with_supervisors(supervisors)
+    .with_state(persisted);
   ProxyState::from_context_with_auth(&ctx, false, true, None, DEFAULT_BODY_LIMIT_BYTES)
 }
 
@@ -380,9 +394,10 @@ async fn metrics_launch_scrape_adds_the_per_launch_series() {
   let id = launch_id.as_str();
   assert!(
     out.contains(&format!(
-      "llamastash:launch_info{{launch=\"{id}\",model=\"solo\",port="
+      "llamastash:launch_info{{launch=\"{id}\",model=\"solo\",port=\"{}\",preset=\"\"}} 1",
+      model.port()
     )),
-    "launch_info names the launch, its model and its port:\n{out}"
+    "launch_info names the launch, its model, its port and its (empty) preset:\n{out}"
   );
   assert!(out.contains(&format!(
     "llamastash:launch_requests_total{{launch=\"{id}\",model=\"solo\"}} 1"
@@ -433,6 +448,53 @@ async fn metrics_launch_scrape_adds_the_per_launch_series() {
       .contains("definitely-absent"),
     "the 404 names the value that matched nothing: {v}"
   );
+
+  let _ = model.stop(Duration::from_secs(3)).await;
+  shutdown_listener(shutdown, handle).await;
+  std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The preset a launch resolved reaches both shapes: `preset="fast"` on the
+/// `launch_info` line, and a `preset` field on the JSON launch row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_launch_scrape_reports_the_preset_the_launch_resolved() {
+  let dir = unique_temp("preset");
+  let registry = SupervisorRegistry::new();
+  let model = spawn_fake("/fixture/solo.gguf", &dir, false).await;
+  let launch_id = registry.next_id();
+  registry.insert(launch_id.clone(), model.clone()).await;
+  let row = running_row("/fixture/solo.gguf")
+    .launch_id(launch_id.as_str())
+    .port(model.port())
+    .preset("fast")
+    .build();
+  let state = build_state_with_running(
+    vec![discovered("/fixture/solo.gguf", Some("solo"))],
+    registry,
+    vec![row],
+  )
+  .await;
+  let (addr, shutdown, handle) = spawn_listener(state).await;
+  drive_request(addr, "solo").await;
+
+  let (_status, _headers, body) = http_get(addr, "/metrics?launch=1", &[]).await;
+  let out = text(body);
+  assert!(
+    out.contains(&format!(
+      "llamastash:launch_info{{launch=\"{}\",model=\"solo\",port=\"{}\",preset=\"fast\"}} 1",
+      launch_id.as_str(),
+      model.port()
+    )),
+    "the preset rides the launch_info labels:\n{out}"
+  );
+
+  let (_status, _headers, body) = http_get(addr, "/metrics?format=json&launch=1", &[]).await;
+  let v: Value = serde_json::from_slice(&body).expect("json");
+  assert_eq!(
+    v["launches"][0]["preset"], "fast",
+    "the JSON launch row carries the preset: {v}"
+  );
+  assert_eq!(v["launches"][0]["launch"], launch_id.as_str());
 
   let _ = model.stop(Duration::from_secs(3)).await;
   shutdown_listener(shutdown, handle).await;
