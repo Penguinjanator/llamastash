@@ -1,15 +1,24 @@
 ## [Unreleased]
 
+## [0.10.1] — 2026-10-30
+
+This release rebuilds the recommender's model catalog. `data/frontier-models.yaml` is a curated list of current open models read straight from HuggingFace, with sizes from the real GGUF files and scores from the Artificial Analysis Intelligence Index instead of whichllm, whose reworked index reads outdated bounds. Quants down to Q2 now ship for models of 20B and up, and the recommender can pick a MoE model that does not fit VRAM on a discrete GPU with its experts in system RAM, ranked lower by how much of it spills. `/metrics` reports which preset a running launch resolved from, and [`RECIPES.md`](RECIPES.md) has an MLX recipe for mlx-lm and oMLX.
+
+
 ### Added
 
+- The recommender's catalog adds a curated list of current open models (`data/frontier-models.yaml`: Qwen3.8 Flash-Next and 27B, Gemma 4, gpt-oss, GLM-4.7-Flash, Flint, LFM, Ministral 3, MiniMax M2.x, DeepSeek V4-Flash and more), read straight from HuggingFace with sizes from the real GGUF files, and ships quants down to Q2 for models of 20B and up. Curated models are scored by the Artificial Analysis Intelligence Index (`data/aa-index.json` plus the live leaderboard) instead of whichllm, which reads AA's reworked index with outdated bounds (Qwen3.8-27B scored 59 against Qwen3.6-27B's 83.5).
 - `/metrics` says which preset a running launch came from: `llamastash:launch_info` gained a `preset` label (empty when the launch started from none) and the JSON `launches` rows a `preset` field.
 - RECIPES.md has an MLX recipe: mlx-lm and oMLX as generic entries on Apple Silicon, each minting a row per MLX repo in the HF cache.
-- The recommender's catalog adds a curated list of current open models (`data/frontier-models.yaml`: Qwen3.8 Flash-Next and 27B, Gemma 4, gpt-oss, GLM-4.7-Flash, Flint, LFM, Ministral 3, MiniMax M2.x, DeepSeek V4-Flash and more), read straight from HuggingFace with sizes from the real GGUF files, and ships quants down to Q2 for models of 20B and up. Curated models are scored by the Artificial Analysis Intelligence Index (`data/aa-index.json` plus the live leaderboard) instead of whichllm, which reads AA's reworked index with outdated bounds (Qwen3.8-27B scored 59 against Qwen3.6-27B's 83.5).
 
 ### Changed
 
 - The recommender can pick a MoE model that does not fit VRAM on a discrete GPU, with its experts in system RAM, ranked lower by how much of it spills. A model with no benchmark score of its own takes whichllm's fallback score from a sibling or the same model line.
 - Snapshot regen tracks whichllm 0.5.23 (was 0.5.7).
+
+### Contributors
+
+- [@deepu105](https://github.com/deepu105): everything
 
 ## [0.10.0] — 2026-10-26
 
