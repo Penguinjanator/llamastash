@@ -4,6 +4,12 @@
 
 - `/metrics` says which preset a running launch came from: `llamastash:launch_info` gained a `preset` label (empty when the launch started from none) and the JSON `launches` rows a `preset` field.
 - RECIPES.md has an MLX recipe: mlx-lm and oMLX as generic entries on Apple Silicon, each minting a row per MLX repo in the HF cache.
+- The recommender's catalog adds a curated list of current open models (`data/frontier-models.yaml`: Qwen3.8 Flash-Next and 27B, Gemma 4, gpt-oss, GLM-4.7-Flash, Flint, LFM, Ministral 3, MiniMax M2.x, DeepSeek V4-Flash and more), read straight from HuggingFace with sizes from the real GGUF files, and ships quants down to Q2 for models of 20B and up. Curated models are scored by the Artificial Analysis Intelligence Index (`data/aa-index.json` plus the live leaderboard) instead of whichllm, which reads AA's reworked index with outdated bounds (Qwen3.8-27B scored 59 against Qwen3.6-27B's 83.5).
+
+### Changed
+
+- The recommender can pick a MoE model that does not fit VRAM on a discrete GPU, with its experts in system RAM, ranked lower by how much of it spills. A model with no benchmark score of its own takes whichllm's fallback score from a sibling or the same model line.
+- Snapshot regen tracks whichllm 0.5.23 (was 0.5.7).
 
 ## [0.10.0] — 2026-10-26
 

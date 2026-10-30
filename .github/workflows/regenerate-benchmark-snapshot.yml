@@ -27,6 +27,8 @@ on:
   pull_request:
     paths:
       - "data/benchmark-snapshot.json"
+      - "data/frontier-models.yaml"
+      - "data/aa-index.json"
       - "scripts/regenerate-benchmark-snapshot.py"
       - "scripts/benchmark_sources/**"
 

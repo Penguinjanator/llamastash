@@ -1,0 +1,174 @@
+# Curated open-weight models the snapshot regen always fetches by repo id,
+# on top of whichllm's discovery (scripts/benchmark_sources/frontier.py).
+#
+# whichllm only lists `text-generation` repos plus its own frontier list, so
+# vision-tagged chat models (Qwen3.5+, Gemma 4, Flash-Next) and recent
+# releases fall through. Each id below is read straight from HuggingFace, and
+# its GGUF quants come from the real files in trusted publisher repos.
+#
+# Fields:
+#   id      source repo (required).
+#   active  active params per token in billions, for MoE models whose repo
+#           name has no `-A<N>B` suffix. Taken from the model card.
+#   gguf    GGUF repos to read, in priority order. Default: probe
+#           unsloth, bartowski, ggml-org, lmstudio-community, mradermacher
+#           and the model's own org for `<name>-GGUF`.
+#   aa      the model's name on the Artificial Analysis leaderboard, without
+#           the effort / reasoning suffix. Its Intelligence Index score
+#           replaces whichllm's (scripts/benchmark_sources/aa_index.py).
+#           No AA row as of 2026-10-30: SmolLM3, LFM3, LFM2.5-24B, Ornith,
+#           Clef, Mellum, Hy-Memory, Flint, Laguna, KAT-Coder-V2.5-Dev.
+#
+# Grouped by the smallest host that runs them at Q4 or lower. MoE models also
+# run on smaller GPUs with experts in system RAM.
+#
+# Checked against HF downloads and recent releases on 2026-10-29. Left out:
+# models over ~420B total (no quant fits 128 GB: Kimi-K3, GLM-5.x, DeepSeek
+# V4-Pro / V4.1-Flash, MiniMax-M3 / M3.1, Muse Spark Open, Ling 3.1 Flash,
+# Qwen3.5-397B) and models with no GGUF from a trusted publisher.
+
+models:
+  # Up to 4 GB
+  - id: Qwen/Qwen3.5-0.8B
+    aa: Qwen3.5 0.8B
+  - id: Qwen/Qwen3.5-2B
+    aa: Qwen3.5 2B
+  - id: Qwen/Qwen3.5-4B
+    aa: Qwen3.5 4B
+  - id: Qwen/Qwen3-4B-Instruct-2507
+    aa: Qwen3 4B 2507 Instruct
+  - id: google/gemma-4-E2B-it
+    aa: Gemma 4 E2B
+  - id: google/gemma-4-E4B-it
+    aa: Gemma 4 E4B
+  - id: LiquidAI/LFM3-1.7B
+  - id: LiquidAI/LFM2.5-1.2B-Instruct
+    aa: LFM2.5-1.2B-Instruct
+  - id: openbmb/MiniCPM5-2B
+    aa: MiniCPM5-2B
+  - id: HuggingFaceTB/SmolLM3-3B
+  - id: LiquidAI/LFM2.5-8B-A1B
+    aa: LFM2.5-8B-A1B
+
+  # 8 GB
+  - id: Qwen/Qwen3.5-9B
+    aa: Qwen3.5 9B
+  - id: ornith-ai/Ornith-1.5-9B
+  - id: Cloudflare/clef-flash
+  - id: ibm-granite/granite-4.2-8b
+    aa: Granite 4.2 8B
+  - id: nvidia/NVIDIA-Nemotron-Nano-9B-v2
+    aa: NVIDIA Nemotron Nano 9B V2
+  - id: mistralai/Ministral-3-8B-Instruct-2512
+    aa: Ministral 3 8B
+  - id: JetBrains/Mellum2.1-12B-A2.5B-Thinking
+
+  # 12-16 GB
+  - id: google/gemma-4-12B-it
+    aa: Gemma 4 12B
+  - id: mistralai/Ministral-3-14B-Instruct-2512
+    aa: Ministral 3 14B
+  - id: openai/gpt-oss-20b
+    active: 3.6
+    aa: gpt-oss-20b
+  - id: LiquidAI/LFM2.5-24B-A2B
+
+  # 24 GB
+  - id: Qwen/Qwen3.8-27B
+    aa: Qwen3.8 27B
+  - id: Qwen/Qwen3.6-27B
+    aa: Qwen3.6 27B
+  - id: Qwen/Qwen3.5-27B
+    aa: Qwen3.5 27B
+  - id: google/gemma-4-31B-it
+    aa: Gemma 4 31B
+  - id: Cloudflare/clef
+  - id: mistralai/Mistral-Small-3.2-24B-Instruct-2506
+    aa: Mistral Small 3.2
+  - id: mistralai/Devstral-Small-2-24B-Instruct-2512
+    aa: Devstral Small 2
+  - id: ibm-granite/granite-4.2-30b
+    aa: Granite 4.2 30B
+  - id: Qwen/Qwen3.6-35B-A3B
+    aa: Qwen3.6 35B A3B
+  - id: Qwen/Qwen3.5-35B-A3B
+    aa: Qwen3.5 35B A3B
+  - id: Qwen/Qwen3-30B-A3B-Instruct-2507
+    aa: Qwen3 30B A3B 2507 Instruct
+  - id: Qwen/Qwen3-Coder-30B-A3B-Instruct
+    aa: Qwen3 Coder 30B A3B Instruct
+  - id: google/gemma-4-26B-A4B-it
+    aa: Gemma 4 26B A4B
+  - id: zai-org/GLM-4.7-Flash
+    active: 3
+    aa: GLM-4.7-Flash
+  - id: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+    aa: Nemotron 3.5 Lightning
+  - id: ornith-ai/Ornith-1.5-35B-A3B
+  - id: tencent/Hy-Memory-30B-A3B
+  - id: RecursiveSI/flint
+    active: 2.5
+  - id: poolside/Laguna-XS-2.1
+    active: 3
+  - id: Kwaipilot/KAT-Coder-V2.5-Dev
+    active: 3
+
+  # 32-48 GB
+  - id: ByteDance-Seed/Seed-OSS-36B-Instruct
+    aa: Seed-OSS-36B-Instruct
+  - id: LGAI-EXAONE/EXAONE-4.5-33B
+    aa: EXAONE 4.5 33B
+  - id: moonshotai/Kimi-Linear-48B-A3B-Instruct
+    aa: Kimi Linear 48B A3B Instruct
+
+  # 64-96 GB
+  - id: openai/gpt-oss-120b
+    active: 5.1
+    aa: gpt-oss-120b
+  - id: Qwen/Qwen3-Next-80B-A3B-Instruct
+    aa: Qwen3 Next 80B A3B Instruct
+  - id: Qwen/Qwen3-Coder-Next
+    active: 3
+    aa: Qwen3 Coder Next
+  - id: zai-org/GLM-4.5-Air
+    active: 12
+    aa: GLM-4.5-Air
+  - id: Qwen/Qwen3.5-122B-A10B
+    aa: Qwen3.5 122B A10B
+  - id: ornith-ai/Ornith-1.5-122B
+    active: 10
+  - id: mistralai/Mistral-Small-4-119B-2603
+    active: 6.5
+    aa: Mistral Small 4
+  - id: poolside/Laguna-S-2.1
+    active: 8
+
+  # 128 GB
+  - id: Qwen/Qwen3.8-Flash-Next
+    active: 6
+    aa: Qwen3.8-Flash-Next
+  - id: stepfun-ai/Step-3.5-Flash
+    active: 11
+    aa: Step 3.5 Flash
+  - id: MiniMaxAI/MiniMax-M2.7
+    active: 10
+    aa: MiniMax-M2.7
+  - id: MiniMaxAI/MiniMax-M2.5
+    active: 10
+    aa: MiniMax-M2.5
+  - id: Qwen/Qwen3-235B-A22B
+    aa: Qwen3 235B A22B
+  - id: thinkingmachines/Inkling-Small
+    active: 12
+    aa: Inkling Small
+  - id: tencent/Hy3
+    active: 21
+    aa: Hy3
+  - id: deepseek-ai/DeepSeek-V4-Flash-0731
+    active: 13
+    aa: DeepSeek V4 Flash 0731
+  - id: XiaomiMiMo/MiMo-V2.6-Flash-RL
+    active: 15
+    # AA has one MiMo-V2.6-Flash row and doesn't say if it is the -RL or
+    # -MOPD weights; -RL came first and has ~7x the downloads.
+    aa: MiMo-V2.6-Flash

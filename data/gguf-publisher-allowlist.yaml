@@ -14,6 +14,7 @@
 allowlist:
   - bartowski
   - unsloth
+  - ggml-org           # llama.cpp's own org; publishes day-one GGUFs of frontier releases
   - lmstudio-community
   - QuantFactory
   - mradermacher

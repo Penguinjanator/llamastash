@@ -15,7 +15,7 @@ invoking the regen script.
 
 R45 single-binary invariant: none of this runs in the Rust artefact.
 
-## whichllm 0.5.7 contract (the shape this module assumes)
+## whichllm 0.5.23 contract (the shape this module assumes)
 
 ``whichllm.models.fetcher.fetch_models(limit, include_vision) -> coroutine``
 returns ``list[ModelInfo]`` where each ``ModelInfo`` carries:
@@ -46,30 +46,46 @@ try:
 except ImportError:  # pragma: no cover — PyYAML is a regen-time CI dep
     yaml = None  # type: ignore[assignment]
 
+from benchmark_sources import frontier as _frontier
 from benchmark_sources.whichllm import SourceResult
 
 # Preferred quants the snapshot ships, ordered loosely from "smallest
 # / fastest" to "largest / most faithful". Every quant in this list
 # that a trusted GGUF publisher ships becomes a separate snapshot row,
 # so the recommender can pick across the quant axis (e.g. Q8_0 on a
-# 64 GB box, Q3_K_M on a 12 GB box). Spans the same range as
-# `whichllm --json --top 10` for direct comparison.
+# 64 GB box, Q3_K_M on a 12 GB box). Q2_K_XL is unsloth's `UD-Q2_K_XL`.
 PREFERRED_QUANTS: Tuple[str, ...] = (
+    "Q2_K",
+    "Q2_K_XL",
+    "IQ3_XXS",
     "Q3_K_M",
+    "IQ4_XS",
     "Q4_K_S",
     "Q4_K_M",
+    "MXFP4",
     "Q5_K_M",
     "Q6_K",
     "Q8_0",
 )
 
+# Quants below Q3_K_M lose too much on small models to be worth a row; they
+# ship only for models this large, where they are the way to fit at all.
+LOW_QUANTS: Tuple[str, ...] = ("Q2_K", "Q2_K_XL", "IQ3_XXS")
+LOW_QUANT_MIN_PARAMS = 20_000_000_000
+
 # Per-quant rough density (GB per billion params) for sanity checks
 # when HF doesn't expose the GGUF file size in metadata. Aligned with
-# bartowski's published numbers as of 2026-05.
+# bartowski's published numbers as of 2026-05; the low and IQ quants are
+# whichllm's bytes-per-weight plus the same ~7% file overhead.
 _QUANT_GB_PER_BPARAM: Dict[str, float] = {
+    "Q2_K": 0.34,
+    "Q2_K_XL": 0.36,
+    "IQ3_XXS": 0.40,
     "Q3_K_M": 0.46,
+    "IQ4_XS": 0.54,
     "Q4_K_S": 0.56,
     "Q4_K_M": 0.60,
+    "MXFP4": 0.57,
     "Q5_K_M": 0.71,
     "Q6_K": 0.82,
     "Q8_0": 1.06,
@@ -84,23 +100,33 @@ _QUANT_GB_PER_BPARAM: Dict[str, float] = {
 # whichllm's top-N when both fit. Q4_K_M stays competitive on
 # tighter-VRAM hosts where speed matters more.
 _QUANT_SPEED_MULT: Dict[str, float] = {
+    "Q2_K": 1.45,
+    "Q2_K_XL": 1.40,
+    "IQ3_XXS": 1.30,
     "Q3_K_M": 1.25,
+    "IQ4_XS": 1.15,
     "Q4_K_S": 1.10,
     "Q4_K_M": 1.10,
+    "MXFP4": 1.12,
     "Q5_K_M": 0.95,
     "Q6_K": 0.85,
     "Q8_0": 0.65,
 }
 
 # Per-quant quality discount applied to the family's benchmark score.
-# Mirrors whichllm's `QUANT_QUALITY_PENALTY` table (engine/quantization
-# .py) as ``1 - penalty`` so Q6_K / Q5_K_M of a frontier model outrank
-# Q4_K_M of the same family when both fit. Q3_K_M's 8% drop lines up
-# with empirical eval data on GGUF quants.
+# Mirrors whichllm's `QUANT_QUALITY_PENALTY` table (whichllm/constants.py)
+# as ``1 - penalty`` so Q6_K / Q5_K_M of a frontier model outrank Q4_K_M
+# of the same family when both fit, and Q2 only wins when nothing larger
+# fits. whichllm has no entry for unsloth's Q2_K_XL; it takes Q2_K's.
 _QUANT_QUALITY_MULT: Dict[str, float] = {
+    "Q2_K": 0.75,
+    "Q2_K_XL": 0.75,
+    "IQ3_XXS": 0.82,
     "Q3_K_M": 0.92,
+    "IQ4_XS": 0.95,
     "Q4_K_S": 0.945,
     "Q4_K_M": 0.95,
+    "MXFP4": 0.94,
     "Q5_K_M": 0.97,
     "Q6_K": 0.98,
     "Q8_0": 0.99,
@@ -109,7 +135,8 @@ _QUANT_QUALITY_MULT: Dict[str, float] = {
 # Bytes per weight per quant, used to synthesize file_size_bytes when
 # the official safetensors-only repo doesn't ship GGUFs of its own.
 # Ported from whichllm's QUANT_BYTES_PER_WEIGHT — see
-# ``_synthesize_variants_for_official_repo`` in this file.
+# ``_synthesize_variants_for_official_repo`` in this file. Only the six
+# classic quants are synthesized; the rest need a real file.
 _BYTES_PER_WEIGHT: Dict[str, float] = {
     "Q3_K_M": 0.4375,
     "Q4_K_S": 0.5625,
@@ -236,16 +263,21 @@ def discover(
     whichllm_limit: int = 300,
 ) -> SourceResult:
     """Run whichllm's discovery, filter to GGUF-bearing candidates from
-    allowlisted publishers, and return the rows as a SourceResult.
+    allowlisted publishers, add the curated frontier models
+    (``data/frontier-models.yaml``), and return the rows as a SourceResult.
 
-    ``include_vision=False`` per Key Decisions: v2 does not ship vision
-    / multimodal models. ``whichllm_limit`` controls how many models
-    whichllm tries to enumerate from HF before this module filters
-    down to ``limit`` rows.
+    ``include_vision=False`` keeps whichllm's broad discovery to
+    text-generation repos. Vision-tagged chat models the recommender
+    should offer are named in the curated list instead, so their GGUFs
+    are read from real files rather than whatever image models the
+    ``image-text-to-text`` listing drags in. ``whichllm_limit`` controls
+    how many models whichllm tries to enumerate from HF before this module
+    filters down to ``limit`` rows; curated models do not count against it.
 
     Failure modes follow the partial-failure policy: any exception
-    inside whichllm bubbles up as ``ok=False`` so the regen script
-    keeps last-known-good live.
+    inside whichllm, or a curated fetch that yields nothing at all,
+    bubbles up as ``ok=False`` so the regen script keeps last-known-good
+    live.
     """
     rows: List[Dict[str, Any]] = []
     try:
@@ -257,7 +289,17 @@ def discover(
         for candidate in candidates:
             for row in _project_candidate(candidate, allowlist, prefixes, defaults):
                 rows.append(_serialise(row))
-        rows = _rank_and_cap(rows, limit=limit)
+        curated = _frontier.fetch_frontier_rows(
+            _frontier.load_frontier_list(repo_root),
+            ladder=PREFERRED_QUANTS,
+            low_quants=LOW_QUANTS,
+            low_quant_min_params=LOW_QUANT_MIN_PARAMS,
+            trusted=lambda pub, src: _publisher_trusted(pub, src, allowlist),
+            task_hints=lambda src: attach_task_hints(src, prefixes, defaults),
+        )
+        if not curated:
+            raise RuntimeError("curated frontier list produced no rows")
+        rows = _rank_and_cap(curated + rows, limit=limit)
     except Exception as exc:  # noqa: BLE001 — surface every failure mode
         return SourceResult(
             name="hf-discovery",
@@ -364,7 +406,7 @@ def _project_candidate(
     else:
         if not _publisher_trusted(publisher, source_hf_id, allowlist):
             return []
-        chosen = _collect_variants(variants)
+        chosen = _collect_variants(variants, params)
         if not chosen:
             return []
 
@@ -463,7 +505,9 @@ def _synthesize_variants_for_official_repo(
     return out
 
 
-def _collect_variants(variants: Iterable[Any]) -> List[Tuple[str, str, int]]:
+def _collect_variants(
+    variants: Iterable[Any], params: int = 0
+) -> List[Tuple[str, str, int]]:
     """Return one ``(quant, filename, file_size_bytes)`` tuple per
     preferred quant the publisher ships. Order matches
     :data:`PREFERRED_QUANTS`.
@@ -483,6 +527,13 @@ def _collect_variants(variants: Iterable[Any]) -> List[Tuple[str, str, int]]:
     by_quant: Dict[str, List[Any]] = {}
     for v in variants:
         q = (_attr(v, "quant_type") or _attr(v, "quant") or "").upper()
+        filename = _attr(v, "filename") or _attr(v, "file") or ""
+        # whichllm labels vision projector files by their own quant
+        # (`mmproj-Q8_0.gguf` reads as Q8_0); they are not the weights.
+        if "mmproj" in filename.lower():
+            continue
+        if q in LOW_QUANTS and params < LOW_QUANT_MIN_PARAMS:
+            continue
         if q in PREFERRED_QUANTS:
             by_quant.setdefault(q, []).append(v)
     out: List[Tuple[str, str, int]] = []
@@ -576,9 +627,21 @@ def _rank_and_cap(rows: List[Dict[str, Any]], *, limit: int) -> List[Dict[str, A
     truncate mid-quant-set for the last few models, producing
     asymmetric coverage. Counting source ids keeps the budget
     interpretable as "how many distinct models the snapshot ships".
+
+    Curated rows (``curated: True``) carry sizes read from the real files,
+    so they replace every discovered row of the same source model and sit
+    outside the ``limit`` budget.
     """
+    curated_sources = {
+        (r.get("source_hf_id") or "").lower() for r in rows if r.get("curated")
+    }
     rows.sort(
-        key=lambda r: (r.get("downloads", 0), r.get("last_modified", "")), reverse=True
+        key=lambda r: (
+            bool(r.get("curated")),
+            r.get("downloads", 0),
+            r.get("last_modified", ""),
+        ),
+        reverse=True,
     )
     deduped: List[Dict[str, Any]] = []
     seen_pair: set[Tuple[str, str]] = set()
@@ -586,15 +649,19 @@ def _rank_and_cap(rows: List[Dict[str, Any]], *, limit: int) -> List[Dict[str, A
     for row in rows:
         source = row.get("source_hf_id") or ""
         quant = row.get("quant") or ""
+        curated = bool(row.get("curated"))
+        if not curated and source.lower() in curated_sources:
+            continue
         pair = (source, quant)
         if pair in seen_pair:
             continue
-        if source not in seen_source and len(seen_source) >= limit:
+        if not curated and source not in seen_source and len(seen_source) >= limit:
             # Past the unique-model budget; drop everything from new
             # source ids but keep emitting more quants of sources
             # already counted in.
             continue
         seen_pair.add(pair)
-        seen_source.add(source)
+        if not curated:
+            seen_source.add(source)
         deduped.append(row)
     return deduped

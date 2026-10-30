@@ -10,7 +10,7 @@ httpx>=0.27,<1.0
 # 2026-05-20-001). The vendored shim's WHICHLLM_VENDORED_COMMIT must
 # stay in lockstep with this pin; Unit 7's CI lint asserts equality at
 # regen time.
-whichllm==0.5.7
+whichllm==0.5.23
 
 # PyYAML parses data/task-hints.yaml + data/gguf-publisher-allowlist.yaml
 # (Unit 4 side-files for catalog curation).

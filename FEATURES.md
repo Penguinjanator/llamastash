@@ -26,7 +26,7 @@ Exit-code contract: `72` aborted-safe-to-re-run, `73` download-failed, `74` smok
 
 ### Hardware-aware model recommender
 
-Every pick is auditable, not a black box. A VRAM-fit hard filter prunes anything that won't load, then a composite ranking ordered by `benchmark score × tok/s × params × recency` ranks what's left. The bundled benchmark snapshot is refreshed daily by CI from Open-LLM-Leaderboard, Aider Polyglot, and a curated whichllm catalog.
+Every pick is auditable, not a black box. A VRAM-fit hard filter prunes anything that won't load, then a composite ranking ordered by `benchmark score × tok/s × params × recency` ranks what's left. On a discrete GPU a MoE model that does not fit VRAM can still be picked with its experts in system RAM, ranked lower by how much spills. The bundled benchmark snapshot is refreshed daily by CI from whichllm's model discovery and benchmark merge, plus a curated list of current open models (`data/frontier-models.yaml`) with quants down to Q2 for models of 20B and up, scored by the Artificial Analysis Intelligence Index.
 
 Each candidate surfaces VRAM headroom, benchmark source, estimated tok/s, parameter count, and quantization so you can override the top pick with informed reasoning. Also exposed standalone via [`llamastash recommend`](docs/usage.md#llamastash-recommend).
 

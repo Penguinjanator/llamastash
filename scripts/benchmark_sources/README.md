@@ -6,7 +6,7 @@ the `whichllm` Python dependency rather than re-vendored adapters.
 ## Status
 
 Tracks `whichllm` at the version pinned in `scripts/requirements.txt`
-(currently `0.5.7`). The matching reference is recorded in `whichllm.py`
+(currently `0.5.23`). The matching reference is recorded in `whichllm.py`
 via `WHICHLLM_PINNED_VERSION` and in `NOTICE`. CI asserts the two pins
 match before each daily regen.
 
@@ -27,6 +27,19 @@ whichllm's own ranking.
   candidates from allowlisted publishers, attaches task hints, dedupes
   on `(source_hf_id, quant)`, and yields rows shaped like the Rust
   `ModelEntry` struct.
+- `frontier.py` — curated models from `data/frontier-models.yaml`, read
+  by repo id: params from the source repo, quants and sizes from the
+  file trees of trusted GGUF repos (`<publisher>/<name>-GGUF`, or the
+  entry's `gguf:` list). Covers what whichllm's discovery misses:
+  vision-tagged chat models and fresh releases.
+- `aa_index.py` — Artificial Analysis Intelligence Index scores for the
+  curated models' `aa:` names. Reference is the pinned capture
+  `data/aa-index.json` (2026-10-16, 477 models); the live leaderboard
+  fills newer names, mapped onto the capture's scale by a least-squares
+  fit over shared names. Scores are scaled to whichllm's 0-100 so they
+  rank against the rest of the catalog. Refresh the capture with
+  `python3 scripts/benchmark_sources/aa_index.py <leaderboard-url> > data/aa-index.json`
+  and refit `_SCALE` / `_OFFSET` when AA reworks its index.
 - `whichllm_combined.py` — score adapter. Calls
   `whichllm.models.benchmark.fetch_benchmark_scores()` and returns a
   case-insensitive `hf_id -> score` index. Inherits Open LLM
@@ -37,13 +50,16 @@ whichllm's own ranking.
 ## Pipeline (regen flow)
 
 1. `hf_discovery.discover()` queries whichllm for candidate `ModelInfo`
-   records (downloads + lastModified + trending + the curated frontier
-   list).
+   records (downloads + lastModified + trending + whichllm's frontier
+   list), and `frontier.py` adds the models in
+   `data/frontier-models.yaml`. A curated model's rows replace whichllm's
+   rows for it and do not count against the model cap.
 2. Each candidate is filtered by GGUF availability + publisher
    allowlist (`data/gguf-publisher-allowlist.yaml`), then projected to
    **one row per preferred quant the publisher ships** — see
-   `PREFERRED_QUANTS` in `hf_discovery.py` (Q3_K_M, Q4_K_S, Q4_K_M,
-   Q5_K_M, Q6_K, Q8_0). Each row carries `source_hf_id`, `params`,
+   `PREFERRED_QUANTS` in `hf_discovery.py` (Q2_K, Q2_K_XL, IQ3_XXS,
+   Q3_K_M, IQ4_XS, Q4_K_S, Q4_K_M, MXFP4, Q5_K_M, Q6_K, Q8_0). The three
+   below Q3_K_M ship only for models of 20B params and up. Each row carries `source_hf_id`, `params`,
    `params_active`, `is_moe`, `weights_bytes` (per-quant),
    `gguf_publisher`, `downloads`, `last_modified`.
 3. Task hints come from `data/task-hints.yaml` via longest-prefix
@@ -54,12 +70,17 @@ whichllm's own ranking.
    ids ships. A snapshot therefore typically holds 300–600 rows.
 5. `whichllm_combined.fetch()` returns one merged score per `hf_id`.
    The regen joins it onto the catalog rows on lowercased
-   `source_hf_id`. Each row gets a small per-quant quality discount
-   (Q8_0 ≈ family score, Q3_K_M ≈ 0.94×) and a per-quant speed mult
-   so the composite ranker can distinguish quants within a family.
-   Rows whichllm doesn't cover ship with `score=0` and source
-   `no-source`; the recommender still ranks them by params / speed /
-   recency so they remain reachable when the user paginates.
+   `source_hf_id`. A curated model with an `aa:` name takes its AA
+   score instead (source `aa-index`). With no direct hit, whichllm's own fallback
+   (`lookup_benchmark_evidence`: a name variant, then a size-interpolated
+   score from the same model line) supplies a confidence-discounted
+   score with source `whichllm-<kind>`. Each row gets a per-quant quality
+   discount (whichllm's quant penalties: Q8_0 0.99×, Q3_K_M 0.92×,
+   Q2_K 0.75×) and a per-quant speed mult so the composite ranker can
+   distinguish quants within a family. Rows with no evidence ship with
+   `score=0` and source `no-source`; the recommender still ranks them by
+   params / speed / recency so they remain reachable when the user
+   paginates.
 6. The Rust recommender's output dedup keeps one row per
    `source_hf_id` (the best-scoring quant that fits), so the user-facing
    top-N looks like a list of distinct models, not five quants of the

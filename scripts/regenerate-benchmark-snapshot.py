@@ -38,7 +38,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_VERSION = 1
@@ -73,6 +73,8 @@ SOURCES_DIR = REPO_ROOT / "scripts" / "benchmark_sources"
 # ``scripts/benchmark_sources/`` per R45 (CI-only, never in the binary).
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
+from benchmark_sources import aa_index as _aa_index  # noqa: E402
+from benchmark_sources import frontier as _frontier  # noqa: E402
 from benchmark_sources import hf_discovery as _hf_discovery  # noqa: E402
 from benchmark_sources import whichllm_combined as _whichllm_scores  # noqa: E402
 from benchmark_sources.whichllm import SourceResult  # noqa: E402
@@ -251,7 +253,8 @@ def build_snapshot(sources: List[SourceResult]) -> Dict[str, Any]:
 
     catalog_rows = _extract_catalog_rows(sources)
     scores_by_adapter = _index_adapter_scores(sources)
-    models = [_compose_model_entry(row, scores_by_adapter) for row in catalog_rows]
+    lookup = _score_lookup(scores_by_adapter.get("whichllm-combined", {}), _aa_overrides())
+    models = [_compose_model_entry(row, lookup) for row in catalog_rows]
 
     candidate: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -300,7 +303,7 @@ def _extract_catalog_rows(sources: List[SourceResult]) -> List[Dict[str, Any]]:
 
 def _compose_model_entry(
     row: Dict[str, Any],
-    scores_by_adapter: Dict[str, Dict[str, float]],
+    lookup: Callable[[str, int], Tuple[float, str]],
 ) -> Dict[str, Any]:
     """Build one ``models[]`` entry. The hf-discovery source supplies
     everything except ``benchmark_score``, ``tok_s_factor``, and
@@ -309,9 +312,7 @@ def _compose_model_entry(
     quant = row.get("quant") or "Q4_K_M"
     file_basename = row.get("file") or ""
     slug = _slug(source_hf_id, quant)
-    family_score, score_source = _pick_benchmark_score(
-        source_hf_id, row.get("task_hints", []), scores_by_adapter
-    )
+    family_score, score_source = lookup(source_hf_id, int(row.get("params") or 0))
     # Apply per-quant quality discount so Q8_0 outranks Q4_K_M of the
     # same model when both fit — matches inference reality where Q3
     # is ~5% off the family score and Q8 is essentially lossless.
@@ -361,26 +362,71 @@ def _slug(source_hf_id: str, quant: str) -> str:
     return f"{base}-{quant.lower()}"
 
 
-def _pick_benchmark_score(
-    source_hf_id: str,
-    task_hints: Sequence[str],
-    scores_by_adapter: Dict[str, Dict[str, float]],
-) -> Tuple[float, str]:
-    """Look up the model's score in whichllm's combined index.
+def _aa_overrides() -> Dict[str, float]:
+    """``{lowercased source id: AA score}`` for curated models with an
+    ``aa:`` name in ``data/frontier-models.yaml``."""
+    scores = _aa_index.load_scores(REPO_ROOT, _aa_index.fetch_html(_aa_index.AA_LIVE_URL))
+    out: Dict[str, float] = {}
+    for entry in _frontier.load_frontier_list(REPO_ROOT):
+        name = entry.get("aa")
+        if not name:
+            continue
+        score = scores.get(_aa_index.canonical(str(name)))
+        if score is None:
+            print(f"[WARN] aa-index: {entry['id']}: no AA score for {name!r}", file=sys.stderr)
+        else:
+            out[entry["id"].lower()] = score
+    return out
 
-    The combined index is already case-insensitive and merges all six
-    upstream sources (current overrides frozen) plus lineage recency
-    demotion. Rows that whichllm doesn't cover get a 0.0 score with
-    source ``no-source`` — they still ship so the recommender can
-    rank by params / speed / recency, but they don't get a misleading
-    constant floor that would let them tie with real scored models.
+
+def _score_lookup(
+    combined: Dict[str, float],
+    aa: Dict[str, float],
+) -> Callable[[str, int], Tuple[float, str]]:
+    """Return ``(source_hf_id, params) -> (score, source)`` over whichllm's
+    combined, case-insensitive index.
+
+    A curated model's AA score (``aa``, keyed by lowercased id) wins, with
+    source ``aa-index``: whichllm scales AA's current index with bounds fit to
+    an older one. Otherwise a direct whichllm hit is source ``whichllm``.
+    Otherwise whichllm's own fallback
+    (``lookup_benchmark_evidence``: an `-Instruct` / name variant, then a
+    size-interpolated score from the same model line) applies, discounted
+    by its confidence the way whichllm's ranker does, with source
+    ``whichllm-<kind>``. Rows with no evidence get 0.0 and ``no-source``:
+    they still ship and rank by params / speed / recency, without a
+    constant floor that would tie them with real scored models.
     """
-    del task_hints  # task routing now lives inside whichllm's merge
-    combined = scores_by_adapter.get("whichllm-combined", {})
-    score = combined.get(source_hf_id.lower())
-    if score is not None:
-        return score, "whichllm"
-    return 0.0, "no-source"
+    from whichllm.models.benchmark import (  # type: ignore[import-not-found]
+        build_line_bucket_index,
+        build_score_index,
+        lookup_benchmark_evidence,
+    )
+
+    ci_index, line_index = build_score_index(combined)
+    buckets = build_line_bucket_index(combined)
+
+    def lookup(source_hf_id: str, params: int) -> Tuple[float, str]:
+        if source_hf_id.lower() in aa:
+            return aa[source_hf_id.lower()], "aa-index"
+        direct = combined.get(source_hf_id.lower())
+        if direct is not None:
+            return direct, "whichllm"
+        evidence = lookup_benchmark_evidence(
+            source_hf_id,
+            None,
+            combined,
+            ci_index=ci_index,
+            line_index=line_index,
+            line_bucket_index=buckets,
+            actual_params_b=params / 1e9 if params else None,
+        )
+        if evidence.score is None:
+            return 0.0, "no-source"
+        conf = max(0.0, min(1.0, evidence.confidence))
+        return round(evidence.score * (0.75 + 0.25 * conf), 2), f"whichllm-{evidence.source}"
+
+    return lookup
 
 
 def _tok_s_factor_for_params(params: int) -> float:

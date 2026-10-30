@@ -28,7 +28,7 @@ WHICHLLM_VENDORED_DATE = "2026-05-19"
 # `whichllm.__version__` before publishing the snapshot — drift means
 # either the pin in scripts/requirements.txt or this constant was
 # bumped without the other.
-WHICHLLM_PINNED_VERSION = "0.5.7"
+WHICHLLM_PINNED_VERSION = "0.5.23"
 
 
 class ExtractionFailed(Exception):

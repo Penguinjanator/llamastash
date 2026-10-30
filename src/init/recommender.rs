@@ -142,16 +142,22 @@ pub fn recommend(
       continue;
     }
     let peak = estimate_peak_bytes_for_entry(entry, options.ctx);
-    if !fits(peak, ceiling, hardware) {
+    let Some(offload_ratio) = placement(entry, peak, ceiling, hardware) else {
       continue;
+    };
+    let mut score = composite_score(entry, snapshot, options);
+    let mut justification = render_one_line(entry, peak, hardware);
+    if offload_ratio > 0.0 {
+      let bench = snapshot.recommender_weights.benchmark * entry.benchmark_score.value / 100.0;
+      score -= bench * (1.0 - offload_quality_factor(entry, offload_ratio));
+      justification.push_str(&format!(" · experts in RAM ~{:.0}%", offload_ratio * 100.0));
     }
-    let score = composite_score(entry, snapshot, options);
     scored.push(Recommendation {
       kind: RecommendationKind::Curated {
         entry: entry.clone(),
       },
       score,
-      justification: render_one_line(entry, peak, hardware),
+      justification,
       estimated_peak_bytes: Some(peak),
     });
   }
@@ -379,6 +385,60 @@ fn effective_vram_ceiling(hw: &HardwareSnapshot, snap: &BenchmarkSnapshot) -> u6
 
 fn fits(peak_bytes: u64, ceiling: u64, _hw: &HardwareSnapshot) -> bool {
   peak_bytes > 0 && peak_bytes <= ceiling
+}
+
+/// RAM left for spilled MoE experts: whichllm's `estimate_usable_ram`,
+/// total minus 15% of RAM clamped to 4–32 GiB.
+fn offload_ram_budget(ram_total_bytes: u64) -> u64 {
+  const GIB: u64 = 1024 * 1024 * 1024;
+  let reserve = ((ram_total_bytes as f64 * 0.15) as u64).clamp(4 * GIB, 32 * GIB);
+  ram_total_bytes.saturating_sub(reserve)
+}
+
+/// `Some(0.0)` when the entry fits in VRAM; `Some(ratio)` when it is a MoE
+/// that `--fit` can run on a discrete GPU with `ratio` of its peak in system
+/// RAM; `None` when it does not run here. The GPU must hold the active slice
+/// plus KV and activations. Unified-memory hosts get no spill: their VRAM
+/// figure already is the shared pool.
+fn placement(entry: &ModelEntry, peak: u64, ceiling: u64, hw: &HardwareSnapshot) -> Option<f64> {
+  if fits(peak, ceiling, hw) {
+    return Some(0.0);
+  }
+  let active = entry.params_active.filter(|_| entry.is_moe)?;
+  if hw.vram_bytes.is_none() || hw.gpu.is_unified() || entry.params == 0 || peak == 0 {
+    return None;
+  }
+  let active_ratio = (active as f64 / entry.params as f64).min(1.0);
+  let non_weights = peak.saturating_sub(entry.weights_bytes);
+  let resident = (entry.weights_bytes as f64 * active_ratio) as u64 + non_weights;
+  if resident > ceiling || peak > ceiling + offload_ram_budget(hw.ram_total_bytes) {
+    return None;
+  }
+  Some((peak - ceiling) as f64 / peak as f64)
+}
+
+/// Benchmark-term multiplier for a MoE run with `ratio` of its peak in
+/// system RAM. Port of whichllm's `_partial_offload_quality_factor` for the
+/// MoE case where the active set stays on the GPU (the only case `placement`
+/// admits).
+fn offload_quality_factor(entry: &ModelEntry, ratio: f64) -> f32 {
+  let ratio = ratio.clamp(0.0, 1.0);
+  let (dense, moe) = match ratio {
+    r if r >= 0.75 => (0.42, 0.66),
+    r if r >= 0.60 => (0.52, 0.70),
+    r if r >= 0.40 => (0.62, 0.76),
+    r if r >= 0.25 => (0.76, 0.82),
+    _ => (0.86, 0.88),
+  };
+  let active_ratio = match (entry.params_active, entry.params) {
+    (Some(a), p) if p > 0 => (a as f64 / p as f64).clamp(0.0, 1.0),
+    _ => 1.0,
+  };
+  if ratio <= 1.0 - active_ratio {
+    f32::max(dense, moe)
+  } else {
+    f32::min(0.76, dense + 0.08)
+  }
 }
 
 /// Hardware-fit verdict for a single GGUF file. Mirrors the
@@ -780,13 +840,9 @@ mod tests {
   }
 
   #[test]
-  fn recommend_8gb_nvidia_does_not_pick_above_8b() {
-    // After the whichllm-aligned VRAM estimator landed, params is no
-    // longer the right proxy for "will this fit". Use the actual peak
-    // vs ceiling check — every surfaced pick must have an estimated
-    // peak that lands under the 8 GB host's effective ceiling. The
-    // recommender's own fit gate already enforces this, so the test
-    // is asserting the contract rather than a hand-picked param cap.
+  fn recommend_8gb_nvidia_fits_vram_or_spills_moe_experts() {
+    // Every pick either fits the 8 GB ceiling, or is a MoE whose experts
+    // spill into the RAM budget and says so.
     let snap = load_bundled();
     let hw = linux_nvidia(8.0);
     let ceiling = effective_vram_ceiling(&hw, &snap);
@@ -795,13 +851,15 @@ mod tests {
       if let (RecommendationKind::Curated { entry }, Some(peak)) =
         (&rec.kind, rec.estimated_peak_bytes)
       {
+        if peak <= ceiling {
+          continue;
+        }
         assert!(
-          peak <= ceiling,
-          "8 GB Nvidia must not surface a model whose peak exceeds the ceiling \
-           ({}: peak={}, ceiling={})",
-          entry.id,
-          peak,
-          ceiling
+          entry.is_moe
+            && rec.justification.contains("experts in RAM")
+            && peak <= ceiling + offload_ram_budget(hw.ram_total_bytes),
+          "{}: peak={peak} over ceiling={ceiling} without a MoE spill",
+          entry.id
         );
       }
     }
@@ -1120,6 +1178,54 @@ mod tests {
       peak < 4_683_960_320 + 2_500_000_000,
       "peak should sit within 2.5 GB of weights at 4k, got {peak}"
     );
+  }
+
+  #[test]
+  fn moe_spills_experts_to_ram_on_a_discrete_gpu() {
+    // 30B-A3B Q4_K_M (~18 GB) on an 8 GB card with 64 GB RAM.
+    let entry = moe_entry(18 * GB, 30_000_000_000, 3_000_000_000);
+    let hw = linux_nvidia(8.0);
+    let ceiling = (8.0 * GB as f64 * SAFETY_MARGIN) as u64;
+    let peak = estimate_peak_bytes_for_entry(&entry, DEFAULT_CTX);
+    let ratio = placement(&entry, peak, ceiling, &hw).expect("runs with experts in RAM");
+    assert!(ratio > 0.4 && ratio < 0.8, "ratio {ratio}");
+    assert!(offload_quality_factor(&entry, ratio) < 1.0);
+  }
+
+  #[test]
+  fn no_spill_for_dense_models_unified_hosts_or_short_ram() {
+    let ceiling = (8.0 * GB as f64 * SAFETY_MARGIN) as u64;
+    let dense = dense_entry(18 * GB, 30_000_000_000);
+    let dense_peak = estimate_peak_bytes_for_entry(&dense, DEFAULT_CTX);
+    assert_eq!(
+      placement(&dense, dense_peak, ceiling, &linux_nvidia(8.0)),
+      None
+    );
+
+    let moe = moe_entry(18 * GB, 30_000_000_000, 3_000_000_000);
+    let peak = estimate_peak_bytes_for_entry(&moe, DEFAULT_CTX);
+    assert_eq!(placement(&moe, peak, ceiling, &apple_silicon(8.0)), None);
+
+    let mut short_ram = linux_nvidia(8.0);
+    short_ram.ram_total_bytes = 16 * GB;
+    assert_eq!(placement(&moe, peak, ceiling, &short_ram), None);
+  }
+
+  #[test]
+  fn spill_needs_the_active_slice_on_the_gpu() {
+    // 235B-A22B Q2 (~80 GB): the 22B active slice plus KV does not fit 4 GB.
+    let entry = moe_entry(80 * GB, 235_000_000_000, 22_000_000_000);
+    let mut hw = linux_nvidia(4.0);
+    hw.ram_total_bytes = 256 * GB;
+    let ceiling = (4.0 * GB as f64 * SAFETY_MARGIN) as u64;
+    let peak = estimate_peak_bytes_for_entry(&entry, DEFAULT_CTX);
+    assert_eq!(placement(&entry, peak, ceiling, &hw), None);
+  }
+
+  #[test]
+  fn offload_ram_budget_keeps_a_bounded_reserve() {
+    assert_eq!(offload_ram_budget(16 * GB), 12 * GB);
+    assert_eq!(offload_ram_budget(512 * GB), 480 * GB);
   }
 
   #[test]
